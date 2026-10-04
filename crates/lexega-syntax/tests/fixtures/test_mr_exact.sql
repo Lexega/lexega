@@ -1,0 +1,3 @@
+SELECT *
+FROM t
+MATCH_RECOGNIZE( PATTERN (A + /* initial rise */ B * C +) DEFINE A AS TRUE, B AS TRUE, C AS TRUE);

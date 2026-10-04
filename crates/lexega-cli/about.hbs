@@ -1,0 +1,28 @@
+================================================================================
+THIRD-PARTY LICENSES
+================================================================================
+
+This software (lexega) includes the following third-party dependencies.
+All are licensed under permissive licenses that allow commercial use.
+
+Generated automatically from Cargo.lock — do not edit manually.
+
+{{#each overview}}
+  {{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+{{#if first_of_kind}}
+================================================================================
+{{name}}
+================================================================================
+{{/if}}
+Used by: {{#each used_by}}{{crate.name}} v{{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+{{#if text}}
+
+{{{text}}}
+{{/if}}
+{{/each}}
+================================================================================
+END OF THIRD-PARTY LICENSES
+================================================================================

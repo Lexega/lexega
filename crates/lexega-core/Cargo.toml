@@ -1,0 +1,50 @@
+[package]
+name = "lexega-core"
+# Released in lockstep with the Lexega engine; the two version numbers match.
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.91"
+description = "SQL governance recognition engine: relational plan, statement fact base and YAML rule evaluation over the lexega-syntax front-end"
+license = "BUSL-1.1"
+repository = "https://github.com/Lexega/lexega"
+homepage = "https://lexega.com"
+keywords = ["sql", "governance", "static-analysis", "snowflake", "tsql"]
+categories = ["development-tools", "parser-implementations"]
+# Published from the public mirror, never from this tree.
+publish = false
+
+[features]
+# Home-directory discovery of dbt profiles for variable loading.
+cli = ["dirs"]
+schema = ["schemars", "lexega-syntax/schema"]
+
+[dependencies]
+lexega-syntax = { path = "../lexega-syntax", version = "2.0.0" }
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+toml = "0.8"
+serde_yaml_ng = "0.10"
+regex = "1.10"
+schemars = { version = "0.8", features = ["chrono"], optional = true }
+dirs = { version = "5.0", optional = true }
+
+# SQL extraction from Python files (AST-based, deterministic)
+littrs-ruff-python-parser = "0.6.1"
+littrs-ruff-python-ast = "0.6.1"
+littrs-ruff-text-size = "0.6.1"
+
+# build.rs transcodes the built-in rule corpus (YAML) to a JSON blob at
+# build time; runtime parses the blob (JSON is far faster than YAML).
+[build-dependencies]
+serde_yaml_ng = "0.10"
+serde_json = "1.0"
+
+[lints.clippy]
+# Lowering, extraction and analysis entry points take one argument per input
+# they combine.
+too_many_arguments = "allow"
+# Plan and fact enums carry their payloads inline; a variant is boxed where
+# its size is shown to matter.
+large_enum_variant = "allow"

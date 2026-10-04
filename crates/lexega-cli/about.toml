@@ -1,0 +1,31 @@
+# cargo-about configuration for generating THIRD_PARTY_LICENSES.txt
+# See: https://embarkstudios.github.io/cargo-about/
+
+# Licenses a dependency may carry.
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+
+# Ignore dev-only dependencies (not shipped in binary)
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Workspace crates (`publish = false`) are first-party, not third-party.
+private = { ignore = true }
+
+# Workarounds for crates with non-standard license files
+# Add entries here if cargo-about can't find a license for a crate
+#[[ring.clarify]]
+#license = "ISC AND MIT AND OpenSSL"

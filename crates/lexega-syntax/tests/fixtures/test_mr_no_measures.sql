@@ -1,0 +1,3 @@
+SELECT *
+FROM t
+MATCH_RECOGNIZE( PATTERN (A + /* comment */ B *) DEFINE A AS TRUE, B AS TRUE);

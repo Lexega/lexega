@@ -1,0 +1,29 @@
+# Linker stack-size flags set the main-thread stack for compiled binaries;
+# RUST_MIN_STACK sets worker-thread stacks (the test harness). Both exist
+# for the deep-nesting fixtures, which recurse further than the defaults
+# allow.
+
+[env]
+# 12 MiB
+RUST_MIN_STACK = "12582912"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:8388608"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-args=-Wl,-z,stack-size=8388608"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-args=-Wl,-z,stack-size=8388608"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-stack_size,0x800000"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-stack_size,0x800000"]

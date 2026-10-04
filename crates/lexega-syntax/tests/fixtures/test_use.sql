@@ -1,0 +1,10 @@
+USE ROLE sysadmin;
+USE DATABASE my_database;
+USE SCHEMA my_schema;
+USE SCHEMA my_db.my_schema;
+USE WAREHOUSE compute_wh;
+USE SECONDARY ROLES ALL;
+USE SECONDARY ROLES NONE;
+USE DATABASE MyDatabase;
+USE ROLE MyCustomRole;
+USE WAREHOUSE My_Compute_WH;

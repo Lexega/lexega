@@ -1,0 +1,3 @@
+SELECT *
+FROM t
+MATCH_RECOGNIZE( PATTERN (A + /* test */ B +) DEFINE A AS TRUE);

@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/lexega-syntax", "crates/lexega-core", "crates/lexega-cli"]
+resolver = "2"
+
+# The settings the released `lexega` binaries are built with.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

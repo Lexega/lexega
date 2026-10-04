@@ -1,0 +1,13 @@
+-- All ALTER PROJECTION POLICY variants
+ALTER PROJECTION POLICY test_policy 
+  RENAME TO new_policy;
+ALTER PROJECTION POLICY IF EXISTS test_policy 
+  SET BODY -> PROJECTION_CONSTRAINT(ALLOW => false);
+ALTER PROJECTION POLICY test_policy 
+  SET TAG owner = 'security', pii = 'true';
+ALTER PROJECTION POLICY test_policy 
+  UNSET TAG owner, pii;
+ALTER PROJECTION POLICY IF EXISTS test_policy 
+  SET COMMENT = 'Updated policy';
+ALTER PROJECTION POLICY test_policy 
+  UNSET COMMENT;

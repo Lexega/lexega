@@ -1,0 +1,3 @@
+CREATE TABLE t (
+    name VARCHAR(255) NOT NULL COLLATE 'en-ci'
+);

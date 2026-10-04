@@ -1,0 +1,3 @@
+# Every file is checked out exactly as committed. Fixtures, some of them
+# CRLF, and generated files are compared byte for byte.
+* -text

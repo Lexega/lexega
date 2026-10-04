@@ -1,0 +1,76 @@
+-- Test compliance rules for CREATE VIEW statements (parser-compatible)
+-- Scenario 1: View with sensitive columns, no protection
+CREATE VIEW employee_salaries
+AS
+SELECT
+    emp_id,
+    full_name,
+    salary,
+    ssn,
+    email_address
+FROM employees;
+-- Scenario 2: View with masked columns
+CREATE VIEW masked_customers (
+    customer_id,
+    email_address MASKING POLICY email_mask,
+    credit_card_number MASKING POLICY cc_mask,
+    phone_number MASKING POLICY phone_mask
+)
+AS
+SELECT
+    customer_id,
+    email_address,
+    credit_card_number,
+    phone_number
+FROM customers;
+-- Scenario 3: View with partial masking (should warn about unmasked columns)
+CREATE VIEW partial_masked_employees (
+    emp_id,
+    salary MASKING POLICY salary_mask,
+    ssn,
+    home_address
+)
+AS
+SELECT
+    emp_id,
+    salary,
+    ssn,
+    home_address
+FROM employees;
+-- Scenario 4: View with tags on sensitive columns
+CREATE VIEW tagged_view (
+    patient_id,
+    medical_record_number TAG (pii='medical'),
+    diagnosis TAG (phi='health_data')
+)
+AS
+SELECT
+    patient_id,
+    medical_record_number,
+    diagnosis
+FROM patients;
+-- Scenario 5: View with mixed protection
+CREATE VIEW mixed_protection (
+    emp_id,
+    salary MASKING POLICY salary_mask,
+    ssn TAG (pii='sensitive'),
+    email_address,
+    home_address TAG (location='private')
+)
+AS
+SELECT
+    emp_id,
+    salary,
+    ssn,
+    email_address,
+    home_address
+FROM employees;
+-- Scenario 6: Non-sensitive view (should have no warnings)
+CREATE VIEW product_inventory
+AS
+SELECT
+    product_id,
+    product_name,
+    quantity,
+    warehouse_location
+FROM inventory;

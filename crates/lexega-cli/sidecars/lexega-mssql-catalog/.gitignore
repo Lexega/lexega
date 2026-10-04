@@ -1,0 +1,2 @@
+# Compiled sidecar binary; build with `go build`.
+/lexega-mssql-catalog

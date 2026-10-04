@@ -1,0 +1,8 @@
+-- Hostile trivia test: MATCH_RECOGNIZE with complex pattern matching
+SELECT /* outer select */ * /* star */ 
+FROM /* before FROM */ stock_data /* table */ 
+MATCH_RECOGNIZE /* keyword */ ( /* open */ PARTITION /* before PARTITION */ BY /* after BY */ symbol /* partition col */ -- partition comment
+ORDER /* before ORDER */ BY /* after BY */ trade_date /* order col */ MEASURES /* before MEASURES */ -- measures comment
+/* before first measure */ FIRST /* agg */ ( /* open */ DOWN /* var */ . /* dot */ trade_date /* col */ ) /* close */ AS /* alias kw */ first_down /* alias */ , /* comma */ /* before second measure */ LAST /* agg */ ( /* open */ UP /* var */ . /* dot */ trade_date /* col */ ) /* close */ AS /* alias kw */ last_up /* alias */ ONE /* before ONE */ ROW /* after ROW */ PER /* after PER */ MATCH /* after MATCH */ -- row per match comment
+AFTER /* before AFTER */ MATCH /* after MATCH */ SKIP /* before SKIP */ TO /* after TO */ NEXT /* before NEXT */ ROW /* after ROW */ PATTERN /* before PATTERN */ ( /* open pattern */ /* before DOWN */ DOWN /* var */ + /* plus */ /* before UP */ UP /* var */ + /* plus2 */ ) /* close pattern */ DEFINE /* before DEFINE */ -- define comment
+/* before first define */ DOWN /* var */ AS /* define as */ DOWN /* ref */ . /* dot */ price /* col */ < /* lt */ PREV /* func */ ( /* open */ DOWN /* arg */ . /* dot */ price /* col2 */ ) /* close */ , /* comma */ /* before second define */ UP /* var */ AS /* define as */ UP /* ref */ . /* dot */ price /* col */ > /* gt */ PREV /* func */ ( /* open */ UP /* arg */ . /* dot */ price /* col2 */ ) /* close */ ) /* close MR */ AS /* before alias */ pattern_match /* alias */ ;
