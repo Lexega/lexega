@@ -27,7 +27,7 @@ together, under one version number.
 ## Install
 
 Every release carries `lexega` for Linux, macOS and Windows, on x64 and
-ARM64, at <https://github.com/Lexega/releases/releases/latest>:
+ARM64, at <https://github.com/Lexega/lexega/releases/latest>:
 `lexega-linux-x64`, `lexega-linux-arm64`, `lexega-darwin-x64`,
 `lexega-darwin-arm64`, `lexega-windows-x64.exe`, `lexega-windows-arm64.exe`.
 `CHECKSUMS.sha256` covers each file, and each binary has an SBOM beside it.
