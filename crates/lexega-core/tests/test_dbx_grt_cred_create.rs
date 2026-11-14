@@ -15,18 +15,18 @@ use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-CRED-CREATE";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -49,12 +49,12 @@ fn test_basic_detection() {
 fn test_risk_level_is_high() {
     let report = analyze_risk("GRANT CREATE STORAGE CREDENTIAL ON METASTORE TO data_ops;")
         .expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
     assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
 }
 
@@ -126,7 +126,7 @@ fn test_revoke_does_not_trigger() {
 // ─── Mixed Script ───
 
 #[test]
-fn test_grant_signal_survives_in_mixed_script() {
+fn test_grant_finding_survives_in_mixed_script() {
     let sql = r#"
         CREATE TABLE staging.events (id INT, ts TIMESTAMP);
         GRANT CREATE STORAGE CREDENTIAL ON METASTORE TO infra_role;
@@ -135,7 +135,7 @@ fn test_grant_signal_survives_in_mixed_script() {
     let rules = analyze_and_get_rules(sql);
     assert!(
         rules.contains(RULE_ID),
-        "CRED-CREATE signal must survive mixed DDL context — got: {rules:?}"
+        "CRED-CREATE finding must survive mixed DDL context — got: {rules:?}"
     );
 }
 
@@ -150,7 +150,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {

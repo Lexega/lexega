@@ -22,11 +22,19 @@
 use crate::ast::AstStmt;
 use crate::ast::{
     AstAlterTag, AstAlterTagAction, AstAlterTagActionKind, AstCreateTag, AstTagAllowedValues,
-    AstTagOnConflict, AstTagPolicyRef, AstTagPropagate, AstTagUnsetProperty, AstUndropTag,
+    AstTagOnConflict, AstTagPolicyRef, AstTagPropagate, AstTagRef, AstTagUnsetProperty,
+    AstUndropTag,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+
+/// What a tag list holds: `name = value` pairs, or bare names.
+#[derive(Clone, Copy)]
+pub(crate) enum TagListShape {
+    Assignments,
+    Names,
+}
 
 impl<'a> Parser<'a> {
     /// Parse CREATE TAG statement.
@@ -770,6 +778,200 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(policies)
+    }
+
+    /// The tag list that starts at token `start`: `name = value {, …}` for
+    /// `SET TAG` and `WITH TAG`, `name {, …}` for `UNSET TAG`. Each name is
+    /// read by the shared object-name reader; a value is one token, or a
+    /// `{{ … }}` expression. Returns the index past the list and its tags;
+    /// `None`, consuming nothing, where the tokens are not such a list.
+    pub(crate) fn tag_list_at(
+        &self,
+        start: usize,
+        shape: TagListShape,
+    ) -> Option<(usize, Vec<AstTagRef>)> {
+        self.tag_list_until(start, shape, |_, _| false)
+    }
+
+    /// [`Self::tag_list_at`], the list ending before a `,` where `ends`
+    /// holds of the token after it: the next item of a list the tag list is
+    /// one item of.
+    fn tag_list_until(
+        &self,
+        start: usize,
+        shape: TagListShape,
+        ends: fn(&Self, usize) -> bool,
+    ) -> Option<(usize, Vec<AstTagRef>)> {
+        let mut at = start;
+        let mut tags = Vec::new();
+        loop {
+            let (next, name) = self.object_ref_at(at, self.id_gen.next())?;
+            at = next;
+            let value = match shape {
+                TagListShape::Assignments => {
+                    let eq = self.tokens.get(at)?;
+                    if !matches!(eq.kind, TokenKind::Operator(Operator::Eq)) {
+                        return None;
+                    }
+                    let first = self.tokens.get(at + 1)?;
+                    let last = self.tag_value_last(at + 1)?;
+                    at = last + 1;
+                    Some(Span {
+                        start: first.span.start,
+                        end: self.tokens[last].span.end,
+                    })
+                }
+                TagListShape::Names => None,
+            };
+            tags.push(AstTagRef { name, value });
+            let comma = self
+                .tokens
+                .get(at)
+                .is_some_and(|tok| matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)));
+            if !comma || ends(self, at + 1) {
+                return Some((at, tags));
+            }
+            at += 1;
+        }
+    }
+
+    /// The last token of the tag value starting at token `first`: the tokens
+    /// up to the next `,`, the list's closing `)`, the statement's end or a
+    /// statement written after it, outside parentheses and `{{ … }}`. `None`
+    /// where no token is there.
+    fn tag_value_last(&self, first: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut at = first;
+        let mut last = None;
+        while let Some(tok) = self.tokens.get(at) {
+            let ends_value = matches!(
+                tok.kind,
+                TokenKind::Eof | TokenKind::Punctuation(Punctuation::Semi)
+            ) || (depth == 0
+                && (matches!(
+                    tok.kind,
+                    TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen)
+                ) || (at > first
+                    && self
+                        .starts_statement(at, crate::parser::core::StatementContext::Recovery))));
+            if ends_value {
+                break;
+            }
+            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                depth += 1;
+            } else if matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                depth -= 1;
+            } else if matches!(tok.kind, TokenKind::JinjaExprOpen) {
+                at = (at..self.tokens.len())
+                    .find(|&j| matches!(self.tokens[j].kind, TokenKind::JinjaExprClose))?;
+            }
+            last = Some(at);
+            at += 1;
+        }
+        last
+    }
+
+    /// The parenthesised tag list whose `(` is token `open`. Returns the index
+    /// past the `)` and the tags; `None` where the tokens are not such a list.
+    pub(crate) fn parenthesised_tag_list_at(
+        &self,
+        open: usize,
+        shape: TagListShape,
+    ) -> Option<(usize, Vec<AstTagRef>)> {
+        let lparen = self.tokens.get(open)?;
+        if !matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+            return None;
+        }
+        let (close, tags) = self.tag_list_at(open + 1, shape)?;
+        let rparen = self.tokens.get(close)?;
+        matches!(rparen.kind, TokenKind::Punctuation(Punctuation::RParen))
+            .then_some((close + 1, tags))
+    }
+
+    /// The parenthesised `name = value` list at the current `(`. Returns the
+    /// end of the closing parenthesis and the tags. A list that is not read as
+    /// tags is skipped to its closing parenthesis and holds none.
+    pub(crate) fn parse_tag_assignments_in_parens(&mut self) -> ParseResult<(u32, Vec<AstTagRef>)> {
+        self.skip_trivia();
+        let open = self.idx;
+        if let Some((next, tags)) = self.parenthesised_tag_list_at(open, TagListShape::Assignments)
+        {
+            self.idx = next;
+            self.record_unparsed_secrets(open, next);
+            return Ok((self.tokens[next - 1].span.end, tags));
+        }
+        if let Some(close) = self.closing_paren_index(open) {
+            self.idx = close + 1;
+            self.record_unparsed_secrets(open, self.idx);
+            return Ok((self.tokens[close].span.end, Vec::new()));
+        }
+        Err(ParseError::new(
+            self.current_span(),
+            ParseErrorKind::UnexpectedEof {
+                expected: vec![")".to_string()],
+            },
+        ))
+    }
+
+    /// Parse the tag list at the current token ([`Self::tag_list_at`]).
+    /// Returns the span over the list and the tags.
+    pub(crate) fn parse_tag_list(
+        &mut self,
+        shape: TagListShape,
+    ) -> ParseResult<(Span, Vec<AstTagRef>)> {
+        self.parse_tag_list_until(shape, |_, _| false)
+    }
+
+    /// [`Self::parse_tag_list`], the list ending as
+    /// [`Self::tag_list_until`] ends it.
+    pub(crate) fn parse_tag_list_until(
+        &mut self,
+        shape: TagListShape,
+        ends: fn(&Self, usize) -> bool,
+    ) -> ParseResult<(Span, Vec<AstTagRef>)> {
+        self.skip_trivia();
+        let start = self.idx;
+        let Some((end, tags)) = self.tag_list_until(start, shape, ends) else {
+            return Err(ParseError::new(
+                self.current_span(),
+                ParseErrorKind::InvalidStatement {
+                    message: "Expected a tag list".to_string(),
+                },
+            ));
+        };
+        self.idx = end;
+        // The values are not read further: their secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(start, end);
+        let span = Span {
+            start: self.tokens[start].span.start,
+            end: self.tokens[end - 1].span.end,
+        };
+        Ok((span, tags))
+    }
+
+    /// [`Self::parse_tag_list`] with the list inside parentheses or not. The
+    /// span covers the parentheses when there are any.
+    pub(crate) fn parse_tag_list_in_optional_parens(
+        &mut self,
+        shape: TagListShape,
+    ) -> ParseResult<(Span, Vec<AstTagRef>)> {
+        let Some(open) = self
+            .peek_non_trivia()
+            .filter(|tok| matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)))
+            .map(|tok| tok.span)
+        else {
+            return self.parse_tag_list(shape);
+        };
+        self.advance();
+        let (_, tags) = self.parse_tag_list(shape)?;
+        let close = self.expect_punct(Punctuation::RParen, ")")?;
+        Ok((
+            Span {
+                start: open.start,
+                end: close.end,
+            },
+            tags,
+        ))
     }
 
     /// Consume `=` or error with the owning property name.

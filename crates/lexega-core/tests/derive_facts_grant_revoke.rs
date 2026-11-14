@@ -32,6 +32,7 @@ fn project_revoke(src: &str) -> lexega_core::facts::statement::StatementFacts {
 
 #[test]
 fn grant_select_on_table_yields_typed_privilege_facts() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT SELECT ON TABLE db.s.t TO ROLE analyst;");
     assert_eq!(facts.kind, StatementKind::Grant);
     let p = facts.privilege.expect("privilege facts populated");
@@ -53,6 +54,7 @@ fn grant_select_on_table_yields_typed_privilege_facts() {
 
 #[test]
 fn grant_with_grant_option_sets_flag() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT SELECT ON TABLE t TO ROLE r WITH GRANT OPTION;");
     let p = facts.privilege.unwrap();
     assert!(p.with_grant_option);
@@ -60,6 +62,7 @@ fn grant_with_grant_option_sets_flag() {
 
 #[test]
 fn grant_all_privileges_marks_all_privileges_flag_and_emits_all_privilege() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT ALL PRIVILEGES ON SCHEMA db.s TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert!(p.all_privileges);
@@ -68,6 +71,7 @@ fn grant_all_privileges_marks_all_privileges_flag_and_emits_all_privilege() {
 
 #[test]
 fn grant_on_all_tables_marks_on_all_with_schema_target() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT USAGE ON ALL TABLES IN SCHEMA db.s TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert!(p.on_all);
@@ -79,6 +83,7 @@ fn grant_on_all_tables_marks_on_all_with_schema_target() {
 
 #[test]
 fn grant_on_future_tables_marks_on_future_with_database_target() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT SELECT ON FUTURE TABLES IN DATABASE db TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert!(p.on_future);
@@ -90,6 +95,7 @@ fn grant_on_future_tables_marks_on_future_with_database_target() {
 
 #[test]
 fn grant_role_targets_role_objectkind() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT ROLE r1 TO ROLE r2;");
     let p = facts.privilege.unwrap();
     assert!(p.privileges.is_empty()); // Role-grant carries no privileges
@@ -102,6 +108,7 @@ fn grant_role_targets_role_objectkind() {
 
 #[test]
 fn grant_database_role_grantee_uses_other_principal_kind() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT USAGE ON DATABASE db TO DATABASE ROLE db.dbr;");
     let p = facts.privilege.unwrap();
     let g = &p.grantees[0];
@@ -117,6 +124,7 @@ fn grant_database_role_grantee_uses_other_principal_kind() {
 
 #[test]
 fn grant_to_user_grantee() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT USAGE ON DATABASE db TO USER u;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.grantees[0].kind, PrincipalKind::User);
@@ -125,6 +133,7 @@ fn grant_to_user_grantee() {
 
 #[test]
 fn grant_to_share_grantee() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT USAGE ON DATABASE db TO SHARE s;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.grantees[0].kind, PrincipalKind::Share);
@@ -132,6 +141,7 @@ fn grant_to_share_grantee() {
 
 #[test]
 fn grant_imported_privileges_preserves_typed_privilege() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT IMPORTED PRIVILEGES ON DATABASE shared_db TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.privileges, vec![Privilege::ImportedPrivileges]);
@@ -139,6 +149,7 @@ fn grant_imported_privileges_preserves_typed_privilege() {
 
 #[test]
 fn grant_create_table_two_word_privilege() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT CREATE TABLE ON SCHEMA db.s TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.privileges, vec![Privilege::CreateTable]);
@@ -146,6 +157,7 @@ fn grant_create_table_two_word_privilege() {
 
 #[test]
 fn grant_apply_masking_policy_three_word_privilege() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT APPLY MASKING POLICY ON ACCOUNT TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.privileges, vec![Privilege::ApplyMaskingPolicy]);
@@ -155,6 +167,7 @@ fn grant_apply_masking_policy_three_word_privilege() {
 
 #[test]
 fn grant_unrecognized_privilege_falls_back_to_other() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT BIND SERVICE ENDPOINT ON ACCOUNT TO ROLE r;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.privileges.len(), 1);
@@ -168,6 +181,7 @@ fn grant_unrecognized_privilege_falls_back_to_other() {
 
 #[test]
 fn grant_ownership_with_copy_current_grants_sets_flag() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT OWNERSHIP ON TABLE t TO ROLE r COPY CURRENT GRANTS;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.privileges, vec![Privilege::Ownership]);
@@ -176,6 +190,7 @@ fn grant_ownership_with_copy_current_grants_sets_flag() {
 
 #[test]
 fn grant_ownership_with_revoke_current_grants_does_not_set_copy_flag() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant("GRANT OWNERSHIP ON SCHEMA db.s TO ROLE r REVOKE CURRENT GRANTS;");
     let p = facts.privilege.unwrap();
     assert!(!p.copy_current_grants);
@@ -183,6 +198,7 @@ fn grant_ownership_with_revoke_current_grants_does_not_set_copy_flag() {
 
 #[test]
 fn revoke_select_yields_revoke_kind() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_revoke("REVOKE SELECT ON TABLE t FROM ROLE r CASCADE;");
     assert_eq!(facts.kind, StatementKind::Revoke);
     let p = facts.privilege.unwrap();
@@ -192,6 +208,7 @@ fn revoke_select_yields_revoke_kind() {
 
 #[test]
 fn quoted_identifiers_preserve_raw_and_normalize() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant(
         r#"GRANT SELECT ON TABLE "Mixed DB"."Mixed Schema"."My Table" TO ROLE "Quoted Role";"#,
     );
@@ -207,6 +224,7 @@ fn quoted_identifiers_preserve_raw_and_normalize() {
 
 #[test]
 fn iceberg_table_object_kind_falls_back_to_generic() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     // ObjectKind has no IcebergTable variant; projection lands on
     // Generic without losing the name.
     let facts = project_grant("GRANT SELECT ON ICEBERG TABLE db.s.it1 TO ROLE r;");
@@ -264,6 +282,7 @@ fn expect_other_privilege(p: &Privilege, normalized: &str) {
 
 #[test]
 fn mssql_server_tier_grant_yields_other_privilege_without_target() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant_mssql("GRANT CONTROL SERVER TO bad_login;");
     assert_eq!(facts.kind, StatementKind::Grant);
     let p = facts.privilege.expect("privilege facts populated");
@@ -277,6 +296,7 @@ fn mssql_server_tier_grant_yields_other_privilege_without_target() {
 
 #[test]
 fn mssql_control_on_database_class_yields_database_target() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant_mssql("GRANT CONTROL ON DATABASE::proddb TO u2;");
     let p = facts.privilege.unwrap();
     expect_other_privilege(&p.privileges[0], "CONTROL");
@@ -286,6 +306,7 @@ fn mssql_control_on_database_class_yields_database_target() {
 
 #[test]
 fn mssql_revoke_class_qualified_yields_typed_facts() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_revoke_mssql("REVOKE SELECT ON OBJECT::dbo.t FROM u1 CASCADE;");
     assert_eq!(facts.kind, StatementKind::Revoke);
     let p = facts.privilege.unwrap();
@@ -298,6 +319,7 @@ fn mssql_revoke_class_qualified_yields_typed_facts() {
 
 #[test]
 fn mssql_multi_grantee_grant_projects_all_principals() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_grant_mssql("GRANT SELECT ON OBJECT::dbo.t TO u1, u2;");
     let p = facts.privilege.unwrap();
     assert_eq!(p.grantees.len(), 2);

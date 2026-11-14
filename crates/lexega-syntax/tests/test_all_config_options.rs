@@ -33,13 +33,13 @@ fn test_keyword_case_all_variants() {
         fs::write(&config_path, format!("keyword_case = \"{}\"", variant_str)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.keyword_case) {
-            (KeywordCase::Upper, KeywordCase::Upper) => true,
-            (KeywordCase::Lower, KeywordCase::Lower) => true,
-            (KeywordCase::Title, KeywordCase::Title) => true,
-            (KeywordCase::Preserve, KeywordCase::Preserve) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.keyword_case),
+            (KeywordCase::Upper, KeywordCase::Upper)
+                | (KeywordCase::Lower, KeywordCase::Lower)
+                | (KeywordCase::Title, KeywordCase::Title)
+                | (KeywordCase::Preserve, KeywordCase::Preserve)
+        );
 
         assert!(matches, "Failed for keyword_case = '{}'", variant_str);
     }
@@ -64,12 +64,12 @@ fn test_identifier_case_all_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.identifier_case) {
-            (IdentifierCase::Upper, IdentifierCase::Upper) => true,
-            (IdentifierCase::Lower, IdentifierCase::Lower) => true,
-            (IdentifierCase::Preserve, IdentifierCase::Preserve) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.identifier_case),
+            (IdentifierCase::Upper, IdentifierCase::Upper)
+                | (IdentifierCase::Lower, IdentifierCase::Lower)
+                | (IdentifierCase::Preserve, IdentifierCase::Preserve)
+        );
 
         assert!(matches, "Failed for identifier_case = '{}'", variant_str);
     }
@@ -112,11 +112,11 @@ fn test_newline_style_variants() {
         fs::write(&config_path, format!("newline_style = \"{}\"", variant_str)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.newline_style) {
-            (NewlineStyle::Unix, NewlineStyle::Unix) => true,
-            (NewlineStyle::Windows, NewlineStyle::Windows) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.newline_style),
+            (NewlineStyle::Unix, NewlineStyle::Unix)
+                | (NewlineStyle::Windows, NewlineStyle::Windows)
+        );
 
         assert!(matches, "Failed for newline_style = '{}'", variant_str);
     }
@@ -136,11 +136,11 @@ fn test_comma_style_variants() {
         fs::write(&config_path, format!("comma_style = \"{}\"", variant_str)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.comma_style) {
-            (CommaStyle::Trailing, CommaStyle::Trailing) => true,
-            (CommaStyle::Leading, CommaStyle::Leading) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.comma_style),
+            (CommaStyle::Trailing, CommaStyle::Trailing)
+                | (CommaStyle::Leading, CommaStyle::Leading)
+        );
 
         assert!(matches, "Failed for comma_style = '{}'", variant_str);
     }
@@ -164,11 +164,14 @@ fn test_boolean_operator_position_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.boolean_operator_position) {
-            (BooleanOperatorPosition::End, BooleanOperatorPosition::End) => true,
-            (BooleanOperatorPosition::Start, BooleanOperatorPosition::Start) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.boolean_operator_position),
+            (BooleanOperatorPosition::End, BooleanOperatorPosition::End)
+                | (
+                    BooleanOperatorPosition::Start,
+                    BooleanOperatorPosition::Start
+                )
+        );
 
         assert!(
             matches,
@@ -196,11 +199,16 @@ fn test_parenthesized_expr_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.parenthesized_expr_style) {
-            (ParenthesizedExprStyle::Compact, ParenthesizedExprStyle::Compact) => true,
-            (ParenthesizedExprStyle::Expanded, ParenthesizedExprStyle::Expanded) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.parenthesized_expr_style),
+            (
+                ParenthesizedExprStyle::Compact,
+                ParenthesizedExprStyle::Compact
+            ) | (
+                ParenthesizedExprStyle::Expanded,
+                ParenthesizedExprStyle::Expanded
+            )
+        );
 
         assert!(
             matches,
@@ -228,11 +236,11 @@ fn test_window_frame_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.window_frame_style) {
-            (WindowFrameStyle::Compact, WindowFrameStyle::Compact) => true,
-            (WindowFrameStyle::Expanded, WindowFrameStyle::Expanded) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.window_frame_style),
+            (WindowFrameStyle::Compact, WindowFrameStyle::Compact)
+                | (WindowFrameStyle::Expanded, WindowFrameStyle::Expanded)
+        );
 
         assert!(matches, "Failed for window_frame_style = '{}'", variant_str);
     }
@@ -257,12 +265,12 @@ fn test_cte_indent_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.cte_indent_style) {
-            (CteIndentStyle::Standard, CteIndentStyle::Standard) => true,
-            (CteIndentStyle::FlushLeft, CteIndentStyle::FlushLeft) => true,
-            (CteIndentStyle::DoubleIndent, CteIndentStyle::DoubleIndent) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.cte_indent_style),
+            (CteIndentStyle::Standard, CteIndentStyle::Standard)
+                | (CteIndentStyle::FlushLeft, CteIndentStyle::FlushLeft)
+                | (CteIndentStyle::DoubleIndent, CteIndentStyle::DoubleIndent)
+        );
 
         assert!(matches, "Failed for cte_indent_style = '{}'", variant_str);
     }
@@ -287,12 +295,15 @@ fn test_subquery_paren_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.subquery_paren_style) {
-            (SubqueryParenStyle::SameLine, SubqueryParenStyle::SameLine) => true,
-            (SubqueryParenStyle::NewLine, SubqueryParenStyle::NewLine) => true,
-            (SubqueryParenStyle::NewLineClosing, SubqueryParenStyle::NewLineClosing) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.subquery_paren_style),
+            (SubqueryParenStyle::SameLine, SubqueryParenStyle::SameLine)
+                | (SubqueryParenStyle::NewLine, SubqueryParenStyle::NewLine)
+                | (
+                    SubqueryParenStyle::NewLineClosing,
+                    SubqueryParenStyle::NewLineClosing
+                )
+        );
 
         assert!(
             matches,
@@ -316,11 +327,11 @@ fn test_flatten_style_variants() {
         fs::write(&config_path, format!("flatten_style = \"{}\"", variant_str)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.flatten_style) {
-            (FlattenStyle::Inline, FlattenStyle::Inline) => true,
-            (FlattenStyle::Stacked, FlattenStyle::Stacked) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.flatten_style),
+            (FlattenStyle::Inline, FlattenStyle::Inline)
+                | (FlattenStyle::Stacked, FlattenStyle::Stacked)
+        );
 
         assert!(matches, "Failed for flatten_style = '{}'", variant_str);
     }
@@ -345,12 +356,12 @@ fn test_copy_into_options_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.copy_into_options_style) {
-            (CopyIntoOptionsStyle::Inline, CopyIntoOptionsStyle::Inline) => true,
-            (CopyIntoOptionsStyle::Stacked, CopyIntoOptionsStyle::Stacked) => true,
-            (CopyIntoOptionsStyle::Grouped, CopyIntoOptionsStyle::Grouped) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.copy_into_options_style),
+            (CopyIntoOptionsStyle::Inline, CopyIntoOptionsStyle::Inline)
+                | (CopyIntoOptionsStyle::Stacked, CopyIntoOptionsStyle::Stacked)
+                | (CopyIntoOptionsStyle::Grouped, CopyIntoOptionsStyle::Grouped)
+        );
 
         assert!(
             matches,
@@ -378,11 +389,14 @@ fn test_match_recognize_format_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.match_recognize_format) {
-            (MatchRecognizeFormat::Compact, MatchRecognizeFormat::Compact) => true,
-            (MatchRecognizeFormat::Expanded, MatchRecognizeFormat::Expanded) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.match_recognize_format),
+            (MatchRecognizeFormat::Compact, MatchRecognizeFormat::Compact)
+                | (
+                    MatchRecognizeFormat::Expanded,
+                    MatchRecognizeFormat::Expanded
+                )
+        );
 
         assert!(
             matches,
@@ -492,11 +506,11 @@ fn test_array_literal_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.array_literal_style) {
-            (ArrayLiteralStyle::Inline, ArrayLiteralStyle::Inline) => true,
-            (ArrayLiteralStyle::Multiline, ArrayLiteralStyle::Multiline) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.array_literal_style),
+            (ArrayLiteralStyle::Inline, ArrayLiteralStyle::Inline)
+                | (ArrayLiteralStyle::Multiline, ArrayLiteralStyle::Multiline)
+        );
 
         assert!(
             matches,
@@ -524,11 +538,11 @@ fn test_object_literal_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.object_literal_style) {
-            (ObjectLiteralStyle::Inline, ObjectLiteralStyle::Inline) => true,
-            (ObjectLiteralStyle::Multiline, ObjectLiteralStyle::Multiline) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.object_literal_style),
+            (ObjectLiteralStyle::Inline, ObjectLiteralStyle::Inline)
+                | (ObjectLiteralStyle::Multiline, ObjectLiteralStyle::Multiline)
+        );
 
         assert!(
             matches,
@@ -557,12 +571,19 @@ fn test_create_stage_clause_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.create_stage_clause_style) {
-            (CreateStageClauseStyle::Stacked, CreateStageClauseStyle::Stacked) => true,
-            (CreateStageClauseStyle::Inline, CreateStageClauseStyle::Inline) => true,
-            (CreateStageClauseStyle::Grouped, CreateStageClauseStyle::Grouped) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.create_stage_clause_style),
+            (
+                CreateStageClauseStyle::Stacked,
+                CreateStageClauseStyle::Stacked
+            ) | (
+                CreateStageClauseStyle::Inline,
+                CreateStageClauseStyle::Inline
+            ) | (
+                CreateStageClauseStyle::Grouped,
+                CreateStageClauseStyle::Grouped
+            )
+        );
 
         assert!(
             matches,
@@ -632,12 +653,12 @@ fn test_pipe_chain_style_variants() {
         .unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected_variant, &config.pipe_chain_style) {
-            (PipeChainStyle::Preserve, PipeChainStyle::Preserve) => true,
-            (PipeChainStyle::Inline, PipeChainStyle::Inline) => true,
-            (PipeChainStyle::Stacked, PipeChainStyle::Stacked) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected_variant, &config.pipe_chain_style),
+            (PipeChainStyle::Preserve, PipeChainStyle::Preserve)
+                | (PipeChainStyle::Inline, PipeChainStyle::Inline)
+                | (PipeChainStyle::Stacked, PipeChainStyle::Stacked)
+        );
 
         assert!(matches, "Failed for pipe_chain_style = '{}'", variant_str);
     }

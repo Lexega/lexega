@@ -99,8 +99,9 @@ pub fn lower_drop_listing_to_plan(s: &AstDrop, source: &str) -> ListingPlan {
     ListingPlan {
         action: ListingAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: ListingOptions {
             or_replace: false,
             if_not_exists: false,
@@ -132,7 +133,7 @@ fn target_from_span(source: &str, span: Span) -> ListingTarget {
 
 fn dequote_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|s| slice_span(source, s))
-        .map(|t| t.trim().trim_matches('\'').trim().to_string())
+        .map(crate::ir::span_extract::literal_value_or_text)
 }
 
 fn bool_from_span(source: &str, span: Option<Span>) -> Option<bool> {

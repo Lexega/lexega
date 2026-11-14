@@ -19,7 +19,7 @@
 //!   [`TableRef`] and [`ColumnId`]. Populated externally (e.g. at
 //!   lowering time) via the `insert_*` builder methods.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::context::node_metadata::{IdentKey, TableRef};
 
@@ -114,7 +114,7 @@ pub struct ColumnMetadata {
     /// catalog snapshot lacks type information for the column.
     /// A column is classified as temporal or high-cardinality on this
     /// string instead of consulting the upstream `CatalogIndex` at
-    /// signal-emit time.
+    /// finding-emit time.
     pub data_type: Option<String>,
 
     /// Foreign-key target this column declares. `None` when the
@@ -260,6 +260,40 @@ pub trait CatalogContext {
     fn resolve_table_tags(&self, _table: &TableRef) -> &[TagRef] {
         &[]
     }
+
+    /// The columns of each PRIMARY KEY and UNIQUE constraint declared on
+    /// `table`, one entry per constraint.
+    ///
+    /// Default returns an empty slice: no key is known.
+    fn table_keys(&self, _table: &TableRef) -> &[Vec<IdentKey>] {
+        &[]
+    }
+
+    /// How much of the value its tags label the column `id` holds, where
+    /// that is not the value itself: a column a script made from a count
+    /// of a tagged column holds the count. `None` for a column holding
+    /// the value, as every catalog column does.
+    fn column_exposure(&self, _id: ColumnId) -> Option<crate::facts::catalog::ValueExposure> {
+        None
+    }
+
+    /// The tags reasoning found reaching the value of the column `id`,
+    /// beside the column's own ([`ColumnMetadata::tags`]): of a column a
+    /// script made from a query, the tags along that query's lineage.
+    /// Empty for any other column, and with recognition alone.
+    fn column_value_tags(&self, _id: ColumnId) -> &[TagRef] {
+        &[]
+    }
+
+    /// What reasoning found constraining the value of the column `id`: of
+    /// a column a script made from a query, what the query's rows meet in
+    /// it. `None` for any other column, and with recognition alone.
+    fn column_value_constraints(
+        &self,
+        _id: ColumnId,
+    ) -> Option<&crate::ir::constraint_types::IrColumnConstraints> {
+        None
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -271,7 +305,7 @@ pub trait CatalogContext {
 /// When callers run without a catalog attached,
 /// lineage/nullability/constraint/taint analyses exercise the same
 /// code path they would with a populated context, and the absence of
-/// catalog data means "no catalog-sourced signals."
+/// catalog data means "no catalog-sourced findings."
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EmptyCatalogContext;
 
@@ -314,8 +348,9 @@ pub struct IndexedCatalogContext {
     table_tags: HashMap<TableRef, Vec<TagRef>>,
     /// Per-table catalog-presence outcome recorded at scan-resolution
     /// time. Three states:
-    /// - Missing entry: no catalog was attached to the lowering call
-    ///   (the table-presence question is unanswerable).
+    /// - Missing entry: no catalog was attached to the lowering call,
+    ///   or it lists only named tables and does not name this one (the
+    ///   table-presence question is unanswerable).
     /// - `Some(true)`: the lowerer consulted the catalog and the table
     ///   was found.
     /// - `Some(false)`: the lowerer consulted the catalog and the
@@ -325,6 +360,10 @@ pub struct IndexedCatalogContext {
     /// Drives `CAT-TBL-UNKNOWN` via the public
     /// [`crate::facts::query::TableEvent::in_catalog`] projection.
     table_in_catalog: HashMap<TableRef, bool>,
+
+    /// For a table the catalog was consulted for and did not have, each
+    /// name it was looked for under ([`crate::catalog::searched_names`]).
+    table_searched: HashMap<TableRef, Vec<TableRef>>,
 
     /// Per-table row count estimate from the catalog. Populated at
     /// lowering time alongside `column_metadata`. Consumed by IR
@@ -343,6 +382,9 @@ pub struct IndexedCatalogContext {
     /// `this_table` has declared FKs but none of them are
     /// `(x, other_table, y)`.
     table_fks: HashMap<TableRef, Vec<FkEdge>>,
+    /// Per-table columns of each declared PRIMARY KEY and UNIQUE
+    /// constraint. Populated from `CatalogTable.constraints`.
+    table_keys: HashMap<TableRef, Vec<Vec<IdentKey>>>,
     /// Reverse index from a `ColumnId` allocated to a scan to the
     /// source `(TableRef, column_name)`. Populated by
     /// `seed_catalog_ctx_from_scan` whenever a scan binds a
@@ -355,8 +397,8 @@ pub struct IndexedCatalogContext {
     /// matched a catalog table.
     /// - Missing entry: no catalog attached, the scan's table was
     ///   not in the catalog (in which case `table_in_catalog` carries
-    ///   `false`), or the `ColumnId` was not produced by
-    ///   `seed_catalog_ctx_from_scan`.
+    ///   `false`), the catalog does not know the table's columns, or
+    ///   the `ColumnId` was not produced by `seed_catalog_ctx_from_scan`.
     /// - `Some(true)`: the column's `display_name` matched a
     ///   declared column on the catalog table.
     /// - `Some(false)`: the catalog table is known, but the column
@@ -381,6 +423,18 @@ pub struct IndexedCatalogContext {
     /// projection. Only populated when a catalog is attached —
     /// without one, ambiguity cannot be detected.
     column_ambiguous: std::collections::HashSet<ColumnId>,
+    /// Per scan-bound column that holds its tagged value only as a
+    /// count, a digest or a derived measure, how much of it it holds
+    /// ([`CatalogContext::column_exposure`]): a column a script made
+    /// from a query, as the query's value reached it.
+    column_exposure: HashMap<ColumnId, crate::facts::catalog::ValueExposure>,
+    /// Per scan-bound column a script made from a query, the tags reasoning
+    /// found reaching its value ([`CatalogContext::column_value_tags`]).
+    column_value_tags: HashMap<ColumnId, Vec<TagRef>>,
+    /// Per scan-bound column a script made from a query, what reasoning
+    /// found constraining its value
+    /// ([`CatalogContext::column_value_constraints`]).
+    column_value_constraints: HashMap<ColumnId, crate::ir::constraint_types::IrColumnConstraints>,
     /// Per-table flag: does the upstream catalog table declare at
     /// least one temporal-typed (DATE / TIME / TIMESTAMP) column?
     /// Populated by `seed_catalog_ctx_from_scan` from the upstream
@@ -399,6 +453,21 @@ pub struct IndexedCatalogContext {
     /// `TemporalJoinTable.temporal_column_names`
     /// so per-column sibling rules can compose against it.
     table_temporal_column_names: HashMap<TableRef, Vec<IdentKey>>,
+    /// Per DML target, the column names the catalog declares for its
+    /// table. Seeded from the full `CatalogTable.columns` list,
+    /// whatever the statement reads of the target. Gives a target's
+    /// `TableEvent.column_count` and the catalog presence of the columns
+    /// the statement writes.
+    target_declared_columns: HashMap<TableRef, BTreeSet<IdentKey>>,
+    /// Per column an `UPDATE` assignment, a `MERGE` branch or an upsert's
+    /// update action writes to a table the catalog resolves, the tags the
+    /// catalog attaches to that column and to its table. An id with no
+    /// entry names no column of a catalogued table.
+    written_column_tags: HashMap<ColumnId, Vec<TagRef>>,
+    /// The catalog the lowerer consulted lists no unique keys (it lists
+    /// only named columns): that a join column has none is not known.
+    /// `false` where it lists them or no catalog was consulted.
+    keys_unlisted: bool,
 }
 
 /// Declared FK edge on a base table. Mirrors `CatalogConstraint`
@@ -443,6 +512,11 @@ impl IndexedCatalogContext {
         Self::default()
     }
 
+    /// The tables a scan reads whose columns lowering resolved.
+    pub(crate) fn tables_read(&self) -> impl Iterator<Item = &TableRef> {
+        self.tables.keys()
+    }
+
     /// Record the catalog-resolved columns for a base table.
     pub fn insert_table_columns(&mut self, table: TableRef, columns: TableColumns) {
         self.tables.insert(table, columns);
@@ -471,18 +545,31 @@ impl IndexedCatalogContext {
     /// at scan-resolution time by `seed_catalog_ctx_from_scan`:
     /// `true` when the catalog had an entry (after session-defaults
     /// resolution), `false` when it did not. Not called at all when
-    /// no catalog is attached to the lowering call.
+    /// no catalog is attached to the lowering call, nor for a table a
+    /// catalog of named tables does not name.
     pub fn insert_table_in_catalog(&mut self, table: TableRef, in_catalog: bool) {
         self.table_in_catalog.insert(table, in_catalog);
     }
 
     /// Look up the catalog-presence outcome for a base table.
-    /// `None` when no catalog was attached or the table was not
-    /// processed by `seed_catalog_ctx_from_scan` (e.g. the scan was
-    /// opaque). `Some(true)` / `Some(false)` when the lowerer
-    /// recorded a definite outcome.
+    /// `None` when no catalog was attached, the catalog does not say,
+    /// or the table was not processed by `seed_catalog_ctx_from_scan`
+    /// (e.g. the scan was opaque). `Some(true)` / `Some(false)` when
+    /// the lowerer recorded a definite outcome.
     pub fn table_in_catalog(&self, table: &TableRef) -> Option<bool> {
         self.table_in_catalog.get(table).copied()
+    }
+
+    /// Record the names a table the catalog does not have was looked for
+    /// under.
+    pub fn insert_table_searched(&mut self, table: TableRef, searched: Vec<TableRef>) {
+        self.table_searched.insert(table, searched);
+    }
+
+    /// The names a table the catalog does not have was looked for under;
+    /// `None` where it was found, or not looked for.
+    pub fn table_searched(&self, table: &TableRef) -> Option<&[TableRef]> {
+        self.table_searched.get(table).map(Vec::as_slice)
     }
 
     /// Record the catalog-supplied row count estimate for a base
@@ -508,8 +595,8 @@ impl IndexedCatalogContext {
     }
 
     /// Look up the catalog-declared kind for a base table.
-    /// `None` when the catalog had no entry for the table (treat as
-    /// `IrTableKind::Unknown` at the call site).
+    /// `None` when the catalog had no entry for the table or does not
+    /// record its kind (treat as `IrTableKind::Unknown` at the call site).
     pub fn table_kind(&self, table: &TableRef) -> Option<IrTableKind> {
         self.table_kinds.get(table).copied()
     }
@@ -550,6 +637,48 @@ impl IndexedCatalogContext {
             .unwrap_or(false)
     }
 
+    /// Record the column names the catalog declares for the table of a
+    /// DML target. Last writer wins.
+    pub(crate) fn insert_target_declared_columns(
+        &mut self,
+        table: TableRef,
+        names: BTreeSet<IdentKey>,
+    ) {
+        self.target_declared_columns.insert(table, names);
+    }
+
+    /// The column names the catalog declares for the DML target
+    /// `table`. `None` when no catalog was attached, it does not
+    /// resolve the table, or the table is no DML target of the statement.
+    pub(crate) fn target_declared_columns(&self, table: &TableRef) -> Option<&BTreeSet<IdentKey>> {
+        self.target_declared_columns.get(table)
+    }
+
+    /// Record the tags the catalog attaches to the written column `id`
+    /// and to its table. Last writer wins.
+    pub(crate) fn insert_written_column_tags(&mut self, id: ColumnId, tags: Vec<TagRef>) {
+        self.written_column_tags.insert(id, tags);
+    }
+
+    /// The tags the catalog attaches to the written column `id` and to its
+    /// table. `None` where `id` names no column of a table the catalog
+    /// resolves.
+    pub(crate) fn written_column_tags(&self, id: ColumnId) -> Option<&[TagRef]> {
+        self.written_column_tags.get(&id).map(Vec::as_slice)
+    }
+
+    /// Record whether the catalog the lowerer consulted lists the unique
+    /// keys of its tables.
+    pub(crate) fn record_keys_listed(&mut self, listed: bool) {
+        self.keys_unlisted = !listed;
+    }
+
+    /// Whether the catalog's silence on a column's unique keys says it
+    /// has none: not where the catalog lists no keys.
+    pub(crate) fn lists_keys(&self) -> bool {
+        !self.keys_unlisted
+    }
+
     /// Record the declared FK edges for a base table.
     pub fn insert_table_fks(&mut self, table: TableRef, edges: Vec<FkEdge>) {
         self.table_fks.insert(table, edges);
@@ -565,6 +694,12 @@ impl IndexedCatalogContext {
             .get(table)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Record the columns of each PRIMARY KEY and UNIQUE constraint
+    /// declared on a base table.
+    pub(crate) fn insert_table_keys(&mut self, table: TableRef, keys: Vec<Vec<IdentKey>>) {
+        self.table_keys.insert(table, keys);
     }
 
     /// Record the authoritative `(source_table, column_name)`
@@ -586,19 +721,45 @@ impl IndexedCatalogContext {
     /// `ColumnId` attached to a Scan whose `TableRef` resolved in
     /// the catalog: `true` when the column's `display_name`
     /// matched a catalog column, `false` when it did not. Not called
-    /// at all when no catalog is attached or the table was absent
-    /// from the catalog.
+    /// at all when no catalog is attached, the table was absent from
+    /// the catalog or the catalog does not know its columns.
     pub fn insert_column_in_catalog(&mut self, id: ColumnId, in_catalog: bool) {
         self.column_in_catalog.insert(id, in_catalog);
     }
 
     /// Look up the catalog-presence outcome for a scan-bound
     /// `ColumnId`. `None` when no catalog was attached, the table
-    /// was not in the catalog, or the id was not produced by a
-    /// scan-resolution step. `Some(true)` / `Some(false)` when the
-    /// lowerer recorded a definite outcome.
+    /// was not in the catalog, its columns are not known, or the id
+    /// was not produced by a scan-resolution step. `Some(true)` /
+    /// `Some(false)` when the lowerer recorded a definite outcome.
     pub fn column_in_catalog(&self, id: ColumnId) -> Option<bool> {
         self.column_in_catalog.get(&id).copied()
+    }
+
+    /// Record that the scan-bound column `id` holds its tagged value only
+    /// as `exposure` ([`CatalogContext::column_exposure`]).
+    pub(crate) fn insert_column_exposure(
+        &mut self,
+        id: ColumnId,
+        exposure: crate::facts::catalog::ValueExposure,
+    ) {
+        self.column_exposure.insert(id, exposure);
+    }
+
+    /// Record the tags reasoning found reaching the value of the
+    /// scan-bound column `id` ([`CatalogContext::column_value_tags`]).
+    pub(crate) fn insert_column_value_tags(&mut self, id: ColumnId, tags: Vec<TagRef>) {
+        self.column_value_tags.insert(id, tags);
+    }
+
+    /// Record what reasoning found constraining the value of the
+    /// scan-bound column `id` ([`CatalogContext::column_value_constraints`]).
+    pub(crate) fn insert_column_value_constraints(
+        &mut self,
+        id: ColumnId,
+        constraints: crate::ir::constraint_types::IrColumnConstraints,
+    ) {
+        self.column_value_constraints.insert(id, constraints);
     }
 
     /// Mark a freshly-allocated `ColumnId` as catalog-ambiguous: the
@@ -652,6 +813,25 @@ impl CatalogContext for IndexedCatalogContext {
 
     fn resolve_table_tags(&self, table: &TableRef) -> &[TagRef] {
         self.table_tags.get(table).map_or(&[], |v| v.as_slice())
+    }
+
+    fn table_keys(&self, table: &TableRef) -> &[Vec<IdentKey>] {
+        self.table_keys.get(table).map_or(&[], Vec::as_slice)
+    }
+
+    fn column_exposure(&self, id: ColumnId) -> Option<crate::facts::catalog::ValueExposure> {
+        self.column_exposure.get(&id).copied()
+    }
+
+    fn column_value_tags(&self, id: ColumnId) -> &[TagRef] {
+        self.column_value_tags.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    fn column_value_constraints(
+        &self,
+        id: ColumnId,
+    ) -> Option<&crate::ir::constraint_types::IrColumnConstraints> {
+        self.column_value_constraints.get(&id)
     }
 
     /// TVF resolution requires extracting the function's identity key
@@ -709,6 +889,7 @@ mod tests {
 
     #[test]
     fn empty_context_returns_none_for_every_lookup() {
+        let _folding = crate::ir::normalize::default_folding();
         let ctx = EmptyCatalogContext;
         let mut alloc = ColumnIdAllocator::new();
         let id = alloc.fresh_test();
@@ -726,12 +907,28 @@ mod tests {
             named_args: vec![],
             distinct: false,
             span: sp(),
+            non_values: Vec::new(),
         };
         assert!(ctx.resolve_tvf_columns(&call).is_none());
     }
 
     #[test]
+    fn indexed_context_roundtrips_table_keys() {
+        let _folding = crate::ir::normalize::default_folding();
+        let keys = vec![
+            vec![IdentKey::new("order_id"), IdentKey::new("line_no")],
+            vec![IdentKey::new("sku")],
+        ];
+        let mut ctx = IndexedCatalogContext::new();
+        ctx.insert_table_keys(tref("lines"), keys.clone());
+        assert_eq!(ctx.table_keys(&tref("lines")), keys.as_slice());
+        assert!(ctx.table_keys(&tref("orders")).is_empty());
+        assert!(EmptyCatalogContext.table_keys(&tref("lines")).is_empty());
+    }
+
+    #[test]
     fn indexed_context_roundtrips_table_columns() {
+        let _folding = crate::ir::normalize::default_folding();
         let mut alloc = ColumnIdAllocator::new();
         let c_id = alloc.fresh_test();
         let d_id = alloc.fresh_test();
@@ -801,6 +998,7 @@ mod tests {
 
     #[test]
     fn indexed_context_roundtrips_tvf_columns() {
+        let _folding = crate::ir::normalize::default_folding();
         let mut alloc = ColumnIdAllocator::new();
         let out_id = alloc.fresh_test();
 
@@ -819,6 +1017,7 @@ mod tests {
             named_args: vec![],
             distinct: false,
             span: sp(),
+            non_values: Vec::new(),
         };
 
         let cols = ctx
@@ -833,6 +1032,7 @@ mod tests {
 
     #[test]
     fn indexed_context_missing_tvf_returns_none() {
+        let _folding = crate::ir::normalize::default_folding();
         let ctx = IndexedCatalogContext::new();
         let call = ScalarExpr::FuncCall {
             func: ResolvedFunc::unresolved("absent_tvf", None, sp()),
@@ -840,12 +1040,14 @@ mod tests {
             named_args: vec![],
             distinct: false,
             span: sp(),
+            non_values: Vec::new(),
         };
         assert!(ctx.resolve_tvf_columns(&call).is_none());
     }
 
     #[test]
     fn indexed_context_tvf_key_derives_from_func_display_name() {
+        let _folding = crate::ir::normalize::default_folding();
         let mut ctx = IndexedCatalogContext::new();
         let mut alloc = ColumnIdAllocator::new();
         let id = alloc.fresh_test();
@@ -865,6 +1067,7 @@ mod tests {
             named_args: vec![],
             distinct: false,
             span: sp(),
+            non_values: Vec::new(),
         };
         assert!(ctx.resolve_tvf_columns(&call).is_some());
 
@@ -879,6 +1082,7 @@ mod tests {
 
     #[test]
     fn indexed_context_counts_reflect_inserts() {
+        let _folding = crate::ir::normalize::default_folding();
         let mut alloc = ColumnIdAllocator::new();
         let mut ctx = IndexedCatalogContext::new();
         assert_eq!(ctx.table_count(), 0);
@@ -896,6 +1100,7 @@ mod tests {
 
     #[test]
     fn indexed_context_duplicate_insert_overwrites() {
+        let _folding = crate::ir::normalize::default_folding();
         let mut alloc = ColumnIdAllocator::new();
         let id_v1 = alloc.fresh_test();
         let id_v2 = alloc.fresh_test();

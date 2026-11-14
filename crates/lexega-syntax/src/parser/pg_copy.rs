@@ -28,7 +28,7 @@
 
 use crate::ast::types::{AstPgCopy, AstStmt, PgCopyDirection, PgCopySubject, PgCopyTarget};
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::lexer::{Keyword, Punctuation, Span, TokenKind, TriviaKind};
 use crate::parser::core::Parser;
 use crate::syntax::SyntaxPgCopyStmt;
 
@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
                 (PgCopySubject::Query(query_span, Box::new(inner_stmt)), None)
             } else {
                 // COPY table_name [ (col, ...) ] ...
-                let table_span = self.parse_pg_copy_table_name()?;
+                let table_span = self.parse_object_name_span()?;
 
                 // Optional column list
                 let cols = if let Some(tok) = self.peek_non_trivia() {
@@ -190,41 +190,32 @@ impl<'a> Parser<'a> {
             target,
             options_span,
             where_span,
+            data_span: self.copy_rows_after(self.idx),
         };
         Ok(AstStmt::PgCopy(Box::new(ast)))
+    }
+
+    /// The rows written after the statement whose tokens run from `from`:
+    /// the [`TriviaKind::CopyData`] of the `;` that ends it.
+    pub(crate) fn copy_rows_after(&self, from: usize) -> Option<Span> {
+        self.tokens
+            .get(from..)?
+            .iter()
+            .find(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+                )
+            })?
+            .trailing_trivia
+            .iter()
+            .find(|trivia| trivia.kind == TriviaKind::CopyData)
+            .map(|trivia| trivia.span)
     }
 
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
-
-    /// Parse a possibly schema-qualified table name for COPY.
-    /// Returns a span covering the whole name (e.g., `public.my_table`).
-    fn parse_pg_copy_table_name(&mut self) -> ParseResult<Span> {
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["table name".to_string()])?;
-        let start = first.span.start;
-        let mut end = first.span.end;
-
-        // Check for dot-qualified: schema.table or catalog.schema.table
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                let _dot = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec![".".to_string()])?;
-                let next_part = self.advance().ok_or_eof(
-                    self.current_span(),
-                    vec!["identifier after '.'".to_string()],
-                )?;
-                end = next_part.span.end;
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span { start, end })
-    }
 
     /// Parse the target/source of a COPY: 'file', PROGRAM 'cmd', STDIN, STDOUT.
     fn parse_pg_copy_target(&mut self, direction: PgCopyDirection) -> ParseResult<PgCopyTarget> {

@@ -14,18 +14,31 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
+}
+
+/// Rule ids across findings and context.
+fn analyze_and_get_entries(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    let mut ids = extract_rule_ids(&report.findings);
+    ids.extend(extract_rule_ids(&report.context));
+    ids
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -36,7 +49,7 @@ fn assert_formats_safe(sql: &str) {
 
 #[test]
 fn test_create_connection_replica_fires_rule() {
-    let rules = analyze_and_get_rules("CREATE CONNECTION myconn AS REPLICA OF org1.acct1.conn1;");
+    let rules = analyze_and_get_context("CREATE CONNECTION myconn AS REPLICA OF org1.acct1.conn1;");
     assert!(rules.contains("SNW-CONN-REPLICA"), "got {rules:?}");
 }
 
@@ -44,7 +57,7 @@ fn test_create_connection_replica_fires_rule() {
 fn test_create_connection_plain_comment_is_not_replica() {
     // Snowflake `COMMENT = '…'` (with `=`) now parses, and a non-replica
     // connection must not fire the replica rule.
-    let rules = analyze_and_get_rules("CREATE CONNECTION myconn COMMENT = 'primary conn';");
+    let rules = analyze_and_get_entries("CREATE CONNECTION myconn COMMENT = 'primary conn';");
     assert!(!rules.contains("SNW-CONN-REPLICA"), "got {rules:?}");
 }
 
@@ -60,12 +73,12 @@ fn test_alter_connection_enable_failover_fires_rule() {
 fn test_alter_connection_disable_failover_and_primary_are_benign() {
     // DISABLE FAILOVER reduces exposure and PRIMARY is an operational
     // promotion — both parse but fire no failover-exposure rule.
-    let disable = analyze_and_get_rules("ALTER CONNECTION myconn DISABLE FAILOVER;");
+    let disable = analyze_and_get_entries("ALTER CONNECTION myconn DISABLE FAILOVER;");
     assert!(
         !disable.contains("SNW-CONN-FAILOVER-ENABLE"),
         "got {disable:?}"
     );
-    let primary = analyze_and_get_rules("ALTER CONNECTION myconn PRIMARY;");
+    let primary = analyze_and_get_entries("ALTER CONNECTION myconn PRIMARY;");
     assert!(
         !primary.contains("SNW-CONN-FAILOVER-ENABLE"),
         "got {primary:?}"
@@ -74,7 +87,7 @@ fn test_alter_connection_disable_failover_and_primary_are_benign() {
 
 #[test]
 fn test_databricks_connection_fires_no_snw_rules() {
-    let rules = analyze_and_get_rules(
+    let rules = analyze_and_get_entries(
         "CREATE CONNECTION myconn TYPE mysql OPTIONS (host 'h', user 'u', password 'p');",
     );
     assert!(!rules.contains("SNW-CONN-REPLICA"), "got {rules:?}");

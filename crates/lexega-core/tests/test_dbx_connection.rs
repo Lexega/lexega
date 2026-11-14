@@ -10,7 +10,7 @@
 //! - ALTER CONNECTION (OWNER TO, RENAME TO, OPTIONS)
 //! - DROP CONNECTION / DROP CONNECTION IF EXISTS
 //! - Multi-statement evidence counting
-//! - Signal emission and YAML rule matching (DBX-CONN-NEW..DBX-CONN-CHG)
+//! - Finding emission and YAML rule matching (DBX-CONN-NEW..DBX-CONN-CHG)
 //! - Formatting round-trip (verify_formatting_safe)
 
 use lexega_core::analyzer::RuleMatch;
@@ -49,9 +49,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -203,7 +203,7 @@ fn test_drop_connection_if_exists() {
 // ─── Risk Analysis ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_create_connection_risk_signal() {
+fn test_create_connection_risk_finding() {
     let sql = r#"CREATE CONNECTION pg_conn
 TYPE POSTGRESQL
 OPTIONS (
@@ -216,15 +216,15 @@ OPTIONS (
     let report = dbx_analyze(sql);
 
     assert!(
-        report.summary.total_reported_signals >= 1,
-        "Should generate at least one signal for CREATE CONNECTION, got {}",
-        report.summary.total_reported_signals
+        report.summary.total_reported_findings >= 1,
+        "Should generate at least one finding for CREATE CONNECTION, got {}",
+        report.summary.total_reported_findings
     );
     assert!(
-        has_signal(&report, "DBX-CONN-NEW"),
-        "Should find DBX-CONN-NEW (Connection Created). Signals: {:?}",
+        has_finding(&report, "DBX-CONN-NEW"),
+        "Should find DBX-CONN-NEW (Connection Created). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(a) => a.matched_rule.as_str(),
@@ -234,44 +234,44 @@ OPTIONS (
 }
 
 #[test]
-fn test_drop_connection_risk_signal() {
+fn test_drop_connection_risk_finding() {
     let sql = "DROP CONNECTION my_connection;";
     let report = dbx_analyze(sql);
 
     assert!(
-        report.summary.total_reported_signals >= 1,
-        "Should generate at least one signal for DROP CONNECTION"
+        report.summary.total_reported_findings >= 1,
+        "Should generate at least one finding for DROP CONNECTION"
     );
     assert!(
-        has_signal(&report, "DBX-CONN-DROP"),
+        has_finding(&report, "DBX-CONN-DROP"),
         "Should find DBX-CONN-DROP (Connection Dropped)"
     );
 }
 
 #[test]
-fn test_alter_connection_owner_risk_signal() {
+fn test_alter_connection_owner_risk_finding() {
     let sql = "ALTER CONNECTION my_connection SET OWNER TO `new_owner`;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-CONN-OWNER-CHG"),
+        has_finding(&report, "DBX-CONN-OWNER-CHG"),
         "Should find DBX-CONN-OWNER-CHG (Connection Ownership Changed)"
     );
 }
 
 #[test]
-fn test_alter_connection_rename_risk_signal() {
+fn test_alter_connection_rename_risk_finding() {
     let sql = "ALTER CONNECTION my_connection RENAME TO other_connection;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-CONN-NAME-CHG"),
+        has_finding(&report, "DBX-CONN-NAME-CHG"),
         "Should find DBX-CONN-NAME-CHG (Connection Renamed)"
     );
 }
 
 #[test]
-fn test_alter_connection_options_risk_signal() {
+fn test_alter_connection_options_risk_finding() {
     let sql = r#"ALTER CONNECTION my_connection OPTIONS (
   host 'newhost.us-west-2.rds.amazonaws.com',
   port '5432'
@@ -280,7 +280,7 @@ fn test_alter_connection_options_risk_signal() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-CONN-CHG"),
+        has_finding(&report, "DBX-CONN-CHG"),
         "Should find DBX-CONN-CHG (Connection Options Modified)"
     );
 }
@@ -298,9 +298,9 @@ ALTER CONNECTION pg_conn_4 RENAME TO pg_conn_4b;
 
     let report = dbx_analyze(sql);
 
-    // Count total evidence across all connection signals
+    // Count total evidence across all connection findings
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| match s {
             RuleMatch::Analysis(a) => a.matched_rule.starts_with("DBX-CONN"),
@@ -360,20 +360,20 @@ fn test_connection_with_backtick_quoted_names() {
 
 #[test]
 fn test_connection_risk_level_classification() {
-    // DROP should be High, CREATE should be Medium
+    // DROP should be Medium
     let sql = "DROP CONNECTION critical_conn;";
     let report = dbx_analyze(sql);
 
-    let drop_signal = report
-        .signals
+    let drop_finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "DBX-CONN-DROP"));
-    assert!(drop_signal.is_some(), "Should have DBX-CONN-DROP signal");
-    if let Some(RuleMatch::Analysis(a)) = drop_signal {
+    assert!(drop_finding.is_some(), "Should have DBX-CONN-DROP finding");
+    if let Some(RuleMatch::Analysis(a)) = drop_finding {
         assert_eq!(
             a.risk_level,
-            lexega_core::analyzer::RiskLevel::High,
-            "DROP CONNECTION should be High risk"
+            lexega_core::analyzer::RiskLevel::Medium,
+            "DROP CONNECTION should be Medium risk"
         );
     }
 }

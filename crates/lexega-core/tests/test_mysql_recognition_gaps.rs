@@ -8,8 +8,9 @@
 //! post-column USING BTREE, CREATE DATABASE/SCHEMA charset tails, trailing
 //! WITH [CASCADED|LOCAL] CHECK OPTION, GROUP BY ... WITH ROLLUP, the `<=>`
 //! null-safe-equality operator (one token), named WINDOW definitions with a
-//! frame clause (in every dialect), and column-level AUTO_INCREMENT after
-//! NOT NULL (kept by the formatter).
+//! frame clause (in every dialect), column-level AUTO_INCREMENT after
+//! NOT NULL (kept by the formatter), and an account name (`user@host`) in
+//! every spelling.
 
 use lexega_core::analyzer::AnalysisConfig;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -26,8 +27,10 @@ fn mysql_cfg() -> AnalysisConfig {
 
 /// Parses (no opaque fallback, no phantom split) and round-trips token-safe.
 fn parses_token_safe(sql: &str) -> String {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mysql();
+    let config = FormatterConfig {
+        dialect: dialect::mysql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("formatter must preserve all tokens");
@@ -175,4 +178,277 @@ fn test_auto_increment_survives_formatting() {
             "AUTO_INCREMENT must survive formatting: {out}"
         );
     }
+}
+
+// ── Account names ─────────────────────────────────────────────────────────
+
+/// Each statement that names an account, with the account written in each
+/// spelling MySQL accepts (an unquoted host runs through its dots and
+/// digits), is one statement and leaves the next one analysed.
+#[test]
+fn an_account_name_is_read_whole_in_every_spelling() {
+    let accounts = [
+        "root@localhost",
+        "root@127.0.0.1",
+        "root@db1.example.com",
+        "root@h_1$x",
+        "'root'@localhost",
+        "`root`@localhost",
+        "'root'@127.0.0.1",
+        "root@'localhost'",
+        "'root'@'%'",
+        "\"root\"@\"localhost\"",
+        "''@localhost",
+        "root @ localhost",
+    ];
+    for account in accounts {
+        for shape in [
+            format!("CREATE USER {account} IDENTIFIED BY 'x';"),
+            format!("ALTER USER {account} ACCOUNT LOCK;"),
+            format!("DROP USER {account};"),
+            format!("DROP USER IF EXISTS {account}, b@localhost;"),
+            format!("GRANT SELECT ON db.* TO {account};"),
+            format!("SET PASSWORD FOR {account} = 'x';"),
+            format!("CREATE DEFINER = {account} VIEW v AS SELECT 1 AS c;"),
+            format!(
+                "CREATE DEFINER = {account} TRIGGER trg BEFORE INSERT ON t \
+                 FOR EACH ROW SET NEW.c = 1;"
+            ),
+            format!(
+                "CREATE DEFINER = {account} EVENT e ON SCHEDULE EVERY 1 DAY \
+                 DO DELETE FROM t2;"
+            ),
+        ] {
+            parses_token_safe(&format!("{shape}\nSELECT id FROM zz_src;"));
+        }
+    }
+}
+
+#[test]
+fn a_set_password_value_is_read_whole_in_every_literal_spelling() {
+    for value in [
+        "'x'",
+        "\"x\"",
+        "_utf8mb4'x'",
+        "_utf8mb4 'x'",
+        "_latin1\"x\"",
+        "N'x'",
+        "n'x'",
+        "X'4142'",
+        "0x4142",
+        "b'0101'",
+        "0b0101",
+        "_binary X'4142'",
+        "_binary 0x4142",
+        "'a' 'b'",
+        "_utf8mb4'a' \"b\"",
+    ] {
+        for shape in [
+            format!("SET PASSWORD = {value};"),
+            format!("SET PASSWORD FOR root@localhost = {value};"),
+            format!("SET PASSWORD FOR 'zz'@'%' = {value}"),
+        ] {
+            parses_token_safe(&format!("{shape}\nSELECT id FROM zz_src;"));
+        }
+    }
+}
+
+// ── LOCK TABLES / UNLOCK TABLES ─────────────────────────────────────────
+
+#[test]
+fn a_table_lock_and_its_release_are_each_read_whole() {
+    for sql in [
+        "UNLOCK TABLES;",
+        "UNLOCK TABLE;",
+        "unlock tables",
+        "LOCK TABLES zz_t READ, zz_u AS u LOW_PRIORITY WRITE, zz_v READ LOCAL;\n\
+         INSERT INTO zz_t VALUES (1);\nUNLOCK TABLES;\nDROP TABLE zz_t;",
+    ] {
+        parses_token_safe(sql);
+    }
+    let report = analyze_risk_with_policy_config(
+        "LOCK TABLES `zz_t` WRITE;\nDELETE FROM zz_t;\nUNLOCK TABLES;\nSELECT id FROM zz_t;",
+        &mysql_cfg(),
+    )
+    .expect("should analyze");
+    let summary = &report.summary;
+    assert_eq!(
+        (
+            summary.statements_parsed,
+            summary.statements_analyzed,
+            summary.statements_skipped
+        ),
+        (4, 4, 0)
+    );
+}
+
+/// The published facts of `sql`'s first statement, read as MySQL.
+fn mysql_facts(sql: &str) -> serde_json::Value {
+    let config = AnalysisConfig {
+        trace_mode: true,
+        ..mysql_cfg()
+    };
+    let report = analyze_risk_with_policy_config(sql, &config).expect("should analyze");
+    let json = serde_json::to_value(&report).expect("report serializes");
+    json["statement_traces"][0]["facts"].clone()
+}
+
+// An account or role written as a string is published as written: only a
+// select item's alias is read as a name of the string's value.
+#[test]
+fn an_account_or_role_written_as_a_string_keeps_its_quotes() {
+    for (sql, grantee) in [
+        ("GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'", "'ROOT'@'%'"),
+        (
+            "GRANT SELECT ON zz.t TO 'App'@'localhost'",
+            "'APP'@'LOCALHOST'",
+        ),
+        ("GRANT ALL ON *.* TO 'zz'@'%' WITH GRANT OPTION", "'ZZ'@'%'"),
+    ] {
+        let facts = mysql_facts(sql);
+        assert_eq!(
+            facts["privilege"]["grantees"][0]["name"]["normalized"], grantee,
+            "{sql}"
+        );
+    }
+    for (sql, target) in [
+        ("CREATE USER 'Zz'@'%' IDENTIFIED BY 'x'", "'ZZ'"),
+        ("DROP USER 'zz'@'%'", "'ZZ'"),
+        ("ALTER USER 'root'@'localhost' IDENTIFIED BY 'x'", "'ROOT'"),
+        ("CREATE ROLE 'Admin'", "'ADMIN'"),
+    ] {
+        let facts = mysql_facts(sql);
+        assert_eq!(facts["ddl"]["target"]["name"]["canonical"], target, "{sql}");
+    }
+}
+
+// ── Administration statements ─────────────────────────────────────────────
+
+/// Each administration statement is read whole and has its own kind.
+#[test]
+fn test_admin_statements_have_their_kinds() {
+    use lexega_core::analyzer::RuleMatch;
+    use lexega_core::rules::{build_v1_rule_corpus, load_v1_rules};
+    for (sql, kind) in [
+        ("ANALYZE TABLE orders;", "analyze_stmt"),
+        (
+            "ANALYZE NO_WRITE_TO_BINLOG TABLE orders UPDATE HISTOGRAM ON total WITH 16 BUCKETS;",
+            "analyze_stmt",
+        ),
+        (
+            "ANALYZE TABLE db1.t DROP HISTOGRAM ON a, b;",
+            "analyze_stmt",
+        ),
+        ("OPTIMIZE LOCAL TABLE audit_log, orders;", "optimize_table"),
+        ("CHECK TABLE orders FOR UPGRADE QUICK;", "check_table"),
+        ("CHECKSUM TABLE orders EXTENDED;", "checksum_table"),
+        ("REPAIR TABLE a, b QUICK USE_FRM;", "repair_table"),
+        ("FLUSH PRIVILEGES;", "flush"),
+        ("FLUSH LOCAL RELAY LOGS FOR CHANNEL c1, STATUS;", "flush"),
+        ("FLUSH TABLES customers, orders WITH READ LOCK;", "flush"),
+        ("FLUSH TABLES WITH READ LOCK;", "flush"),
+        ("KILL QUERY 12345;", "kill"),
+        ("KILL CONNECTION @pid;", "kill"),
+        ("ALTER INSTANCE ROTATE INNODB MASTER KEY;", "alter_instance"),
+        (
+            "ALTER INSTANCE RELOAD TLS FOR CHANNEL mysql_admin NO ROLLBACK ON ERROR;",
+            "alter_instance",
+        ),
+        ("XA START 'txn-1';", "xa_transaction"),
+        (
+            "XA END 'txn-1', 'b', 1 SUSPEND FOR MIGRATE;",
+            "xa_transaction",
+        ),
+        ("XA COMMIT 'txn-1' ONE PHASE;", "xa_transaction"),
+        ("XA RECOVER CONVERT XID;", "xa_transaction"),
+        (
+            "RENAME USER 'reporter'@'localhost' TO 'analyst'@'localhost', bob TO robert@'%';",
+            "rename_user",
+        ),
+    ] {
+        parses_token_safe(sql);
+        let custom = load_v1_rules(&format!(
+            r#"
+rules:
+  - id: TEST-ADMIN-KIND
+    risk_level: info
+    message: "kind"
+    triggers:
+      all_of:
+        - kind: {kind}
+"#
+        ))
+        .expect("rules parse");
+        let cfg = AnalysisConfig {
+            dialect: Some(dialect::mysql()),
+            custom_rules: Some(build_v1_rule_corpus(custom, false).expect("corpus").into()),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(sql, &cfg).expect("should analyze");
+        let ids: Vec<String> = report
+            .entries()
+            .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
+            .collect();
+        assert_eq!(ids, ["TEST-ADMIN-KIND"], "{sql} is {kind}");
+    }
+    // The statements inside a routine's body.
+    parses_token_safe(
+        "CREATE PROCEDURE p() BEGIN FLUSH PRIVILEGES; KILL QUERY 5; ANALYZE TABLE t; END;",
+    );
+}
+
+/// A form another dialect writes keeps that dialect's reader.
+#[test]
+fn test_admin_shapes_leave_other_dialects_forms() {
+    for (sql, d) in [
+        ("REPAIR TABLE t SYNC PARTITIONS;", dialect::databricks()),
+        ("REPAIR TABLE t;", dialect::databricks()),
+        ("KILL 53;", dialect::mssql()),
+        (
+            "KILL QUERY NOTIFICATION SUBSCRIPTION ALL;",
+            dialect::mssql(),
+        ),
+        ("ANALYZE orders;", dialect::postgres()),
+    ] {
+        let cfg = AnalysisConfig {
+            dialect: Some(d),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(sql, &cfg).expect("should analyze");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+    }
+}
+
+/// `START TRANSACTION` with MySQL's characteristics, at the top level, and
+/// EXPLAIN's `FORMAT =`.
+#[test]
+fn test_start_transaction_characteristics_and_explain_format() {
+    parses_token_safe("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ WRITE;");
+    parses_token_safe("START TRANSACTION READ ONLY;");
+    parses_token_safe("START TRANSACTION;");
+    parses_token_safe("EXPLAIN FORMAT=JSON SELECT id FROM orders WHERE total > 10;");
+    parses_token_safe("EXPLAIN ANALYZE FORMAT = TREE SELECT 1;");
+}
+
+// ── The client's DELIMITER ────────────────────────────────────────────────
+
+/// A routine written between `DELIMITER $$` and `DELIMITER ;` is read whole
+/// and its body analyzed.
+#[test]
+fn test_delimiter_wrapped_routine_is_analyzed() {
+    use lexega_core::analyzer::RuleMatch;
+    let sql = "DELIMITER $$\nCREATE PROCEDURE p(IN s VARCHAR(64))\nBEGIN\n  SET @q = CONCAT('SELECT * FROM t_', s);\n  PREPARE stmt FROM @q;\n  EXECUTE stmt;\nEND$$\nDELIMITER ;\nSELECT 1;\n";
+    parses_token_safe(sql);
+    let report = analyze_risk_with_policy_config(sql, &mysql_cfg()).expect("should analyze");
+    let ids: Vec<String> = report
+        .entries()
+        .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
+        .collect();
+    // The body's PREPARE runs a concatenation: PROC-DYNSQL where `@q` is not
+    // resolved, DYNSQL-CONCAT where analysis resolves it.
+    assert!(
+        ids.iter()
+            .any(|id| id == "PROC-DYNSQL" || id == "DYNSQL-CONCAT"),
+        "{ids:?}"
+    );
 }

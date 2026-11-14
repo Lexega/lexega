@@ -100,8 +100,9 @@ pub fn lower_drop_replication_failover_group_to_plan(
         action: ReplicationFailoverGroupAction::Drop,
         group_type,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         allowed_accounts: Vec::new(),
         object_types: Vec::new(),
         allowed_databases: Vec::new(),
@@ -126,8 +127,8 @@ fn group_type_from_text(text: &str) -> ReplicationGroupType {
     }
 }
 
-/// Split a bare comma-separated list (no surrounding parens) into trimmed,
-/// unquoted entries.
+/// Split a bare comma-separated list (no surrounding parens) into its
+/// trimmed entries, a string literal's by its value.
 fn split_list(source: &str, span: Option<Span>) -> Vec<String> {
     let Some(span) = span else {
         return Vec::new();
@@ -135,9 +136,8 @@ fn split_list(source: &str, span: Option<Span>) -> Vec<String> {
     slice_span(source, span)
         .unwrap_or("")
         .split(',')
-        .map(|s| s.trim().trim_matches('\'').trim())
+        .map(crate::ir::span_extract::literal_value_or_text)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect()
 }
 

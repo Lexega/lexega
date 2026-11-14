@@ -7,9 +7,49 @@
 
 use crate::lexer::Span;
 
+/// A place in a text: its 1-based line, and its 1-based column counted in
+/// characters and in UTF-16 code units. Each report gives the column in the
+/// unit its format defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextPosition {
+    pub line: usize,
+    /// Column in characters (Unicode scalar values).
+    pub column: usize,
+    /// Column in UTF-16 code units.
+    pub utf16_column: usize,
+}
+
+impl TextPosition {
+    /// The first column of 1-based `line`.
+    pub fn line_start(line: usize) -> Self {
+        Self {
+            line,
+            column: 1,
+            utf16_column: 1,
+        }
+    }
+
+    /// Where `text`, written from this place, ends.
+    pub fn after(self, text: &str) -> Self {
+        let (from, tail) = match text.rfind('\n') {
+            Some(newline) => (
+                Self::line_start(self.line + text.matches('\n').count()),
+                &text[newline + 1..],
+            ),
+            None => (self, text),
+        };
+        Self {
+            line: from.line,
+            column: from.column + tail.chars().count(),
+            utf16_column: from.utf16_column + tail.encode_utf16().count(),
+        }
+    }
+}
+
 /// Line offset index for O(log n) line number lookups
 ///
 /// Build once, use many times. Replaces O(n) scanning for each lookup.
+#[derive(Debug, Clone)]
 pub struct LineIndex {
     /// Byte offsets where each line starts (0-indexed positions)
     line_starts: Vec<usize>,
@@ -57,16 +97,36 @@ impl LineIndex {
         }
     }
 
-    /// Get 1-indexed column number for a span (O(log n) via binary search)
-    /// Column is the offset from the start of the line
-    pub fn get_column_number(&self, span: Span) -> usize {
-        let pos = span.start as usize;
-        let line_idx = match self.line_starts.binary_search(&pos) {
-            Ok(line) => line,                    // Exact match at line start
-            Err(line) => line.saturating_sub(1), // Between line starts
-        };
-        let line_start = self.line_starts.get(line_idx).copied().unwrap_or(0);
-        pos.saturating_sub(line_start) + 1 // 1-indexed
+    /// The place of byte `offset` in `text`, the text this index was built
+    /// from: an offset inside a character is the place of that character.
+    pub fn position(&self, text: &str, offset: usize) -> TextPosition {
+        let mut offset = offset.min(text.len());
+        while !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = self.line_starts.partition_point(|&start| start <= offset);
+        let start = self
+            .line_starts
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or(0);
+        TextPosition::line_start(line.max(1)).after(text.get(start..offset).unwrap_or_default())
+    }
+
+    /// The byte offset in `text`, the text this index was built from, of
+    /// 1-based `line` and `column` in characters, as [`Self::position`]
+    /// gives them; `None` past the end of that line.
+    pub fn offset_at(&self, text: &str, line: usize, column: usize) -> Option<usize> {
+        let start = *self.line_starts.get(line.checked_sub(1)?)?;
+        let end = self.line_starts.get(line).copied().unwrap_or(text.len());
+        let line_text = text.get(start..end)?;
+        let skip = column.checked_sub(1)?;
+        line_text
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(line_text.len()))
+            .nth(skip)
+            .map(|at| start + at)
     }
 
     /// CENTRALIZED LINE RESOLUTION: Resolve a span to full line info including template mapping
@@ -129,5 +189,30 @@ mod tests {
         // Test line 3 (positions 14+)
         assert_eq!(index.get_line_number(Span { start: 14, end: 15 }), 3);
         assert_eq!(index.get_line_number(Span { start: 19, end: 20 }), 3);
+    }
+
+    // A column counts what comes before it on its line in characters and in
+    // UTF-16 code units, never in bytes: `ñ` and `€` are one of each, an
+    // emoji is one character and two code units.
+    #[test]
+    fn a_position_counts_characters_and_utf16_units_not_bytes() {
+        let src = "select 1;\nselect 'ñ€😀中' , x = null;";
+        let index = LineIndex::new(src);
+        let at = src.find("x =").expect("x");
+        let position = index.position(src, at);
+        assert_eq!(
+            position,
+            TextPosition {
+                line: 2,
+                column: 17,
+                utf16_column: 18
+            }
+        );
+        assert_eq!(index.offset_at(src, 2, 17), Some(at));
+        assert_eq!(index.position(src, 0), TextPosition::line_start(1));
+        // An offset inside a character is that character's place.
+        let euro = src.find('€').expect("euro");
+        assert_eq!(index.position(src, euro + 1), index.position(src, euro));
+        assert_eq!(index.offset_at(src, 3, 1), None);
     }
 }

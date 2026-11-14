@@ -40,7 +40,7 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| {
+    report.entries().any(|s| {
         let RuleMatch::Analysis(ref g) = s;
         g.matched_rule == rule_id
     })
@@ -152,14 +152,14 @@ fn test_cache_uncache_multi_statement() {
 // ============================================================================
 
 #[test]
-fn test_cache_table_signal_basic() {
+fn test_cache_table_finding_basic() {
     let sql = "CACHE TABLE my_table;";
     let report = dbx_analyze(sql);
 
     assert!(
-        report.signals.len() >= 1,
-        "Should generate at least one signal for CACHE TABLE, got: {:?}",
-        report.signals
+        !report.findings.is_empty(),
+        "Should generate at least one finding for CACHE TABLE, got: {:?}",
+        report.findings
     );
     assert!(
         has_rule(&report, "DBX-TBL-CACHE"),
@@ -168,13 +168,13 @@ fn test_cache_table_signal_basic() {
 }
 
 #[test]
-fn test_cache_lazy_table_signal() {
+fn test_cache_lazy_table_finding() {
     let sql = "CACHE LAZY TABLE my_table;";
     let report = dbx_analyze(sql);
 
     assert!(
-        report.signals.len() >= 1,
-        "Should generate at least one signal for CACHE LAZY TABLE"
+        report.entries().next().is_some(),
+        "Should generate at least one entry for CACHE LAZY TABLE"
     );
     assert!(
         has_rule(&report, "INFO-DBX-TBL-CACHE-LAZY"),
@@ -183,22 +183,25 @@ fn test_cache_lazy_table_signal() {
 }
 
 #[test]
-fn test_uncache_table_signal() {
+fn test_uncache_table_finding() {
     let sql = "UNCACHE TABLE my_table;";
     let report = dbx_analyze(sql);
 
     assert!(
-        report.signals.len() >= 1,
-        "Should generate at least one signal for UNCACHE TABLE"
+        !report.context.is_empty(),
+        "Should generate at least one context entry for UNCACHE TABLE"
     );
     assert!(
-        has_rule(&report, "DBX-TBL-UNCACHE"),
+        report
+            .context
+            .iter()
+            .any(|s| s.rule_id() == Some("DBX-TBL-UNCACHE")),
         "Should find DBX-TBL-UNCACHE (Table Uncached)"
     );
 }
 
 #[test]
-fn test_uncache_table_if_exists_signal() {
+fn test_uncache_table_if_exists_finding() {
     let sql = "UNCACHE TABLE IF EXISTS my_table;";
     let report = dbx_analyze(sql);
 
@@ -213,7 +216,7 @@ fn test_uncache_table_if_exists_signal() {
 // ============================================================================
 
 #[test]
-fn test_cache_uncache_multi_statement_signals() {
+fn test_cache_uncache_multi_statement_findings() {
     let sql = r#"
         CACHE TABLE t1;
         CACHE LAZY TABLE t2;
@@ -223,8 +226,7 @@ fn test_cache_uncache_multi_statement_signals() {
 
     // Count evidence for each rule
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|f| {
             let RuleMatch::Analysis(ref g) = f;
             g.matched_rule.contains("DBX-TBL-CACHE") || g.matched_rule.contains("DBX-TBL-UNCACHE")
@@ -251,8 +253,8 @@ fn test_cache_table_risk_level() {
     let sql = "CACHE TABLE my_table;";
     let report = dbx_analyze(sql);
 
-    for signal in &report.signals {
-        let RuleMatch::Analysis(ref g) = signal;
+    for finding in report.entries() {
+        let RuleMatch::Analysis(ref g) = finding;
         if g.matched_rule == "DBX-TBL-CACHE" {
             assert_eq!(
                 g.risk_level,
@@ -268,8 +270,8 @@ fn test_cache_lazy_table_risk_level() {
     let sql = "CACHE LAZY TABLE my_table;";
     let report = dbx_analyze(sql);
 
-    for signal in &report.signals {
-        let RuleMatch::Analysis(ref g) = signal;
+    for finding in report.entries() {
+        let RuleMatch::Analysis(ref g) = finding;
         if g.matched_rule == "INFO-DBX-TBL-CACHE-LAZY" {
             assert_eq!(
                 g.risk_level,
@@ -285,13 +287,13 @@ fn test_uncache_table_risk_level() {
     let sql = "UNCACHE TABLE my_table;";
     let report = dbx_analyze(sql);
 
-    for signal in &report.signals {
-        let RuleMatch::Analysis(ref g) = signal;
+    for finding in report.context.iter() {
+        let RuleMatch::Analysis(ref g) = finding;
         if g.matched_rule == "DBX-TBL-UNCACHE" {
             assert_eq!(
                 g.risk_level,
-                RiskLevel::Low,
-                "UNCACHE TABLE should be Low risk"
+                RiskLevel::Info,
+                "UNCACHE TABLE should be Info risk"
             );
         }
     }
@@ -308,7 +310,7 @@ fn test_cache_table_tracks_target_table() {
 
     // Should track the target table as referenced
     assert!(
-        report.summary.total_reported_signals > 0,
-        "CACHE TABLE should generate at least one signal"
+        report.summary.total_reported_findings > 0,
+        "CACHE TABLE should generate at least one finding"
     );
 }

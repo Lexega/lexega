@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterProjectionPolicy, SyntaxAlterProjectionPolicyAction, SyntaxCreateProjectionPolicy,
     SyntaxDropProjectionPolicy,
@@ -625,46 +626,14 @@ impl<'a> Parser<'a> {
                         );
                         let tag_span = tag_tok.span;
 
-                        // Parse tag assignments until we hit something that isn't a tag assignment
-                        let assignments_start = self.current_span().start;
-                        let mut assignments_end;
-
-                        // Consume at least one tag assignment
-                        loop {
-                            // Tag name (possibly qualified: db.schema.tag_name)
-                            let _tag_name_span = self.parse_qualified_name_span()?;
-
-                            // =
-                            let _eq_tok = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
-
-                            // Tag value (string)
-                            let tag_value_tok = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["tag_value".to_string()])?;
-
-                            assignments_end = tag_value_tok.span.end;
-
-                            // Check for comma (more assignments)
-                            if let Some(tok) = self.peek_non_trivia() {
-                                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                                    self.advance(); // consume comma
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
-
-                        let assignments_span = Span {
-                            start: assignments_start,
-                            end: assignments_end,
-                        };
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
 
                         AstAlterProjectionPolicyActionKind::SetTag {
                             set_span: Some(set_span),
                             tag_span: Some(tag_span),
                             assignments_span,
+                            tags,
                         }
                     }
 
@@ -720,34 +689,13 @@ impl<'a> Parser<'a> {
                         );
                         let tag_span = tag_tok.span;
 
-                        // Parse tag names (comma-separated)
-                        let tags_start = self.current_span().start;
-                        let mut tags_end;
-
-                        // Consume at least one tag name
-                        loop {
-                            let tag_name_span = self.parse_qualified_name_span()?;
-                            tags_end = tag_name_span.end;
-
-                            // Check for comma (more tags)
-                            if let Some(tok) = self.peek_non_trivia() {
-                                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                                    self.advance(); // consume comma
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
-
-                        let tags_span = Span {
-                            start: tags_start,
-                            end: tags_end,
-                        };
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                         AstAlterProjectionPolicyActionKind::UnsetTag {
                             unset_span: Some(unset_span),
                             tag_span: Some(tag_span),
                             tags_span,
+                            tags,
                         }
                     }
 

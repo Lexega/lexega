@@ -10,7 +10,7 @@
 //!   PREDICTIVE OPTIMIZATION, DEFAULT COLLATION, OPTIONS, catalog-less ALTER)
 //! - DROP CATALOG with CASCADE, RESTRICT, IF EXISTS
 //! - Formatting (semantic preservation via verify_formatting_safe)
-//! - Risk analysis (signal generation and evidence counts)
+//! - Risk analysis (finding generation and evidence counts)
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -48,9 +48,16 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -372,110 +379,110 @@ fn format_drop_catalog_restrict() {
 }
 
 // ============================================================================
-// Risk Analysis — Signal Generation
+// Risk Analysis — Finding Generation
 // ============================================================================
 
 #[test]
-fn signal_create_catalog() {
+fn finding_create_catalog() {
     let report = dbx_analyze("CREATE CATALOG my_catalog;");
     assert!(
-        has_signal(&report, "DBX-CAT-NEW"),
-        "Should emit DBX-CAT-NEW (Catalog Created). Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-CAT-NEW"),
+        "Should emit DBX-CAT-NEW (Catalog Created). Findings: {:?}",
+        report.context
     );
 }
 
 #[test]
-fn signal_create_foreign_catalog() {
+fn finding_create_foreign_catalog() {
     let report = dbx_analyze("CREATE FOREIGN CATALOG ext USING CONNECTION my_conn;");
     assert!(
-        has_signal(&report, "DBX-CAT-NEW"),
-        "Foreign catalog should also emit DBX-CAT-NEW. Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-CAT-NEW"),
+        "Foreign catalog should also emit DBX-CAT-NEW. Findings: {:?}",
+        report.context
     );
 }
 
 #[test]
-fn signal_alter_catalog_owner_to() {
+fn finding_alter_catalog_owner_to() {
     let report = dbx_analyze("ALTER CATALOG my_catalog OWNER TO `admins`;");
     assert!(
-        has_signal(&report, "DBX-CAT-OWNER-CHG"),
-        "Should emit DBX-CAT-OWNER-CHG (Ownership Transfer). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-OWNER-CHG"),
+        "Should emit DBX-CAT-OWNER-CHG (Ownership Transfer). Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_drop_catalog_cascade() {
+fn finding_drop_catalog_cascade() {
     let report = dbx_analyze("DROP CATALOG my_catalog CASCADE;");
     assert!(
-        has_signal(&report, "DBX-CAT-CASCADE-DROP"),
-        "Should emit DBX-CAT-CASCADE-DROP (CASCADE drop — Critical). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-CASCADE-DROP"),
+        "Should emit DBX-CAT-CASCADE-DROP (CASCADE drop — Critical). Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_drop_catalog_without_cascade() {
+fn finding_drop_catalog_without_cascade() {
     let report = dbx_analyze("DROP CATALOG my_catalog;");
     assert!(
-        has_signal(&report, "DBX-CAT-DROP"),
-        "Should emit DBX-CAT-DROP (Drop — High). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-DROP"),
+        "Should emit DBX-CAT-DROP (Drop — High). Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_drop_catalog_restrict() {
+fn finding_drop_catalog_restrict() {
     let report = dbx_analyze("DROP CATALOG my_catalog RESTRICT;");
     assert!(
-        has_signal(&report, "DBX-CAT-DROP"),
-        "RESTRICT is non-cascade, should emit DBX-CAT-DROP. Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-DROP"),
+        "RESTRICT is non-cascade, should emit DBX-CAT-DROP. Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_alter_catalog_set_tags() {
+fn finding_alter_catalog_set_tags() {
     let report = dbx_analyze("ALTER CATALOG my_catalog SET TAGS ('env' = 'prod');");
     assert!(
-        has_signal(&report, "DBX-CAT-TAG-CHG"),
-        "Should emit DBX-CAT-TAG-CHG (Tags Modified). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-TAG-CHG"),
+        "Should emit DBX-CAT-TAG-CHG (Tags Modified). Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_alter_catalog_unset_tags() {
+fn finding_alter_catalog_unset_tags() {
     let report = dbx_analyze("ALTER CATALOG my_catalog UNSET TAGS ('env');");
     assert!(
-        has_signal(&report, "DBX-CAT-TAG-RMV"),
-        "Should emit DBX-CAT-TAG-RMV (Tags Removed). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-CAT-TAG-RMV"),
+        "Should emit DBX-CAT-TAG-RMV (Tags Removed). Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn signal_alter_catalog_predictive_optimization() {
+fn finding_alter_catalog_predictive_optimization() {
     let report = dbx_analyze("ALTER CATALOG my_catalog ENABLE PREDICTIVE OPTIMIZATION;");
     assert!(
-        has_signal(&report, "DBX-CAT-PREDOPT-CHG"),
-        "Should emit DBX-CAT-PREDOPT-CHG (Predictive Optimization Changed). Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-CAT-PREDOPT-CHG"),
+        "Should emit DBX-CAT-PREDOPT-CHG (Predictive Optimization Changed). Findings: {:?}",
+        report.context
     );
 
     let report2 = dbx_analyze("ALTER CATALOG my_catalog DISABLE PREDICTIVE OPTIMIZATION;");
     assert!(
-        has_signal(&report2, "DBX-CAT-PREDOPT-CHG"),
-        "DISABLE should also emit DBX-CAT-PREDOPT-CHG. Signals: {:?}",
-        report2.signals
+        has_context(&report2, "DBX-CAT-PREDOPT-CHG"),
+        "DISABLE should also emit DBX-CAT-PREDOPT-CHG. Findings: {:?}",
+        report2.context
     );
 
     let report3 = dbx_analyze("ALTER CATALOG my_catalog INHERIT PREDICTIVE OPTIMIZATION;");
     assert!(
-        has_signal(&report3, "DBX-CAT-PREDOPT-CHG"),
-        "INHERIT should also emit DBX-CAT-PREDOPT-CHG. Signals: {:?}",
-        report3.signals
+        has_context(&report3, "DBX-CAT-PREDOPT-CHG"),
+        "INHERIT should also emit DBX-CAT-PREDOPT-CHG. Findings: {:?}",
+        report3.context
     );
 }
 
@@ -492,21 +499,24 @@ fn multi_statement_evidence_count() {
     "#;
     let report = dbx_analyze(sql);
 
-    // Should have all three signal types
-    assert!(has_signal(&report, "DBX-CAT-NEW"), "Missing CREATE signal");
+    // Should have all three finding types
     assert!(
-        has_signal(&report, "DBX-CAT-OWNER-CHG"),
-        "Missing OWNER TO signal"
+        has_context(&report, "DBX-CAT-NEW"),
+        "Missing CREATE context entry"
     );
     assert!(
-        has_signal(&report, "DBX-CAT-CASCADE-DROP"),
-        "Missing CASCADE DROP signal"
+        has_finding(&report, "DBX-CAT-OWNER-CHG"),
+        "Missing OWNER TO finding"
+    );
+    assert!(
+        has_finding(&report, "DBX-CAT-CASCADE-DROP"),
+        "Missing CASCADE DROP finding"
     );
 
     // At least one critical (CASCADE drop)
     assert!(
         report.summary.critical_count >= 1,
-        "Expected at least 1 critical signal for CASCADE drop, got {}",
+        "Expected at least 1 critical finding for CASCADE drop, got {}",
         report.summary.critical_count
     );
 }
@@ -521,7 +531,7 @@ fn multi_statement_drops() {
     let report = dbx_analyze(sql);
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-CAT-DROP"))
         .map(|s| {
@@ -541,15 +551,15 @@ fn multi_statement_drops() {
 // ============================================================================
 
 #[test]
-fn no_signal_for_select() {
+fn no_finding_for_select() {
     let report = dbx_analyze("SELECT 1;");
     assert!(
-        !has_signal(&report, "DBX-CAT-NEW"),
-        "SELECT should not emit any catalog signal"
+        !has_finding(&report, "DBX-CAT-NEW") && !has_context(&report, "DBX-CAT-NEW"),
+        "SELECT should not emit any catalog finding"
     );
     assert!(
-        !has_signal(&report, "DBX-CAT-DROP"),
-        "SELECT should not emit any catalog signal"
+        !has_finding(&report, "DBX-CAT-DROP"),
+        "SELECT should not emit any catalog finding"
     );
 }
 
@@ -603,7 +613,7 @@ fn ast_alter_catalog_owner_to_fields() {
         assert!(
             matches!(
                 a.action_kind,
-                lexega_core::ast::AlterCatalogActionKind::OwnerTo
+                lexega_core::ast::AlterCatalogActionKind::OwnerTo { .. }
             ),
             "Action should be OwnerTo"
         );
@@ -692,9 +702,9 @@ fn risk_dbx_grant_all_on_catalog_triggers_dbx_c018() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
-        "GRANT ALL ON CATALOG should trigger DBX-GRT-CAT-ALLPRIV. Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
+        "GRANT ALL ON CATALOG should trigger DBX-GRT-CAT-ALLPRIV. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -705,9 +715,9 @@ fn risk_dbx_grant_all_on_catalog_no_privs_keyword() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
-        "GRANT ALL ON CATALOG (without PRIVILEGES keyword) should still trigger DBX-GRT-CAT-ALLPRIV. Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
+        "GRANT ALL ON CATALOG (without PRIVILEGES keyword) should still trigger DBX-GRT-CAT-ALLPRIV. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -718,11 +728,11 @@ fn risk_dbx_grant_all_on_catalog_also_triggers_grant_all_priv() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "GRT-ALL-PRIV"),
+        has_finding(&report, "GRT-ALL-PRIV"),
         "GRANT ALL ON CATALOG should also trigger generic GRT-ALL-PRIV"
     );
     assert!(
-        has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
+        has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
         "GRANT ALL ON CATALOG should trigger DBX-GRT-CAT-ALLPRIV"
     );
 }
@@ -734,7 +744,7 @@ fn risk_dbx_grant_select_on_catalog_does_not_trigger_dbx_c018() {
     let report = dbx_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
+        !has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
         "GRANT USE CATALOG (not ALL) should NOT trigger DBX-GRT-CAT-ALLPRIV"
     );
 }
@@ -746,7 +756,7 @@ fn risk_dbx_grant_all_on_schema_does_not_trigger_dbx_c018() {
     let report = dbx_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
+        !has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
         "GRANT ALL ON SCHEMA should NOT trigger DBX-GRT-CAT-ALLPRIV (catalog-specific)"
     );
 }
@@ -757,7 +767,7 @@ fn risk_dbx_grant_all_on_database_does_not_trigger_dbx_c018() {
     let report = dbx_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-GRT-CAT-ALLPRIV"),
+        !has_finding(&report, "DBX-GRT-CAT-ALLPRIV"),
         "GRANT ALL ON DATABASE should NOT trigger DBX-GRT-CAT-ALLPRIV"
     );
 }
@@ -768,7 +778,7 @@ fn risk_dbx_grant_manage_on_catalog_triggers_dbx_c053() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-GRT-CAT-MANAGE"),
+        has_finding(&report, "DBX-GRT-CAT-MANAGE"),
         "GRANT MANAGE ON CATALOG should trigger DBX-GRT-CAT-MANAGE"
     );
 }
@@ -779,7 +789,7 @@ fn risk_dbx_grant_manage_on_schema_triggers_dbx_c054() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-GRT-SCHEMA-MANAGE"),
+        has_finding(&report, "DBX-GRT-SCHEMA-MANAGE"),
         "GRANT MANAGE ON SCHEMA should trigger DBX-GRT-SCHEMA-MANAGE"
     );
 }
@@ -790,7 +800,7 @@ fn risk_dbx_grant_manage_on_volume_triggers_grt_vol_manage() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-GRT-VOL-MANAGE"),
+        has_finding(&report, "DBX-GRT-VOL-MANAGE"),
         "GRANT MANAGE ON VOLUME should trigger DBX-GRT-VOL-MANAGE"
     );
 }
@@ -801,7 +811,7 @@ fn risk_dbx_revoke_all_on_catalog_triggers_rvk_cat_allpriv() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-RVK-CAT-ALLPRIV"),
+        has_finding(&report, "DBX-RVK-CAT-ALLPRIV"),
         "REVOKE ALL PRIVILEGES ON CATALOG should trigger DBX-RVK-CAT-ALLPRIV"
     );
 }
@@ -812,7 +822,16 @@ fn risk_dbx_revoke_manage_on_catalog_triggers_rvk_cat_manage() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-RVK-CAT-MANAGE"),
+        has_finding(&report, "DBX-RVK-CAT-MANAGE"),
         "REVOKE MANAGE ON CATALOG should trigger DBX-RVK-CAT-MANAGE"
     );
+}
+
+#[test]
+fn risk_dbx_grant_to_account_users_is_a_grant_to_everyone() {
+    // `account users` is Unity Catalog's group of every user.
+    let report = dbx_analyze("GRANT ALL PRIVILEGES ON CATALOG prod TO `account users`;");
+    assert!(has_finding(&report, "GRT-TO-PUBLIC"));
+    let report = dbx_analyze("GRANT USE CATALOG ON CATALOG prod TO `data engineers`;");
+    assert!(!has_finding(&report, "GRT-TO-PUBLIC"));
 }

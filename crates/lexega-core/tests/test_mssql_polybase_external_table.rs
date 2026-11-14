@@ -5,7 +5,7 @@
 //! FILE_FORMAT=, REJECTED_ROW_LOCATION=)`.
 //!
 //! Covers recognition (parse + byte-exact round-trip, not skipped), the
-//! DATA_SOURCE federated-access signal, the credential-leak composition, and
+//! DATA_SOURCE federated-access finding, the credential-leak composition, and
 //! the non-regression of the BigQuery `OPTIONS(...)` external-table form.
 
 use lexega_core::analyzer::{AnalysisConfig, RuleMatch};
@@ -24,7 +24,7 @@ fn mssql_cfg() -> AnalysisConfig {
 fn rule_ids_cfg(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
+        .findings
         .iter()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
@@ -35,8 +35,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -105,8 +107,10 @@ fn test_bigquery_external_table_not_affected() {
         dialect: Some(dialect::bigquery()),
         ..Default::default()
     };
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::bigquery();
+    let config = FormatterConfig {
+        dialect: dialect::bigquery(),
+        ..Default::default()
+    };
 
     let sql = "CREATE EXTERNAL TABLE ds.t OPTIONS (format='CSV', uris=['gs://b/f.csv']);";
     let out = format_sql_with_config(sql, &config).expect("should format");

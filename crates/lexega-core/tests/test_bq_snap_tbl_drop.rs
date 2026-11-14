@@ -12,11 +12,11 @@ use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 
 /// Helper: collect all rule IDs from an analysis report.
-fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> Vec<String> {
+    findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
@@ -29,7 +29,7 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
 fn test_basic_drop_snapshot_table() {
     let sql = "DROP SNAPSHOT TABLE my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "Should detect BQ-SNAP-TBL-DROP. Got: {:?}",
@@ -41,7 +41,7 @@ fn test_basic_drop_snapshot_table() {
 fn test_if_exists_variant() {
     let sql = "DROP SNAPSHOT TABLE IF EXISTS my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "IF EXISTS variant should trigger. Got: {:?}",
@@ -53,7 +53,7 @@ fn test_if_exists_variant() {
 fn test_qualified_name() {
     let sql = "DROP SNAPSHOT TABLE ds.my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "Qualified name should trigger. Got: {:?}",
@@ -65,7 +65,7 @@ fn test_qualified_name() {
 fn test_fully_qualified_name() {
     let sql = "DROP SNAPSHOT TABLE proj.ds.my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "Fully-qualified 3-part name should trigger. Got: {:?}",
@@ -77,7 +77,7 @@ fn test_fully_qualified_name() {
 fn test_if_exists_with_qualified_name() {
     let sql = "DROP SNAPSHOT TABLE IF EXISTS ds.my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "IF EXISTS + qualified name should trigger. Got: {:?}",
@@ -93,12 +93,12 @@ fn test_if_exists_with_qualified_name() {
 fn test_risk_level_is_medium() {
     let sql = "DROP SNAPSHOT TABLE my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-SNAP-TBL-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert_eq!(
                 a.risk_level,
@@ -113,12 +113,12 @@ fn test_risk_level_is_medium() {
 fn test_message_content() {
     let sql = "DROP SNAPSHOT TABLE my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-SNAP-TBL-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert!(
                 a.message.contains("Snapshot table dropped"),
@@ -170,7 +170,7 @@ fn test_multi_statement_evidence_count() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-SNAP-TBL-DROP"))
         .map(|s| match s {
@@ -199,20 +199,20 @@ fn test_multi_statement_both_analyzed() {
 }
 
 // ──────────────────────────────────────────────────────────
-// Signal evidence
+// Finding evidence
 // ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_signal_evidence_present() {
+fn test_finding_evidence_present() {
     let sql = "DROP SNAPSHOT TABLE my_snap;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-SNAP-TBL-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    let evidence = signal.unwrap().evidence();
-    assert!(!evidence.is_empty(), "Signal should have evidence entries");
+    assert!(finding.is_some(), "Finding should exist");
+    let evidence = finding.unwrap().evidence();
+    assert!(!evidence.is_empty(), "Finding should have evidence entries");
 }
 
 // ──────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ fn test_signal_evidence_present() {
 fn test_not_triggered_by_create_snapshot_table() {
     let sql = "CREATE SNAPSHOT TABLE snap CLONE src;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "CREATE SNAPSHOT TABLE should NOT trigger BQ-SNAP-TBL-DROP. Got: {:?}",
@@ -235,7 +235,7 @@ fn test_not_triggered_by_create_snapshot_table() {
 fn test_not_triggered_by_drop_table() {
     let sql = "DROP TABLE my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "Plain DROP TABLE should NOT trigger BQ-SNAP-TBL-DROP. Got: {:?}",
@@ -247,7 +247,7 @@ fn test_not_triggered_by_drop_table() {
 fn test_not_triggered_by_drop_search_index() {
     let sql = "DROP SEARCH INDEX idx ON tbl;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),
         "DROP SEARCH INDEX should NOT trigger BQ-SNAP-TBL-DROP. Got: {:?}",
@@ -259,11 +259,12 @@ fn test_not_triggered_by_drop_search_index() {
 fn test_create_triggers_new_rule_not_drop() {
     let sql = "CREATE SNAPSHOT TABLE snap CLONE src;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
+    let context_ids = extract_rule_ids(&report.context);
     assert!(
-        ids.contains(&"BQ-SNAP-TBL-NEW".to_string()),
+        context_ids.contains(&"BQ-SNAP-TBL-NEW".to_string()),
         "CREATE SNAPSHOT TABLE should trigger BQ-SNAP-TBL-NEW. Got: {:?}",
-        ids
+        context_ids
     );
     assert!(
         !ids.contains(&"BQ-SNAP-TBL-DROP".to_string()),

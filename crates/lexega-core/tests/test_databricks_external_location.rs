@@ -9,8 +9,8 @@ use lexega_core::{format_sql_with_config, verify_formatting_safe, FormatterConfi
 
 use lexega_core::api::analyze_risk;
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.findings.iter().any(
         |s| matches!(s, lexega_core::analyzer::RuleMatch::Analysis(g) if g.matched_rule == rule_id),
     )
 }
@@ -112,12 +112,12 @@ fn test_create_external_location_formatting_structure() {
 // ───────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_create_external_location_risk_signal() {
+fn test_create_external_location_risk_finding() {
     let sql = "CREATE EXTERNAL LOCATION s3_remote URL 's3://us-east-1/location' WITH (STORAGE CREDENTIAL s3_remote_cred);";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        report.summary.total_reported_signals > 0,
-        "Should generate signals for CREATE EXTERNAL LOCATION (got 0 — parser may have fallen back to OpaqueContent)"
+        report.summary.total_reported_findings > 0,
+        "Should generate findings for CREATE EXTERNAL LOCATION (got 0 — parser may have fallen back to OpaqueContent)"
     );
 }
 
@@ -126,19 +126,19 @@ fn test_create_external_location_risk_rule_id() {
     let sql = "CREATE EXTERNAL LOCATION s3_remote URL 's3://us-east-1/location' WITH (STORAGE CREDENTIAL s3_remote_cred);";
     let report = analyze_risk(sql).expect("should analyze");
 
-    let has_extloc_new = report.signals.iter().any(|s| {
+    let has_extloc_new = report.findings.iter().any(|s| {
         let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;
         g.matched_rule == "DBX-EXTLOC-NEW"
     });
     assert!(
         has_extloc_new,
-        "Should find DBX-EXTLOC-NEW (External Location Created) signal. Signals: {:?}",
+        "Should find DBX-EXTLOC-NEW (External Location Created) finding. Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| {
                 match s {
-                    lexega_core::analyzer::RuleMatch::Analysis(g) => format!("{}", g.matched_rule),
+                    lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.to_string(),
                 }
             })
             .collect::<Vec<_>>()
@@ -151,10 +151,10 @@ fn test_alter_external_location_owner_risk_rule_id() {
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "DBX-EXTLOC-OWNER-CHG"),
-        "Should find DBX-EXTLOC-OWNER-CHG (External Location Ownership Changed). Signals: {:?}",
+        has_finding(&report, "DBX-EXTLOC-OWNER-CHG"),
+        "Should find DBX-EXTLOC-OWNER-CHG (External Location Ownership Changed). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -169,10 +169,10 @@ fn test_alter_external_location_set_credential_risk_rule_id() {
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "DBX-EXTLOC-CRED-CHG"),
-        "Should find DBX-EXTLOC-CRED-CHG (External Location Credential Modified). Signals: {:?}",
+        has_finding(&report, "DBX-EXTLOC-CRED-CHG"),
+        "Should find DBX-EXTLOC-CRED-CHG (External Location Credential Modified). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -187,10 +187,10 @@ fn test_alter_external_location_set_url_force_risk_rule_id() {
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "DBX-EXTLOC-URL-CHG"),
-        "Should find DBX-EXTLOC-URL-CHG (External Location URL Modified / weak config). Signals: {:?}",
+        has_finding(&report, "DBX-EXTLOC-URL-CHG"),
+        "Should find DBX-EXTLOC-URL-CHG (External Location URL Modified / weak config). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -205,10 +205,10 @@ fn test_alter_external_location_set_url_risk_rule_id() {
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "DBX-EXTLOC-URL-CHG"),
-        "Should find DBX-EXTLOC-URL-CHG (External Location URL Modified). Signals: {:?}",
+        has_finding(&report, "DBX-EXTLOC-URL-CHG"),
+        "Should find DBX-EXTLOC-URL-CHG (External Location URL Modified). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -218,15 +218,44 @@ fn test_alter_external_location_set_url_risk_rule_id() {
 }
 
 #[test]
+fn test_rename_external_location_fires_name_chg_not_url_chg() {
+    let report = analyze_risk("ALTER EXTERNAL LOCATION l RENAME TO l2;").expect("should analyze");
+
+    assert!(
+        has_finding(&report, "DBX-EXTLOC-NAME-CHG"),
+        "RENAME TO should fire DBX-EXTLOC-NAME-CHG"
+    );
+    assert!(
+        !has_finding(&report, "DBX-EXTLOC-URL-CHG"),
+        "RENAME TO must not fire DBX-EXTLOC-URL-CHG"
+    );
+}
+
+#[test]
+fn test_set_url_external_location_fires_url_chg_not_name_chg() {
+    let report = analyze_risk("ALTER EXTERNAL LOCATION l SET URL 's3://bucket/path';")
+        .expect("should analyze");
+
+    assert!(
+        has_finding(&report, "DBX-EXTLOC-URL-CHG"),
+        "SET URL should fire DBX-EXTLOC-URL-CHG"
+    );
+    assert!(
+        !has_finding(&report, "DBX-EXTLOC-NAME-CHG"),
+        "SET URL must not fire DBX-EXTLOC-NAME-CHG"
+    );
+}
+
+#[test]
 fn test_drop_external_location_risk_rule_id() {
     let sql = "DROP EXTERNAL LOCATION s3_remote;";
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "DBX-EXTLOC-DROP"),
-        "Should find DBX-EXTLOC-DROP (External Location Dropped). Signals: {:?}",
+        has_finding(&report, "DBX-EXTLOC-DROP"),
+        "Should find DBX-EXTLOC-DROP (External Location Dropped). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -247,9 +276,9 @@ fn test_create_external_location_multi_statement() {
     "#;
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Count total evidence across all signals
+    // Count total evidence across all findings
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| {
             let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;

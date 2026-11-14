@@ -67,7 +67,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::On)?;
 
         // table_name (possibly schema-qualified: schema.table)
-        let table_name = self.parse_pg_policy_qualified_name()?;
+        let table_name = self.parse_object_name_span()?;
 
         // Optional clauses - all order-sensitive per PG grammar
         let mut permissiveness: Option<(PgPolicyPermissiveness, Span)> = None;
@@ -257,7 +257,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::On)?;
 
         // table_name
-        let table_name = self.parse_pg_policy_qualified_name()?;
+        let table_name = self.parse_object_name_span()?;
 
         // Determine action: RENAME TO or modify (TO/USING/WITH CHECK)
         let mut end = table_name.end;
@@ -428,7 +428,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::On)?;
 
         // table_name
-        let table_name = self.parse_pg_policy_qualified_name()?;
+        let table_name = self.parse_object_name_span()?;
         let mut end = table_name.end;
 
         // [CASCADE | RESTRICT]
@@ -501,28 +501,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a possibly schema-qualified name: [schema.]name
-    fn parse_pg_policy_qualified_name(&mut self) -> ParseResult<Span> {
-        let first = self.parse_pg_policy_identifier()?;
-        let mut end = first.end;
-
-        // Check for dot (schema qualification)
-        if let Some(tok) = self.peek() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                let _dot = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec![".".to_string()])?;
-                let second = self.parse_pg_policy_identifier()?;
-                end = second.end;
-            }
-        }
-
-        Ok(Span {
-            start: first.start,
-            end,
-        })
-    }
-
     /// Parse a comma-separated list of role specifications.
     /// Roles can be: identifier, PUBLIC, CURRENT_USER, CURRENT_ROLE, SESSION_USER
     fn parse_pg_policy_role_list(&mut self) -> ParseResult<(Vec<PgPolicyRole>, u32)> {
@@ -555,6 +533,10 @@ impl<'a> Parser<'a> {
     /// Can be: regular identifier, PUBLIC (Identifier), CURRENT_USER (Keyword),
     ///         CURRENT_ROLE (Identifier), SESSION_USER (Identifier)
     fn parse_pg_policy_role_spec(&mut self) -> ParseResult<Span> {
+        // A role a template writes some of (`app_user_{{ var('env') }}`).
+        if self.templated_part_at(self.idx).is_some() {
+            return self.parse_object_name_span();
+        }
         let tok = self.advance().ok_or_else(|| {
             ParseError::unexpected_eof(self.current_span(), vec!["role name".to_string()])
         })?;

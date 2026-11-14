@@ -33,7 +33,9 @@ use crate::context::node_metadata::{
 use crate::lexer::Span;
 
 use super::column::ColumnId;
+use super::plan::RelPlan;
 use super::scalar::ScalarExpr;
+use super::visitor::ScalarExprVisitor;
 
 /// Closed enum of non-query DDL policy facts.
 ///
@@ -70,7 +72,7 @@ pub enum PolicyStatementFacts {
 }
 
 impl PolicyStatementFacts {
-    /// Stable label for diagnostics / signal emission. Closed-enum
+    /// Stable label for diagnostics / finding emission. Closed-enum
     /// exhaustive — adding a variant fails compilation here.
     pub fn kind_label(&self) -> &'static str {
         match self {
@@ -85,6 +87,41 @@ impl PolicyStatementFacts {
             PolicyStatementFacts::Masking(_) => "masking_policy",
             PolicyStatementFacts::PgPolicy(_) => "pg_policy",
         }
+    }
+
+    /// The policy's body expressions: a row access or masking policy's
+    /// body, a PostgreSQL policy's `USING` and `WITH CHECK`.
+    pub(crate) fn bodies(&self) -> Vec<&ScalarExpr> {
+        match self {
+            PolicyStatementFacts::RowAccess(fact) => fact.body.iter().collect(),
+            PolicyStatementFacts::Masking(fact) => fact.body.iter().collect(),
+            PolicyStatementFacts::PgPolicy(fact) => {
+                fact.using.iter().chain(&fact.with_check).collect()
+            }
+            PolicyStatementFacts::Password(_)
+            | PolicyStatementFacts::Session(_)
+            | PolicyStatementFacts::Authentication(_)
+            | PolicyStatementFacts::Network(_)
+            | PolicyStatementFacts::Aggregation(_)
+            | PolicyStatementFacts::Projection(_)
+            | PolicyStatementFacts::ApiIntegration(_) => Vec::new(),
+        }
+    }
+
+    /// The plans the policy's body expressions hold: each subquery
+    /// written directly in a body, not those nested in another.
+    pub(crate) fn held_plans(&self) -> Vec<&RelPlan> {
+        struct Held<'a>(Vec<&'a RelPlan>);
+        impl<'a> ScalarExprVisitor<'a> for Held<'a> {
+            fn visit_scalar_subquery(&mut self, plan: &'a RelPlan, _correlates: &'a [ColumnId]) {
+                self.0.push(plan);
+            }
+        }
+        let mut held = Held(Vec::new());
+        for body in self.bodies() {
+            held.visit_scalar_expr(body);
+        }
+        held.0
     }
 }
 

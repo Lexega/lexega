@@ -12,15 +12,17 @@ use lexega_syntax::{
 };
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(BigQueryDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(BigQueryDialect),
+        ..Default::default()
+    }
 }
 
 fn snowflake_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(SnowflakeDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(SnowflakeDialect),
+        ..Default::default()
+    }
 }
 
 fn assert_no_opaque_with_dialect(sql: &str, dialect: &dyn Dialect) {

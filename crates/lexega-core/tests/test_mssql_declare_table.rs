@@ -23,9 +23,10 @@ use lexega_core::{format_sql_with_config, parse_sql_with_dialect, FormatterConfi
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn parse_mssql(sql: &str) -> Vec<AstStmt> {
@@ -177,8 +178,10 @@ fn test_declare_table_no_semicolon() {
 #[test]
 fn test_declare_table_risk_analysis() {
     let sql = "DECLARE @t TABLE(id INT, name VARCHAR(50));\nDECLARE @x INT;\nDECLARE @r TABLE(val DECIMAL(10,2));";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("analysis should succeed");
     assert_eq!(

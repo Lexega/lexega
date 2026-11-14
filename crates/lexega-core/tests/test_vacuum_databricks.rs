@@ -159,25 +159,23 @@ fn test_vacuum_format_idempotent() {
 }
 
 // ============================================================================
-// Risk analysis tests — VACUUM signals
+// Risk analysis tests — VACUUM findings
 // ============================================================================
 
 #[test]
 fn test_vacuum_risk_basic() {
     let report = dbx_analyze("VACUUM my_table;");
 
-    // Should have at least one signal (INFO-PG-MAINT-VACUUM: maintenance executed)
-    let vacuum_signals: Vec<_> = report
-        .signals
-        .iter()
+    // Should have at least one finding (INFO-PG-MAINT-VACUUM: maintenance executed)
+    let vacuum_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-PG-MAINT-VACUUM"))
         .collect();
     assert!(
-        !vacuum_signals.is_empty(),
-        "VACUUM should generate INFO-PG-MAINT-VACUUM (maintenance executed). Signals: {:?}",
+        !vacuum_findings.is_empty(),
+        "VACUUM should generate INFO-PG-MAINT-VACUUM (maintenance executed). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
@@ -190,17 +188,15 @@ fn test_vacuum_risk_low_retention() {
     let report = dbx_analyze("VACUUM my_table RETAIN 24 HOURS;");
 
     // Should trigger DBX-VACUUM-LOWRET: VACUUM with low retention
-    let low_retention_signals: Vec<_> = report
-        .signals
-        .iter()
+    let low_retention_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-LOWRET"))
         .collect();
     assert!(
-        !low_retention_signals.is_empty(),
-        "VACUUM RETAIN 24 HOURS should generate DBX-VACUUM-LOWRET (low retention). Signals: {:?}",
+        !low_retention_findings.is_empty(),
+        "VACUUM RETAIN 24 HOURS should generate DBX-VACUUM-LOWRET (low retention). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
@@ -213,30 +209,28 @@ fn test_vacuum_risk_safe_retention() {
     let report = dbx_analyze("VACUUM my_table RETAIN 168 HOURS;");
 
     // Should NOT trigger DBX-VACUUM-LOWRET (168 hours = 7 days, meets minimum)
-    let low_retention_signals: Vec<_> = report
-        .signals
-        .iter()
+    let low_retention_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-LOWRET"))
         .collect();
     assert!(
-        low_retention_signals.is_empty(),
+        low_retention_findings.is_empty(),
         "VACUUM RETAIN 168 HOURS should not generate DBX-VACUUM-LOWRET. Got: {:?}",
-        low_retention_signals
+        low_retention_findings
     );
 }
 
 #[test]
-fn test_vacuum_risk_dry_run_still_signals() {
-    // DRY RUN is safe but still generates maintenance signal
+fn test_vacuum_risk_dry_run_still_findings() {
+    // DRY RUN is safe but still generates maintenance finding
     let report = dbx_analyze("VACUUM my_table DRY RUN;");
 
-    let maintenance_signals: Vec<_> = report
-        .signals
-        .iter()
+    let maintenance_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-PG-MAINT-VACUUM"))
         .collect();
     assert!(
-        !maintenance_signals.is_empty(),
+        !maintenance_findings.is_empty(),
         "VACUUM DRY RUN should still generate INFO-PG-MAINT-VACUUM (maintenance executed)."
     );
 }
@@ -246,13 +240,12 @@ fn test_vacuum_risk_low_retention_with_dry_run() {
     let report = dbx_analyze("VACUUM my_table RETAIN 12 HOURS DRY RUN;");
 
     // Should still trigger low retention warning even with DRY RUN
-    let low_retention_signals: Vec<_> = report
-        .signals
-        .iter()
+    let low_retention_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-LOWRET"))
         .collect();
     assert!(
-        !low_retention_signals.is_empty(),
+        !low_retention_findings.is_empty(),
         "VACUUM RETAIN 12 HOURS DRY RUN should generate DBX-VACUUM-LOWRET."
     );
 }
@@ -268,8 +261,7 @@ fn test_vacuum_multi_statement_evidence() {
 
     // Count maintenance evidence (all 3 should generate INFO-PG-MAINT-VACUUM)
     let maintenance_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-PG-MAINT-VACUUM"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -283,8 +275,7 @@ fn test_vacuum_multi_statement_evidence() {
 
     // Only table2 (24 hours) should trigger low retention
     let low_retention_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-LOWRET"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -306,15 +297,14 @@ fn test_vacuum_risk_zero_retention_critical() {
     let report = dbx_analyze("VACUUM my_table RETAIN 0 HOURS;");
 
     // Should trigger DBX-VACUUM-ZERO: VACUUM with zero retention (Critical)
-    let zero_retention_signals: Vec<_> = report
-        .signals
-        .iter()
+    let zero_retention_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-ZERO"))
         .collect();
     assert!(
-        !zero_retention_signals.is_empty(),
-        "VACUUM RETAIN 0 HOURS should generate DBX-VACUUM-ZERO (zero retention, Critical). Signals: {:?}",
-        report.signals.iter().map(|s| match s {
+        !zero_retention_findings.is_empty(),
+        "VACUUM RETAIN 0 HOURS should generate DBX-VACUUM-ZERO (zero retention, Critical). Findings: {:?}",
+        report.entries().map(|s| match s {
             RuleMatch::Analysis(g) => format!("{} ({:?})", g.matched_rule, g.risk_level),
         }).collect::<Vec<_>>()
     );
@@ -322,18 +312,17 @@ fn test_vacuum_risk_zero_retention_critical() {
     // Should be Critical severity
     assert!(
         report.summary.critical_count >= 1,
-        "VACUUM RETAIN 0 should have at least one Critical signal. Got: critical={}",
+        "VACUUM RETAIN 0 should have at least one Critical finding. Got: critical={}",
         report.summary.critical_count
     );
 
     // Should ALSO trigger DBX-VACUUM-LOWRET (low retention, High) since 0 < 168
-    let low_retention_signals: Vec<_> = report
-        .signals
-        .iter()
+    let low_retention_findings: Vec<_> = report
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VACUUM-LOWRET"))
         .collect();
     assert!(
-        !low_retention_signals.is_empty(),
+        !low_retention_findings.is_empty(),
         "VACUUM RETAIN 0 HOURS should also generate DBX-VACUUM-LOWRET (low retention)."
     );
 }

@@ -10,7 +10,7 @@ use crate::analyzer::{AnalysisConfig, AnalysisReport, RiskError};
 use crate::catalog::CatalogIndex;
 use crate::dialect::Dialect;
 use crate::error::ParseError;
-use crate::rules::Signal;
+use crate::rules::Finding;
 use crate::template::RenderArtifacts;
 use crate::{Engine, PreparedScript};
 
@@ -53,6 +53,8 @@ pub fn analyze_risk_with_policy_config_and_catalog_path(
     let engine = Engine::recognition();
     let PreparedScript { artifacts, script } =
         engine.prepare_and_parse(src, &policy_config.dialect, None)?;
+    // The catalog index is built and read under the one dialect.
+    let _dialect = engine.apply_dialect(&policy_config.dialect);
     let catalog_index = match catalog_path {
         Some(path) => Some(
             CatalogIndex::load_from_path(std::path::Path::new(path)).map_err(|e| {
@@ -116,56 +118,56 @@ pub fn analyze_risk_with_policy_config_and_catalog_index(
     )
 }
 
-/// Signals from the privilege statements of `sql`.
-pub fn analyze_privilege_facts(sql: &str) -> Result<Vec<Signal>, ParseError> {
+/// Findings from the privilege statements of `sql`.
+pub fn analyze_privilege_facts(sql: &str) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_privilege_facts(sql)
 }
 
-/// Signals from the privilege statements of `sql`, with a catalog.
+/// Findings from the privilege statements of `sql`, with a catalog.
 pub fn analyze_privilege_facts_with_catalog(
     sql: &str,
     catalog: &CatalogIndex,
-) -> Result<Vec<Signal>, ParseError> {
+) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_privilege_facts_with_catalog(sql, catalog)
 }
 
-/// Signals from the DDL statements of `sql`.
-pub fn analyze_ddl_facts(sql: &str) -> Result<Vec<Signal>, ParseError> {
+/// Findings from the DDL statements of `sql`.
+pub fn analyze_ddl_facts(sql: &str) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_ddl_facts(sql)
 }
 
-/// Signals from the DDL statements of `sql`, parsed as `dialect`.
+/// Findings from the DDL statements of `sql`, parsed as `dialect`.
 pub fn analyze_ddl_facts_with_dialect(
     sql: &str,
     dialect: &dyn Dialect,
-) -> Result<Vec<Signal>, ParseError> {
+) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_ddl_facts_with_dialect(sql, dialect)
 }
 
-/// Signals from the query-bearing statements of `sql`.
-pub fn analyze_query_facts(sql: &str) -> Result<Vec<Signal>, ParseError> {
+/// Findings from the query-bearing statements of `sql`.
+pub fn analyze_query_facts(sql: &str) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_query_facts(sql)
 }
 
-/// Signals from the query-bearing statements of `sql`, with a catalog.
+/// Findings from the query-bearing statements of `sql`, with a catalog.
 pub fn analyze_query_facts_with_catalog(
     sql: &str,
     catalog: &CatalogIndex,
-) -> Result<Vec<Signal>, ParseError> {
+) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_query_facts_with_catalog(sql, catalog)
 }
 
-/// Signals from the query-bearing statements of `sql`, parsed as
+/// Findings from the query-bearing statements of `sql`, parsed as
 /// `dialect`.
 pub fn analyze_query_facts_with_dialect(
     sql: &str,
     dialect: &dyn Dialect,
-) -> Result<Vec<Signal>, ParseError> {
+) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_query_facts_with_dialect(sql, dialect)
 }
 
-/// Signals from the policy-attachment statements of `sql`.
-pub fn analyze_policy_attachment_facts(sql: &str) -> Result<Vec<Signal>, ParseError> {
+/// Findings from the policy-attachment statements of `sql`.
+pub fn analyze_policy_attachment_facts(sql: &str) -> Result<Vec<Finding>, ParseError> {
     Engine::recognition().analyze_policy_attachment_facts(sql)
 }
 

@@ -128,96 +128,40 @@ pub fn lower_declare_handler_to_handler_plan(
 ///
 /// Closed-enum exhaustive over [`AstStmt`] (no `_ =>` arm). Adding a
 /// new [`AstStmt`] variant breaks this build and forces a deliberate
-/// recursion-or-leaf decision. Mirrors the precedent in
+/// decision on its kind; the bodies it holds are [`AstStmt::bodies`]'s.
+/// Mirrors the precedent in
 /// [`super::ProcedurePlan`]'s `collect_body_statement_kinds`.
 fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyStatementKindIr>) {
+    // A body nested deeper than the stack lets the analyzer walk is not read.
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return;
+    };
     match stmt {
         // ───────── Trigger leaves ─────────
         AstStmt::Resignal { .. } => kinds.push(HandlerBodyStatementKindIr::Resignal),
         AstStmt::Signal { .. } => kinds.push(HandlerBodyStatementKindIr::Signal),
         AstStmt::GetDiagnostics { .. } => kinds.push(HandlerBodyStatementKindIr::GetDiagnostics),
 
-        // ───────── Body-bearing scripting variants — recurse ─────────
-        AstStmt::Block(b) => {
-            for s in &b.decls {
-                collect_body_statement_kinds(s, kinds);
-            }
-            for s in &b.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::If(i) => {
-            for br in &i.branches {
-                for s in &br.body {
-                    collect_body_statement_kinds(s, kinds);
-                }
-            }
-            for s in &i.else_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::CaseStmt(c) => {
-            for br in &c.branches {
-                for s in &br.body {
-                    collect_body_statement_kinds(s, kinds);
-                }
-            }
-            for s in &c.else_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::While(w) => {
-            for s in &w.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::For(f) => {
-            for s in &f.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::ForEach(f) => {
-            for s in &f.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::Loop(l) => {
-            for s in &l.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::Repeat(r) => {
-            for s in &r.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::DeclareHandler(h) => collect_body_statement_kinds(&h.handler_action, kinds),
-        AstStmt::MssqlTryCatch(t) => {
-            for s in &t.try_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-            for s in &t.catch_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::MssqlIf(i) => {
-            for s in &i.then_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-            for s in &i.else_body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
-        AstStmt::MssqlWhile(w) => {
-            for s in &w.body {
-                collect_body_statement_kinds(s, kinds);
-            }
-        }
+        // ───────── Body-bearing scripting variants ─────────
+        // Their bodies are read below.
+        AstStmt::Block(_)
+        | AstStmt::If(_)
+        | AstStmt::CaseStmt(_)
+        | AstStmt::While(_)
+        | AstStmt::For(_)
+        | AstStmt::ForEach(_)
+        | AstStmt::Loop(_)
+        | AstStmt::Repeat(_)
+        | AstStmt::DeclareHandler(_)
+        | AstStmt::MssqlTryCatch(_)
+        | AstStmt::MssqlIf(_)
+        | AstStmt::MssqlWhile(_) => {}
 
         // ───────── Non-body-bearing leaves ─────────
         // Listed exhaustively so the closed-enum contract remains
         // compiler-enforced.
         AstStmt::Select(_)
+        | AstStmt::Perform(_)
         | AstStmt::SetSelect(_)
         | AstStmt::ValuesQuery(_)
         | AstStmt::Insert(_)
@@ -227,6 +171,7 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::Delete(_)
         | AstStmt::Merge(_)
         | AstStmt::Explain(_)
+        | AstStmt::PsqlGexec(_)
         | AstStmt::ExecuteImmediate { .. }
         | AstStmt::ExecuteImmediateFrom(_)
         | AstStmt::OpaqueContent { .. }
@@ -235,7 +180,9 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::JinjaConditionalStmt(_)
         | AstStmt::Error { .. }
         | AstStmt::GoBatchSeparator { .. }
+        | AstStmt::SqlcmdCommand { .. }
         | AstStmt::Reconfigure { .. }
+        | AstStmt::MssqlServerCommand { .. }
         | AstStmt::AlterAccount(_)
         | AstStmt::AlterAggregationPolicy(_)
         | AstStmt::AlterApiIntegration(_)
@@ -399,6 +346,7 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::DropExternalLocation(_)
         | AstStmt::DropMaskingPolicy(_)
         | AstStmt::DropMssqlTrigger(_)
+        | AstStmt::MssqlTriggerState(_)
         | AstStmt::DropNetworkPolicy(_)
         | AstStmt::DropPasswordPolicy(_)
         | AstStmt::DropPgPolicy(_)
@@ -431,6 +379,7 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::MssqlRaiserror(_)
         | AstStmt::MssqlSetOption(_)
         | AstStmt::MysqlSet(_)
+        | AstStmt::MysqlUnlockTables(_)
         | AstStmt::MssqlThrow(_)
         | AstStmt::MssqlWaitfor(_)
         | AstStmt::Null { .. }
@@ -447,6 +396,11 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::PgCreateOperator(_)
         | AstStmt::CreatePrincipal(_)
         | AstStmt::PgCreateRule(_)
+        | AstStmt::MssqlCreateRule(_)
+        | AstStmt::MysqlDo(_)
+        | AstStmt::ExecuteTask(_)
+        | AstStmt::MysqlCreateLoadableFunction(_)
+        | AstStmt::MysqlAdmin(_)
         | AstStmt::PgCreateTablespace(_)
         | AstStmt::PgDeallocate(_)
         | AstStmt::PgDiscard(_)
@@ -488,6 +442,7 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::Return { .. }
         | AstStmt::Revoke(_)
         | AstStmt::Rollback { .. }
+        | AstStmt::Savepoint(_)
         | AstStmt::SetVariable { .. }
         | AstStmt::Show(_)
         | AstStmt::Truncate(_)
@@ -539,5 +494,25 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
         | AstStmt::AlterAlert(_)
         | AstStmt::Use(_)
         | AstStmt::Vacuum(_) => {}
+    }
+    // Every body it holds but a block's exception handlers, the body of a
+    // routine defined in this one and an `INSERT … EXEC`'s `EXEC`.
+    for body in stmt.bodies() {
+        match body.role {
+            crate::ast::BodyRole::ExceptionHandler
+            | crate::ast::BodyRole::Routine
+            | crate::ast::BodyRole::InsertExec => continue,
+            crate::ast::BodyRole::Declarations
+            | crate::ast::BodyRole::Block
+            | crate::ast::BodyRole::Branch
+            | crate::ast::BodyRole::Else
+            | crate::ast::BodyRole::Loop
+            | crate::ast::BodyRole::LoopQuery
+            | crate::ast::BodyRole::Catch
+            | crate::ast::BodyRole::HandlerAction => {}
+        }
+        for s in body.stmts {
+            collect_body_statement_kinds(s, kinds);
+        }
     }
 }

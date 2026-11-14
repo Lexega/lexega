@@ -15,18 +15,18 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(report.entries())
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -103,13 +103,13 @@ fn test_resource_monitor_triggers_changed() {
 }
 
 #[test]
-fn test_resource_monitor_drop_high() {
+fn test_resource_monitor_drop_medium() {
     let report = analyze_risk("DROP RESOURCE MONITOR IF EXISTS rm;").expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
     assert!(rules.contains("SNW-RESMON-DROP"), "got {rules:?}");
     assert!(
-        report.summary.high_count >= 1,
-        "dropping a cost guardrail is high severity"
+        report.summary.medium_count >= 1,
+        "dropping a cost guardrail is medium severity"
     );
 }
 

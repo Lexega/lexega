@@ -105,12 +105,19 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
         }
         AstStmt::Assign {
             name_span,
+            subscript_span,
             assign_op_span,
             expr,
             semicolon_token,
             ..
         } => {
-            format_assign(printer, *name_span, *assign_op_span, expr.as_ref())?;
+            format_assign(
+                printer,
+                *name_span,
+                *subscript_span,
+                *assign_op_span,
+                expr.as_ref(),
+            )?;
             if let Some(semi_id) = semicolon_token {
                 printer.push_token_id(*semi_id);
             }
@@ -133,24 +140,27 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
             }
         }
         AstStmt::Declare {
+            span,
             declare_span,
             declare_token,
-            name,
-            type_span,
-            default_op_token,
-            default_expr,
+            variables,
             semicolon_token,
             ..
         } => {
-            format_declare(
-                printer,
-                *declare_span,
-                *declare_token,
-                name,
-                *type_span,
-                *default_op_token,
-                default_expr.as_ref().map(|e| e.as_ref()),
-            )?;
+            if let [variable] = variables.as_slice() {
+                format_declare(
+                    printer,
+                    *declare_span,
+                    *declare_token,
+                    &variable.name,
+                    variable.type_span,
+                    variable.default_op_token,
+                    variable.default_expr.as_deref(),
+                )?;
+            } else {
+                // A list of variables is printed as written.
+                printer.push_span(*span);
+            }
             if let Some(semi_id) = semicolon_token {
                 printer.push_token_id(*semi_id);
             }
@@ -350,6 +360,8 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
             break_span,
             break_token,
             label_token,
+            when_span,
+            condition,
             semicolon_token,
             ..
         } => {
@@ -364,6 +376,7 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
                 printer.space();
                 printer.push_token_id(*lbl_id);
             }
+            format_loop_control_condition(printer, *when_span, condition.as_deref())?;
             // Emit semicolon if present
             if let Some(semi_id) = semicolon_token {
                 printer.push_token_id(*semi_id);
@@ -373,6 +386,8 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
             continue_span,
             continue_token,
             label_token,
+            when_span,
+            condition,
             semicolon_token,
             ..
         } => {
@@ -386,6 +401,7 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
                 printer.space();
                 printer.push_token_id(*lbl_id);
             }
+            format_loop_control_condition(printer, *when_span, condition.as_deref())?;
             // Emit semicolon if present
             if let Some(semi_id) = semicolon_token {
                 printer.push_token_id(*semi_id);
@@ -599,13 +615,28 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
             printer.push_span(s.span);
         }
         AstStmt::MssqlWhile(s) => {
-            printer.push_span(s.span);
+            let loop_start = match s.label_span {
+                Some(ls) => {
+                    printer.push_span(ls);
+                    printer.newline();
+                    s.while_span.start
+                }
+                None => s.span.start,
+            };
+            printer.push_span(Span {
+                start: loop_start,
+                end: s.span.end,
+            });
         }
         AstStmt::MssqlPrint(p) => {
             printer.push_span(p.span);
             if let Some(semi_id) = p.semicolon_token {
                 printer.push_token_id(semi_id);
             }
+        }
+        AstStmt::Perform(p) => {
+            printer.push_span(p.span);
+            printer.push_token_id(p.semicolon_token);
         }
         AstStmt::MssqlThrow(t) => {
             printer.push_span(t.span);
@@ -646,13 +677,301 @@ pub fn format_statement(printer: &mut Printer, stmt: &AstStmt) -> Result<(), For
         AstStmt::PgSet(s) => {
             printer.push_span(s.span);
         }
-        _ => {
-            // Non-scripting statement - should not be called from here
-            printer.exit_recursion();
-            return Err(FormatterError::NotImplemented(format!(
-                "Non-scripting statement in scripting formatter: {:?}",
-                stmt
-            )));
+        // Every other statement is no scripting construct: it formats as at
+        // the top of a script, inside a block or a procedure body alike.
+        AstStmt::ValuesQuery(_)
+        | AstStmt::MssqlExecuteAs(_)
+        | AstStmt::MssqlRevert { .. }
+        | AstStmt::MssqlAuditDdl(_)
+        | AstStmt::MssqlSecurityObjectDdl(_)
+        | AstStmt::MysqlSet(_)
+        | AstStmt::MysqlUnlockTables(_)
+        | AstStmt::CreateMssqlTrigger(_)
+        | AstStmt::DropMssqlTrigger(_)
+        | AstStmt::MssqlTriggerState(_)
+        | AstStmt::Savepoint(_)
+        | AstStmt::MssqlBulkInsert(_)
+        | AstStmt::MssqlCreateExternalModel(_)
+        | AstStmt::MssqlCreateExternalDataSource(_)
+        | AstStmt::MssqlAlterExternalDataSource(_)
+        | AstStmt::CreateForeignServer(_)
+        | AstStmt::AlterForeignServer(_)
+        | AstStmt::MssqlAlterServerConfiguration(_)
+        | AstStmt::CreateUserMapping(_)
+        | AstStmt::AlterUserMapping(_)
+        | AstStmt::DropUserMapping(_)
+        | AstStmt::CreateForeignTable(_)
+        | AstStmt::ImportForeignSchema(_)
+        | AstStmt::MssqlAlterExternalModel(_)
+        | AstStmt::MssqlDropExternalModel(_)
+        | AstStmt::MssqlCreateVectorIndex(_)
+        | AstStmt::ClauseFragment { .. }
+        | AstStmt::CreateDynamicTable(_)
+        | AstStmt::CreateTask(_)
+        | AstStmt::CreateStage(_)
+        | AstStmt::CreateRowAccessPolicy(_)
+        | AstStmt::CreateMaskingPolicy(_)
+        | AstStmt::CreateNetworkPolicy(_)
+        | AstStmt::CreateSessionPolicy(_)
+        | AstStmt::CreateAuthenticationPolicy(_)
+        | AstStmt::CreateApiIntegration(_)
+        | AstStmt::CreateNotificationIntegration(_)
+        | AstStmt::CreatePasswordPolicy(_)
+        | AstStmt::CreateAggregationPolicy(_)
+        | AstStmt::CreateProjectionPolicy(_)
+        | AstStmt::CreateStorageIntegration(_)
+        | AstStmt::AlterRowAccessPolicy(_)
+        | AstStmt::AlterMaskingPolicy(_)
+        | AstStmt::AlterNetworkPolicy(_)
+        | AstStmt::AlterSessionPolicy(_)
+        | AstStmt::AlterSession(_)
+        | AstStmt::AlterAuthenticationPolicy(_)
+        | AstStmt::AlterUser(_)
+        | AstStmt::AlterAccount(_)
+        | AstStmt::AlterApiIntegration(_)
+        | AstStmt::AlterNotificationIntegration(_)
+        | AstStmt::CreateShare(_)
+        | AstStmt::AlterShare(_)
+        | AstStmt::CreateDatashare(_)
+        | AstStmt::AlterDatashare(_)
+        | AstStmt::CreateSecurityIntegration(_)
+        | AstStmt::AlterSecurityIntegration(_)
+        | AstStmt::AlterReplicationGroup(_)
+        | AstStmt::AlterFailoverGroup(_)
+        | AstStmt::AlterPasswordPolicy(_)
+        | AstStmt::AlterAggregationPolicy(_)
+        | AstStmt::AlterProjectionPolicy(_)
+        | AstStmt::AlterStorageIntegration(_)
+        | AstStmt::AlterTable(_)
+        | AstStmt::AlterView(_)
+        | AstStmt::AlterMaterializedView(_)
+        | AstStmt::AlterDynamicTable(_)
+        | AstStmt::AlterFunction(_)
+        | AstStmt::AlterProcedure(_)
+        | AstStmt::AlterStage(_)
+        | AstStmt::AlterTask(_)
+        | AstStmt::Show(_)
+        | AstStmt::Describe(_)
+        | AstStmt::Use(_)
+        | AstStmt::DropRowAccessPolicy(_)
+        | AstStmt::DropAllRowAccessPolicies(_)
+        | AstStmt::DropMaskingPolicy(_)
+        | AstStmt::DropNetworkPolicy(_)
+        | AstStmt::DropSessionPolicy(_)
+        | AstStmt::DropAuthenticationPolicy(_)
+        | AstStmt::DropApiIntegration(_)
+        | AstStmt::DropNotificationIntegration(_)
+        | AstStmt::DropPasswordPolicy(_)
+        | AstStmt::DropAggregationPolicy(_)
+        | AstStmt::DropProjectionPolicy(_)
+        | AstStmt::DropStorageIntegration(_)
+        | AstStmt::DropTask(_)
+        | AstStmt::CreateWarehouse(_)
+        | AstStmt::AlterWarehouse(_)
+        | AstStmt::DropWarehouse(_)
+        | AstStmt::CreatePipe(_)
+        | AstStmt::AlterPipe(_)
+        | AstStmt::DropPipe(_)
+        | AstStmt::CreateTag(_)
+        | AstStmt::AlterTag(_)
+        | AstStmt::UndropTag(_)
+        | AstStmt::CreateFileFormat(_)
+        | AstStmt::AlterFileFormat(_)
+        | AstStmt::CreateSecret(_)
+        | AstStmt::AlterSecret(_)
+        | AstStmt::CreateNetworkRule(_)
+        | AstStmt::AlterNetworkRule(_)
+        | AstStmt::CreateResourceMonitor(_)
+        | AstStmt::AlterResourceMonitor(_)
+        | AstStmt::CreateComputePool(_)
+        | AstStmt::AlterComputePool(_)
+        | AstStmt::CreateGitRepository(_)
+        | AstStmt::AlterGitRepository(_)
+        | AstStmt::CreateImageRepository(_)
+        | AstStmt::AlterImageRepository(_)
+        | AstStmt::CreateStreamlit(_)
+        | AstStmt::AlterStreamlit(_)
+        | AstStmt::CreateService(_)
+        | AstStmt::AlterService(_)
+        | AstStmt::CreateNotebook(_)
+        | AstStmt::AlterNotebook(_)
+        | AstStmt::CreateSemanticView(_)
+        | AstStmt::AlterSemanticView(_)
+        | AstStmt::CreateCortexSearchService(_)
+        | AstStmt::AlterCortexSearchService(_)
+        | AstStmt::CreateApplication(_)
+        | AstStmt::AlterApplication(_)
+        | AstStmt::CreateApplicationPackage(_)
+        | AstStmt::AlterApplicationPackage(_)
+        | AstStmt::CreateListing(_)
+        | AstStmt::AlterListing(_)
+        | AstStmt::CreateManagedAccount(_)
+        | AstStmt::CreateAccount(_)
+        | AstStmt::StageFileCommand(_)
+        | AstStmt::CreateAlert(_)
+        | AstStmt::AlterAlert(_)
+        | AstStmt::CreateJoinPolicy(_)
+        | AstStmt::AlterJoinPolicy(_)
+        | AstStmt::DropJoinPolicy(_)
+        | AstStmt::CreateDataMetricFunction(_)
+        | AstStmt::CreateReplicationFailoverGroup(_)
+        | AstStmt::CreateExternalAccessIntegration(_)
+        | AstStmt::AlterExternalAccessIntegration(_)
+        | AstStmt::DropExternalAccessIntegration(_)
+        | AstStmt::CreateStream(_)
+        | AstStmt::AlterStream(_)
+        | AstStmt::DropStream(_)
+        | AstStmt::CreateDatabase(_)
+        | AstStmt::AlterDatabase(_)
+        | AstStmt::DropDatabase(_)
+        | AstStmt::UndropDatabase(_)
+        | AstStmt::CreateSchema(_)
+        | AstStmt::AlterSchema(_)
+        | AstStmt::DropSchema(_)
+        | AstStmt::UndropSchema(_)
+        | AstStmt::UndropTable(_)
+        | AstStmt::UndropType(_)
+        | AstStmt::ReplaceInto(_)
+        | AstStmt::MultiInsert(_)
+        | AstStmt::Explain(_)
+        | AstStmt::PsqlGexec(_)
+        | AstStmt::MysqlDo(_)
+        | AstStmt::ExecuteTask(_)
+        | AstStmt::MysqlCreateLoadableFunction(_)
+        | AstStmt::MysqlAdmin(_)
+        | AstStmt::CreateIndex(_)
+        | AstStmt::CreateSynonym(_)
+        | AstStmt::CommentOn(_)
+        | AstStmt::DoBlock(_)
+        | AstStmt::Vacuum(_)
+        | AstStmt::AnalyzeStmt(_)
+        | AstStmt::CreateType(_)
+        | AstStmt::AlterType(_)
+        | AstStmt::CreateExtension(_)
+        | AstStmt::CreateSequence(_)
+        | AstStmt::AlterSequence(_)
+        | AstStmt::CreatePgTrigger(_)
+        | AstStmt::AlterPgTrigger(_)
+        | AstStmt::DropPgTrigger(_)
+        | AstStmt::CreateDomain(_)
+        | AstStmt::AlterDomain(_)
+        | AstStmt::DropDomain(_)
+        | AstStmt::CreatePgPolicy(_)
+        | AstStmt::AlterPgPolicy(_)
+        | AstStmt::DropPgPolicy(_)
+        | AstStmt::AlterIndex(_)
+        | AstStmt::Reindex(_)
+        | AstStmt::PgPrepare(_)
+        | AstStmt::PgExecute(_)
+        | AstStmt::PgDeallocate(_)
+        | AstStmt::PgCopy(_)
+        | AstStmt::PgRefreshMatview(_)
+        | AstStmt::PgListen(_)
+        | AstStmt::PgNotify(_)
+        | AstStmt::PgUnlisten(_)
+        | AstStmt::PgLockTable(_)
+        | AstStmt::PgCreateRule(_)
+        | AstStmt::MssqlCreateRule(_)
+        | AstStmt::PgCreateAggregate(_)
+        | AstStmt::PgCreateOperator(_)
+        | AstStmt::PgAlterSystem(_)
+        | AstStmt::PgAlterTablespace(_)
+        | AstStmt::PgDropOwned(_)
+        | AstStmt::PgReassignOwned(_)
+        | AstStmt::PgDiscard(_)
+        | AstStmt::PgCluster(_)
+        | AstStmt::PgPublication(_)
+        | AstStmt::PgSubscription(_)
+        | AstStmt::CreatePrincipal(_)
+        | AstStmt::AlterPrincipal(_)
+        | AstStmt::DropPrincipal(_)
+        | AstStmt::PgDropExtension(_)
+        | AstStmt::PgAlterRule(_)
+        | AstStmt::PgDropRule(_)
+        | AstStmt::PgAlterTableTriggerState(_)
+        | AstStmt::PgDropSequence(_)
+        | AstStmt::PgDropType(_)
+        | AstStmt::PgDropIndex(_)
+        | AstStmt::PgCreateTablespace(_)
+        | AstStmt::PgDropTablespace(_)
+        | AstStmt::BqExportData(_)
+        | AstStmt::BqLoadData(_)
+        | AstStmt::MysqlLoadData(_)
+        | AstStmt::MysqlRenameTable(_)
+        | AstStmt::CreateEvent(_)
+        | AstStmt::AlterEvent(_)
+        | AstStmt::CreateMysqlTrigger(_)
+        | AstStmt::BqAssert(_)
+        | AstStmt::BqCreateSnapshotTable(_)
+        | AstStmt::BqDropSnapshotTable(_)
+        | AstStmt::BqCreateSearchIndex(_)
+        | AstStmt::BqDropSearchIndex(_)
+        | AstStmt::BqCreateVectorIndex(_)
+        | AstStmt::BqDropVectorIndex(_)
+        | AstStmt::BqAlterVectorIndex(_)
+        | AstStmt::BqCreateModel(_)
+        | AstStmt::BqAlterModel(_)
+        | AstStmt::BqExportModel(_)
+        | AstStmt::BqDropModel(_)
+        | AstStmt::Optimize(_)
+        | AstStmt::DescribeHistory(_)
+        | AstStmt::Restore(_)
+        | AstStmt::MssqlBackup(_)
+        | AstStmt::MssqlRestore(_)
+        | AstStmt::MssqlDbcc(_)
+        | AstStmt::MssqlKeyManagement(_)
+        | AstStmt::MssqlSecurityPolicy(_)
+        | AstStmt::MssqlKeyBackup(_)
+        | AstStmt::MssqlAssembly(_)
+        | AstStmt::MssqlAddSignature(_)
+        | AstStmt::MssqlSetuser(_)
+        | AstStmt::MssqlServerCommand { .. }
+        | AstStmt::MssqlAlterServiceMasterKey(_)
+        | AstStmt::PgAlterDefaultPrivileges(_)
+        | AstStmt::CacheTable(_)
+        | AstStmt::UncacheTable(_)
+        | AstStmt::RepairTable(_)
+        | AstStmt::CreateCatalog(_)
+        | AstStmt::AlterCatalog(_)
+        | AstStmt::DropCatalog(_)
+        | AstStmt::CreateVolume(_)
+        | AstStmt::AlterVolume(_)
+        | AstStmt::DropVolume(_)
+        | AstStmt::CreateExternalLocation(_)
+        | AstStmt::AlterExternalLocation(_)
+        | AstStmt::DropExternalLocation(_)
+        | AstStmt::CreateStorageCredential(_)
+        | AstStmt::AlterStorageCredential(_)
+        | AstStmt::DropStorageCredential(_)
+        | AstStmt::CreateConnection(_)
+        | AstStmt::AlterConnection(_)
+        | AstStmt::DropConnection(_)
+        | AstStmt::CreateFlow(_)
+        | AstStmt::CreateExternalTable(_)
+        | AstStmt::CreateExternalSchema(_)
+        | AstStmt::PipeChain { .. }
+        | AstStmt::Await { .. }
+        | AstStmt::Cancel { .. }
+        | AstStmt::CreateProcedure(_)
+        | AstStmt::CreateFunction(_)
+        | AstStmt::CreateTableFunction(_)
+        | AstStmt::ExecuteImmediateFrom(_)
+        | AstStmt::CreateExternalFunction(_)
+        | AstStmt::BeginTransaction { .. }
+        | AstStmt::Commit { .. }
+        | AstStmt::Rollback { .. }
+        | AstStmt::CopyIntoTable { .. }
+        | AstStmt::CopyIntoLocation { .. }
+        | AstStmt::Unload { .. }
+        | AstStmt::RedshiftCopy { .. }
+        | AstStmt::JinjaPlaceholder { .. }
+        | AstStmt::JinjaConditionalStmt(_)
+        | AstStmt::SqlcmdCommand { .. }
+        | AstStmt::Grant(_)
+        | AstStmt::Revoke(_)
+        | AstStmt::Deny(_)
+        | AstStmt::AlterAuthorization(_) => {
+            crate::formatter::Formatter::format_stmt(printer, stmt)?;
         }
     }
 
@@ -1020,11 +1339,16 @@ fn format_let_cursor(
 fn format_assign(
     printer: &mut Printer,
     name_span: Span,
+    subscript_span: Option<Span>,
     assign_op_span: Option<Span>,
     expr: &AstExpr,
 ) -> Result<(), FormatterError> {
     // Format variable name with trivia emission
     printer.push_identifier_span(name_span);
+    // The subscripts as written: an index may be a literal.
+    if let Some(subscripts) = subscript_span {
+        printer.push_span(subscripts);
+    }
 
     if printer.config().spaces_around_operators {
         printer.space();
@@ -1099,19 +1423,20 @@ fn format_call(
         // Procedure name
         printer.push_span(procedure_name_span);
 
-        // Arguments (if present)
+        // Arguments (if present), parentheses included, as written.
         if let Some(lparen) = l_paren {
-            printer.push_token_id(lparen);
-            if let Some(rparen) = r_paren {
-                // Get rparen span before using printer mutably
-                let rparen_start = printer.get_token_by_id(rparen).unwrap().span.start;
-                // Emit everything between parens using emit_all_tokens_until
-                printer.emit_all_tokens_until(rparen_start);
-                printer.push_token_id(rparen);
-            } else {
-                // No closing paren - emit all remaining tokens in the span
-                // This handles incomplete input like "CALL foo(1, 2"
-                printer.emit_all_tokens_until(span.end);
+            let open = printer.get_token_by_id(lparen).map(|t| t.span.start);
+            let close = r_paren
+                .and_then(|rparen| printer.get_token_by_id(rparen))
+                .map(|t| t.span.end);
+            match (open, close) {
+                (Some(start), Some(end)) => printer.push_span(Span { start, end }),
+                // No closing paren (incomplete input like "CALL foo(1, 2"):
+                // every remaining token of the statement.
+                (None, Some(_)) | (Some(_), None) | (None, None) => {
+                    printer.push_token_id(lparen);
+                    printer.emit_all_tokens_until(span.end);
+                }
             }
         }
 
@@ -1180,18 +1505,41 @@ fn format_fetch_cursor(
     printer.push_keyword_span(fetch_span);
     printer.space();
 
+    // The orientation, `FROM` and `GLOBAL` before the name, as written.
+    if let Some(written) = printer.tokens_span_within(fetch_span.end, cursor_name_span.start) {
+        printer.push_span(written);
+        printer.space();
+    }
+
     // Emit cursor name
     printer.push_span(cursor_name_span);
-    printer.space();
 
     // Emit INTO clause
-    printer.push_span(into_clause_span);
+    if into_clause_span.end > into_clause_span.start {
+        printer.space();
+        printer.push_span(into_clause_span);
+    }
 
     // Emit semicolon if captured from CST
     if let Some(semi_id) = semicolon_token {
         printer.push_token_id(semi_id);
     }
 
+    Ok(())
+}
+
+/// A loop control statement's PL/pgSQL `WHEN condition`, where written.
+fn format_loop_control_condition(
+    printer: &mut Printer,
+    when_span: Option<Span>,
+    condition: Option<&crate::ast::AstExpr>,
+) -> Result<(), FormatterError> {
+    if let (Some(when_span), Some(condition)) = (when_span, condition) {
+        printer.space();
+        printer.push_keyword_span(when_span);
+        printer.space();
+        crate::formatter::statements::select::format_expression(printer, condition)?;
+    }
     Ok(())
 }
 
@@ -1221,13 +1569,31 @@ fn format_close_cursor(
 fn format_declaration_body(printer: &mut Printer, decl: &AstStmt) -> Result<(), FormatterError> {
     match decl {
         AstStmt::Declare {
-            name,
-            type_span,
-            default_op_span,
-            default_expr,
+            span,
+            variables,
             semicolon_token,
             ..
         } => {
+            let [crate::ast::AstDeclaredVariable {
+                name,
+                type_span,
+                default_op_span,
+                default_expr,
+                ..
+            }] = variables.as_slice()
+            else {
+                // A list of variables is printed as written.
+                if let Some(first) = variables.first() {
+                    printer.push_span(crate::lexer::Span {
+                        start: first.span.start,
+                        end: span.end,
+                    });
+                }
+                if let Some(semi_id) = semicolon_token {
+                    printer.push_token_id(*semi_id);
+                }
+                return Ok(());
+            };
             // Use push_identifier_span to emit trivia attached to the name token
             printer.push_identifier_span(name.span);
 
@@ -1288,19 +1654,7 @@ fn format_declaration_body(printer: &mut Printer, decl: &AstStmt) -> Result<(), 
         } => {
             // Use push_identifier_span to emit trivia attached to the cursor name token
             printer.push_identifier_span(cursor_name.span);
-
-            printer.space();
-            if let Some(token_id) = cursor_token {
-                printer.push_token_id(*token_id);
-            } else {
-                printer.push_keyword("CURSOR");
-            }
-            printer.space();
-            if let Some(token_id) = for_token {
-                printer.push_token_id(*token_id);
-            } else {
-                printer.push_keyword("FOR");
-            }
+            push_cursor_head(printer, cursor_name.span.end, *cursor_token, *for_token);
 
             // Check config for cursor query formatting
             if printer.config().cursor_query_on_newline {
@@ -1410,6 +1764,42 @@ fn format_declare_table(
 }
 
 /// Format DECLARE cursor_name CURSOR FOR query
+/// Emits what a cursor declaration writes after its name: `[INSENSITIVE]
+/// [SCROLL] CURSOR [option ...] FOR`, the options as written.
+fn push_cursor_head(
+    printer: &mut Printer,
+    name_end: u32,
+    cursor_token: Option<crate::cst::TokenId>,
+    for_token: Option<crate::cst::TokenId>,
+) {
+    let span_of = |printer: &Printer, id: Option<crate::cst::TokenId>| {
+        id.and_then(|id| printer.get_token_by_id(id))
+            .map(|t| t.span)
+    };
+    let words_before = |printer: &mut Printer, from: u32, to: Option<Span>| {
+        if let Some(words) = to.and_then(|to| printer.tokens_span_within(from, to.start)) {
+            printer.space();
+            printer.push_keyword_span(words);
+        }
+    };
+    let cursor = span_of(printer, cursor_token);
+    words_before(printer, name_end, cursor);
+    printer.space();
+    match cursor_token {
+        Some(token_id) => printer.push_token_id(token_id),
+        None => printer.push_keyword("CURSOR"),
+    }
+    if let Some(cursor) = cursor {
+        let for_span = span_of(printer, for_token);
+        words_before(printer, cursor.end, for_span);
+    }
+    printer.space();
+    match for_token {
+        Some(token_id) => printer.push_token_id(token_id),
+        None => printer.push_keyword("FOR"),
+    }
+}
+
 fn format_declare_cursor(
     printer: &mut Printer,
     declare_span: Span,
@@ -1428,19 +1818,7 @@ fn format_declare_cursor(
     printer.space();
 
     printer.push_identifier_span(cursor_name.span);
-
-    printer.space();
-    if let Some(token_id) = cursor_token {
-        printer.push_token_id(token_id);
-    } else {
-        printer.push_keyword("CURSOR");
-    }
-    printer.space();
-    if let Some(token_id) = for_token {
-        printer.push_token_id(token_id);
-    } else {
-        printer.push_keyword("FOR");
-    }
+    push_cursor_head(printer, cursor_name.span.end, cursor_token, for_token);
 
     // Check config for cursor query formatting
     if printer.config().cursor_query_on_newline {
@@ -1671,8 +2049,13 @@ fn format_case_stmt(
             printer.push_keyword_span(branch.when_span);
         }
         printer.space();
-        // Format the condition expression to emit trivia attached to it
-        format_expression(printer, &branch.condition)?;
+        if branch.more_values.is_empty() {
+            // Format the condition expression to emit trivia attached to it
+            format_expression(printer, &branch.condition)?;
+        } else {
+            // A WHEN list, printed as written.
+            printer.push_span(branch.condition_span);
+        }
         printer.space();
         // Use token ID for THEN if available
         if let Some(token_id) = branch.then_token {

@@ -226,7 +226,7 @@ fn walk_expr_for_gating(
             walk_expr_for_gating(left, func_catalog, is_temporal_column, out);
             walk_expr_for_gating(right, func_catalog, is_temporal_column, out);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 walk_expr_for_gating(operand, func_catalog, is_temporal_column, out);
             }
@@ -286,6 +286,11 @@ fn walk_expr_for_gating(
                 }
                 // A subquery RHS is its own scope and is not walked.
                 QuantifiedRhs::Subquery(_, _) => {}
+            }
+        }
+        ScalarExpr::RowCmp { left, .. } => {
+            for e in left {
+                walk_expr_for_gating(e, func_catalog, is_temporal_column, out);
             }
         }
         ScalarExpr::FieldAccess { base, .. } => {

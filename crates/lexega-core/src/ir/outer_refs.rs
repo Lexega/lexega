@@ -119,6 +119,7 @@ mod tests {
         let mut alloc = ColumnIdAllocator::new();
         let s = scan(&mut alloc, 1);
         let plan = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(s),
             predicate: ScalarExpr::BinOp {
                 op: crate::ir::scalar::BinOpKind::Cmp(crate::ir::scalar::ComparisonOp::Eq),
@@ -147,6 +148,7 @@ mod tests {
         // EXISTS ( SELECT 1 FROM t WHERE outer_col = 42 ) — outer_col is
         // really an OuterRef with scope 1.
         let subquery = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(inner_scan),
             predicate: outer(1, 99),
             kind: FilterKind::Where,
@@ -155,6 +157,7 @@ mod tests {
             hints: Vec::new(),
         };
         let plan = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(outer_scan),
             predicate: ScalarExpr::Exists {
                 subquery: Box::new(subquery),

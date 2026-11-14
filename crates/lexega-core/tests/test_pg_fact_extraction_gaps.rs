@@ -34,7 +34,7 @@ fn pg_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 /// carrier in the report.
 fn tables_accessed_list(report: &lexega_core::analyzer::AnalysisReport) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for stmt in &report.statement_signals {
+    for stmt in &report.statement_traces {
         let Some(facts) = stmt.facts.as_ref() else {
             continue;
         };
@@ -119,7 +119,7 @@ fn test_writable_cte_update_returning() {
     // is exposed via the per-statement
     // `StatementFacts.query.writes_table` carrier — verify
     // `inventory` appears there.
-    let has_write_signal = report.statement_signals.iter().any(|s| {
+    let has_write_finding = report.statement_traces.iter().any(|s| {
         s.facts
             .as_ref()
             .and_then(|f| f.query.as_ref())
@@ -131,7 +131,7 @@ fn test_writable_cte_update_returning() {
             .unwrap_or(false)
     });
     assert!(
-        has_write_signal,
+        has_write_finding,
         "inventory write should surface on query.writes_table"
     );
 }
@@ -567,4 +567,61 @@ fn test_mixed_pg_statements_no_collision() {
         has_table_accessed(&report, "logs"),
         "logs should be extracted from PREPARE INSERT"
     );
+}
+
+#[test]
+fn a_domain_is_named_by_each_part_as_written() {
+    for (sql, parts) in [
+        (
+            "CREATE DOMAIN \"D1\".\"S 1\".\"EMAIL_T X\" AS TEXT CHECK (VALUE LIKE '%@%');",
+            "D1|S 1|EMAIL_T X",
+        ),
+        ("ALTER DOMAIN s1.\"Email\" SET NOT NULL;", "|s1|Email"),
+        ("DROP DOMAIN D1.S1.Email_T;", "d1|s1|email_t"),
+    ] {
+        let report = pg_analyze(sql);
+        let targets: Vec<String> = report
+            .statement_traces
+            .iter()
+            .filter_map(|s| s.facts.as_ref()?.ddl.as_ref()?.target.as_ref())
+            .map(|t| {
+                let part = |p: Option<&lexega_core::facts::IdentName>| {
+                    p.map_or(String::new(), |p| p.normalized.clone())
+                };
+                format!(
+                    "{}|{}|{}",
+                    part(t.name.database.as_ref()),
+                    part(t.name.schema.as_ref()),
+                    t.name.name.normalized
+                )
+            })
+            .collect();
+        assert_eq!(targets, [parts], "{sql}");
+    }
+}
+
+#[test]
+fn a_query_psql_gexec_sends_runs_its_rows_as_dynamic_sql() {
+    use lexega_core::analyzer::RuleMatch;
+    let ids = |sql: &str| -> Vec<String> {
+        let report = pg_analyze(sql);
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+        report
+            .findings
+            .iter()
+            .map(|m| match m {
+                RuleMatch::Analysis(g) => g.matched_rule.clone(),
+            })
+            .collect()
+    };
+    let query = "SELECT 'DROP TABLE ' || tablename FROM pg_tables";
+    let sent = ids(&format!("{query} \\gexec\n"));
+    assert!(sent.iter().any(|id| id == "DYNSQL"), "{sent:?}");
+    for ended in [format!("{query} \\g\n"), format!("{query};")] {
+        let read = ids(&ended);
+        assert!(
+            !read.iter().any(|id| id.starts_with("DYNSQL")),
+            "{ended}: {read:?}"
+        );
+    }
 }

@@ -17,205 +17,250 @@ use crate::lexer::Span;
 
 /// Extract a SQL string literal's content from a span covering its
 /// quoted form. Handles single-quote and double-quote delimited
-/// strings; unescapes doubled single quotes (`''` → `'`). Returns
-/// `None` when the span text is not quoted.
+/// strings; unescapes doubled single quotes (`''` → `'`), and backslash
+/// escapes as [`decode_string_literal_text`] reads them. Returns `None`
+/// when the span text is not quoted.
 pub fn extract_string_literal_value(span: Span, source: &str) -> Option<String> {
     decode_string_literal_text(slice_span(source, span)?)
 }
 
-/// Decode a SQL string literal's raw (quoted) text to its content.
-/// Strips matching single/double-quote delimiters and unescapes doubled
-/// single quotes (`''` → `'`); also decodes PostgreSQL dollar-quoted
-/// literals (`$$…$$` / `$tag$…$tag$`), whose value is the verbatim inner
-/// content (dollar quoting performs no escape processing). Returns `None`
-/// when the text is not a recognized string literal. The string-input
-/// sibling of [`extract_string_literal_value`] for callers that already
-/// hold the literal text (not a span) — e.g. the dynamic-SQL classifier's
+/// The value of each string literal at `spans`, decoded as
+/// [`extract_string_literal_value`] decodes it; a literal that does not
+/// decode keeps its text as written, so it is still one value.
+pub(crate) fn string_literal_values(spans: &[Span], source: &str) -> Vec<String> {
+    spans
+        .iter()
+        .filter_map(|&span| {
+            extract_string_literal_value(span, source)
+                .or_else(|| slice_span(source, span).map(str::to_string))
+        })
+        .collect()
+}
+
+/// The joined value of adjacent string literals a dialect reads as one
+/// (`'a' 'b'` is `ab`), each part decoded as [`extract_string_literal_value`]
+/// decodes it. `None` where a part is no closed string literal.
+pub(crate) fn joined_string_literal_value(parts: &[Span], source: &str) -> Option<String> {
+    parts
+        .iter()
+        .map(|part| extract_string_literal_value(*part, source))
+        .collect()
+}
+
+/// [`joined_string_literal_value`] written as one single-quoted literal that
+/// decodes back to it in the dialect in force: `'` doubled, and `\` doubled
+/// where that dialect reads backslash escapes.
+pub(crate) fn joined_string_literal_text(parts: &[Span], source: &str) -> Option<String> {
+    let value = joined_string_literal_value(parts, source)?;
+    let mut escaped = value.replace('\'', "''");
+    if crate::ir::normalize::dialect_in_force().backslash_escapes_in_single_quoted_strings() {
+        escaped = escaped.replace('\\', "\\\\");
+    }
+    Some(format!("'{escaped}'"))
+}
+
+/// Decode a SQL string literal's raw text, surrounding white space
+/// ignored, to its value: [`crate::lexer::decode_string_literal`], read as
+/// the dialect of the analysis running on the thread reads it (Snowflake
+/// outside every analysis): backslash escapes where that dialect reads
+/// them in a plain string, and in an `E'…'` string. Returns `None` when
+/// the text is not one closed string literal. The string-input sibling of
+/// [`extract_string_literal_value`] for callers that already hold the
+/// literal text (not a span) — e.g. the dynamic-SQL classifier's
 /// `ScalarExpr::Lit::Str`, which carries the raw quoted slice.
 pub fn decode_string_literal_text(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    // PostgreSQL/Redshift escape-string literal `E'…'` / `e'…'`: same
-    // quote-doubling as a regular literal, plus C-style backslash escapes.
-    // Only when an `E`/`e` actually precedes a quote (a bare identifier
-    // starting with `e` is left intact).
-    if let Some(rest) = raw
-        .strip_prefix(['E', 'e'])
-        .filter(|rest| rest.starts_with('\''))
-    {
-        if rest.len() >= 2 && rest.ends_with('\'') {
-            return Some(decode_escape_string_inner(&rest[1..rest.len() - 1]));
-        }
-    }
-    // Strip an optional national-character prefix (T-SQL `N'...'`); only
-    // when it actually precedes a quote, so a bare identifier starting
-    // with `n` is left intact.
-    let raw = raw
-        .strip_prefix(['N', 'n'])
-        .filter(|rest| rest.starts_with('\'') || rest.starts_with('"'))
-        .unwrap_or(raw);
-    // PostgreSQL dollar-quoted literal: `$tag$…$tag$` (tag may be empty:
-    // `$$…$$`). The opening tag runs to the second `$`; the value is the
-    // verbatim bytes between matching open/close tags — NO unescaping.
-    if let Some(decoded) = decode_dollar_quoted(raw) {
-        return Some(decoded);
-    }
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        // Not expected for SQL string literals here, but keep best-effort.
-        return Some(raw[1..raw.len() - 1].to_string());
-    }
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        // Unescape doubled single quotes: '' -> '
-        let inner = &raw[1..raw.len() - 1];
-        return Some(inner.replace("''", "'"));
-    }
-    None
+    decoded_literal(raw, crate::ir::normalize::dialect_in_force().as_ref())
+        .map(|(_, decoded)| decoded.value)
 }
 
-/// Decode a quoted string literal AND produce a byte-offset map from the
-/// decoded text back into `raw`. `map[i]` is the byte offset within `raw` of
-/// the source byte that produced decoded byte `i`. `map` has one more entry
-/// than `decoded` has bytes (the final entry is the source offset just past
-/// the decoded content), so a half-open decoded span from `a` to `b` maps to
-/// the source span from `map[a]` to `map[b]`.
-///
-/// Handles the cases whose source→decoded transform is offset-trackable:
-/// dollar-quoted (`$$…$$`, verbatim — identity map), double-quoted (`"…"`),
-/// and single-quoted (`'…'` / `N'…'`) with `''`→`'` un-doubling (each `''`
-/// collapses two source bytes to one, shifting the map). Returns `None` for
-/// `E'…'` backslash-escape strings (offsets not tracked here) and anything
-/// [`decode_string_literal_text`] cannot decode — callers fall back to a
-/// coarse location for those rare forms.
+/// [`decode_string_literal_text`] AND a byte-offset map from the decoded
+/// text back into `raw`, read in the same dialect. `map[i]` is the byte
+/// offset within `raw` of the source that produced decoded byte `i` (the
+/// start of a doubled quote or a backslash escape). `map` has one more
+/// entry than `decoded` has bytes (the final entry is the source offset
+/// just past the decoded content), so a half-open decoded span from `a` to
+/// `b` maps to the source span from `map[a]` to `map[b]`.
 pub fn decode_string_literal_text_with_map(raw: &str) -> Option<(String, Vec<u32>)> {
-    let lead = (raw.len() - raw.trim_start().len()) as u32;
-    let t = raw.trim();
-    // Escape-strings are not offset-mapped (rare in dynamic-SQL bodies).
-    if t.strip_prefix(['E', 'e'])
-        .filter(|rest| rest.starts_with('\''))
-        .is_some()
-    {
-        return None;
+    decode_string_literal_text_with_map_in(raw, crate::ir::normalize::dialect_in_force().as_ref())
+}
+
+/// [`decode_string_literal_text_with_map`], read as `dialect` reads it.
+pub(crate) fn decode_string_literal_text_with_map_in(
+    raw: &str,
+    dialect: &dyn crate::dialect::Dialect,
+) -> Option<(String, Vec<u32>)> {
+    let (lead, decoded) = decoded_literal(raw, dialect)?;
+    let mut map = Vec::with_capacity(decoded.value.len() + 1);
+    for (c, source) in decoded.value.chars().zip(&decoded.sources) {
+        let last = source.end.saturating_sub(source.start).saturating_sub(1);
+        for k in 0..c.len_utf8() as u32 {
+            map.push(lead + source.start + k.min(last));
+        }
     }
-    // Optional national-character prefix `N'…'` / `n'…'`.
-    let (body, prefix) = match t
-        .strip_prefix(['N', 'n'])
-        .filter(|rest| rest.starts_with('\'') || rest.starts_with('"'))
-    {
-        Some(rest) => (rest, 1u32),
-        None => (t, 0u32),
+    map.push(lead + decoded.content.end);
+    Some((decoded.value, map))
+}
+
+/// The value of the closed string literal `text` writes, white space around
+/// it ignored, read as the dialect in force reads it. `None` for text that
+/// is no string literal of that dialect: a `"…"` it reads as a name, a bare
+/// word, a number.
+pub(crate) fn string_literal_value(text: &str) -> Option<String> {
+    let dialect = crate::ir::normalize::dialect_in_force();
+    let text = text.trim();
+    let decoded = crate::lexer::decode_string_literal(text, dialect.as_ref())?;
+    let opener = text.get(..decoded.content.start as usize)?;
+    let is_name = opener.ends_with('"') && !dialect.supports_double_quoted_strings();
+    (decoded.closed && !is_name).then_some(decoded.value)
+}
+
+/// The value of the string literal `text` writes, or `text` itself, white
+/// space around it ignored, where it writes none.
+pub(crate) fn literal_value_or_text(text: &str) -> String {
+    string_literal_value(text).unwrap_or_else(|| text.trim().to_string())
+}
+
+/// [`literal_value_or_text`], with a quoted name read without its quotes.
+pub(crate) fn literal_value_or_name(text: &str) -> String {
+    string_literal_value(text).unwrap_or_else(|| {
+        crate::catalog::provider::strip_quoting(text.trim())
+            .0
+            .to_string()
+    })
+}
+
+/// One `key=value` entry of a connection string a string literal writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WrittenConnectionEntry {
+    /// The key as written.
+    pub(crate) key: String,
+    /// The value, inside the `"…"` or `{…}` that may delimit it; `None`
+    /// where a placeholder overlaps it.
+    pub(crate) value: Option<String>,
+}
+
+/// The value of the closed string literal written at `span`, decoded as
+/// the dialect in force reads it, with the source span of each byte.
+struct WrittenValue {
+    value: String,
+    map: Vec<u32>,
+    at: u32,
+}
+
+impl WrittenValue {
+    fn read(span: Span, source: &str) -> Option<Self> {
+        let (value, map) = decode_string_literal_text_with_map(slice_span(source, span)?)?;
+        Some(Self {
+            value,
+            map,
+            at: span.start,
+        })
+    }
+
+    /// Whether a placeholder overlaps the source that writes `range` of the
+    /// value: a render or a substitution wrote it, so it is no literal.
+    fn filled(&self, range: &std::ops::Range<usize>, placeholders: &[Span]) -> bool {
+        let written = Span {
+            start: self.at + self.map[range.start],
+            end: self.at + self.map[range.end],
+        };
+        placeholders.iter().any(|p| p.overlaps(written))
+    }
+}
+
+/// The password of each URL the string literal written at `span` holds with
+/// user information ([`lexega_syntax::secrets::url_password_ranges`]),
+/// decoded. A password a placeholder overlaps is left out.
+pub(crate) fn url_password_literals(
+    span: Span,
+    source: &str,
+    placeholders: &[Span],
+) -> Vec<String> {
+    let Some(written) = WrittenValue::read(span, source) else {
+        return Vec::new();
     };
-    let base = lead + prefix; // offset within `raw` where `body` begins
-
-    // Dollar-quoted: verbatim content, linear map.
-    if let Some((inner, content_off)) = decode_dollar_quoted_content(body) {
-        let start = base + content_off;
-        let map: Vec<u32> = (0..=inner.len() as u32).map(|i| start + i).collect();
-        return Some((inner.to_string(), map));
-    }
-    // Double-quoted: strip quotes, linear map.
-    if body.len() >= 2 && body.starts_with('"') && body.ends_with('"') {
-        let inner = &body[1..body.len() - 1];
-        let start = base + 1;
-        let map: Vec<u32> = (0..=inner.len() as u32).map(|i| start + i).collect();
-        return Some((inner.to_string(), map));
-    }
-    // Single-quoted with `''`→`'` un-doubling.
-    if body.len() >= 2 && body.starts_with('\'') && body.ends_with('\'') {
-        let inner = &body[1..body.len() - 1];
-        let inner_base = base + 1;
-        let mut out = String::with_capacity(inner.len());
-        let mut map: Vec<u32> = Vec::with_capacity(inner.len() + 1);
-        let bytes = inner.as_bytes();
-        let mut i = 0usize;
-        while i < bytes.len() {
-            if bytes[i] == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
-                map.push(inner_base + i as u32);
-                out.push('\'');
-                i += 2;
-            } else {
-                let ch = inner.get(i..).and_then(|s| s.chars().next())?;
-                let len = ch.len_utf8();
-                for k in 0..len {
-                    map.push(inner_base + (i + k) as u32);
-                }
-                out.push(ch);
-                i += len;
-            }
-        }
-        map.push(inner_base + bytes.len() as u32);
-        return Some((out, map));
-    }
-    None
+    lexega_syntax::secrets::url_password_ranges(&written.value)
+        .into_iter()
+        .filter(|range| !written.filled(range, placeholders))
+        .map(|range| written.value[range].to_string())
+        .collect()
 }
 
-/// Like [`decode_dollar_quoted`] but also returns the byte offset within
-/// `raw` where the verbatim content begins (i.e. the open-tag length).
-fn decode_dollar_quoted_content(raw: &str) -> Option<(&str, u32)> {
-    let rest = raw.strip_prefix('$')?;
-    let second = rest.find('$')?;
-    let tag_end = second + 2;
-    let tag = &raw[..tag_end];
-    let tag_inner = &rest[..second];
-    if !tag_inner.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    if raw.len() >= 2 * tag.len() && raw.ends_with(tag) {
-        Some((&raw[tag.len()..raw.len() - tag.len()], tag.len() as u32))
-    } else {
-        None
-    }
+/// The entries of the connection string the string literal written at
+/// `span` holds ([`lexega_syntax::secrets::connection_string_entries`]),
+/// decoded.
+pub(crate) fn connection_string_entries(
+    span: Span,
+    source: &str,
+    placeholders: &[Span],
+) -> Vec<WrittenConnectionEntry> {
+    let Some(written) = WrittenValue::read(span, source) else {
+        return Vec::new();
+    };
+    lexega_syntax::secrets::connection_string_entries(&written.value)
+        .into_iter()
+        .map(|entry| WrittenConnectionEntry {
+            key: written.value[entry.key].to_string(),
+            value: (!written.filled(&entry.value, placeholders))
+                .then(|| written.value[entry.value].to_string()),
+        })
+        .collect()
 }
 
-/// Decode a PostgreSQL dollar-quoted literal (`$$…$$` / `$tag$…$tag$`) to
-/// its verbatim inner content, or `None` when `raw` is not a well-formed
-/// dollar-quoted run. The tag is the run from the leading `$` to the next
-/// `$` inclusive (empty tag = `$$`); a valid tag's inner chars are
-/// identifier characters, and the same tag must close the run. Dollar
-/// quoting does no escape processing, so the content is returned as-is.
-fn decode_dollar_quoted(raw: &str) -> Option<String> {
-    let rest = raw.strip_prefix('$')?;
-    let second = rest.find('$')?;
-    let tag_end = second + 2; // index just past the closing `$` of the open tag
-    let tag = &raw[..tag_end];
-    let tag_inner = &rest[..second];
-    if !tag_inner.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    if raw.len() >= 2 * tag.len() && raw.ends_with(tag) {
-        return Some(raw[tag.len()..raw.len() - tag.len()].to_string());
-    }
-    None
+/// The strings of T-SQL `OPENROWSET`'s `'data source';'user';'password'`
+/// run written at `span` ([`lexega_syntax::secrets::connection_call_strings`]),
+/// decoded, each under the key [`lexega_syntax::secrets::LOGIN_RUN_KEYS`]
+/// names its place by. A string a placeholder overlaps has no value.
+pub(crate) fn login_run_entries(
+    span: Span,
+    source: &str,
+    placeholders: &[Span],
+) -> Vec<WrittenConnectionEntry> {
+    use crate::lexer::TokenKind;
+    let Some(text) = slice_span(source, span) else {
+        return Vec::new();
+    };
+    let dialect = crate::ir::normalize::dialect_in_force();
+    let tokens: Vec<crate::lexer::Token> =
+        crate::lexer::tokenize_with_dialect(text, dialect.as_ref())
+            .tokens
+            .into_iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::LineComment | TokenKind::BlockComment | TokenKind::JinjaComment
+                )
+            })
+            .collect();
+    lexega_syntax::secrets::connection_call_strings(&tokens)
+        .into_iter()
+        .filter_map(|string| {
+            let key = lexega_syntax::secrets::LOGIN_RUN_KEYS.get(string.place_in_run?)?;
+            let token = tokens.get(string.token)?.span;
+            let literal = Span {
+                start: span.start + token.start,
+                end: span.start + token.end,
+            };
+            let written = WrittenValue::read(literal, source)?;
+            let whole = 0..written.value.len();
+            Some(WrittenConnectionEntry {
+                key: (*key).to_string(),
+                value: (!written.filled(&whole, placeholders)).then(|| written.value.clone()),
+            })
+        })
+        .collect()
 }
 
-/// Decode the inner body (between the outer quotes) of a PostgreSQL/Redshift
-/// escape-string literal `E'…'`. Unescapes doubled quotes (`''` → `'`) and
-/// the quote-affecting C-style escapes (`\'` → `'`, `\\` → `\`); any other
-/// `\x` is passed through verbatim — the quote handling is what the
-/// downstream re-lex needs to keep string boundaries correct.
-fn decode_escape_string_inner(inner: &str) -> String {
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('\'') => out.push('\''),
-                Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            },
-            '\'' => {
-                // Doubled '' -> single '
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
-                }
-                out.push('\'');
-            }
-            _ => out.push(c),
-        }
-    }
-    out
+/// The closed string literal `raw` writes, decoded as `dialect` reads it,
+/// and the offset of its text in `raw` past the leading white space.
+fn decoded_literal(
+    raw: &str,
+    dialect: &dyn crate::dialect::Dialect,
+) -> Option<(u32, crate::lexer::DecodedString)> {
+    let lead = (raw.len() - raw.trim_start().len()) as u32;
+    crate::lexer::decode_string_literal(raw.trim(), dialect)
+        .filter(|decoded| decoded.closed)
+        .map(|decoded| (lead, decoded))
 }
 
 /// Extract an integer literal value from a span. The span may cover the
@@ -249,7 +294,6 @@ pub fn extract_integer_literal_value(span: Span, source: &str) -> Option<i32> {
 /// - `INTO target_table t`
 /// - `TABLE(target_table)`
 /// - `IDENTIFIER('schema.table')` (returns a placeholder)
-/// - `@stage_name` (stage reference)
 ///
 /// Applies session defaults conservatively: fills `db` from the session
 /// when no qualifier was present, and only fills `schema` when the
@@ -268,16 +312,6 @@ pub fn extract_table_ref_from_object_span(
     }
 
     let text = &source[start..end];
-    if let Some(stage_name) = extract_stage_reference_prefix(text) {
-        return Some(TableRef {
-            server: None,
-            db: None,
-            schema: None,
-            name: stage_name,
-            span: Some(span),
-        });
-    }
-
     let lex_result = tokenize(text);
 
     // Best-effort parsing for spans like:
@@ -415,55 +449,8 @@ pub fn extract_table_ref_from_object_span(
         }
     };
 
-    // Apply session defaults conservatively.
-    // - If table had no explicit db qualifier, fill db from session.
-    // - Only fill schema from session when the table was fully unqualified.
-    let db_was_none = table_ref.db.is_none();
-
-    if db_was_none {
-        if let Some(db) = &session.db {
-            table_ref.db = Some(db.clone());
-        }
-    }
-
-    if db_was_none && table_ref.schema.is_none() {
-        if let Some(schema) = &session.schema {
-            table_ref.schema = Some(schema.clone());
-        }
-    }
-
+    session.place(&mut table_ref.db, &mut table_ref.schema);
     Some(table_ref)
-}
-
-/// Detect a `@stage_name` prefix on a raw span text and return the
-/// stage's name including the leading `@`. Stops at the first
-/// whitespace outside a quoted segment. Returns `None` for inputs
-/// that do not begin with `@` or that contain only a bare `@`.
-fn extract_stage_reference_prefix(raw: &str) -> Option<String> {
-    let trimmed = raw.trim_start();
-    if !trimmed.starts_with('@') {
-        return None;
-    }
-
-    let mut out = String::new();
-    let mut in_quote = false;
-    for ch in trimmed.chars() {
-        if ch == '"' {
-            in_quote = !in_quote;
-            out.push(ch);
-            continue;
-        }
-        if ch.is_whitespace() && !in_quote {
-            break;
-        }
-        out.push(ch);
-    }
-
-    if out == "@" {
-        None
-    } else {
-        Some(out)
-    }
 }
 
 /// Fill `db` and `schema` on a `TableRef` from the session defaults
@@ -473,16 +460,132 @@ fn extract_stage_reference_prefix(raw: &str) -> Option<String> {
 /// - `schema` is filled only when the reference was fully unqualified
 ///   (i.e. `db` was also unset).
 pub fn apply_session_defaults_to_table_ref(table: &mut TableRef, session: &SessionContext) {
-    let db_was_none = table.db.is_none();
-    if db_was_none {
-        if let Some(db) = &session.db {
-            table.db = Some(db.clone());
+    let (db, schema) = session_default_parts(table, session);
+    let (db, schema) = (db.map(str::to_string), schema.map(str::to_string));
+    table.db = db;
+    table.schema = schema;
+}
+
+/// The `db` and `schema` parts of `table` with the session defaults for
+/// the parts it omits, by the rule of
+/// [`apply_session_defaults_to_table_ref`].
+pub(crate) fn session_default_parts<'a>(
+    table: &'a TableRef,
+    session: &'a SessionContext,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let db = table.db.as_deref().or(session.db.as_deref());
+    let schema = match (&table.db, &table.schema) {
+        (None, None) => session.schema.as_deref(),
+        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => table.schema.as_deref(),
+    };
+    (db, schema)
+}
+
+#[cfg(test)]
+mod session_default_tests {
+    use super::{apply_session_defaults_to_table_ref, session_default_parts};
+    use crate::context::node_metadata::TableRef;
+    use crate::ir::SessionContext;
+
+    #[test]
+    fn a_default_fills_only_the_part_the_reference_omits() {
+        let session = SessionContext {
+            db: Some("d".to_string()),
+            schema: Some("s".to_string()),
+            search_path: Vec::new(),
+        };
+        let bare = TableRef::new("t".to_string());
+        let cases = [
+            (bare.clone(), (Some("d"), Some("s"))),
+            // A schema written under no database takes the database only.
+            (
+                bare.clone().with_schema("x".to_string()),
+                (Some("d"), Some("x")),
+            ),
+            // A database written with no schema takes no default schema.
+            (bare.clone().with_db("y".to_string()), (Some("y"), None)),
+            (
+                bare.clone()
+                    .with_db("y".to_string())
+                    .with_schema("x".to_string()),
+                (Some("y"), Some("x")),
+            ),
+        ];
+        for (table, parts) in cases {
+            assert_eq!(session_default_parts(&table, &session), parts, "{table:?}");
+            let mut filled = table.clone();
+            apply_session_defaults_to_table_ref(&mut filled, &session);
+            assert_eq!((filled.db.as_deref(), filled.schema.as_deref()), parts);
+            let none = SessionContext::default();
+            assert_eq!(
+                session_default_parts(&table, &none),
+                (table.db.as_deref(), table.schema.as_deref())
+            );
         }
     }
-    if db_was_none && table.schema.is_none() {
-        if let Some(schema) = &session.schema {
-            table.schema = Some(schema.clone());
+}
+
+#[cfg(test)]
+mod dialect_in_force_tests {
+    use super::{literal_value_or_name, literal_value_or_text, string_literal_value};
+    use crate::ir::normalize::set_normalization_dialect;
+
+    #[test]
+    fn a_literal_is_read_as_the_dialect_in_force_reads_it() {
+        {
+            let _snowflake = set_normalization_dialect("snowflake");
+            assert_eq!(string_literal_value("'a\\'b'").as_deref(), Some("a'b"));
+            assert_eq!(string_literal_value(" 'it''s' ").as_deref(), Some("it's"));
+            assert_eq!(
+                string_literal_value("$$./x.sql$$").as_deref(),
+                Some("./x.sql")
+            );
+            // A double-quoted name is no string; neither is an unclosed one.
+            assert_eq!(string_literal_value("\"Name\""), None);
+            assert_eq!(string_literal_value("'open"), None);
+            assert_eq!(literal_value_or_name("\"Name\""), "Name");
+            assert_eq!(literal_value_or_text(" @v "), "@v");
         }
+        {
+            let _postgres = set_normalization_dialect("postgresql");
+            assert_eq!(string_literal_value("'a\\'b'").as_deref(), Some("a\\'b"));
+            assert_eq!(string_literal_value("E'a\\'b'").as_deref(), Some("a'b"));
+        }
+        {
+            let _mysql = set_normalization_dialect("mysql");
+            assert_eq!(string_literal_value("\"a\\tb\"").as_deref(), Some("a\tb"));
+        }
+        {
+            let _mssql = set_normalization_dialect("mssql");
+            assert_eq!(string_literal_value("N'it''s'").as_deref(), Some("it's"));
+        }
+    }
+
+    #[test]
+    fn snowflake_tag_and_session_values_read_backslash_escapes() {
+        let _snowflake = set_normalization_dialect("snowflake");
+        let sql = "CREATE TAG t ALLOWED_VALUES 'a''b', 'c\\'d'; \
+                   ALTER SESSION SET QUERY_TAG = 'e\\'f';";
+        let script =
+            crate::parse_sql_with_dialect(sql, &crate::dialect::SnowflakeDialect).expect("parses");
+        let crate::ast::AstStmt::CreateTag(tag) = &script.stmts[0] else {
+            panic!("a CREATE TAG: {:?}", script.stmts[0]);
+        };
+        let plan = crate::ir::lower_create_tag_to_tag_plan(tag, sql);
+        let Some(crate::ir::TagAlterActionIr::SetAllowedValues { values }) =
+            plan.alter_actions.first()
+        else {
+            panic!("allowed values: {:?}", plan.alter_actions);
+        };
+        assert_eq!(values, &["a'b", "c'd"]);
+        let crate::ast::AstStmt::AlterSession(session) = &script.stmts[1] else {
+            panic!("an ALTER SESSION: {:?}", script.stmts[1]);
+        };
+        let plan = crate::ir::lower_alter_session_to_session_plan(session, sql);
+        let crate::ir::SessionAction::Set { params } = &plan.action else {
+            panic!("a SET: {:?}", plan.action);
+        };
+        assert_eq!(params[0].value, "e'f");
     }
 }
 
@@ -524,8 +627,52 @@ mod with_map_tests {
     }
 
     #[test]
-    fn escape_string_is_not_mapped() {
-        // E'…' backslash-escape strings are not offset-mapped here.
-        assert!(decode_string_literal_text_with_map("E'x'").is_none());
+    fn escape_string_maps_each_escape_to_its_start() {
+        // E'a\nb''c': `\n` (offsets 3,4) and `''` (offsets 6,7) are one byte each.
+        let (d, m) = decode_string_literal_text_with_map("E'a\\nb''c'").unwrap();
+        assert_eq!(d, "a\nb'c");
+        assert_eq!(m, vec![2, 3, 5, 6, 8, 9]);
+    }
+
+    #[test]
+    fn a_plain_string_keeps_its_backslash_and_a_double_quoted_one_undoubles() {
+        let _postgres = crate::ir::normalize::set_normalization_dialect("postgresql");
+        assert_eq!(
+            super::decode_string_literal_text("'a\\'b'").as_deref(),
+            Some("a\\'b")
+        );
+        assert_eq!(
+            super::decode_string_literal_text(" \"a\"\"b\" ").as_deref(),
+            Some("a\"b")
+        );
+        assert_eq!(super::decode_string_literal_text("'open"), None);
+        assert_eq!(super::decode_string_literal_text("X'41'"), None);
+    }
+
+    #[test]
+    fn a_string_is_decoded_as_the_dialect_in_force_reads_it() {
+        for dialect in ["snowflake", "mysql", "bigquery", "databricks"] {
+            let _scope = crate::ir::normalize::set_normalization_dialect(dialect);
+            assert_eq!(
+                super::decode_string_literal_text("'a\\'b'").as_deref(),
+                Some("a'b"),
+                "{dialect}"
+            );
+            let (d, m) = decode_string_literal_text_with_map("'a\\'b'").unwrap();
+            assert_eq!((d.as_str(), m), ("a'b", vec![1, 2, 4, 5]), "{dialect}");
+        }
+        for dialect in ["postgresql", "redshift", "mssql"] {
+            let _scope = crate::ir::normalize::set_normalization_dialect(dialect);
+            assert_eq!(
+                super::decode_string_literal_text("'dom\\usr'").as_deref(),
+                Some("dom\\usr"),
+                "{dialect}"
+            );
+            assert_eq!(
+                super::decode_string_literal_text("'it''s'").as_deref(),
+                Some("it's"),
+                "{dialect}"
+            );
+        }
     }
 }

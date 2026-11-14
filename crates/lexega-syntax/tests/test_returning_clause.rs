@@ -6,9 +6,10 @@ use lexega_syntax::{format_sql_with_config, verify_formatting_safe, FormatterCon
 use std::sync::Arc;
 
 fn postgres_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -235,4 +236,70 @@ fn test_insert_multiple_rows_with_returning() {
 
     assert!(formatted.contains("RETURNING"), "Should preserve RETURNING");
     assert!(formatted.contains("VALUES"), "Should preserve VALUES");
+}
+
+#[test]
+fn a_merge_returning_and_returning_with_names_are_read_and_formatted() {
+    use lexega_syntax::ast::AstStmt;
+    let pg = PostgresDialect;
+    let text = |sql: &str, span: lexega_syntax::lexer::Span| {
+        sql[span.start as usize..span.end as usize].to_string()
+    };
+    let merge = "MERGE INTO u USING o ON o.id = u.id WHEN MATCHED THEN UPDATE SET name = o.name \
+                 RETURNING old.name, new.name";
+    let script = lexega_syntax::parse_sql_with_dialect(merge, &pg).expect("parses");
+    let [AstStmt::Merge(m)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let returning = m.returning.as_ref().expect("a RETURNING list");
+    assert_eq!(returning.items.len(), 2);
+    assert_eq!(text(merge, m.span), merge);
+
+    let update = "UPDATE u SET name = email WHERE id = 1 \
+                  RETURNING WITH (OLD AS o, NEW AS n) o.name, n.name";
+    let script = lexega_syntax::parse_sql_with_dialect(update, &pg).expect("parses");
+    let [AstStmt::Update(u)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let returning = u.returning.as_ref().expect("a RETURNING list");
+    let aliases = returning.with_aliases.as_ref().expect("the names");
+    assert_eq!(text(update, aliases.span), "WITH (OLD AS o, NEW AS n)");
+    assert_eq!(
+        aliases
+            .old
+            .as_ref()
+            .map(|o| text(update, o.span))
+            .as_deref(),
+        Some("o")
+    );
+    assert_eq!(
+        aliases
+            .new
+            .as_ref()
+            .map(|n| text(update, n.span))
+            .as_deref(),
+        Some("n")
+    );
+    assert_eq!(returning.items.len(), 2);
+
+    // One version named.
+    let one = "DELETE FROM u WHERE id = 1 RETURNING WITH (OLD AS gone) gone.name";
+    let script = lexega_syntax::parse_sql_with_dialect(one, &pg).expect("parses");
+    let [AstStmt::Delete(d)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let aliases = d
+        .returning
+        .as_ref()
+        .and_then(|r| r.with_aliases.as_ref())
+        .expect("the names");
+    assert!(aliases.new.is_none());
+
+    let config = postgres_config();
+    for sql in [merge, update, one] {
+        let formatted = format_sql_with_config(sql, &config).expect("formats");
+        verify_formatting_safe(sql, &formatted)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+        assert!(formatted.contains("RETURNING"), "{formatted}");
+    }
 }

@@ -14,7 +14,8 @@ use serde::Serialize;
 
 use super::sarif::{
     finding_fingerprint, get_all_locations_from_evidence, get_file_path_from_evidence,
-    get_line_number, get_location_from_evidence, get_rule_id, get_statement_preview, ToolRun,
+    get_line_number, get_location_from_evidence, get_rule_id, get_statement_preview,
+    unrendered_files, ToolRun, NOT_ANALYZED_NOTE, NOT_RENDERED_NOTE,
 };
 use super::{AnalysisReport, RiskLevel, RuleMatch};
 
@@ -125,7 +126,7 @@ fn lexega_scanner(run: &ToolRun<'_>) -> GlScanner {
 }
 
 fn build_vulnerability(
-    signal: &RuleMatch,
+    finding: &RuleMatch,
     rule_id: &str,
     file: String,
     line: usize,
@@ -136,10 +137,10 @@ fn build_vulnerability(
     let name: String = rule_id.chars().take(GL_NAME_MAX_CHARS).collect();
 
     GlVulnerability {
-        id: finding_fingerprint(rule_id, &file, statement, signal.message()),
+        id: finding_fingerprint(rule_id, &file, statement, finding.message()),
         name,
-        description: signal.message().to_string(),
-        severity: risk_level_to_gl_severity(signal.risk_level()).to_string(),
+        description: finding.message().to_string(),
+        severity: risk_level_to_gl_severity(finding.risk_level()).to_string(),
         location: GlLocation {
             file,
             start_line: line,
@@ -167,36 +168,36 @@ pub fn to_gl_sast(report: &AnalysisReport, run: &ToolRun<'_>) -> GlSastReport {
 
     let mut vulnerabilities: Vec<GlVulnerability> = Vec::new();
 
-    for signal in &report.signals {
-        let rule_id = get_rule_id(signal);
+    for finding in &report.findings {
+        let rule_id = get_rule_id(finding);
 
         // Mirror the SARIF emitter: one vulnerability per evidence location
         // (UNION branches etc.), single-location fallback otherwise.
-        let all_locations = get_all_locations_from_evidence(signal);
+        let all_locations = get_all_locations_from_evidence(finding);
         if all_locations.len() > 1 {
-            for (path, line, _col, preview) in all_locations {
+            for place in all_locations {
                 vulnerabilities.push(build_vulnerability(
-                    signal,
+                    finding,
                     &rule_id,
-                    path,
-                    line,
-                    preview.as_deref(),
+                    place.path,
+                    place.line,
+                    place.preview.as_deref(),
                 ));
             }
         } else {
-            let (path, line) = match get_location_from_evidence(signal) {
-                Some((p, l, _)) => (p, l),
+            let (path, line) = match get_location_from_evidence(finding) {
+                Some(place) => (place.path, place.line),
                 None => (
-                    get_file_path_from_evidence(signal, &file_fallback),
-                    get_line_number(signal).unwrap_or(1),
+                    get_file_path_from_evidence(finding, &file_fallback),
+                    get_line_number(finding).unwrap_or(1),
                 ),
             };
             vulnerabilities.push(build_vulnerability(
-                signal,
+                finding,
                 &rule_id,
                 path,
                 line,
-                get_statement_preview(signal).as_deref(),
+                get_statement_preview(finding).as_deref(),
             ));
         }
     }
@@ -240,6 +241,30 @@ pub fn to_gl_sast(report: &AnalysisReport, run: &ToolRun<'_>) -> GlSastReport {
                     value: note.to_string(),
                 })
                 .into_iter()
+                .chain(run.run_notes.iter().map(|note| GlScanMessage {
+                    level: "info".to_string(),
+                    value: note.clone(),
+                }))
+                .chain(
+                    unrendered_files(report, run)
+                        .into_iter()
+                        .map(|path| GlScanMessage {
+                            level: "warn".to_string(),
+                            value: format!("{}: {}", path, NOT_RENDERED_NOTE),
+                        }),
+                )
+                .chain(
+                    run.skipped_files
+                        .iter()
+                        .map(|(path, reason)| GlScanMessage {
+                            level: "warn".to_string(),
+                            value: format!("{}: {} {}", path, NOT_ANALYZED_NOTE, reason),
+                        }),
+                )
+                .chain(run.macro_files.iter().map(|(path, note)| GlScanMessage {
+                    level: "info".to_string(),
+                    value: format!("{}: {}", path, note),
+                }))
                 .collect(),
         },
         vulnerabilities,
@@ -249,22 +274,26 @@ pub fn to_gl_sast(report: &AnalysisReport, run: &ToolRun<'_>) -> GlSastReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalysisSignal, RiskEvidence};
+    use crate::analyzer::{AnalysisFinding, RiskEvidence};
 
     const RUN: ToolRun<'static> = ToolRun {
         name: "sqlcheck",
         version: "1.0.0",
         base_path: None,
         depth_note: None,
+        unrendered_files: &[],
+        skipped_files: &[],
+        macro_files: &[],
+        run_notes: &[],
     };
 
-    fn test_signal(rule: &str, line: usize, preview: &str) -> RuleMatch {
-        RuleMatch::Analysis(AnalysisSignal {
+    fn test_finding(rule: &str, line: usize, preview: &str) -> RuleMatch {
+        RuleMatch::Analysis(AnalysisFinding {
             message: format!("{} fired", rule),
             risk_level: RiskLevel::Critical,
             matched_rule: rule.to_string(),
-            signal_type: "test-signal".to_string(),
-            signals_merged: Some(1),
+            finding_type: "test-finding".to_string(),
+            findings_merged: Some(1),
             evidence_count: Some(1),
             scope: Some("statement".to_string()),
             statement_line_number: Some(line),
@@ -274,9 +303,9 @@ mod tests {
             contributors: None,
             parent_context: None,
             evidence: vec![RiskEvidence::RuleMatch {
-                signal_type: "SelectStatement".to_string(),
+                finding_type: "SelectStatement".to_string(),
                 resolution_status: None,
-                signal_value: "".to_string(),
+                rule_id: "".to_string(),
                 line_number: Some(line),
                 column_number: None,
                 template_line_number: None,
@@ -285,6 +314,7 @@ mod tests {
                 statement_preview: Some(preview.to_string()),
                 source_file: None,
                 location: None,
+                position: None,
                 assumed_role: None,
             }],
             scan_type: None,
@@ -302,8 +332,8 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
 
         let gl = to_gl_sast(&report, &RUN);
         let json = serde_json::to_value(&gl).unwrap();
@@ -345,6 +375,99 @@ mod tests {
     }
 
     #[test]
+    fn a_file_analyzed_on_template_text_carries_a_warning() {
+        let mut report = AnalysisReport::new();
+        report.source_file_path = Some("models/a.sql".to_string());
+        report.summary.render_completeness = crate::analyzer::RenderCompleteness::NotRendered;
+
+        let json = serde_json::to_value(to_gl_sast(&report, &RUN)).unwrap();
+        assert_eq!(json["scan"]["messages"][0]["level"], "warn");
+        assert_eq!(
+            json["scan"]["messages"][0]["value"],
+            format!("models/a.sql: {}", NOT_RENDERED_NOTE)
+        );
+
+        let batch_files = ["models/b.sql".to_string(), "models/c.sql".to_string()];
+        let json = serde_json::to_value(to_gl_sast(
+            &report,
+            &ToolRun {
+                unrendered_files: &batch_files,
+                ..RUN
+            },
+        ))
+        .unwrap();
+        let values: Vec<&str> = json["scan"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                format!("models/b.sql: {}", NOT_RENDERED_NOTE),
+                format!("models/c.sql: {}", NOT_RENDERED_NOTE)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_file_a_batch_could_not_render_is_named_as_not_analyzed() {
+        let mut report = AnalysisReport::new();
+        report.summary.render_completeness = crate::analyzer::RenderCompleteness::NotRendered;
+        let skipped = [(
+            "models/m.sql".to_string(),
+            "Jinja rendering error: Division by zero".to_string(),
+        )];
+        let json = serde_json::to_value(to_gl_sast(
+            &report,
+            &ToolRun {
+                skipped_files: &skipped,
+                ..RUN
+            },
+        ))
+        .unwrap();
+        let messages: Vec<(&str, &str)> = json["scan"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["level"].as_str().unwrap(), m["value"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            messages,
+            [(
+                "warn",
+                format!(
+                    "models/m.sql: {} Jinja rendering error: Division by zero",
+                    NOT_ANALYZED_NOTE
+                )
+                .as_str()
+            )]
+        );
+    }
+
+    // Each macro file of a batch is a message of its own, with what the run
+    // says of it.
+    #[test]
+    fn a_batch_names_each_macro_file_it_did_not_analyze() {
+        let report = AnalysisReport::new();
+        let macros = [("macros/a.sql".to_string(), "a's note".to_string())];
+        let json = serde_json::to_value(to_gl_sast(
+            &report,
+            &ToolRun {
+                macro_files: &macros,
+                ..RUN
+            },
+        ))
+        .unwrap();
+        assert_eq!(json["scan"]["messages"][0]["level"], "info");
+        assert_eq!(
+            json["scan"]["messages"][0]["value"],
+            "macros/a.sql: a's note"
+        );
+    }
+
+    #[test]
     fn timestamps_match_gitlab_pattern() {
         let report = AnalysisReport::new();
         let gl = to_gl_sast(&report, &RUN);
@@ -365,8 +488,8 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("/repo/models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
 
         let gl = to_gl_sast(&report, &RUN);
         let sarif = crate::analyzer::sarif::to_sarif(&report, &RUN);
@@ -386,11 +509,11 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 90, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 90, "DELETE FROM t"));
 
         let gl = to_gl_sast(&report, &RUN);
         let a = &gl.vulnerabilities[0].id;

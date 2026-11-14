@@ -21,7 +21,6 @@ fn skip(reason: SkipReason, line: usize, prefix: &str) -> SkippedStatement {
         line_number: line,
         statement_prefix: prefix.to_string(),
         impact_category: None,
-        signals_extracted: None,
     }
 }
 
@@ -319,6 +318,276 @@ fn strict_does_not_flag_incomplete_analysis() {
     );
 }
 
+// ─── enforce_strict_mode: statements only partly parsed ─────────────────
+
+#[test]
+fn a_statement_only_partly_parsed_is_counted_and_passes_strict() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    let analyze = |dialect: &str, sql: &str| {
+        let config = AnalysisConfig {
+            dialect: lexega_core::dialect::dialect_from_name(dialect),
+            ..Default::default()
+        };
+        assert!(config.dialect.is_some(), "{dialect}");
+        analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
+    };
+    let mut cases = Vec::new();
+    for dialect in [
+        "snowflake",
+        "postgresql",
+        "mysql",
+        "mssql",
+        "bigquery",
+        "databricks",
+    ] {
+        cases.push((dialect, "GRANT FROM users;"));
+        cases.push((dialect, "ALTER TABLE users FROBNICATE x;"));
+    }
+    cases.push(("postgresql", "SELECT a grant FROM t;"));
+    cases.push(("mysql", "SELECT a grant FROM t;"));
+    cases.push(("mysql", "SELECT a revoke FROM t;"));
+    cases.push((
+        "postgresql",
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN GRANT FROM users; END $$;",
+    ));
+    for (dialect, sql) in cases {
+        let report = analyze(dialect, sql);
+        // Counted Partial, not skipped; no strictness refuses it.
+        assert_eq!(report.summary.statements_partial, 1, "{dialect}: {sql}");
+        assert_eq!(report.summary.statements_skipped, 0, "{dialect}: {sql}");
+        for opts in [
+            AnalysisOptions::default(),
+            AnalysisOptions::strict(),
+            AnalysisOptions::pedantic(),
+        ] {
+            let codes: Vec<_> = enforce_strict_mode(&report, &opts)
+                .iter()
+                .map(|x| x.code)
+                .collect();
+            assert!(codes.is_empty(), "{dialect}: {sql}: {codes:?}");
+        }
+    }
+    // Valid statements whose action is kept as written, and statements
+    // parsed in full, pass.
+    for (dialect, sql) in [
+        ("postgresql", "GRANT SELECT ON users TO r;"),
+        ("mysql", "REVOKE SELECT ON users FROM r;"),
+        ("snowflake", "ALTER TABLE users ADD COLUMN c INT;"),
+        ("postgresql", "ALTER TABLE orders OWNER TO r;"),
+        ("postgresql", "GRANT r TO u;"),
+        ("postgresql", "REVOKE r FROM u;"),
+        ("postgresql", "GRANT r TO u WITH ADMIN OPTION;"),
+        (
+            "postgresql",
+            "ALTER TABLE orders ATTACH PARTITION orders_2024 FOR VALUES FROM (1) TO (2);",
+        ),
+        ("mssql", "ALTER TABLE dbo.orders NOCHECK CONSTRAINT ALL;"),
+        (
+            "mssql",
+            "ALTER TABLE dbo.orders WITH CHECK CHECK CONSTRAINT ALL;",
+        ),
+        ("mssql", "ALTER TABLE dbo.orders REBUILD;"),
+        ("mssql", "ALTER TABLE dbo.orders SWITCH TO dbo.archive;"),
+        ("mysql", "ALTER TABLE orders ENGINE = InnoDB;"),
+    ] {
+        let report = analyze(dialect, sql);
+        assert!(
+            enforce_strict_mode(&report, &AnalysisOptions::strict()).is_empty(),
+            "{dialect}: {sql}"
+        );
+    }
+}
+
+// ─── a statement cut at a token the parser does not bind ───────────────
+
+#[test]
+fn a_statement_cut_at_an_unbound_token_is_partial_and_its_tail_fails_strict() {
+    use lexega_core::analyzer::{AnalysisConfig, ConfidenceLevel};
+    use lexega_core::api::analyze_risk_with_policy_config;
+    // MySQL's `:=` in an expression and PostgreSQL's postfix factorial `!`
+    // are operators the parser does not read.
+    for (dialect, sql) in [
+        ("mysql", "DELETE FROM users WHERE id = @n := 1;"),
+        (
+            "postgresql",
+            "UPDATE users SET flag = 1 WHERE id = 5 ! AND tenant = 2;",
+        ),
+        (
+            "postgresql",
+            "SELECT 1;\nUPDATE users SET flag = 5 ! WHERE id = 1;",
+        ),
+        (
+            "postgresql",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN UPDATE users SET flag = 1 WHERE id = 5 !; END $$",
+        ),
+    ] {
+        let config = AnalysisConfig {
+            dialect: lexega_core::dialect::dialect_from_name(dialect),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(sql, &config).expect("analysis");
+        assert_eq!(report.summary.statements_partial, 1, "{dialect}: {sql}");
+        assert_eq!(report.summary.statements_skipped, 1, "{dialect}: {sql}");
+        assert_eq!(
+            report.summary.analysis_confidence,
+            ConfidenceLevel::Medium,
+            "{dialect}: {sql}"
+        );
+        let codes: Vec<_> = enforce_strict_mode(&report, &AnalysisOptions::strict())
+            .iter()
+            .map(|x| x.code)
+            .collect();
+        assert_eq!(codes, ["E_STRICT_OPAQUE"], "{dialect}: {sql}");
+    }
+}
+
+// A statement read whole and followed, with no `;`, by a word, a label or a
+// client directive is not partial.
+#[test]
+fn a_statement_ended_where_no_expression_continues_is_not_partial() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    for (dialect, sql) in [
+        ("mssql", "DELETE FROM users\nTHROW 50000, 'x', 1"),
+        ("mssql", "UPDATE users SET a = 1\nKILL 52"),
+        ("mssql", "DELETE FROM users\n:setvar x y"),
+        ("mssql", "DELETE FROM users\n:r other.sql"),
+        ("mssql", "DELETE FROM users\n$(Tail)"),
+        ("mssql", "DELETE FROM users\nretry:\nPRINT 'x'"),
+        (
+            "mssql",
+            ":setvar Env prod\nDELETE FROM dbo.staging\n:r .\\other.sql",
+        ),
+        ("mssql", "ALTER ROLE db_owner ADD MEMBER bob\n:setvar x y"),
+        ("databricks", "DELETE FROM users\nOPTIMIZE users"),
+        ("databricks", "DELETE FROM users\nVACUUM users"),
+        (
+            "mssql",
+            "CREATE PROCEDURE p AS BEGIN DELETE FROM users\nTHROW 50000, 'x', 1; END",
+        ),
+    ] {
+        let config = AnalysisConfig {
+            dialect: lexega_core::dialect::dialect_from_name(dialect),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(sql, &config).expect("analysis");
+        assert_eq!(report.summary.statements_partial, 0, "{dialect}: {sql}");
+    }
+}
+
+// ─── T-SQL statements that end where they are read in full ─────────────
+
+/// The rule ids a T-SQL `sql` raises, and the `--strict` codes it fails with.
+fn tsql_rules_and_strict(sql: &str) -> (Vec<String>, Vec<&'static str>) {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    let config = AnalysisConfig {
+        dialect: lexega_core::dialect::dialect_from_name("mssql"),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config(sql, &config).expect("analysis");
+    let rules = report
+        .findings
+        .iter()
+        .filter_map(|s| s.rule_id())
+        .map(str::to_string)
+        .collect();
+    let codes = enforce_strict_mode(&report, &AnalysisOptions::strict())
+        .iter()
+        .map(|x| x.code)
+        .collect();
+    (rules, codes)
+}
+
+// `OPTION (…)` query hints end a DELETE, UPDATE or MERGE: the statement is
+// read whole, an unbounded write is reported and a bounded one is not.
+#[test]
+fn a_dml_statement_with_query_hints_is_read_whole() {
+    for (sql, rule, raised) in [
+        ("DELETE FROM users OPTION (MAXDOP 1)", "DML-WRITE-UNBOUNDED", true),
+        (
+            "DELETE FROM users WHERE id = 1 OPTION (MAXDOP 1)",
+            "DML-WRITE-UNBOUNDED",
+            false,
+        ),
+        ("UPDATE users SET a = 1 OPTION (RECOMPILE)", "DML-WRITE-UNBOUNDED", true),
+        // The inner join bounds the rows written; the outer join keeps
+        // every row of `u`.
+        (
+            "UPDATE u SET a = 1 FROM users u JOIN orders o ON o.id = u.id OPTION (RECOMPILE)",
+            "DML-WRITE-UNBOUNDED",
+            false,
+        ),
+        (
+            "UPDATE u SET a = 1 FROM users u LEFT JOIN orders o ON o.id = u.id OPTION (RECOMPILE)",
+            "DML-WRITE-UNBOUNDED",
+            true,
+        ),
+        (
+            "MERGE users AS t USING orders AS s ON t.id = s.id WHEN MATCHED THEN DELETE OPTION (MAXDOP 1);",
+            "DML-MERGE-DELETE",
+            true,
+        ),
+    ] {
+        let (rules, codes) = tsql_rules_and_strict(sql);
+        assert_eq!(rules.iter().any(|r| r == rule), raised, "{sql}: {rules:?}");
+        assert!(codes.is_empty(), "{sql}: {codes:?}");
+    }
+}
+
+// CHECKPOINT, KILL and SHUTDOWN are statements of their own: one after a
+// DELETE with no `;` leaves the DELETE whole, and each passes `--strict`.
+#[test]
+fn a_tsql_server_command_is_a_statement() {
+    for (sql, unbounded) in [
+        ("DELETE FROM users\nCHECKPOINT", true),
+        ("CHECKPOINT 10", false),
+        ("KILL 52", false),
+        ("KILL 52 WITH STATUSONLY", false),
+        ("SHUTDOWN", false),
+        ("SHUTDOWN WITH NOWAIT", false),
+        (
+            "CREATE PROCEDURE p AS BEGIN DELETE FROM users\nCHECKPOINT\nEND",
+            true,
+        ),
+    ] {
+        let (rules, codes) = tsql_rules_and_strict(sql);
+        assert_eq!(
+            rules.iter().any(|r| r == "DML-WRITE-UNBOUNDED"),
+            unbounded,
+            "{sql}: {rules:?}"
+        );
+        assert!(codes.is_empty(), "{sql}: {codes:?}");
+    }
+}
+
+// ─── enforce_strict_mode: T-SQL batch separators ────────────────────────
+
+#[test]
+fn strict_passes_a_go_line_with_comments() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    for go in [
+        "GO /* deploy step 2 */",
+        "/* deploy step 2 */ GO",
+        "GO 2 /* a */ -- b",
+    ] {
+        let sql = format!("SELECT 1;\n{go}\nUPDATE dbo.Orders SET Status = 0 WHERE id = 1;");
+        let config = AnalysisConfig {
+            dialect: lexega_core::dialect::dialect_from_name("mssql"),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(&sql, &config).expect("analysis");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+        let codes: Vec<_> = enforce_strict_mode(&report, &AnalysisOptions::strict())
+            .iter()
+            .map(|x| x.code)
+            .collect();
+        assert!(codes.is_empty(), "{sql}: {codes:?}");
+    }
+}
+
 // ─── StrictMode::as_str labels ──────────────────────────────────────────
 
 #[test]
@@ -354,5 +623,108 @@ fn strict_mode_labels_round_trip_through_parser() {
     ] {
         let parsed = parse_strict_mode(m.as_str()).expect("as_str must be parseable");
         assert_eq!(parsed, m, "round-trip failed for {:?}", m.as_str());
+    }
+}
+
+// A sqlcmd command that runs what the analysis did not read — an included
+// file, a batch sent to another server, an operating-system command, the
+// editor, `:exit(query)` — counts as skipped, says what it runs, lowers
+// confidence and fails `--strict`, quoting no more of its line than the
+// command and the file or server it names. A command that sets the
+// client's state passes.
+#[test]
+fn a_sqlcmd_command_that_runs_what_was_not_read_fails_strict() {
+    use lexega_core::analyzer::{AnalysisConfig, ConfidenceLevel, SqlcmdUnread};
+    use lexega_core::api::analyze_risk_with_policy_config;
+    let config = AnalysisConfig {
+        dialect: lexega_core::dialect::dialect_from_name("mssql"),
+        ..Default::default()
+    };
+    for (line, runs, quoted) in [
+        (
+            ":r .\\Tables\\DropEverything.sql",
+            SqlcmdUnread::IncludedFile,
+            ":r .",
+        ),
+        (
+            ":connect srv\\inst -U sa -P Hunter2Secret",
+            SqlcmdUnread::OtherServer,
+            ":connect srv",
+        ),
+        ("!! del /q Hunter2Secret", SqlcmdUnread::OsCommand, "!!"),
+        (":!! dir Hunter2Secret", SqlcmdUnread::OsCommand, ":!!"),
+        (":ED", SqlcmdUnread::EditedBatch, ":ED"),
+        (
+            ":EXIT(SELECT COUNT(*) FROM dbo.t WHERE k = 'Hunter2Secret')",
+            SqlcmdUnread::ExitQuery,
+            // The query is sent unread, so only the command is shown.
+            ":EXIT",
+        ),
+    ] {
+        let sql = format!("{line}\nGO\nSELECT a FROM dbo.t\nGO\n");
+        let report = analyze_risk_with_policy_config(&sql, &config).expect("analysis");
+        assert_eq!(report.summary.statements_skipped, 1, "{sql}");
+        assert_eq!(report.summary.statements_analyzed, 1, "{sql}");
+        assert_eq!(
+            report.summary.analysis_confidence,
+            ConfidenceLevel::Medium,
+            "{sql}"
+        );
+        assert_eq!(report.skipped_details.len(), 1, "{sql}");
+        let skipped = &report.skipped_details[0];
+        assert_eq!(skipped.reason, SkipReason::SqlcmdCommand(runs), "{sql}");
+        assert_eq!(skipped.line_number, 1, "{sql}");
+        assert!(
+            skipped.statement_prefix.starts_with(quoted),
+            "{sql}: {}",
+            skipped.statement_prefix
+        );
+        // Nothing of an `:exit` query is quoted.
+        assert!(
+            !skipped.statement_prefix.contains("COUNT"),
+            "{sql}: {}",
+            skipped.statement_prefix
+        );
+        let violations = enforce_strict_mode(&report, &AnalysisOptions::strict());
+        let codes: Vec<_> = violations.iter().map(|v| v.code).collect();
+        assert_eq!(codes, ["E_STRICT_NOT_READ"], "{sql}");
+        assert!(
+            violations[0].message.contains(runs.describe()),
+            "{sql}: {}",
+            violations[0].message
+        );
+        let json = serde_json::to_string(&report).expect("json");
+        assert!(!json.contains("Hunter2Secret"), "{sql}: {json}");
+        let messages: String = violations.iter().map(|v| v.message.as_str()).collect();
+        assert!(!messages.contains("Hunter2Secret"), "{sql}: {messages}");
+    }
+    for line in [
+        ":setvar Db Prod",
+        ":on error exit",
+        ":List",
+        ":listvar",
+        ":out C:\\log.txt",
+        ":error STDOUT",
+        ":perftrace STDERR",
+        ":xml ON",
+        ":help",
+        ":reset",
+        ":serverlist",
+        ":quit",
+        ":exit",
+        ":exit()",
+    ] {
+        let sql = format!("{line}\nGO\nSELECT a FROM dbo.t\nGO\n");
+        let report = analyze_risk_with_policy_config(&sql, &config).expect("analysis");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+        assert_eq!(
+            report.summary.analysis_confidence,
+            ConfidenceLevel::High,
+            "{sql}"
+        );
+        assert!(
+            enforce_strict_mode(&report, &AnalysisOptions::strict()).is_empty(),
+            "{sql}"
+        );
     }
 }

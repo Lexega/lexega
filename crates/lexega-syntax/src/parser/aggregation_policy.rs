@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterAggregationPolicy, SyntaxAlterAggregationPolicyAction,
     SyntaxCreateAggregationPolicy, SyntaxDropAggregationPolicy,
@@ -729,24 +730,13 @@ impl<'a> Parser<'a> {
                         self.advance(); // consume TAG
                         let tag_span = Some(next_tok.span);
 
-                        // Parse tag assignments: tag1 = 'value1', tag2 = 'value2', ...
-                        let assignments_start = self.current_span().start;
-                        while let Some(tok) = self.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        let assignments_end = self.current_span().start;
-                        let tags_span = Span {
-                            start: assignments_start,
-                            end: assignments_end,
-                        };
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
 
                         AstAlterAggregationPolicyActionKind::SetTag {
                             set_span,
                             tag_span,
                             tags_span,
+                            tags,
                         }
                     }
                     TokenKind::Keyword(Keyword::Comment) => {
@@ -798,24 +788,13 @@ impl<'a> Parser<'a> {
                         self.advance(); // consume TAG
                         let tag_span = Some(next_tok.span);
 
-                        // Parse tag names: tag1, tag2, ...
-                        let tags_start = self.current_span().start;
-                        while let Some(tok) = self.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        let tags_end = self.current_span().start;
-                        let tags_span = Span {
-                            start: tags_start,
-                            end: tags_end,
-                        };
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                         AstAlterAggregationPolicyActionKind::UnsetTag {
                             unset_span,
                             tag_span,
                             tags_span,
+                            tags,
                         }
                     }
                     TokenKind::Keyword(Keyword::Comment) => {

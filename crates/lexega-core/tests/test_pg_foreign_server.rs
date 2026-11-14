@@ -25,8 +25,7 @@ fn pg_cfg() -> AnalysisConfig {
 fn rule_ids_cfg(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -36,8 +35,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::postgres();
+    let config = FormatterConfig {
+        dialect: dialect::postgres(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -190,8 +191,10 @@ fn test_alter_does_not_fire_create_rules() {
 fn test_databricks_server_and_connection_not_hijacked() {
     // These lack `FOREIGN DATA`, so the FDW guard must not intercept them —
     // they stay on the Databricks connection parser and raise no FDW finding.
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::databricks();
+    let config = FormatterConfig {
+        dialect: dialect::databricks(),
+        ..Default::default()
+    };
     let dbx_cfg = AnalysisConfig {
         dialect: Some(dialect::databricks()),
         ..Default::default()

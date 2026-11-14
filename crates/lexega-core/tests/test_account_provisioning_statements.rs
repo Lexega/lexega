@@ -15,18 +15,18 @@ use lexega_core::{
 };
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -68,6 +68,7 @@ fn test_account_type_extracted() {
 
 #[test]
 fn test_managed_account_does_not_leak_credentials() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     // LEAST-LEAK: the admin password must never reach the structured facts.
     let sql =
         "CREATE MANAGED ACCOUNT ra ADMIN_NAME = u ADMIN_PASSWORD = 'topsecret_pw_9' TYPE = READER;";

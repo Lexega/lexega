@@ -20,9 +20,10 @@ use lexega_core::{format_sql_with_config, parse_sql_with_dialect, FormatterConfi
 use std::collections::HashSet;
 
 fn mysql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mysql();
-    config
+    FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) {
@@ -72,15 +73,17 @@ fn assert_snowflake_opaque(sql: &str) {
 }
 
 fn mysql_rule_ids(sql: &str) -> HashSet<String> {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mysql());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mysql()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .unwrap_or_else(|e| panic!("analysis failed for {:?}: {:?}", sql, e));
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|m| match m {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|m| match m {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -182,9 +185,25 @@ fn test_prepare_from_concat_flags_injection() {
         "concatenated prepared-statement body must flag DYNSQL-CONCAT, got {:?}",
         ids
     );
+    // DYNSQL-CONCAT reports the concatenated body; DYNSQL does not again.
     assert!(
-        ids.contains("DYNSQL"),
-        "dynamic SQL execution must flag DYNSQL, got {:?}",
+        !ids.contains("DYNSQL"),
+        "a concatenated body is DYNSQL-CONCAT's alone, got {:?}",
+        ids
+    );
+}
+
+#[test]
+fn a_prepared_body_built_by_concat_ws_is_a_concatenation() {
+    // `CONCAT_WS` joins its operands with the separator: the body is built
+    // from the variable as `CONCAT` builds it.
+    let ids = mysql_rule_ids(
+        "PREPARE stmt FROM CONCAT_WS(' ', 'SELECT * FROM users WHERE name =', @input);\n\
+         EXECUTE stmt;",
+    );
+    assert!(
+        ids.contains("DYNSQL-CONCAT"),
+        "a body CONCAT_WS builds must flag DYNSQL-CONCAT, got {:?}",
         ids
     );
 }

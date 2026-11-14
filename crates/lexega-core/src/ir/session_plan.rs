@@ -34,7 +34,7 @@ pub struct SessionParamIr {
     /// Parameter name, upper-cased (Snowflake session params are
     /// case-insensitive unquoted identifiers).
     pub name: String,
-    /// Value text as written, single quotes stripped for string literals.
+    /// Value text as written; a string literal's value for a string.
     pub value: String,
     /// Lexical kind of the value.
     pub value_kind: SessionValueKind,
@@ -50,7 +50,8 @@ pub fn lower_alter_session_to_session_plan(s: &AstAlterSession, source: &str) ->
                 .iter()
                 .map(|p| {
                     let value_kind = lower_value_kind(p.value_kind);
-                    let raw = unquote_literal(span_text(source, p.value_span).trim());
+                    let raw =
+                        super::span_extract::literal_value_or_text(span_text(source, p.value_span));
                     // Boolean literals are case-insensitive in SQL; canonicalize
                     // to upper-case so value predicates match any source casing
                     // (`= true` / `= TRUE`). String values stay verbatim — their
@@ -95,13 +96,4 @@ fn span_text(source: &str, span: Span) -> &str {
     source
         .get(span.start as usize..span.end as usize)
         .unwrap_or("")
-}
-
-/// Strip surrounding `'…'` quotes and fold `''` escapes; otherwise unchanged.
-fn unquote_literal(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        raw[1..raw.len() - 1].replace("''", "'")
-    } else {
-        raw.to_string()
-    }
 }

@@ -15,7 +15,7 @@
 //! - write_report_artifact, write_optional_report_artifact (findings, handles
 //!   SARIF transform internally)
 //! - resolve_artifact_path
-//! - sanitize_artifact_key
+//! - sanitize_artifact_key, ArtifactKeys
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use std::process;
 
 use lexega_core::analyzer::{self, AnalysisReport, ToolRun};
 
-use super::io::{is_cloud_uri, write_uri};
+use super::io::{is_cloud_uri, is_web_uri, write_uri};
 
 /// Format for findings artifacts (risk reports, batch summaries, review
 /// reports). SARIF is allowed here because findings have a SARIF schema.
@@ -49,6 +49,21 @@ impl ReportArtifactFormat {
             "yaml" | "yml" => Ok(ReportArtifactFormat::Yaml),
             "sarif" => Ok(ReportArtifactFormat::Sarif),
             _ => Err("--report-artifact-format must be json, yaml, or sarif".to_string()),
+        }
+    }
+
+    /// The format a file's extension names, or none for a directory or an
+    /// extension no report has.
+    pub fn from_path(path: &str) -> Option<Self> {
+        let p = path.trim().to_ascii_lowercase();
+        if p.ends_with(".sarif") {
+            Some(ReportArtifactFormat::Sarif)
+        } else if p.ends_with(".yaml") || p.ends_with(".yml") {
+            Some(ReportArtifactFormat::Yaml)
+        } else if p.ends_with(".json") {
+            Some(ReportArtifactFormat::Json)
+        } else {
+            None
         }
     }
 }
@@ -78,28 +93,107 @@ impl DecisionArtifactFormat {
     }
 }
 
-/// Format derived from file extension for --report-out
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFileFormat {
-    Json,
-    Yaml,
-    Sarif,
+/// A `--report-artifact-format` that names another format than the
+/// `--report-out` file's extension does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportFormatConflict {
+    pub format: ReportArtifactFormat,
+    pub target: String,
+    pub by_extension: ReportArtifactFormat,
 }
 
-impl OutputFileFormat {
-    /// Derive format from file extension, returns None for directories or unknown extensions
-    pub fn from_path(path: &str) -> Option<Self> {
-        let p = path.trim().to_ascii_lowercase();
-        if p.ends_with(".sarif") {
-            Some(OutputFileFormat::Sarif)
-        } else if p.ends_with(".yaml") || p.ends_with(".yml") {
-            Some(OutputFileFormat::Yaml)
-        } else if p.ends_with(".json") {
-            Some(OutputFileFormat::Json)
-        } else {
-            None
+impl std::fmt::Display for ReportFormatConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--report-artifact-format {} contradicts --report-out '{}', whose extension names {}; give one of them, or make them agree",
+            self.format.extension(),
+            self.target,
+            self.by_extension.extension()
+        )
+    }
+}
+
+impl std::error::Error for ReportFormatConflict {}
+
+/// The format of the `--report-out` artifact at `target`, for one file and
+/// a batch alike: `explicit`, the `--report-artifact-format` given, else the
+/// one `target`'s extension names, else `fallback`. An explicit format that
+/// contradicts the extension is an error.
+pub(crate) fn resolve_report_format(
+    target: &str,
+    explicit: Option<ReportArtifactFormat>,
+    fallback: ReportArtifactFormat,
+) -> Result<ReportArtifactFormat, ReportFormatConflict> {
+    let by_extension = ReportArtifactFormat::from_path(target);
+    match (explicit, by_extension) {
+        (Some(format), Some(by_extension)) if format != by_extension => Err(ReportFormatConflict {
+            format,
+            target: target.to_string(),
+            by_extension,
+        }),
+        (Some(format), _) => Ok(format),
+        (None, Some(by_extension)) => Ok(by_extension),
+        (None, None) => Ok(fallback),
+    }
+}
+
+/// A `--report-out` or `--decision-out` target nothing is written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReportTargetError {
+    /// A web address: files are written to a path or uploaded with a cloud
+    /// CLI.
+    WebAddress { option: String, target: String },
+    /// A name that is neither a report file nor a directory.
+    UnknownFile(String),
+}
+
+impl std::fmt::Display for ReportTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReportTargetError::WebAddress { option, target } => write!(
+                f,
+                "{option} '{target}' is a web address, which cannot be written to; use a local path, s3://, gs:// or az://"
+            ),
+            ReportTargetError::UnknownFile(target) => write!(
+                f,
+                "--report-out '{target}' names neither a report file (.json, .yaml, .yml, .sarif) nor a directory; end a directory's name with '/'"
+            ),
         }
     }
+}
+
+impl std::error::Error for ReportTargetError {}
+
+/// Refuse a web address as the target of `option` (`--report-out`,
+/// `--decision-out`).
+pub fn check_output_target(option: &str, target: &str) -> Result<(), ReportTargetError> {
+    if is_web_uri(target.trim()) {
+        return Err(ReportTargetError::WebAddress {
+            option: option.to_string(),
+            target: target.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a `--report-out` target a report is never written to: a web
+/// address, or a name with an extension other than a report's that is not
+/// a directory. `-` (standard output), a report file, a name ending in `/`,
+/// a name with no extension and an existing directory are targets.
+pub fn check_report_target(target: &str) -> Result<(), ReportTargetError> {
+    check_output_target("--report-out", target)?;
+    let trimmed = target.trim();
+    let path = Path::new(trimmed);
+    let names_a_file = trimmed != "-"
+        && !trimmed.ends_with('/')
+        && !is_artifact_file_path(trimmed)
+        && path.extension().is_some()
+        && (is_cloud_uri(trimmed) || !path.is_dir());
+    if names_a_file {
+        return Err(ReportTargetError::UnknownFile(target.to_string()));
+    }
+    Ok(())
 }
 
 pub fn is_artifact_file_path(path: &str) -> bool {
@@ -235,6 +329,11 @@ pub fn resolve_artifact_path(base: &str, default_name: &str) -> PathBuf {
     }
 }
 
+/// The longest key [`sanitize_artifact_key`] returns: with a suffix such as
+/// `.decision.json` it stays within the 255 bytes a file name may hold.
+const MAX_ARTIFACT_KEY_BYTES: usize = 200;
+
+/// A file-name-safe key for `input`, at most `MAX_ARTIFACT_KEY_BYTES` long.
 pub fn sanitize_artifact_key(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -245,8 +344,132 @@ pub fn sanitize_artifact_key(input: &str) -> String {
     }
     // Avoid empty names
     if out.is_empty() {
-        "file".to_string()
-    } else {
-        out
+        return "file".to_string();
+    }
+    if out.len() <= MAX_ARTIFACT_KEY_BYTES {
+        return out;
+    }
+    // A longer key keeps its end, the file's own name, behind a 64-bit
+    // FNV-1a hash of the whole input, so two long paths that end alike stay
+    // apart. `out` is ASCII, so any byte index is a character boundary.
+    let hash = fnv1a(input);
+    let tail = &out[out.len() - (MAX_ARTIFACT_KEY_BYTES - 17)..];
+    format!("{hash:016x}_{tail}")
+}
+
+/// The 64-bit FNV-1a hash of `input`: stable across runs and platforms.
+fn fnv1a(input: &str) -> u64 {
+    input.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The artifact key of each source a run writes artifacts for, so that no
+/// two of them share one. A source keys on its [`sanitize_artifact_key`]
+/// unless another source of the run has that key too, read without case as
+/// a case-insensitive file system reads a file name; each such source then
+/// keys on it followed by `-` and a hash of its own name.
+pub(crate) struct ArtifactKeys {
+    keys: std::collections::HashMap<String, String>,
+}
+
+impl ArtifactKeys {
+    /// The keys of the sources `names` names.
+    pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        let names: BTreeSet<&str> = names.into_iter().collect();
+        let mut sharing: HashMap<String, usize> = HashMap::new();
+        for name in &names {
+            *sharing
+                .entry(sanitize_artifact_key(name).to_ascii_lowercase())
+                .or_default() += 1;
+        }
+        let mut keys = HashMap::with_capacity(names.len());
+        let mut taken: HashSet<String> = HashSet::with_capacity(names.len());
+        let mut shared = Vec::new();
+        for name in names {
+            let key = sanitize_artifact_key(name);
+            let folded = key.to_ascii_lowercase();
+            if sharing.get(&folded).is_some_and(|count| *count == 1) {
+                taken.insert(folded);
+                keys.insert(name.to_string(), key);
+            } else {
+                shared.push((name, key));
+            }
+        }
+        for (name, key) in shared {
+            let hash = fnv1a(name);
+            let mut attempt = 0_u32;
+            let unique = loop {
+                let candidate = match attempt {
+                    0 => format!("{key}-{:08x}", hash >> 32),
+                    1 => format!("{key}-{hash:016x}"),
+                    n => format!("{key}-{hash:016x}-{n}"),
+                };
+                if taken.insert(candidate.to_ascii_lowercase()) {
+                    break candidate;
+                }
+                attempt += 1;
+            };
+            keys.insert(name.to_string(), unique);
+        }
+        Self { keys }
+    }
+
+    /// The key of the source `name` names; a source the run did not list
+    /// keys on its [`sanitize_artifact_key`].
+    pub(crate) fn key(&self, name: &str) -> String {
+        self.keys
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| sanitize_artifact_key(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_no_other_source_has_is_the_sanitized_name() {
+        let keys = ArtifactKeys::new(["migrations/cleanup_orders.sql", "a/b.sql"]);
+        assert_eq!(
+            keys.key("migrations/cleanup_orders.sql"),
+            "migrations_cleanup_orders.sql"
+        );
+        assert_eq!(keys.key("a/b.sql"), "a_b.sql");
+    }
+
+    #[test]
+    fn sources_that_share_a_key_each_get_their_own() {
+        let names = ["a/b_c.sql", "a_b/c.sql", "a_b_c.sql", "A/B_C.sql", "x.sql"];
+        let keys = ArtifactKeys::new(names);
+        let all: Vec<String> = names.iter().map(|name| keys.key(name)).collect();
+        let distinct: std::collections::HashSet<String> =
+            all.iter().map(|key| key.to_ascii_lowercase()).collect();
+        assert_eq!(distinct.len(), names.len(), "{all:?}");
+        assert_eq!(keys.key("x.sql"), "x.sql");
+        for (name, key) in names.iter().zip(&all).take(4) {
+            assert!(
+                key.starts_with(&sanitize_artifact_key(name)) && key.len() == name.len() + 9,
+                "{name}: {key}"
+            );
+        }
+        // The same run names a source alike every time.
+        let again = ArtifactKeys::new(names.iter().rev().copied());
+        for (name, key) in names.iter().zip(&all) {
+            assert_eq!(&again.key(name), key);
+        }
+    }
+
+    #[test]
+    fn a_hashed_key_never_takes_another_sources_key() {
+        let hashed = format!("a_b.sql-{:08x}", fnv1a("a/b.sql") >> 32);
+        let names = ["a/b.sql", "a_b.sql", hashed.as_str()];
+        let keys = ArtifactKeys::new(names);
+        let all: std::collections::HashSet<String> =
+            names.iter().map(|name| keys.key(name)).collect();
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert_eq!(keys.key(&hashed), hashed);
     }
 }

@@ -9,6 +9,6 @@
 pub mod node_metadata;
 
 pub use lexega_syntax::context::{
-    diagnostics, span_map, Diagnostic, FormattedContext, FormattedContextError, MappingKind,
-    RenderContext, Severity, SpanMap, SpanMapError, SpanMapping,
+    diagnostics, span_map, CopiedSpan, Diagnostic, FormattedContext, FormattedContextError,
+    MappingKind, RenderContext, Severity, SpanMap, SpanMapError, SpanMapping,
 };

@@ -122,7 +122,10 @@ pub fn lower_alter_share_to_share_plan(s: &AstAlterShare, source: &str) -> Share
         }
         K::Set { .. } => plan.had_set_properties = true,
         K::Unset { .. } => plan.had_unset_properties = true,
-        K::Unknown(_) => plan.has_unknown_clauses = true,
+        // The plan models no shared objects: an object action is as unmodelled as an unknown one.
+        K::AddObject { .. } | K::RemoveObject { .. } | K::Unknown(_) => {
+            plan.has_unknown_clauses = true
+        }
     }
     plan
 }
@@ -133,8 +136,9 @@ pub fn lower_drop_share_to_share_plan(s: &AstDrop, source: &str) -> SharePlan {
     SharePlan {
         action: ShareAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: ShareOptions {
             or_replace: false,
             if_not_exists: false,

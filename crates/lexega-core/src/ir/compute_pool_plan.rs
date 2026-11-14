@@ -123,8 +123,9 @@ pub fn lower_drop_compute_pool_to_compute_pool_plan(s: &AstDrop, source: &str) -
     ComputePoolPlan {
         action: ComputePoolAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: ComputePoolOptions {
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
@@ -163,7 +164,7 @@ fn bool_from_span(source: &str, span: Option<Span>) -> Option<bool> {
 
 fn upper_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|sp| slice_span(source, sp))
-        .map(|t| t.trim().trim_matches('\'').trim().to_ascii_uppercase())
+        .map(|t| crate::ir::span_extract::literal_value_or_text(t).to_ascii_uppercase())
 }
 
 fn trim_text(source: &str, span: Option<Span>) -> Option<String> {

@@ -8,12 +8,13 @@
 
 use crate::ast::{
     AstAlterDatabase, AstAlterDatabaseAction, AstAlterDatabaseActionKind, AstCreateDatabase,
-    AstCreateDatabaseVariant, AstDropDatabase, AstStmt, AstUndropDatabase, AstUnknownClause,
-    UnknownKind,
+    AstCreateDatabaseVariant, AstDropDatabase, AstStmt, AstTagRef, AstUndropDatabase,
+    AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 impl<'a> Parser<'a> {
     /// Parse CREATE DATABASE statement.
@@ -77,6 +78,7 @@ impl<'a> Parser<'a> {
         let mut extras: Vec<AstUnknownClause> = Vec::new();
         let mut comment_span: Option<Span> = None;
         let mut tag_span: Option<Span> = None;
+        let mut tags: Vec<AstTagRef> = Vec::new();
 
         let variant = self.parse_create_database_variant(&mut extras)?;
 
@@ -92,7 +94,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse trailing COMMENT and TAG
-        self.parse_database_trailing_clauses(&mut comment_span, &mut tag_span)?;
+        self.parse_database_trailing_clauses(&mut comment_span, &mut tag_span, &mut tags)?;
 
         // Calculate final span
         let mut span_end = name_span.end;
@@ -168,6 +170,7 @@ impl<'a> Parser<'a> {
             properties_span,
             comment_span,
             tag_span,
+            tags,
             extras,
         })))
     }
@@ -770,6 +773,7 @@ impl<'a> Parser<'a> {
         &mut self,
         comment_span: &mut Option<Span>,
         tag_span: &mut Option<Span>,
+        tags: &mut Vec<AstTagRef>,
     ) -> ParseResult<()> {
         while let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -810,26 +814,21 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                // Consume until closing paren or statement end
+                // The parenthesised list, or what follows up to the statement end
                 let mut end = self.current_span().end;
-                let mut paren_depth = 0;
-                while let Some(t) = self.peek_non_trivia() {
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        paren_depth += 1;
-                    }
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)) {
-                        paren_depth -= 1;
-                        if paren_depth <= 0 {
-                            end = t.span.end;
-                            self.advance();
+                if self
+                    .peek_non_trivia()
+                    .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))
+                {
+                    (end, *tags) = self.parse_tag_assignments_in_parens()?;
+                } else {
+                    while let Some(t) = self.peek_non_trivia() {
+                        if matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)) {
                             break;
                         }
+                        end = t.span.end;
+                        self.advance();
                     }
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                        break;
-                    }
-                    end = t.span.end;
-                    self.advance();
                 }
 
                 *tag_span = Some(Span { start, end });
@@ -872,14 +871,23 @@ impl<'a> Parser<'a> {
 
     /// Consume tokens until semicolon or EOF, return end position
     pub(crate) fn consume_until_semi_or_eof(&mut self) -> ParseResult<u32> {
+        self.consume_until_semi_or_eof_before(usize::MAX)
+    }
+
+    /// [`Self::consume_until_semi_or_eof`], consuming no token at or past
+    /// the index `bound` ([`Parser::clauses_bound`]).
+    pub(crate) fn consume_until_semi_or_eof_before(&mut self, bound: usize) -> ParseResult<u32> {
+        let from = self.idx;
         let mut end = self.current_span().end;
-        while let Some(tok) = self.peek_non_trivia() {
+        while let Some(tok) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
                 break;
             }
             end = tok.span.end;
             self.advance();
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(end)
     }
 
@@ -934,11 +942,22 @@ impl<'a> Parser<'a> {
         // Optional IF EXISTS
         let if_exists_span = self.parse_optional_if_exists()?;
 
-        // Database name (can be qualified: db_name or account.db_name)
-        let name_span = self.parse_qualified_name_span()?;
+        // Database name (can be qualified: db_name or account.db_name);
+        // T-SQL `CURRENT` names the database in use.
+        let current = self
+            .peek_non_trivia()
+            .filter(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::Current)))
+            .map(|tok| tok.span);
+        let name_span = if let Some(current) = current {
+            self.advance();
+            current
+        } else {
+            self.parse_qualified_name_span()?
+        };
 
         // Parse action
         let mut extras = Vec::new();
+        self.record_setting_secrets(self.idx);
         let (action, stmt_end) = self.parse_alter_database_action(&mut extras)?;
 
         let stmt = AstAlterDatabase {
@@ -1070,17 +1089,15 @@ impl<'a> Parser<'a> {
                             .expect_invariant("TAG keyword consumed after match");
                         let tag_span = tag_tok.span;
 
-                        // Parse tag assignments until statement end
-                        let assignments_start = self.current_span().start;
-                        action_end = self.consume_until_semi_or_eof()?;
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
+                        action_end = assignments_span.end;
 
                         kind = AstAlterDatabaseActionKind::SetTag {
                             set_span,
                             tag_span,
-                            assignments_span: Span {
-                                start: assignments_start,
-                                end: action_end,
-                            },
+                            assignments_span,
+                            tags,
                         };
                     } else if !multi && next_tok.lexeme(self.source).eq_ignore_ascii_case("COMMENT")
                     {
@@ -1102,8 +1119,15 @@ impl<'a> Parser<'a> {
                         };
                     } else {
                         // SET properties
+                        if next_tok
+                            .lexeme(self.source)
+                            .eq_ignore_ascii_case("DBPROPERTIES")
+                        {
+                            self.record_option_list_secrets(self.idx + 1);
+                        }
                         let props_start = self.current_span().start;
-                        action_end = self.consume_until_semi_or_eof()?;
+                        let bound = self.clauses_bound(self.database_set_options_end(self.idx));
+                        action_end = self.consume_until_semi_or_eof_before(bound)?;
 
                         kind = AstAlterDatabaseActionKind::SetProperties {
                             set_span,
@@ -1137,17 +1161,14 @@ impl<'a> Parser<'a> {
                             .expect_invariant("TAG keyword consumed after match");
                         let tag_span = tag_tok.span;
 
-                        // Parse tag names until statement end
-                        let tags_start = self.current_span().start;
-                        action_end = self.consume_until_semi_or_eof()?;
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                        action_end = tags_span.end;
 
                         kind = AstAlterDatabaseActionKind::UnsetTag {
                             unset_span,
                             tag_span,
-                            tags_span: Span {
-                                start: tags_start,
-                                end: action_end,
-                            },
+                            tags_span,
+                            tags,
                         };
                     } else if next_tok.lexeme(self.source).eq_ignore_ascii_case("COMMENT") {
                         // UNSET COMMENT
@@ -1432,9 +1453,14 @@ impl<'a> Parser<'a> {
             }
 
             _ => {
-                // Unknown action - capture as unknown clause
+                // Unknown action - capture as unknown clause; a T-SQL action
+                // ends where its grammar does if the dialect needs no
+                // terminator.
                 let introducer_span = tok.span;
-                action_end = self.consume_until_semi_or_eof()?;
+                let bound = self
+                    .database_action_end(self.idx)
+                    .map_or(usize::MAX, |end| self.clauses_bound(end));
+                action_end = self.consume_until_semi_or_eof_before(bound)?;
 
                 kind = AstAlterDatabaseActionKind::Unknown(AstUnknownClause {
                     node_id: self.id_gen.next(),
@@ -1458,5 +1484,163 @@ impl<'a> Parser<'a> {
         };
 
         Ok((action, action_end))
+    }
+
+    /// The index past T-SQL `ALTER DATABASE … SET` options at `i`:
+    /// `option [, option]* [WITH { ROLLBACK AFTER n [SECONDS] | ROLLBACK
+    /// IMMEDIATE | NO_WAIT }]`; `i` where none is written.
+    fn database_set_options_end(&self, i: usize) -> usize {
+        let Some(end) = self.comma_list_end(i, |j| self.database_option_end(j)) else {
+            return i;
+        };
+        self.with_list_end(end, |j| {
+            self.words_end(j, &["ROLLBACK", "AFTER"])
+                .and_then(|k| self.option_value_end(k))
+                .map(|k| self.words_end(k, &["SECONDS"]).unwrap_or(k))
+                .or_else(|| self.any_words_end(j, &[&["ROLLBACK", "IMMEDIATE"], &["NO_WAIT"]]))
+        })
+        .unwrap_or(end)
+    }
+
+    /// The index past one T-SQL database option at `i`: `name [=] value
+    /// [unit] [(…)]`, `name (…)`, a bare option (`SINGLE_USER`), or
+    /// `PARTNER SAFETY FULL`, `PARTNER TIMEOUT n`, `HADR AVAILABILITY
+    /// GROUP = name`, `QUERY_STORE CLEAR [ALL]`.
+    fn database_option_end(&self, i: usize) -> Option<usize> {
+        const BARE: [&str; 12] = [
+            "SINGLE_USER",
+            "RESTRICTED_USER",
+            "MULTI_USER",
+            "ONLINE",
+            "OFFLINE",
+            "EMERGENCY",
+            "READ_ONLY",
+            "READ_WRITE",
+            "ENABLE_BROKER",
+            "DISABLE_BROKER",
+            "NEW_BROKER",
+            "ERROR_BROKER_CONVERSATIONS",
+        ];
+        if !self.is_word_at(i) {
+            return None;
+        }
+        let next = i + 1;
+        if let Some(group) = self.words_end(i, &["HADR", "AVAILABILITY", "GROUP"]) {
+            return self.eq_value_end(group);
+        }
+        if let Some(k) = self
+            .words_end(i, &["PARTNER"])
+            .and_then(|k| self.any_words_end(k, &[&["SAFETY"], &["TIMEOUT"]]))
+        {
+            return self.option_value_end(k);
+        }
+        if let Some(clear) = self.words_end(i, &["QUERY_STORE", "CLEAR"]) {
+            return Some(self.words_end(clear, &["ALL"]).unwrap_or(clear));
+        }
+        let bare = BARE.iter().any(|word| self.word_at(i, word))
+            || self.parens_end(next).is_some()
+            || self
+                .tokens
+                .get(next)
+                .is_some_and(|t| self.should_stop_scan_at_statement_start(t));
+        let value_end = match self.eq_value_end(next) {
+            Some(end) => end,
+            None if bare => next,
+            None => self.option_value_end(next)?,
+        };
+        let value_end = self
+            .any_words_end(
+                value_end,
+                &[&["SECONDS"], &["MINUTES"], &["HOURS"], &["DAYS"]],
+            )
+            .unwrap_or(value_end);
+        Some(self.parens_end(value_end).unwrap_or(value_end))
+    }
+
+    /// The index past a T-SQL `ALTER DATABASE` action at `i` other than
+    /// `SET`: `MODIFY { NAME = name | FILE (…) | FILEGROUP name option |
+    /// (…) | option }`, `COLLATE name`, `ADD [LOG] FILE (…) [, (…)]* [TO
+    /// FILEGROUP name]`, `ADD FILEGROUP name [CONTAINS …]`, `REMOVE {FILE |
+    /// FILEGROUP} name`, `{ADD | REMOVE} SECONDARY ON SERVER name [WITH
+    /// (…)]`, `FAILOVER`, `FORCE_FAILOVER_ALLOW_DATA_LOSS`; `None` for any
+    /// other.
+    fn database_action_end(&self, i: usize) -> Option<usize> {
+        let file_specs = |k: usize| self.comma_list_end(k, |j| self.parens_end(j));
+        if let Some(k) = self.words_end(i, &["MODIFY", "NAME"]) {
+            return self.eq_value_end(k);
+        }
+        if let Some(k) = self.words_end(i, &["MODIFY", "FILE"]) {
+            return self.parens_end(k);
+        }
+        if let Some(k) = self.words_end(i, &["MODIFY", "FILEGROUP"]) {
+            let name = self.option_value_end(k)?;
+            return Some(
+                self.words_end(name, &["NAME"])
+                    .and_then(|n| self.eq_value_end(n))
+                    .or_else(|| {
+                        self.any_words_end(
+                            name,
+                            &[
+                                &["READ_ONLY"],
+                                &["READ_WRITE"],
+                                &["READONLY"],
+                                &["READWRITE"],
+                                &["DEFAULT"],
+                                &["AUTOGROW_SINGLE_FILE"],
+                                &["AUTOGROW_ALL_FILES"],
+                            ],
+                        )
+                    })
+                    .unwrap_or(name),
+            );
+        }
+        if let Some(k) = self.words_end(i, &["MODIFY"]) {
+            return self.parens_end(k).or_else(|| self.option_item_end(k));
+        }
+        if let Some(k) = self.words_end(i, &["COLLATE"]) {
+            return self.option_value_end(k);
+        }
+        if let Some(k) = self.words_end(i, &["ADD", "LOG", "FILE"]) {
+            return file_specs(k);
+        }
+        if let Some(k) = self.words_end(i, &["ADD", "FILE"]) {
+            let end = file_specs(k)?;
+            return Some(
+                self.words_end(end, &["TO", "FILEGROUP"])
+                    .and_then(|g| self.option_value_end(g))
+                    .unwrap_or(end),
+            );
+        }
+        if let Some(k) = self.words_end(i, &["ADD", "FILEGROUP"]) {
+            let end = self.option_value_end(k)?;
+            return Some(
+                self.any_words_end(
+                    end,
+                    &[
+                        &["CONTAINS", "FILESTREAM"],
+                        &["CONTAINS", "MEMORY_OPTIMIZED_DATA"],
+                    ],
+                )
+                .unwrap_or(end),
+            );
+        }
+        if let Some(k) = self.any_words_end(i, &[&["REMOVE", "FILE"], &["REMOVE", "FILEGROUP"]]) {
+            return self.option_value_end(k);
+        }
+        if let Some(k) = self.any_words_end(
+            i,
+            &[
+                &["ADD", "SECONDARY", "ON", "SERVER"],
+                &["REMOVE", "SECONDARY", "ON", "SERVER"],
+            ],
+        ) {
+            let end = self.option_value_end(k)?;
+            return Some(
+                self.words_end(end, &["WITH"])
+                    .and_then(|w| self.parens_end(w))
+                    .unwrap_or(end),
+            );
+        }
+        self.any_words_end(i, &[&["FAILOVER"], &["FORCE_FAILOVER_ALLOW_DATA_LOSS"]])
     }
 }

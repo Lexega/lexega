@@ -4,32 +4,32 @@
 /// Tests for DBX-GRT-SCHEMA-MODIFY — Grant MODIFY on Schema
 ///
 /// Rule ID: DBX-GRT-SCHEMA-MODIFY
-/// Risk: High
+/// Risk: Medium
 /// YAML detail pattern: privilege=MODIFY,object_type=*SCHEMA* (glob on object_type)
 ///
 /// The `*SCHEMA*` glob is the most interesting pattern in the DBX-GRT rules because
 /// it catches future grants where extract_object() returns multi-word object types:
 ///   - `ON FUTURE TABLES IN SCHEMA s` → object_type = "TABLES IN SCHEMA"
 ///   - `ON FUTURE SCHEMAS IN CATALOG c` → object_type = "SCHEMAS IN CATALOG"
-/// Both contain "SCHEMA" and match the `*SCHEMA*` glob.
+///     Both contain "SCHEMA" and match the `*SCHEMA*` glob.
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-SCHEMA-MODIFY";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -49,22 +49,22 @@ fn test_basic_detection() {
 }
 
 #[test]
-fn test_risk_level_is_high() {
+fn test_risk_level_is_medium() {
     let report = analyze_risk("GRANT MODIFY ON SCHEMA my_catalog.my_schema TO etl_role;")
         .expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
-    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
+    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::Medium);
 }
 
 // ─── Object Type Boundary ───
 
 /// MODIFY ON TABLE → object_type="TABLE" → does NOT contain "SCHEMA".
-/// Verified via CLI: 0 DBX-GRT signals for MODIFY ON TABLE.
+/// Verified via CLI: 0 DBX-GRT findings for MODIFY ON TABLE.
 #[test]
 fn test_modify_on_table_does_not_trigger() {
     let rules = analyze_and_get_rules("GRANT MODIFY ON TABLE prod.analytics.orders TO writers;");
@@ -173,7 +173,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {

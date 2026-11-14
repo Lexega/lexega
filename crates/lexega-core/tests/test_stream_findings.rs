@@ -4,7 +4,13 @@
 use lexega_core::api::analyze_risk;
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(
+    report.findings.iter().any(
+        |s| matches!(s, lexega_core::analyzer::RuleMatch::Analysis(g) if g.matched_rule == rule_id),
+    )
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.context.iter().any(
         |s| matches!(s, lexega_core::analyzer::RuleMatch::Analysis(g) if g.matched_rule == rule_id),
     )
 }
@@ -15,16 +21,16 @@ fn test_create_stream_emits_info_c250() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
     println!(
-        "Statement signals count: {}",
-        report.statement_signals.len()
+        "Statement findings count: {}",
+        report.statement_traces.len()
     );
 
     // Show per-statement previews
-    for sig in &report.statement_signals {
+    for sig in &report.statement_traces {
         println!(
             "Statement at line {}: {:?}",
             sig.line_number, sig.statement_preview
@@ -33,8 +39,8 @@ fn test_create_stream_emits_info_c250() {
 
     // Check matched rules
     println!("\nMatched rules:");
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.context {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -43,9 +49,9 @@ fn test_create_stream_emits_info_c250() {
 
     // The actual assertion
     assert!(
-        has_rule(&report, "SNW-STREAM-NEW"),
-        "Should find SNW-STREAM-NEW (Stream Created) rule match. Got {} signals total.",
-        report.summary.total_reported_signals
+        has_context(&report, "SNW-STREAM-NEW"),
+        "Should find SNW-STREAM-NEW (Stream Created) rule match. Got {} context entries total.",
+        report.context.len()
     );
 }
 
@@ -55,13 +61,13 @@ fn test_drop_stream_emits_snw_stream_drop() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
 
     // Check matched rules
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.findings {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -75,7 +81,7 @@ fn test_drop_stream_emits_snw_stream_drop() {
 }
 
 // ============================================================================
-// Task signals
+// Task findings
 // ============================================================================
 
 #[test]
@@ -84,11 +90,11 @@ fn test_create_task_emits_info_c230() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.context {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -96,8 +102,8 @@ fn test_create_task_emits_info_c230() {
     }
 
     assert!(
-        has_rule(&report, "SNW-TASK-NEW"),
-        "Expected SNW-TASK-NEW signal for CREATE TASK"
+        has_context(&report, "SNW-TASK-NEW"),
+        "Expected SNW-TASK-NEW finding for CREATE TASK"
     );
 }
 
@@ -107,11 +113,11 @@ fn test_drop_task_emits_snw_task_drop() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.findings {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -120,12 +126,12 @@ fn test_drop_task_emits_snw_task_drop() {
 
     assert!(
         has_rule(&report, "SNW-TASK-DROP"),
-        "Expected SNW-TASK-DROP signal for DROP TASK"
+        "Expected SNW-TASK-DROP finding for DROP TASK"
     );
 }
 
 // ============================================================================
-// Dynamic Table signals
+// Dynamic Table findings
 // ============================================================================
 
 #[test]
@@ -134,11 +140,11 @@ fn test_create_dynamic_table_emits_info_c220() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.context {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -146,22 +152,22 @@ fn test_create_dynamic_table_emits_info_c220() {
     }
 
     assert!(
-        has_rule(&report, "SNW-DYNTBL-NEW"),
-        "Expected SNW-DYNTBL-NEW signal for CREATE DYNAMIC TABLE"
+        has_context(&report, "SNW-DYNTBL-NEW"),
+        "Expected SNW-DYNTBL-NEW finding for CREATE DYNAMIC TABLE"
     );
 }
 
 #[test]
-fn test_drop_dynamic_table_emits_signal() {
+fn test_drop_dynamic_table_emits_finding() {
     let sql = "DROP DYNAMIC TABLE my_dt;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     println!(
-        "Total reported signals: {}",
-        report.summary.total_reported_signals
+        "Total reported findings: {}",
+        report.summary.total_reported_findings
     );
-    for signal in &report.signals {
-        match signal {
+    for finding in &report.findings {
+        match finding {
             lexega_core::analyzer::RuleMatch::Analysis(g) => {
                 println!("  Rule: {} - {}", g.matched_rule, g.message);
             }
@@ -170,6 +176,6 @@ fn test_drop_dynamic_table_emits_signal() {
 
     assert!(
         has_rule(&report, "SNW-DYNTBL-DROP"),
-        "Expected SNW-DYNTBL-DROP signal for DROP DYNAMIC TABLE"
+        "Expected SNW-DYNTBL-DROP finding for DROP DYNAMIC TABLE"
     );
 }

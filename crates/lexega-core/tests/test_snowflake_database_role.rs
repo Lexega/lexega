@@ -10,10 +10,9 @@ use std::collections::HashSet;
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
         Ok(report) => report
-            .signals
-            .iter()
-            .filter_map(|f| match f {
-                RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+            .entries()
+            .map(|f| match f {
+                RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
             .collect(),
         Err(e) => {

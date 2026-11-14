@@ -23,23 +23,25 @@ use lexega_core::analyzer::AnalysisReport;
 use lexega_core::dialect::mssql;
 
 fn analyze_mssql(sql: &str) -> AnalysisReport {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("analysis should succeed")
 }
 
-fn has_signal(report: &AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| s.rule_id() == Some(rule_id))
+fn has_finding(report: &AnalysisReport, rule_id: &str) -> bool {
+    report.findings.iter().any(|s| s.rule_id() == Some(rule_id))
 }
 
 fn assert_fires(sql: &str, rule_id: &str) {
     let report = analyze_mssql(sql);
     assert!(
-        has_signal(&report, rule_id),
-        "{rule_id} should fire on: {sql}\nsignals: {:?}",
+        has_finding(&report, rule_id),
+        "{rule_id} should fire on: {sql}\nfindings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .filter_map(|s| s.rule_id())
             .collect::<Vec<_>>()
@@ -49,7 +51,7 @@ fn assert_fires(sql: &str, rule_id: &str) {
 fn assert_silent(sql: &str, rule_id: &str) {
     let report = analyze_mssql(sql);
     assert!(
-        !has_signal(&report, rule_id),
+        !has_finding(&report, rule_id),
         "{rule_id} should NOT fire on: {sql}"
     );
 }
@@ -175,14 +177,14 @@ fn grant_to_guest_fires() {
 fn benign_object_grant_fires_no_mssql_grt_rule() {
     let report = analyze_mssql("GRANT SELECT ON OBJECT::dbo.t TO app_user;");
     let fired: Vec<&str> = report
-        .signals
+        .findings
         .iter()
         .filter_map(|s| s.rule_id())
         .filter(|id| id.starts_with("MSSQL-GRT-"))
         .collect();
     assert!(
         fired.is_empty(),
-        "unexpected MSSQL-GRT-* signals: {fired:?}"
+        "unexpected MSSQL-GRT-* findings: {fired:?}"
     );
 }
 
@@ -191,7 +193,7 @@ fn deny_of_dangerous_permission_fires_no_mssql_grt_rule() {
     // DENY is a restriction, not an escalation — the MSSQL-GRT-* family
     // gates on kind: grant.
     let report = analyze_mssql("DENY CONTROL SERVER TO l;");
-    assert!(!has_signal(&report, "MSSQL-GRT-CONTROL-SERVER"));
+    assert!(!has_finding(&report, "MSSQL-GRT-CONTROL-SERVER"));
 }
 
 // ── Regressions: server-tier parse fix restores generic rules ────────

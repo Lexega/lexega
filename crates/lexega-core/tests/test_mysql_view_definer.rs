@@ -4,7 +4,7 @@
 //! MySQL `CREATE VIEW` security-context prelude — `ALGORITHM`, `DEFINER`, and
 //! `SQL SECURITY { DEFINER | INVOKER }`.
 //!
-//! The governance signal for a view is the DEFINER account plus the SQL
+//! The governance finding for a view is the DEFINER account plus the SQL
 //! SECURITY mode — together they decide whose privileges the view's query runs
 //! under. A view with SQL SECURITY DEFINER (the MySQL default) can expose rows
 //! the caller could not read directly. The clauses are parsed into typed
@@ -29,7 +29,7 @@ fn mysql_cfg() -> AnalysisConfig {
 fn rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &mysql_cfg()).expect("should analyze");
     report
-        .signals
+        .findings
         .iter()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
@@ -39,8 +39,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 /// query is pretty-printed (Pattern B), so byte-exactness is not asserted —
 /// only token preservation + that nothing was skipped.
 fn parses_token_safe(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mysql();
+    let config = FormatterConfig {
+        dialect: dialect::mysql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("formatter must preserve all tokens");
@@ -137,12 +139,12 @@ fn custom_rule_ids(sql: &str, custom_yaml: &str) -> Vec<String> {
         build_v1_rule_corpus(custom, /* include_builtins = */ false).expect("corpus builds");
     let cfg = AnalysisConfig {
         dialect: Some(dialect::mysql()),
-        custom_rules: Some(corpus),
+        custom_rules: Some(corpus.into()),
         ..Default::default()
     };
     let report = analyze_risk_with_policy_config(sql, &cfg).expect("should analyze");
     report
-        .signals
+        .findings
         .iter()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()

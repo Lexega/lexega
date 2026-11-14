@@ -16,21 +16,32 @@ use crate::template::records::PlaceholderRecord;
 /// This function tokenizes the SQL and tracks clause context to determine
 /// where the placeholder appears (WHERE, FROM, SELECT, etc.)
 pub fn classify_placeholder(rendered_sql: &str, placeholder: &PlaceholderRecord) -> ImpactZone {
-    // Control-flow placeholders (no position) are not in SQL output
-    if placeholder.render_start == 0
-        && placeholder.render_end == 0
-        && !placeholder.placeholder_text.starts_with("__LEXEGA_PH_")
-    {
-        return ImpactZone::Other; // Control flow, not in SQL
-    }
+    classify_placeholders(rendered_sql, std::slice::from_ref(placeholder))
+        .into_iter()
+        .next()
+        .unwrap_or(ImpactZone::Other)
+}
 
-    // If placeholder wasn't found in output (render_start/end still 0 but is sentinel)
-    // it may have been in a false branch - treat as Other
-    if placeholder.render_start == 0 && placeholder.render_end == 0 {
-        return ImpactZone::Other;
+/// [`classify_placeholder`] of each of `placeholders`, in their order, read
+/// in one pass over the rendered SQL's tokens.
+pub fn classify_placeholders(
+    rendered_sql: &str,
+    placeholders: &[PlaceholderRecord],
+) -> Vec<ImpactZone> {
+    // A placeholder with no position (control flow, or one in a branch not
+    // rendered) is not in the SQL output.
+    let mut zones = vec![ImpactZone::Other; placeholders.len()];
+    let mut positioned: Vec<(usize, usize)> = placeholders
+        .iter()
+        .enumerate()
+        .filter(|(_, placeholder)| placeholder.render_start != 0 || placeholder.render_end != 0)
+        .map(|(index, placeholder)| (placeholder.render_start, index))
+        .collect();
+    if positioned.is_empty() {
+        return zones;
     }
-
-    let placeholder_byte_pos = placeholder.render_start;
+    positioned.sort_unstable();
+    let mut pending = positioned.into_iter().peekable();
 
     // Tokenize and track clause context
     let lex_result = tokenize(rendered_sql);
@@ -51,17 +62,15 @@ pub fn classify_placeholder(rendered_sql: &str, placeholder: &PlaceholderRecord)
     let mut _in_drop = false;
 
     for token in &lex_result.tokens {
-        let token_start = token.span.start as usize;
         let token_end = token.span.end as usize;
 
-        // If we've passed the placeholder position, return current zone
-        if token_start > placeholder_byte_pos {
-            return current_zone;
+        // A placeholder this token holds, or one the scan has passed, is in
+        // the current zone.
+        while let Some((_, index)) = pending.next_if(|(at, _)| *at < token_end) {
+            zones[index] = current_zone.clone();
         }
-
-        // If this token IS the placeholder, return current zone
-        if token_start <= placeholder_byte_pos && token_end > placeholder_byte_pos {
-            return current_zone;
+        if pending.peek().is_none() {
+            return zones;
         }
 
         // Track parentheses for subquery/nested context
@@ -188,8 +197,11 @@ pub fn classify_placeholder(rendered_sql: &str, placeholder: &PlaceholderRecord)
         }
     }
 
-    // The placeholder's recorded position lies in no token.
-    current_zone
+    // The placeholders whose recorded position lies in no token.
+    for (_, index) in pending {
+        zones[index] = current_zone.clone();
+    }
+    zones
 }
 
 /// Statistics from placeholder classification
@@ -254,9 +266,8 @@ pub fn compute_placeholder_stats(
         ..Default::default()
     };
 
-    for placeholder in placeholders {
-        let zone = classify_placeholder(rendered_sql, placeholder);
-
+    let zones = classify_placeholders(rendered_sql, placeholders);
+    for (placeholder, zone) in placeholders.iter().zip(zones) {
         if zone == ImpactZone::Unknown {
             stats.unknown += 1;
             stats.high_impact += 1; // Unknown is always counted as high-impact
@@ -351,6 +362,47 @@ mod tests {
             zone
         );
         assert!(zone.is_high_impact());
+    }
+
+    #[test]
+    fn placeholders_classified_together_are_classified_as_each_alone() {
+        let sql = "SELECT __LEXEGA_PH_000003__ FROM a JOIN __LEXEGA_PH_000001__ ON a.id = b.id \
+                   WHERE __LEXEGA_PH_000002__ = 1";
+        let at = |text: &str| sql.find(text).expect("placeholder in the SQL");
+        let placeholders = [
+            make_placeholder(
+                1,
+                at("__LEXEGA_PH_000001__"),
+                at("__LEXEGA_PH_000001__") + 18,
+            ),
+            make_placeholder(
+                2,
+                at("__LEXEGA_PH_000002__"),
+                at("__LEXEGA_PH_000002__") + 18,
+            ),
+            make_placeholder(
+                3,
+                at("__LEXEGA_PH_000003__"),
+                at("__LEXEGA_PH_000003__") + 18,
+            ),
+            make_placeholder(4, 0, 0),
+            make_placeholder(5, sql.len() + 4, sql.len() + 4),
+        ];
+        let alone: Vec<ImpactZone> = placeholders
+            .iter()
+            .map(|placeholder| classify_placeholder(sql, placeholder))
+            .collect();
+        assert_eq!(
+            alone,
+            [
+                ImpactZone::Join,
+                ImpactZone::Where,
+                ImpactZone::Select,
+                ImpactZone::Other,
+                ImpactZone::Where,
+            ]
+        );
+        assert_eq!(classify_placeholders(sql, &placeholders), alone);
     }
 
     #[test]

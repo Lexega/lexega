@@ -165,7 +165,7 @@ fn test_sample_rows_variations() {
         let ast = parse_stmt_from_str(sql);
         assert!(ast.is_some(), "Failed to parse: {}", sql);
 
-        let formatted = format_sql(sql).expect(&format!("Failed to format: {}", sql));
+        let formatted = format_sql(sql).unwrap_or_else(|_| panic!("Failed to format: {}", sql));
         assert!(
             formatted.contains("SAMPLE"),
             "Missing SAMPLE in: {}",

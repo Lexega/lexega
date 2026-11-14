@@ -150,3 +150,57 @@ fn test_create_task_call() {
     let formatted = format_sql(sql).expect("should parse");
     verify_formatting_safe(sql, &formatted).expect("should preserve tokens");
 }
+
+/// The one statement `sql` holds, which must be read whole.
+fn one_statement(sql: &str) -> lexega_syntax::AstStmt {
+    let script = lexega_syntax::parse_sql(sql).expect("should parse");
+    let [stmt] = script.stmts.as_slice() else {
+        panic!("{sql}: expected one statement, got {:?}", script.stmts);
+    };
+    stmt.clone()
+}
+
+/// A task whose body is a scripting block holds the whole block, `END` included.
+#[test]
+fn test_create_task_block_body_is_one_statement() {
+    for sql in [
+        "CREATE TASK t WAREHOUSE = w SCHEDULE = '1 minute' AS BEGIN SELECT 1; END;",
+        "CREATE TASK t AS BEGIN LET s := 'DELETE FROM o WHERE id = ' || :v; EXECUTE IMMEDIATE :s; END;",
+        "CREATE TASK t AS DECLARE n INT DEFAULT 1; BEGIN SELECT :n; END;",
+    ] {
+        let lexega_syntax::AstStmt::CreateTask(task) = one_statement(sql) else {
+            panic!("{sql}: not a CREATE TASK");
+        };
+        assert!(
+            matches!(task.body.as_ref(), Some(Ok(body)) if matches!(**body, lexega_syntax::AstStmt::Block { .. })),
+            "{sql}: body {:?}",
+            task.body
+        );
+        let formatted = format_sql(sql).expect("should format");
+        verify_formatting_safe(sql, &formatted).expect("should preserve tokens");
+    }
+}
+
+/// `BEGIN TRANSACTION` as a task's body stays a transaction statement.
+#[test]
+fn test_create_task_transaction_body_is_no_block() {
+    let sql = "CREATE TASK t AS BEGIN TRANSACTION;";
+    let lexega_syntax::AstStmt::CreateTask(task) = one_statement(sql) else {
+        panic!("not a CREATE TASK");
+    };
+    assert!(
+        matches!(task.body.as_ref(), Some(Ok(body)) if !matches!(**body, lexega_syntax::AstStmt::Block { .. })),
+        "body {:?}",
+        task.body
+    );
+}
+
+/// `ALTER TASK … MODIFY AS` takes a scripting block too.
+#[test]
+fn test_alter_task_modify_as_block_is_one_statement() {
+    let sql = "ALTER TASK t MODIFY AS BEGIN SELECT 1; END;";
+    assert!(matches!(
+        one_statement(sql),
+        lexega_syntax::AstStmt::AlterTask(_)
+    ));
+}

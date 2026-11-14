@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use lexega_core::context::RenderContext;
-use lexega_core::formatter::config::FormatterConfig;
+use lexega_core::formatter::config::{FormatterConfig, LineBreak};
 use lexega_core::formatter::Formatter;
 #[cfg(debug_assertions)]
 use lexega_core::lexer;
@@ -44,6 +44,7 @@ pub fn format_batch(
     fail_on_missing_packages: bool,
     quiet_mode: bool,
     ext: &dyn Extension,
+    projects: &lexega_core::template::ProjectsOnDisk,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let total = files.len();
     if !quiet_mode {
@@ -65,6 +66,7 @@ pub fn format_batch(
             fail_on_missing_packages,
             quiet: quiet_mode,
             batch: true,
+            projects,
         })?)
     } else {
         None
@@ -83,8 +85,8 @@ pub fn format_batch(
         }
 
         // Read file
-        let input = match fs::read_to_string(path) {
-            Ok(content) => content,
+        let source = match super::io::read_sql_file(path) {
+            Ok(source) => source,
             Err(e) => {
                 if !quiet_mode {
                     eprintln!();
@@ -95,8 +97,7 @@ pub fn format_batch(
             }
         };
 
-        // Strip UTF-8 BOM if present
-        let input = strip_bom(&input);
+        let input = source.text.as_str();
 
         // Template/rendering path
         let has_jinja = enable_jinja || has_jinja_syntax(input);
@@ -106,7 +107,7 @@ pub fn format_batch(
 
         let input_for_formatting = if should_render_jinja {
             if let Some(ref mut renderer) = shared_renderer {
-                match renderer.render(input) {
+                match renderer.render(Some(path.as_path()), input) {
                     Ok(sql) => sql,
                     Err(e) => {
                         eprintln!();
@@ -176,20 +177,10 @@ pub fn format_batch(
         if has_jinja {
             fmt_ctx = fmt_ctx.mark_as_template();
         }
+        let ending = LineEnding::of(input_for_parse, config);
         let formatter = Formatter::with_config(config.clone());
-        let formatted = match formatter.format_script(fmt_ctx, &script) {
-            Ok(formatted_ctx) => match formatted_ctx.formatted() {
-                Some(fc) => fc.formatted_sql().to_string(),
-                None => {
-                    eprintln!();
-                    eprintln!(
-                        "ERROR {}: Formatting failed - no output generated",
-                        path_str
-                    );
-                    error_count += 1;
-                    continue;
-                }
-            },
+        let rendered = match formatter.format_script(fmt_ctx, &script) {
+            Ok(rendered) => rendered,
             Err(e) => {
                 eprintln!();
                 eprintln!("ERROR {}: Format error: {}", path_str, e);
@@ -197,6 +188,41 @@ pub fn format_batch(
                 continue;
             }
         };
+        let Some(formatted_ctx) = rendered.formatted() else {
+            eprintln!();
+            eprintln!(
+                "ERROR {}: Formatting failed - no output generated",
+                path_str
+            );
+            error_count += 1;
+            continue;
+        };
+        let formatted = ending.file_text(formatted_ctx.formatted_sql());
+
+        // The text to be written must read as the input, every span copied as
+        // written byte for byte, before it is checked, counted as verified or
+        // written.
+        if !config.skip_verification {
+            let verified = lexega_core::verify_formatting_safe_with_dialect(
+                input_for_parse,
+                &formatted,
+                config.dialect.as_ref(),
+            )
+            .and_then(|()| {
+                lexega_core::verify_copied_spans(
+                    input_for_parse,
+                    &formatted,
+                    formatted_ctx.copied_spans(),
+                )
+            });
+            if let Err(msg) = verified {
+                eprintln!();
+                eprintln!("ERROR {}: Formatting verification failed:", path_str);
+                eprintln!("{}", msg);
+                error_count += 1;
+                continue;
+            }
+        }
 
         // Verify if requested
         if verify_mode && parse_sql_with_dialect(&formatted, config.dialect.as_ref()).is_err() {
@@ -211,7 +237,7 @@ pub fn format_batch(
 
         // Check mode - just report if different
         if check_mode {
-            if formatted != input_for_parse {
+            if !ending.already_formatted(input_for_parse, &formatted) {
                 eprintln!();
                 eprintln!("ERROR {}: Would reformat", path_str);
                 error_count += 1;
@@ -229,7 +255,8 @@ pub fn format_batch(
 
         // Write back if requested
         if write_back {
-            if let Err(e) = fs::write(path, &formatted) {
+            // Written back in the encoding it was read in.
+            if let Err(e) = fs::write(path, source.encoding.encode(&formatted)) {
                 eprintln!();
                 eprintln!("ERROR {}: Write error: {}", path_str, e);
                 error_count += 1;
@@ -276,10 +303,67 @@ pub fn format_batch(
     Ok(())
 }
 
+/// The line ending a file is written with.
+#[derive(Clone, Copy)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    /// The ending the formatter writes `text` with under `config`.
+    fn of(text: &str, config: &FormatterConfig) -> Self {
+        let tokens =
+            lexega_core::lexer::tokenize_with_dialect(text, config.dialect.as_ref()).tokens;
+        match config.newline_style.resolve(text, &tokens) {
+            LineBreak::Crlf => Self::Crlf,
+            LineBreak::Lf => Self::Lf,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::Crlf => "\r\n",
+        }
+    }
+
+    /// `formatted`, the formatter's text, as a file's text: one final line
+    /// break is added where it has none.
+    fn file_text(self, formatted: &str) -> String {
+        let mut text = formatted.to_string();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push_str(self.as_str());
+        }
+        text
+    }
+
+    /// Whether `source` is already `formatted`, a missing final line break
+    /// aside.
+    fn already_formatted(self, source: &str, formatted: &str) -> bool {
+        let expected = self.file_text(formatted);
+        self.without_final_break(&expected) == self.without_final_break(source)
+    }
+
+    fn without_final_break(self, text: &str) -> &str {
+        text.strip_suffix(self.as_str()).unwrap_or(text)
+    }
+}
+
+/// Whether `a` and `b` name the same existing file.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    matches!((dunce::canonicalize(a), dunce::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// Whether `path` is a glob pattern.
+fn is_glob(path: &str) -> bool {
+    path.contains('*') || path.contains('?')
+}
+
 /// Handle the `fmt` subcommand for SQL formatting
 pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
     // Parse arguments (skip program name and "fmt" subcommand)
-    let mut input_file: Option<String> = None;
+    let mut inputs: Vec<String> = Vec::new();
     let mut output_file: Option<String> = None;
     let mut style: Option<String> = None;
     #[cfg(debug_assertions)]
@@ -600,7 +684,10 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
             }
             "--dialect" => {
                 if i + 1 >= args.len() {
-                    eprintln!("Error: --dialect requires a value (snowflake|postgresql|bigquery|databricks|redshift)");
+                    eprintln!(
+                        "Error: --dialect requires a value ({})",
+                        super::io::DIALECT_OPTIONS
+                    );
                     process::exit(1);
                 }
                 dialect_name = Some(args[i + 1].clone());
@@ -708,17 +795,15 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
                 process::exit(1);
             }
             _ => {
-                if input_file.is_none() {
-                    input_file = Some(args[i].clone());
-                } else {
-                    eprintln!("Error: Multiple input files specified");
-                    print_fmt_usage(&args[0], ext);
-                    process::exit(1);
-                }
+                inputs.push(args[i].clone());
                 i += 1;
             }
         }
     }
+
+    // The first input names where `.lexega.toml` is looked for and, with one
+    // input, what is read.
+    let input_file = inputs.first().cloned();
 
     // Rendering templates is up to the build.
     if force_render_jinja
@@ -728,6 +813,25 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         || dbt_profile.is_some()
     {
         ext.authorize(&args[0], &[Capability::TemplateRendering]);
+    }
+
+    // A rendering run writes rendered SQL: over its source it would destroy
+    // the template.
+    if !jinja_preserve
+        && (force_render_jinja || !jinja_vars.is_empty() || !jinja_var_files.is_empty())
+    {
+        if write_back {
+            eprintln!("Error: --write would replace the templates with their rendered SQL.");
+            eprintln!("Drop --var, --var-file and --render-jinja to format the templates as written, or write the rendered SQL of one file elsewhere with -o <file>.");
+            process::exit(1);
+        }
+        if let (Some(out), Some(input)) = (&output_file, &input_file) {
+            if is_same_file(Path::new(out), Path::new(input)) {
+                eprintln!("Error: --output names the input file, which would be replaced by its rendered SQL.");
+                eprintln!("Drop --var, --var-file and --render-jinja to format the template as written, or write the rendered SQL to another file.");
+                process::exit(1);
+            }
+        }
     }
 
     // Load base configuration from file or use default
@@ -741,30 +845,28 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
             }
         }
     } else if !no_config {
-        // Auto-discover .lexega.toml from input file directory
-        if let Some(ref input) = input_file {
-            let input_path = std::path::Path::new(input);
-            if let Some(discovered_path) = FormatterConfig::discover(input_path) {
-                match FormatterConfig::from_toml_file(&discovered_path) {
-                    Ok(cfg) => {
-                        eprintln!("Using config file: {}", discovered_path.display());
-                        cfg
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to load discovered config file '{}': {}",
-                            discovered_path.display(),
-                            e
-                        );
-                        eprintln!("Falling back to default configuration");
-                        FormatterConfig::default()
-                    }
+        // Auto-discover .lexega.toml from the first input, or the working
+        // directory when the input is standard input
+        let start = input_file
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        match start.as_deref().and_then(FormatterConfig::discover) {
+            Some(discovered_path) => match FormatterConfig::from_toml_file(&discovered_path) {
+                Ok(cfg) => {
+                    eprintln!("Using config file: {}", discovered_path.display());
+                    cfg
                 }
-            } else {
-                FormatterConfig::default()
-            }
-        } else {
-            FormatterConfig::default()
+                Err(e) => {
+                    eprintln!(
+                        "Error loading config file '{}': {}",
+                        discovered_path.display(),
+                        e
+                    );
+                    process::exit(1);
+                }
+            },
+            None => FormatterConfig::default(),
         }
     } else {
         // --no-config flag provided, skip config file loading
@@ -1121,42 +1223,59 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         }
     }
 
-    // Handle batch mode (directory or glob patterns)
-    if let Some(ref path) = input_file {
-        let path_obj = Path::new(path);
-        let is_directory = path_obj.is_dir();
-        let is_glob = path.contains('*') || path.contains('?');
+    // The run's one reading of the dbt projects it finds on disk.
+    let projects = lexega_core::template::ProjectsOnDisk::default();
 
-        if is_directory || is_glob {
-            // Batch mode
-            if write_back && check_mode {
-                eprintln!("Error: --write and --check are mutually exclusive");
+    // Batch mode: several inputs, a directory or a glob pattern
+    let is_batch = inputs.len() > 1
+        || inputs
+            .iter()
+            .any(|path| Path::new(path).is_dir() || is_glob(path));
+
+    if is_batch {
+        if write_back && check_mode {
+            eprintln!("Error: --write and --check are mutually exclusive");
+            process::exit(1);
+        }
+        if write_back && verify_only_mode {
+            eprintln!("Error: --write and --verify-only are mutually exclusive");
+            process::exit(1);
+        }
+
+        if output_file.is_some() {
+            eprintln!(
+                "Error: --output cannot be used with several files or directory/glob batch formatting"
+            );
+            process::exit(1);
+        }
+
+        if !(write_back || check_mode || verify_only_mode) {
+            eprintln!("Error: formatting several files needs --write to rewrite them, --check to test them or --verify-only to verify them");
+            process::exit(1);
+        }
+
+        // The pool runs the parser: give workers the parser's documented
+        // minimum stack (rayon's 2 MiB default is below the parse stack
+        // budget, so the graceful depth trip could not fire before the
+        // guard page).
+        let mut pool_builder =
+            rayon::ThreadPoolBuilder::new().stack_size(lexega_core::MIN_PARSE_STACK_BYTES);
+        if let Some(n) = jobs {
+            pool_builder = pool_builder.num_threads(n);
+        }
+        pool_builder.build_global().unwrap_or_else(|e| {
+            eprintln!("Warning: Could not set thread pool size: {}", e);
+        });
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        for path in &inputs {
+            if !is_glob(path) && !Path::new(path).exists() {
+                eprintln!("Error: '{}' does not exist", path);
                 process::exit(1);
             }
-            if write_back && verify_only_mode {
-                eprintln!("Error: --write and --verify-only are mutually exclusive");
-                process::exit(1);
-            }
-
-            if output_file.is_some() {
-                eprintln!("Error: --output cannot be used with directory/glob batch formatting");
-                process::exit(1);
-            }
-
-            // The pool runs the parser: give workers the parser's documented
-            // minimum stack (rayon's 2 MiB default is below the parse stack
-            // budget, so the graceful depth trip could not fire before the
-            // guard page).
-            let mut pool_builder =
-                rayon::ThreadPoolBuilder::new().stack_size(lexega_core::MIN_PARSE_STACK_BYTES);
-            if let Some(n) = jobs {
-                pool_builder = pool_builder.num_threads(n);
-            }
-            pool_builder.build_global().unwrap_or_else(|e| {
-                eprintln!("Warning: Could not set thread pool size: {}", e);
-            });
-
-            let found = collect_sql_files(path, recursive);
+        }
+        let inputs_read: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        for found in collect_sql_files(&inputs_read, recursive, &projects) {
             if !quiet_mode {
                 for skipped in &found.skipped {
                     eprintln!(
@@ -1166,36 +1285,39 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
                     );
                 }
             }
-            let files = found.files;
+            files.extend(found.files);
+        }
+        files.sort();
+        files.dedup();
 
-            if files.is_empty() {
-                eprintln!("No SQL files found matching: {}", path);
+        if files.is_empty() {
+            eprintln!("No SQL files found matching: {}", inputs.join(" "));
+            process::exit(1);
+        }
+
+        match format_batch(
+            files,
+            &config,
+            write_back,
+            check_mode,
+            verify_only_mode,
+            verify_mode,
+            enable_jinja,
+            force_render_jinja,
+            jinja_preserve,
+            &jinja_vars,
+            &jinja_var_files,
+            dbt_profile.clone(),
+            dbt_project_path.clone(),
+            fail_on_missing_packages,
+            quiet_mode,
+            ext,
+            &projects,
+        ) {
+            Ok(_) => return,
+            Err(e) => {
+                eprintln!("Batch formatting failed: {}", e);
                 process::exit(1);
-            }
-
-            match format_batch(
-                files,
-                &config,
-                write_back,
-                check_mode,
-                verify_only_mode,
-                verify_mode,
-                enable_jinja,
-                force_render_jinja,
-                jinja_preserve,
-                &jinja_vars,
-                &jinja_var_files,
-                dbt_profile.clone(),
-                dbt_project_path.clone(),
-                fail_on_missing_packages,
-                quiet_mode,
-                ext,
-            ) {
-                Ok(_) => return,
-                Err(e) => {
-                    eprintln!("Batch formatting failed: {}", e);
-                    process::exit(1);
-                }
             }
         }
     }
@@ -1204,6 +1326,8 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
     // Auto-detect stdin: if no file provided and stdin is piped (not a TTY), read from stdin
     let use_stdin = use_stdin || (input_file.is_none() && !io::stdin().is_terminal());
 
+    // The encoding a file written out is in: the input file's.
+    let mut input_encoding = lexega_core::extract::SourceEncoding::Utf8;
     // Read input: either from stdin or from the specified file
     let input = if use_stdin {
         let mut buffer = String::new();
@@ -1213,10 +1337,12 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         });
         buffer
     } else if let Some(ref file_path) = input_file {
-        fs::read_to_string(file_path).unwrap_or_else(|e| {
+        let source = super::io::read_sql_file(Path::new(file_path)).unwrap_or_else(|e| {
             eprintln!("Error reading file '{}': {}", file_path, e);
             process::exit(1);
-        })
+        });
+        input_encoding = source.encoding;
+        source.text
     } else {
         eprintln!("Error: No input provided. Provide a filename or pipe input.");
         print_fmt_usage(&args[0], ext);
@@ -1254,6 +1380,7 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
             fail_on_missing_packages,
             quiet: debug_tokens,
             batch: false,
+            projects: &projects,
         }) {
             Ok(renderer) => renderer,
             Err(e) => {
@@ -1262,7 +1389,8 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
             }
         };
 
-        match renderer.render(input) {
+        let read_from = input_file.as_deref().filter(|_| !use_stdin).map(Path::new);
+        match renderer.render(read_from, input) {
             Ok(sql) => {
                 if !debug_tokens {
                     eprintln!("✓ Template rendered successfully");
@@ -1427,8 +1555,10 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         return;
     }
 
+    let ending = LineEnding::of(input, &config);
+
     // Try to parse as a script (multiple statements) first using Result-based API
-    let formatted = match parse_sql_with_dialect(input, config.dialect.as_ref()) {
+    let (formatted, copied) = match parse_sql_with_dialect(input, config.dialect.as_ref()) {
         Ok(script) => {
             // Format
             let mut fmt_ctx = RenderContext::from_source(input);
@@ -1436,20 +1566,20 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
                 fmt_ctx = fmt_ctx.mark_as_template();
             }
             let formatter = Formatter::with_config(config.clone());
-            let formatted_ctx = formatter
+            let rendered = formatter
                 .format_script(fmt_ctx, &script)
                 .unwrap_or_else(|e| {
                     eprintln!("Format error: {}", e);
                     process::exit(1);
                 });
-            formatted_ctx
-                .formatted()
-                .unwrap_or_else(|| {
-                    eprintln!("Format error: no output generated");
-                    process::exit(1);
-                })
-                .formatted_sql()
-                .to_string()
+            let formatted_ctx = rendered.formatted().unwrap_or_else(|| {
+                eprintln!("Format error: no output generated");
+                process::exit(1);
+            });
+            (
+                ending.file_text(formatted_ctx.formatted_sql()),
+                formatted_ctx.copied_spans().to_vec(),
+            )
         }
         Err(script_err) => {
             // Script parsing failed - use rich error formatting
@@ -1476,23 +1606,21 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         }
     };
 
-    // Apply reverse mapping if Jinja was used
-    // For render mode (with variables), output is rendered SQL
-    // For normal format mode, output is the formatted input (with Jinja preserved)
-    let final_output = formatted.clone();
-
     // Perform verification AFTER formatting to catch any data loss
     // ALWAYS verify in both debug and release builds unless explicitly skipped
     // This catches token loss and data corruption before outputting malformed SQL
     let verification_needed = !config.skip_verification;
 
     if verification_needed {
-        // Verify formatting safety (token count, comment preservation, etc.)
-        match lexega_core::verify_formatting_safe_with_dialect(
+        // The text to be written must read as the input, every span copied as
+        // written byte for byte.
+        let verified = lexega_core::verify_formatting_safe_with_dialect(
             input,
             &formatted,
             config.dialect.as_ref(),
-        ) {
+        )
+        .and_then(|()| lexega_core::verify_copied_spans(input, &formatted, &copied));
+        match verified {
             Ok(()) => {
                 if verify_only_mode {
                     if has_jinja {
@@ -1503,11 +1631,7 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
                     process::exit(0);
                 } else if check_mode {
                     // Check mode: verify formatting is safe AND check if content would change
-                    // Normalize trailing newlines for comparison since we always ensure
-                    // output ends with a newline when writing (see println! below)
-                    let input_normalized = input.strip_suffix('\n').unwrap_or(input);
-                    let formatted_normalized = formatted.strip_suffix('\n').unwrap_or(&formatted);
-                    if formatted_normalized != input_normalized {
+                    if !ending.already_formatted(input, &formatted) {
                         eprintln!(
                             "Would reformat: {}",
                             input_file.as_deref().unwrap_or("<stdin>")
@@ -1536,11 +1660,7 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         process::exit(0);
     } else if check_mode {
         // Check mode without verification - still check if content would change
-        // Normalize trailing newlines for comparison since we always ensure
-        // output ends with a newline when writing (see println! below)
-        let input_normalized = input.strip_suffix('\n').unwrap_or(input);
-        let formatted_normalized = formatted.strip_suffix('\n').unwrap_or(&formatted);
-        if formatted_normalized != input_normalized {
+        if !ending.already_formatted(input, &formatted) {
             eprintln!(
                 "Would reformat: {}",
                 input_file.as_deref().unwrap_or("<stdin>")
@@ -1569,7 +1689,7 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
     };
 
     if let Some(out_path) = write_path {
-        fs::write(&out_path, &final_output).unwrap_or_else(|e| {
+        fs::write(&out_path, input_encoding.encode(&formatted)).unwrap_or_else(|e| {
             eprintln!("Error writing to '{}': {}", out_path, e);
             process::exit(1);
         });
@@ -1578,10 +1698,10 @@ pub fn handle_fmt_command(args: &[String], ext: &dyn Extension) {
         }
     } else {
         // Use print! to avoid double newlines, but ensure output ends with newline
-        if final_output.ends_with('\n') {
-            print!("{}", final_output);
+        if formatted.ends_with('\n') {
+            print!("{}", formatted);
         } else {
-            println!("{}", final_output);
+            println!("{}", formatted);
         }
     }
 }

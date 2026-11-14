@@ -27,8 +27,10 @@ fn test_left_join_default_no_normalization() {
 fn test_left_join_with_normalization() {
     let sql = "SELECT * FROM orders o LEFT JOIN customers c ON c.id = o.customer_id";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // With normalization: LEFT JOIN becomes LEFT OUTER JOIN
@@ -52,8 +54,10 @@ fn test_right_join_default_no_normalization() {
 fn test_right_join_with_normalization() {
     let sql = "SELECT * FROM orders o RIGHT JOIN customers c ON c.id = o.customer_id";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // With normalization: RIGHT JOIN becomes RIGHT OUTER JOIN
@@ -70,8 +74,10 @@ fn test_full_outer_join_always_explicit() {
     let result_default = format_sql_with_config(sql, &config_default).unwrap();
     assert!(result_default.contains("FULL OUTER JOIN"));
 
-    let mut config_normalized = FormatterConfig::default();
-    config_normalized.normalize_join_keywords = true;
+    let config_normalized = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result_normalized = format_sql_with_config(sql, &config_normalized).unwrap();
     assert!(result_normalized.contains("FULL OUTER JOIN"));
 }
@@ -85,8 +91,10 @@ fn test_inner_join_unchanged() {
     let result_default = format_sql_with_config(sql, &config_default).unwrap();
     assert!(result_default.contains("INNER JOIN"));
 
-    let mut config_normalized = FormatterConfig::default();
-    config_normalized.normalize_join_keywords = true;
+    let config_normalized = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result_normalized = format_sql_with_config(sql, &config_normalized).unwrap();
     assert!(result_normalized.contains("INNER JOIN"));
 }
@@ -100,8 +108,10 @@ fn test_cross_join_unchanged() {
     let result_default = format_sql_with_config(sql, &config_default).unwrap();
     assert!(result_default.contains("CROSS JOIN"));
 
-    let mut config_normalized = FormatterConfig::default();
-    config_normalized.normalize_join_keywords = true;
+    let config_normalized = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result_normalized = format_sql_with_config(sql, &config_normalized).unwrap();
     assert!(result_normalized.contains("CROSS JOIN"));
 }
@@ -122,8 +132,10 @@ fn test_natural_left_join_default_no_normalization() {
 fn test_natural_left_join_with_normalization() {
     let sql = "SELECT * FROM orders o NATURAL LEFT JOIN customers c";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // With normalization: NATURAL LEFT JOIN becomes NATURAL LEFT OUTER JOIN
@@ -147,8 +159,10 @@ fn test_natural_right_join_default_no_normalization() {
 fn test_natural_right_join_with_normalization() {
     let sql = "SELECT * FROM orders o NATURAL RIGHT JOIN customers c";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // With normalization: NATURAL RIGHT JOIN becomes NATURAL RIGHT OUTER JOIN
@@ -175,8 +189,10 @@ fn test_multiple_joins_mixed() {
     assert!(!result_default.contains("OUTER"));
 
     // Test with normalization
-    let mut config_normalized = FormatterConfig::default();
-    config_normalized.normalize_join_keywords = true;
+    let config_normalized = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result_normalized = format_sql_with_config(sql, &config_normalized).unwrap();
     assert!(result_normalized.contains("LEFT OUTER JOIN"));
     assert!(result_normalized.contains("RIGHT OUTER JOIN"));
@@ -200,8 +216,10 @@ fn test_directed_left_join_no_normalization() {
 fn test_directed_left_join_with_normalization() {
     let sql = "SELECT * FROM orders o DIRECTED LEFT JOIN customers c ON c.id = o.customer_id";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // DIRECTED should be preserved, LEFT JOIN should be normalized
@@ -227,8 +245,10 @@ fn test_lateral_left_join_no_normalization() {
 fn test_lateral_left_join_with_normalization() {
     let sql = "SELECT * FROM orders o LATERAL LEFT JOIN customers c ON c.id = o.customer_id";
 
-    let mut config = FormatterConfig::default();
-    config.normalize_join_keywords = true;
+    let config = FormatterConfig {
+        normalize_join_keywords: true,
+        ..Default::default()
+    };
     let result = format_sql_with_config(sql, &config).unwrap();
 
     // LATERAL should be preserved, LEFT JOIN should be normalized

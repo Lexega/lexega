@@ -28,9 +28,10 @@ use lexega_core::{
 // ============================================================================
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn bq_token_kinds(sql: &str) -> Vec<TokenKind> {
@@ -44,7 +45,7 @@ fn bq_token_kinds(sql: &str) -> Vec<TokenKind> {
         .collect()
 }
 
-fn bq_token_lexemes<'a>(sql: &'a str) -> Vec<&'a str> {
+fn bq_token_lexemes(sql: &str) -> Vec<&str> {
     let dialect = BigQueryDialect;
     let result = tokenize_with_dialect(sql, &dialect);
     result
@@ -73,7 +74,8 @@ fn test_bq_at_param_single_token() {
     assert_eq!(
         kinds,
         vec![TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            word_operator: None,
         }],
         "@myparam should be a single AtVariable token"
     );
@@ -95,7 +97,8 @@ fn test_bq_at_param_in_where() {
             matches!(
                 k,
                 TokenKind::Identifier {
-                    kind: IdentifierKind::AtVariable
+                    kind: IdentifierKind::AtVariable,
+                    ..
                 }
             )
         })
@@ -122,7 +125,8 @@ fn test_bq_multiple_at_params() {
             matches!(
                 k,
                 TokenKind::Identifier {
-                    kind: IdentifierKind::AtVariable
+                    kind: IdentifierKind::AtVariable,
+                    ..
                 }
             )
         })
@@ -142,7 +146,8 @@ fn test_bq_at_param_reserved_keyword_from() {
     assert_eq!(
         kinds,
         vec![TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            word_operator: None,
         }]
     );
 }
@@ -180,7 +185,8 @@ fn test_bq_double_at_accepted() {
     assert_eq!(
         kinds,
         vec![TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            word_operator: None,
         }]
     );
 }
@@ -301,8 +307,10 @@ UPDATE settings SET value = @new_val WHERE key = @setting_key;
 #[test]
 fn test_bq_at_param_risk_analysis() {
     let sql = "SELECT * FROM users WHERE id = @user_id AND status = @status;";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis should succeed with @param");
     assert!(
@@ -318,8 +326,10 @@ fn test_bq_at_param_risk_multi_statement() {
 SELECT * FROM orders WHERE customer_id = @cust_id;
 DELETE FROM expired_sessions WHERE session_id = @sess_id;
 "#;
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis should succeed");
     assert!(

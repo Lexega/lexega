@@ -138,7 +138,7 @@ impl<'a> Parser<'a> {
         let (if_span, exists_span) = self.try_parse_if_exists();
 
         // Index name (possibly schema-qualified)
-        let name = self.parse_schema_qualified_name()?;
+        let name = self.parse_object_name_span()?;
 
         // T-SQL: `ALTER INDEX name ON <object> <maintenance>` (PG has no ON here)
         if matches!(
@@ -170,7 +170,7 @@ impl<'a> Parser<'a> {
         let on_span = self.expect_keyword(Keyword::On)?;
 
         // Target object (possibly schema-qualified)
-        let object = self.parse_schema_qualified_name()?;
+        let object = self.parse_object_name_span()?;
 
         // Maintenance keyword: REBUILD | REORGANIZE | DISABLE | SET
         let tok = self.peek_non_trivia().ok_or_else(|| {
@@ -303,7 +303,7 @@ impl<'a> Parser<'a> {
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["RENAME".to_string()])?;
                 let to_span = self.expect_keyword(Keyword::To)?;
-                let new_name = self.parse_schema_qualified_name()?;
+                let new_name = self.parse_object_name_span()?;
                 Ok(AlterIndexSubAction::RenameTo {
                     rename_span: rename_tok.span,
                     to_span,
@@ -332,7 +332,7 @@ impl<'a> Parser<'a> {
                     let tablespace_tok = self
                         .advance()
                         .ok_or_eof(self.current_span(), vec!["TABLESPACE".to_string()])?;
-                    let tablespace_name = self.parse_schema_qualified_name()?;
+                    let tablespace_name = self.parse_object_name_span()?;
                     Ok(AlterIndexSubAction::SetTablespace {
                         set_span: set_tok.span,
                         tablespace_span: tablespace_tok.span,
@@ -373,7 +373,7 @@ impl<'a> Parser<'a> {
                         partition_span = Some(p.span);
                     }
                 }
-                let index_name = self.parse_schema_qualified_name()?;
+                let index_name = self.parse_object_name_span()?;
                 Ok(AlterIndexSubAction::AttachPartition {
                     attach_span: attach_tok.span,
                     partition_span,
@@ -393,7 +393,7 @@ impl<'a> Parser<'a> {
                 let ext_tok = self
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["EXTENSION".to_string()])?;
-                let extension_name = self.parse_schema_qualified_name()?;
+                let extension_name = self.parse_object_name_span()?;
                 Ok(AlterIndexSubAction::DependsOnExtension {
                     no_span: None,
                     depends_span: depends_tok.span,
@@ -436,7 +436,7 @@ impl<'a> Parser<'a> {
                 let ext_tok = self
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["EXTENSION".to_string()])?;
-                let extension_name = self.parse_schema_qualified_name()?;
+                let extension_name = self.parse_object_name_span()?;
                 Ok(AlterIndexSubAction::DependsOnExtension {
                     no_span: Some(no_tok.span),
                     depends_span: depends_tok.span,
@@ -561,7 +561,7 @@ impl<'a> Parser<'a> {
             ));
         }
         // tablespace name
-        let tablespace_name = self.parse_schema_qualified_name()?;
+        let tablespace_name = self.parse_object_name_span()?;
 
         // Optional OWNED BY role_name [, ...]
         let mut owned_by_roles = Vec::new();
@@ -577,13 +577,13 @@ impl<'a> Parser<'a> {
                 owned_span = Some(owned_tok.span);
                 by_span = Some(self.expect_keyword(Keyword::By)?);
                 // Parse role list
-                let role_name = self.parse_schema_qualified_name()?;
+                let role_name = self.parse_object_name_span()?;
                 owned_by_roles.push(role_name);
                 // Additional roles separated by commas
                 while let Some(tok) = self.peek_non_trivia() {
                     if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
                         self.advance(); // consume comma
-                        let role_name = self.parse_schema_qualified_name()?;
+                        let role_name = self.parse_object_name_span()?;
                         owned_by_roles.push(role_name);
                     } else {
                         break;
@@ -609,7 +609,7 @@ impl<'a> Parser<'a> {
                 },
             ));
         }
-        let new_tablespace_name = self.parse_schema_qualified_name()?;
+        let new_tablespace_name = self.parse_object_name_span()?;
         let mut end_pos = new_tablespace_name.end;
 
         // Optional NOWAIT
@@ -692,7 +692,7 @@ impl<'a> Parser<'a> {
         // Name: required for INDEX/TABLE/SCHEMA, optional for DATABASE/SYSTEM
         let name = match target_type {
             ReindexTargetType::Index | ReindexTargetType::Table | ReindexTargetType::Schema => {
-                let name_span = self.parse_schema_qualified_name()?;
+                let name_span = self.parse_object_name_span()?;
                 end = name_span.end;
                 Some(name_span)
             }
@@ -702,9 +702,9 @@ impl<'a> Parser<'a> {
                     if !matches!(
                         tok.kind,
                         TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
-                    ) && !self.is_statement_start_token(tok)
+                    ) && !self.is_statement_keyword(tok)
                     {
-                        let name_span = self.parse_schema_qualified_name()?;
+                        let name_span = self.parse_object_name_span()?;
                         end = name_span.end;
                         Some(name_span)
                     } else {
@@ -803,31 +803,6 @@ impl<'a> Parser<'a> {
     // Helpers
     // =========================================================================
 
-    /// Parse a possibly schema-qualified name (e.g., `schema.name` or just `name`).
-    /// Returns the full span covering the entire qualified name.
-    fn parse_schema_qualified_name(&mut self) -> ParseResult<Span> {
-        let first_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["name".to_string()])?;
-        let start = first_tok.span.start;
-        let mut end = first_tok.span.end;
-
-        // Check for dot-separated qualification
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                let part = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["qualified name part".to_string()])?;
-                end = part.span.end;
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span { start, end })
-    }
-
     /// Try to parse IF EXISTS. Returns true if found.
     fn try_parse_if_exists(&mut self) -> (Option<Span>, Option<Span>) {
         if let Some(tok) = self.peek_non_trivia() {
@@ -845,26 +820,5 @@ impl<'a> Parser<'a> {
             }
         }
         (None, None)
-    }
-
-    /// Check if a token could start a new statement (used for optional name detection).
-    fn is_statement_start_token(&self, tok: &crate::lexer::Token) -> bool {
-        matches!(
-            tok.kind,
-            TokenKind::Keyword(Keyword::Select)
-                | TokenKind::Keyword(Keyword::Insert)
-                | TokenKind::Keyword(Keyword::Update)
-                | TokenKind::Keyword(Keyword::Delete)
-                | TokenKind::Keyword(Keyword::Create)
-                | TokenKind::Keyword(Keyword::Alter)
-                | TokenKind::Keyword(Keyword::Drop)
-                | TokenKind::Keyword(Keyword::Grant)
-                | TokenKind::Keyword(Keyword::Revoke)
-                | TokenKind::Keyword(Keyword::Deny)
-                | TokenKind::Keyword(Keyword::Truncate)
-                | TokenKind::Keyword(Keyword::Begin)
-                | TokenKind::Keyword(Keyword::Commit)
-                | TokenKind::Keyword(Keyword::Rollback)
-        )
     }
 }

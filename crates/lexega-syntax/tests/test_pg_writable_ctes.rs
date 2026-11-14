@@ -21,9 +21,10 @@ use lexega_syntax::{
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 fn sf_config() -> FormatterConfig {
@@ -69,7 +70,7 @@ fn pg_parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

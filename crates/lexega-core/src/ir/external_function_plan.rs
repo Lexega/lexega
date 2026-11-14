@@ -83,12 +83,12 @@ fn scheme_of(url: &str) -> Option<String> {
 
 fn upper_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|sp| slice_span(source, sp))
-        .map(|t| t.trim().trim_matches('\'').trim().to_ascii_uppercase())
+        .map(|t| crate::ir::span_extract::literal_value_or_text(t).to_ascii_uppercase())
         .filter(|s| !s.is_empty())
 }
 
 fn dequote_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|sp| slice_span(source, sp))
-        .map(|t| t.trim().trim_matches('\'').trim().to_string())
+        .map(crate::ir::span_extract::literal_value_or_text)
         .filter(|s| !s.is_empty())
 }

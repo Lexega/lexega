@@ -50,20 +50,16 @@ fn test_select_missing_from_expression() {
 fn test_unclosed_parenthesis() {
     // Currently may succeed with partial parse
     let result = try_parse_stmt_from_str("SELECT * FROM (SELECT * FROM users");
-    match result {
-        Ok(_) => {}  // Parser may be lenient
-        Err(_) => {} // Or it may fail
-    }
+    // Either outcome is accepted: the parser may be lenient or strict.
+    let _ = result;
 }
 
 #[test]
 fn test_invalid_create_table() {
     // CREATE TABLE without name - currently returns Some
     let result = try_parse_stmt_from_str("CREATE TABLE");
-    match result {
-        Ok(_) => {}  // Parser is lenient
-        Err(_) => {} // Or strict
-    }
+    // Either outcome is accepted: the parser may be lenient or strict.
+    let _ = result;
 }
 
 #[test]
@@ -131,26 +127,24 @@ fn test_unclosed_case_expression() {
 fn test_invalid_join() {
     // JOIN without table - currently returns Some
     let result = try_parse_stmt_from_str("SELECT * FROM users JOIN");
-    match result {
-        Ok(_) => {}  // Parser is lenient
-        Err(_) => {} // Or strict
-    }
+    // Either outcome is accepted: the parser may be lenient or strict.
+    let _ = result;
 }
 
 #[test]
 fn test_join_missing_on() {
     // JOIN without ON/USING - currently returns Some
     let result = try_parse_stmt_from_str("SELECT * FROM users JOIN orders");
-    match result {
-        Ok(_) => {}  // Parser is lenient
-        Err(_) => {} // Or strict
-    }
+    // Either outcome is accepted: the parser may be lenient or strict.
+    let _ = result;
 }
 
 #[test]
 fn test_invalid_scripting_block() {
-    let result = try_parse_stmt_from_str("BEGIN");
-    assert!(result.is_err(), "BEGIN without END should fail");
+    let result = try_parse_stmt_from_str("BEGIN SELECT 1;");
+    assert!(result.is_err(), "a block without END should fail");
+    // `BEGIN` alone is a transaction, as the script reads it.
+    assert!(try_parse_stmt_from_str("BEGIN").is_ok());
 }
 
 #[test]
@@ -178,7 +172,7 @@ fn test_script_with_one_invalid_stmt() {
     match result {
         Ok(script) => {
             // Parser succeeded, possibly with partial parse of second statement
-            assert!(script.stmts.len() >= 1);
+            assert!(!script.stmts.is_empty());
         }
         Err(_) => {
             // Or parser failed on invalid second statement
@@ -273,10 +267,8 @@ fn test_invalid_function_call() {
 fn test_invalid_subquery() {
     // Incomplete subquery - parser may be lenient
     let result = try_parse_stmt_from_str("SELECT * FROM (SELECT * FROM");
-    match result {
-        Ok(_) => {}  // Parser is lenient
-        Err(_) => {} // Or strict
-    }
+    // Either outcome is accepted: the parser may be lenient or strict.
+    let _ = result;
 }
 
 #[test]

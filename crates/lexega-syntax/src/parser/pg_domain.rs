@@ -48,26 +48,7 @@ impl<'a> Parser<'a> {
         let domain_keyword = self.last_token_id();
 
         // Domain name (possibly schema-qualified: schema.name)
-        let name_start = self.current_span().start;
-        let name_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["domain name".to_string()])?;
-        let mut domain_name_end = name_tok.span.end;
-
-        // Check for schema qualification (dot)
-        if let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                let after_dot = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["domain name".to_string()])?;
-                domain_name_end = after_dot.span.end;
-            }
-        }
-        let domain_name = Span {
-            start: name_start,
-            end: domain_name_end,
-        };
+        let domain_name = self.parse_object_name_span()?;
 
         // Optional AS keyword
         let mut as_keyword_span = None;
@@ -191,26 +172,7 @@ impl<'a> Parser<'a> {
         let domain_keyword = self.last_token_id();
 
         // Domain name (possibly schema-qualified)
-        let name_start = self.current_span().start;
-        let name_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["domain name".to_string()])?;
-        let mut name_end = name_tok.span.end;
-
-        // Check for schema qualification
-        if let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                let after_dot = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["domain name".to_string()])?;
-                name_end = after_dot.span.end;
-            }
-        }
-        let domain_name = Span {
-            start: name_start,
-            end: name_end,
-        };
+        let domain_name = self.parse_object_name_span()?;
 
         // Parse the action
         let action = self.parse_alter_domain_action()?;
@@ -293,37 +255,14 @@ impl<'a> Parser<'a> {
 
         // Domain names (comma-separated, possibly schema-qualified)
         let mut domain_names = Vec::new();
-        let parse_domain_name_span = |parser: &mut Parser<'a>| -> ParseResult<Span> {
-            let name_start = parser.current_span().start;
-            let name_tok = parser
-                .advance()
-                .ok_or_eof(parser.current_span(), vec!["domain name".to_string()])?;
-            let mut name_end = name_tok.span.end;
-
-            if let Some(tok) = parser.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                    parser.advance(); // dot
-                    let after_dot = parser
-                        .advance()
-                        .ok_or_eof(parser.current_span(), vec!["domain name".to_string()])?;
-                    name_end = after_dot.span.end;
-                }
-            }
-
-            Ok(Span {
-                start: name_start,
-                end: name_end,
-            })
-        };
-
-        let first_name = parse_domain_name_span(self)?;
+        let first_name = self.parse_object_name_span()?;
         let mut end = first_name.end;
         domain_names.push(first_name);
 
         while let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
                 self.advance(); // consume comma
-                let next_name = parse_domain_name_span(self)?;
+                let next_name = self.parse_object_name_span()?;
                 end = next_name.end;
                 domain_names.push(next_name);
             } else {
@@ -636,15 +575,13 @@ impl<'a> Parser<'a> {
                 {
                     // SET SCHEMA new_schema
                     self.advance(); // consume SCHEMA
-                    let schema_tok = self
-                        .advance()
-                        .ok_or_eof(self.current_span(), vec!["schema name".to_string()])?;
+                    let new_schema = self.take_name_or_token_span("schema name")?;
                     Ok(AlterDomainAction::SetSchema {
                         span: Span {
                             start: action_start,
-                            end: schema_tok.span.end,
+                            end: new_schema.end,
                         },
-                        new_schema: schema_tok.span,
+                        new_schema,
                     })
                 } else {
                     Err(crate::error::ParseError::new(
@@ -767,15 +704,13 @@ impl<'a> Parser<'a> {
                 if matches!(next.kind, TokenKind::Keyword(Keyword::To)) {
                     // RENAME TO new_name
                     self.advance(); // consume TO
-                    let new_name_tok = self
-                        .advance()
-                        .ok_or_eof(self.current_span(), vec!["new name".to_string()])?;
+                    let new_name = self.take_name_or_token_span("new name")?;
                     Ok(AlterDomainAction::RenameTo {
                         span: Span {
                             start: action_start,
-                            end: new_name_tok.span.end,
+                            end: new_name.end,
                         },
-                        new_name: new_name_tok.span,
+                        new_name,
                     })
                 } else if matches!(next.kind, TokenKind::Keyword(Keyword::Constraint)) {
                     // RENAME CONSTRAINT old_name TO new_name
@@ -826,15 +761,13 @@ impl<'a> Parser<'a> {
                     .ok_or_eof(self.current_span(), vec!["TO".to_string()])?;
 
                 // new_owner | CURRENT_ROLE | CURRENT_USER | SESSION_USER
-                let owner_tok = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["owner name".to_string()])?;
+                let new_owner = self.take_name_or_token_span("owner name")?;
                 Ok(AlterDomainAction::OwnerTo {
                     span: Span {
                         start: action_start,
-                        end: owner_tok.span.end,
+                        end: new_owner.end,
                     },
-                    new_owner: owner_tok.span,
+                    new_owner,
                 })
             }
 

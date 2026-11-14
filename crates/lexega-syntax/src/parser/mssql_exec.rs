@@ -12,7 +12,7 @@ use crate::ast::types::{AstImpersonationPrincipalKind, AstMssqlExec, AstMssqlExe
 use crate::ast::AstStmt;
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{NamePosition, Parser};
 
 impl<'a> Parser<'a> {
     /// Parse an MSSQL `EXEC` or `EXECUTE` statement.
@@ -58,7 +58,8 @@ impl<'a> Parser<'a> {
         if matches!(
             next.kind,
             TokenKind::Identifier {
-                kind: crate::lexer::IdentifierKind::AtVariable
+                kind: crate::lexer::IdentifierKind::AtVariable,
+                ..
             }
         ) {
             // Save position and look ahead for '='
@@ -93,11 +94,10 @@ impl<'a> Parser<'a> {
             )
         })?;
 
-        // The first component of a qualified name can be a keyword (e.g., "master") or identifier
-        if !self.can_be_identifier_token(proc_first)
-            && !matches!(proc_first.kind, TokenKind::Keyword(_))
-        {
-            return Err(ParseError::new(
+        // The qualified name (`master..xp_cmdshell` omits a part); its last
+        // part is the procedure's own name.
+        let name = self.parse_object_ref().map_err(|_| {
+            ParseError::new(
                 proc_first.span,
                 ParseErrorKind::InvalidStatement {
                     message: format!(
@@ -105,69 +105,39 @@ impl<'a> Parser<'a> {
                         Parser::token_description(proc_first, self.source)
                     ),
                 },
-            ));
-        }
-
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["procedure name".to_string()])?;
-        let name_start = first.span.start;
-        let mut name_end = first.span.end;
-        // Last dot-part — the base procedure identity.
-        let mut base_name_span = first.span;
-
-        // Consume dot-separated additional parts: .ident [.ident].
-        // T-SQL allows omitted components (`master..xp_cmdshell`): a dot
-        // immediately followed by another dot is an empty slot — skip it
-        // and keep consuming so `base_name_span` lands on the final real
-        // part (the procedure's own name).
-        while let Some(dot_tok) = self.peek_non_trivia() {
-            if !matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            self.advance(); // consume dot
-            let part = self.peek_non_trivia().ok_or_else(|| {
-                ParseError::new(
-                    self.current_span(),
-                    ParseErrorKind::InvalidStatement {
-                        message: "Expected identifier after dot in qualified procedure name"
-                            .to_string(),
-                    },
-                )
-            })?;
-            // Omitted middle component: leave the next dot for the loop.
-            if matches!(part.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                name_end = dot_tok.span.end;
-                continue;
-            }
-            if !self.can_be_identifier_token(part) && !matches!(part.kind, TokenKind::Keyword(_)) {
-                return Err(ParseError::new(
-                    part.span,
-                    ParseErrorKind::InvalidStatement {
-                        message: format!(
-                            "Expected identifier after dot, found {}",
-                            Parser::token_description(part, self.source)
-                        ),
-                    },
-                ));
-            }
-            let part_tok = self.advance().ok_or_eof(
-                self.current_span(),
-                vec!["identifier after dot".to_string()],
-            )?;
-            name_end = part_tok.span.end;
-            base_name_span = part_tok.span;
-        }
-
-        let procedure_name_span = Span {
-            start: name_start,
-            end: name_end,
-        };
+            )
+        })?;
+        let procedure_name_span = name.span;
+        let base_name_span = name
+            .parts
+            .iter()
+            .flatten()
+            .flatten()
+            .last()
+            .map_or(name.span, crate::ast::AstNamePart::span);
 
         // Parse arguments (everything until ; or EOF or statement boundary)
-        let (args_span, args) = self.parse_mssql_exec_args()?;
+        let (args_span, mut args) = self.parse_mssql_exec_args()?;
+        let text = |span: Span| {
+            self.source
+                .get(span.start as usize..span.end as usize)
+                .unwrap_or("")
+        };
+        let written: Vec<&str> = match &name.parts {
+            Some(parts) => parts
+                .iter()
+                .map(|part| part.as_ref().map_or("", |part| text(part.span())))
+                .collect(),
+            None => vec![text(base_name_span)],
+        };
+        let procedure = crate::dialect::normalize_routine_name_in(self.dialect, &written);
+        let procedure: Vec<&str> = procedure.iter().map(String::as_str).collect();
+        let secrets = self.record_call_argument_secrets(&procedure, &args);
+        self.template_placeholder_arguments(&mut args, &secrets);
 
-        let end = args_span.map(|s| s.end).unwrap_or(name_end);
+        let end = self
+            .read_exec_options()
+            .unwrap_or(args_span.map(|s| s.end).unwrap_or(procedure_name_span.end));
 
         Ok(AstStmt::MssqlExec(Box::new(AstMssqlExec {
             node_id: self.id_gen.next(),
@@ -294,7 +264,7 @@ impl<'a> Parser<'a> {
                 let server = self
                     .peek_non_trivia()
                     .ok_or_eof(self.current_span(), vec!["linked server name".to_string()])?;
-                if !self.can_be_identifier_token(server) {
+                let Some(server_span) = self.take_name_span(NamePosition::Object) else {
                     return Err(ParseError::new(
                         server.span,
                         ParseErrorKind::InvalidStatement {
@@ -304,13 +274,13 @@ impl<'a> Parser<'a> {
                             ),
                         },
                     ));
-                }
-                let server_tok = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["linked server name".to_string()])?;
-                at_linked_server_span = Some(server_tok.span);
-                stmt_end = server_tok.span.end;
+                };
+                at_linked_server_span = Some(server_span);
+                stmt_end = server_span.end;
             }
+        }
+        if let Some(options_end) = self.read_exec_options() {
+            stmt_end = options_end;
         }
 
         Ok(AstStmt::MssqlExec(Box::new(AstMssqlExec {
@@ -340,7 +310,9 @@ impl<'a> Parser<'a> {
     ///   - With OUTPUT: `@param = @var OUTPUT`
     ///   - DEFAULT keyword
     ///
-    /// Returns `None` if there are no arguments. Consumes until `;` or EOF.
+    /// Returns `None` if there are no arguments. The list ends at `;`, the
+    /// end of input, or a token that starts a statement (`GO` included): no
+    /// argument begins with one.
     pub(crate) fn parse_mssql_exec_args(
         &mut self,
     ) -> ParseResult<(Option<Span>, Vec<crate::ast::AstCallArg>)> {
@@ -349,13 +321,6 @@ impl<'a> Parser<'a> {
             None => return Ok((None, Vec::new())),
         };
 
-        // If the next token is a semicolon or statement-starting keyword, no args
-        if matches!(next.kind, TokenKind::Punctuation(Punctuation::Semi))
-            || matches!(next.kind, TokenKind::Eof)
-        {
-            return Ok((None, Vec::new()));
-        }
-
         let args_start = next.span.start;
         let mut args_end = next.span.start;
         let mut typed_args: Vec<crate::ast::AstCallArg> = Vec::new();
@@ -363,14 +328,10 @@ impl<'a> Parser<'a> {
         // Parse each argument as a typed expression with optional
         // `@name =` / `name =>` prefix. Continue past commas.
         while let Some(tok) = self.peek_non_trivia() {
-            // Stop on semicolon / EOF / GO batch separator.
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
-                || matches!(tok.kind, TokenKind::Eof)
-            {
-                break;
-            }
-            if matches!(tok.kind, TokenKind::Identifier { .. })
-                && tok.lexeme(self.source).eq_ignore_ascii_case("GO")
+            if matches!(
+                tok.kind,
+                TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+            ) || self.should_stop_scan_at_statement_start(tok)
             {
                 break;
             }
@@ -386,7 +347,8 @@ impl<'a> Parser<'a> {
             if matches!(
                 tok.kind,
                 TokenKind::Identifier {
-                    kind: crate::lexer::IdentifierKind::AtVariable
+                    kind: crate::lexer::IdentifierKind::AtVariable,
+                    ..
                 }
             ) {
                 let name_span = tok.span;
@@ -409,6 +371,8 @@ impl<'a> Parser<'a> {
                             name_id = Some(crate::ast::AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: name_span,
+                                kind: crate::ast::AstIdentifierKind::Variable,
+                                templated: None,
                             });
                             name_op_span = Some(eq_span);
                         } else {
@@ -435,11 +399,13 @@ impl<'a> Parser<'a> {
             // T-SQL trailing modifier keywords (OUTPUT, OUT, READONLY)
             // ride after the expression; absorb into the arg span.
             while let Some(post) = self.peek_non_trivia() {
-                let absorb = matches!(post.kind, TokenKind::Keyword(crate::lexer::Keyword::Output))
-                    || matches!(post.kind, TokenKind::Identifier { .. }) && {
-                        let lex = post.lexeme(self.source);
-                        lex.eq_ignore_ascii_case("OUT") || lex.eq_ignore_ascii_case("READONLY")
-                    };
+                let absorb = matches!(
+                    post.kind,
+                    TokenKind::Keyword(crate::lexer::Keyword::Output | crate::lexer::Keyword::Out)
+                ) || matches!(post.kind, TokenKind::Identifier { .. }) && {
+                    let lex = post.lexeme(self.source);
+                    lex.eq_ignore_ascii_case("OUT") || lex.eq_ignore_ascii_case("READONLY")
+                };
                 if !absorb {
                     break;
                 }
@@ -481,6 +447,28 @@ impl<'a> Parser<'a> {
         } else {
             Ok((None, typed_args))
         }
+    }
+
+    /// Consumes EXEC's `WITH <execute_option> [, …]` where it follows;
+    /// returns the end of the last option.
+    fn read_exec_options(&mut self) -> Option<u32> {
+        self.peek_non_trivia()?;
+        let end = self.with_list_end(self.idx, |k| self.exec_option_end(k))?;
+        self.idx = end;
+        self.tokens.get(end - 1).map(|last| last.span.end)
+    }
+
+    /// The index past one `<execute_option>` at `k`: `RECOMPILE`, or
+    /// `RESULT SETS { UNDEFINED | NONE | ( <result_sets_definition>, … ) }`.
+    fn exec_option_end(&self, k: usize) -> Option<usize> {
+        if self.word_at(k, "RECOMPILE") {
+            return Some(k + 1);
+        }
+        let sets = self.words_end(k, &["RESULT", "SETS"])?;
+        if self.word_at(sets, "UNDEFINED") || self.word_at(sets, "NONE") {
+            return Some(sets + 1);
+        }
+        self.parens_end(sets)
     }
 }
 
@@ -543,12 +531,31 @@ impl<'a> Parser<'a> {
         let mut trailing_span = None;
         if let Some(with_tok) = self.peek_non_trivia() {
             if matches!(with_tok.kind, TokenKind::Keyword(Keyword::With)) {
+                let bound = self.clauses_bound(
+                    self.words_end(self.idx, &["WITH", "NO", "REVERT"])
+                        .or_else(|| {
+                            self.words_end(self.idx, &["WITH", "COOKIE", "INTO"])
+                                .filter(|&k| {
+                                    self.tokens.get(k).is_some_and(|t| {
+                                        matches!(
+                                            t.kind,
+                                            TokenKind::Identifier {
+                                                kind: crate::lexer::IdentifierKind::AtVariable,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                })
+                                .map(|k| k + 1)
+                        })
+                        .unwrap_or(self.idx + 1),
+                );
                 let with_start = with_tok.span.start;
                 self.advance(); // WITH
                 let mut with_end = with_tok.span.end;
-                // Consume the WITH body up to statement end; flag NO REVERT.
+                // Consume the WITH body up to its end; flag NO REVERT.
                 let mut prev_was_no = false;
-                while let Some(t) = self.peek_non_trivia() {
+                while let Some(t) = self.peek_non_trivia().filter(|_| self.idx < bound) {
                     if matches!(
                         t.kind,
                         TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
@@ -598,10 +605,16 @@ impl<'a> Parser<'a> {
         let mut with_cookie_span = None;
         if let Some(with_tok) = self.peek_non_trivia() {
             if matches!(with_tok.kind, TokenKind::Keyword(Keyword::With)) {
+                // `WITH COOKIE = @cookie`.
+                let bound = self.clauses_bound(
+                    self.words_end(self.idx, &["WITH", "COOKIE"])
+                        .and_then(|k| self.eq_value_end(k))
+                        .unwrap_or(self.idx + 1),
+                );
                 let with_start = with_tok.span.start;
                 self.advance(); // WITH
                 let mut with_end = with_tok.span.end;
-                while let Some(t) = self.peek_non_trivia() {
+                while let Some(t) = self.peek_non_trivia().filter(|_| self.idx < bound) {
                     if matches!(
                         t.kind,
                         TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof

@@ -9,7 +9,7 @@
 //! - ALTER SCHEMA SET DBPROPERTIES, OWNER TO, PREDICTIVE OPTIMIZATION, DEFAULT COLLATION
 //! - ALTER SCHEMA SET/UNSET TAGS (Databricks-style with TAGS Identifier)
 //! - DROP SCHEMA CASCADE/RESTRICT (already supported, sanity check)
-//! - Signal emission and YAML rule matching (DBX-SCHEMA-*)
+//! - Finding emission and YAML rule matching (DBX-SCHEMA-*)
 //! - Formatting round-trip (verify_formatting_safe)
 //! - Multi-statement evidence counting
 
@@ -49,9 +49,16 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -92,13 +99,13 @@ fn test_create_schema_managed_location_with_if_not_exists() {
 }
 
 #[test]
-fn test_create_schema_managed_location_signal() {
+fn test_create_schema_managed_location_finding() {
     let sql = "CREATE SCHEMA my_schema MANAGED LOCATION 's3://depts/finance';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-SCHEMA-MGLOC"),
-        "Should detect DBX-SCHEMA-MGLOC (Schema Managed Location Set). Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-SCHEMA-MGLOC"),
+        "Should detect DBX-SCHEMA-MGLOC (Schema Managed Location Set). Findings: {:?}",
+        report.context
     );
 }
 
@@ -112,13 +119,13 @@ fn test_create_schema_location() {
 }
 
 #[test]
-fn test_create_schema_location_signal() {
+fn test_create_schema_location_finding() {
     let sql = "CREATE SCHEMA my_schema LOCATION '/samplepath';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-SCHEMA-LOC"),
-        "Should detect DBX-SCHEMA-LOC (Schema Location Set). Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-SCHEMA-LOC"),
+        "Should detect DBX-SCHEMA-LOC (Schema Location Set). Findings: {:?}",
+        report.context
     );
 }
 
@@ -166,17 +173,17 @@ fn test_alter_schema_set_dbproperties() {
 }
 
 #[test]
-fn test_alter_schema_set_dbproperties_signal() {
+fn test_alter_schema_set_dbproperties_finding() {
     let sql = "ALTER SCHEMA my_schema SET DBPROPERTIES ('Edited-by' = 'John');";
     let report = dbx_analyze(sql);
     // DBX-SCHEMA-DBPROPS-CHG matches condition: modified on AlterSchemaStatement
     // SCHEMA-PROPS-CHG also matches modified condition
     let has_schema_props =
-        has_signal(&report, "SCHEMA-PROPS-CHG") || has_signal(&report, "DBX-SCHEMA-DBPROPS-CHG");
+        has_finding(&report, "SCHEMA-PROPS-CHG") || has_finding(&report, "DBX-SCHEMA-DBPROPS-CHG");
     assert!(
         has_schema_props,
-        "Should detect schema modification signal. Signals: {:?}",
-        report.signals
+        "Should detect schema modification finding. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -195,13 +202,13 @@ fn test_alter_schema_owner_to_without_set() {
 }
 
 #[test]
-fn test_alter_schema_owner_to_signal() {
+fn test_alter_schema_owner_to_finding() {
     let sql = "ALTER SCHEMA my_schema OWNER TO `admin_user`;";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-SCHEMA-OWNER-CHG"),
-        "Should detect DBX-SCHEMA-OWNER-CHG (Schema Ownership Transferred). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-SCHEMA-OWNER-CHG"),
+        "Should detect DBX-SCHEMA-OWNER-CHG (Schema Ownership Transferred). Findings: {:?}",
+        report.findings
     );
 }
 
@@ -225,13 +232,13 @@ fn test_alter_schema_inherit_predictive_optimization() {
 }
 
 #[test]
-fn test_alter_schema_predictive_optimization_signal() {
+fn test_alter_schema_predictive_optimization_finding() {
     let sql = "ALTER SCHEMA my_schema ENABLE PREDICTIVE OPTIMIZATION;";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-SCHEMA-PREDOPT-CHG"),
-        "Should detect DBX-SCHEMA-PREDOPT-CHG (Schema Predictive Optimization Changed). Signals: {:?}",
-        report.signals
+        has_context(&report, "DBX-SCHEMA-PREDOPT-CHG"),
+        "Should detect DBX-SCHEMA-PREDOPT-CHG (Schema Predictive Optimization Changed). Findings: {:?}",
+        report.context
     );
 }
 
@@ -245,13 +252,13 @@ fn test_alter_schema_default_collation() {
 }
 
 #[test]
-fn test_alter_schema_default_collation_signal() {
+fn test_alter_schema_default_collation_finding() {
     let sql = "ALTER SCHEMA my_schema DEFAULT COLLATION UNICODE_CI_AI;";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-SCHEMA-COLLAT-CHG"),
-        "Should detect DBX-SCHEMA-COLLAT-CHG (Schema Default Collation Changed). Signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-SCHEMA-COLLAT-CHG"),
+        "Should detect DBX-SCHEMA-COLLAT-CHG (Schema Default Collation Changed). Findings: {:?}",
+        report.findings
     );
 }
 
@@ -301,10 +308,9 @@ DROP SCHEMA IF EXISTS old_schema CASCADE;
 
     let report = dbx_analyze(sql);
 
-    // Count total evidence across all signals
+    // Count total evidence across all findings and context entries
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .map(|f| match f {
             RuleMatch::Analysis(ref p) => p.evidence_count.unwrap_or(1),
         })
@@ -312,10 +318,10 @@ DROP SCHEMA IF EXISTS old_schema CASCADE;
 
     assert!(
         total_evidence >= 4,
-        "Should have evidence for each statement. Got {} evidence from {} signals. Signals: {:?}",
+        "Should have evidence for each statement. Got {} evidence from {} entries. Entries: {:?}",
         total_evidence,
-        report.signals.len(),
-        report.signals
+        report.entries().count(),
+        report.entries().collect::<Vec<_>>()
     );
 }
 

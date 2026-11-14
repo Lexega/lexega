@@ -159,8 +159,10 @@ fn test_multiple_statements() {
 fn test_keyword_case_preserved() {
     use lexega_core::formatter::config::{FormatterConfig, KeywordCase};
 
-    let mut config = FormatterConfig::default();
-    config.keyword_case = KeywordCase::Upper;
+    let config = FormatterConfig {
+        keyword_case: KeywordCase::Upper,
+        ..Default::default()
+    };
 
     let sql = "drop table users";
     let formatted = format_sql_with_config(sql, &config);

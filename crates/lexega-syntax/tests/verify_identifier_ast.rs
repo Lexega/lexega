@@ -199,3 +199,39 @@ fn test_identifier_span_still_valid() {
         panic!("Should be a SELECT statement");
     }
 }
+
+#[test]
+fn a_view_named_by_identifier_is_named_by_the_whole_call() {
+    for (sql, name, columns) in [
+        (
+            "CREATE VIEW IDENTIFIER('prod.a.v') AS SELECT 1 AS x",
+            "IDENTIFIER('prod.a.v')",
+            0,
+        ),
+        (
+            "CREATE OR REPLACE SECURE VIEW IDENTIFIER($v) AS SELECT 1 AS x",
+            "IDENTIFIER($v)",
+            0,
+        ),
+        (
+            "CREATE VIEW IDENTIFIER('prod.a.v') (x COMMENT 'c') AS SELECT 1",
+            "IDENTIFIER('prod.a.v')",
+            1,
+        ),
+        (
+            "CREATE MATERIALIZED VIEW IDENTIFIER('prod.a.mv') AS SELECT 1 AS x",
+            "IDENTIFIER('prod.a.mv')",
+            0,
+        ),
+    ] {
+        let stmt = parse_stmt_from_str(sql).expect("parses");
+        let AstStmt::CreateView(view) = &stmt else {
+            panic!("{sql}: {stmt:?}");
+        };
+        let span = view.name.span;
+        assert_eq!(&sql[span.start as usize..span.end as usize], name, "{sql}");
+        assert!(view.name.identifier_arg.is_some(), "{sql}");
+        assert_eq!(view.columns.len(), columns, "{sql}");
+        assert!(view.query.is_ok(), "{sql}");
+    }
+}

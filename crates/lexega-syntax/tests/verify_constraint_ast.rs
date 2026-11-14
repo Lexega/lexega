@@ -165,7 +165,7 @@ fn test_foreign_key_parses() {
             );
 
             assert_eq!(
-                &src[references_table.start as usize..references_table.end as usize],
+                &src[references_table.span.start as usize..references_table.span.end as usize],
                 "users"
             );
 
@@ -220,7 +220,7 @@ fn test_foreign_key_named_multi_column() {
             );
 
             assert_eq!(
-                &src[references_table.start as usize..references_table.end as usize],
+                &src[references_table.span.start as usize..references_table.span.end as usize],
                 "products"
             );
 
@@ -259,7 +259,7 @@ fn test_foreign_key_qualified_table_name() {
             references_table, ..
         } => {
             assert_eq!(
-                &src[references_table.start as usize..references_table.end as usize],
+                &src[references_table.span.start as usize..references_table.span.end as usize],
                 "db.schema.users"
             );
         }

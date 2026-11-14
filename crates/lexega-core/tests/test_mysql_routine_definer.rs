@@ -27,8 +27,7 @@ fn mysql_cfg() -> AnalysisConfig {
 fn rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &mysql_cfg()).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -37,8 +36,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 /// Procedure/function bodies are pretty-printed (Pattern B), so byte-exactness
 /// is not asserted here — only token preservation + that nothing was skipped.
 fn parses_token_safe(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mysql();
+    let config = FormatterConfig {
+        dialect: dialect::mysql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("formatter must preserve all tokens");
@@ -87,8 +88,10 @@ fn test_definer_function_single_line_byte_exact() {
     // A RETURN-form function body is emitted verbatim, so the whole statement —
     // DEFINER clause included — must round-trip byte-for-byte.
     let sql = "CREATE DEFINER=root@localhost FUNCTION f() RETURNS INT RETURN 1;";
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mysql();
+    let config = FormatterConfig {
+        dialect: dialect::mysql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     assert_eq!(out, sql, "byte-exact round-trip expected");
 }
@@ -149,13 +152,12 @@ fn custom_rule_ids(sql: &str, custom_yaml: &str) -> Vec<String> {
         build_v1_rule_corpus(custom, /* include_builtins = */ false).expect("corpus builds");
     let cfg = AnalysisConfig {
         dialect: Some(dialect::mysql()),
-        custom_rules: Some(corpus),
+        custom_rules: Some(corpus.into()),
         ..Default::default()
     };
     let report = analyze_risk_with_policy_config(sql, &cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -226,4 +228,46 @@ fn test_drop_in_definer_procedure_body_fires() {
         "CREATE DEFINER='a'@'%' PROCEDURE p() BEGIN DROP TABLE audit_log; END;",
         "TBL-DROP",
     );
+}
+
+// ── CREATE FUNCTION … SONAME: a function loaded from a shared library ──────
+
+#[test]
+fn loadable_function_is_a_create_function_with_its_library() {
+    for sql in [
+        "CREATE FUNCTION sys_exec RETURNS INTEGER SONAME 'lib_mysqludf_sys.so';",
+        "CREATE AGGREGATE FUNCTION IF NOT EXISTS db1.avgcost RETURNS REAL SONAME 'udf_example.so';",
+    ] {
+        parses_token_safe(sql);
+    }
+    let rule = |library: &str| {
+        format!(
+            r#"
+rules:
+  - id: TEST-LOADABLE
+    risk_level: info
+    message: "function from a shared library"
+    triggers:
+      all_of:
+        - kind: create_function
+        - ddl.function.loadable_library: {library}
+"#
+        )
+    };
+    let sql = "CREATE FUNCTION sys_exec RETURNS INTEGER SONAME 'lib_mysqludf_sys.so';";
+    assert!(
+        custom_rule_ids(sql, &rule("lib_mysqludf_sys.so")).contains(&"TEST-LOADABLE".to_string())
+    );
+    assert!(custom_rule_ids(sql, &rule("other.so")).is_empty());
+    // A function with a body has no library.
+    let body = "CREATE FUNCTION f(a INT) RETURNS INT DETERMINISTIC RETURN a + 1;";
+    assert!(custom_rule_ids(body, &rule("lib_mysqludf_sys.so")).is_empty());
+}
+
+#[test]
+fn loadable_function_raises_mysql_udf_soname() {
+    let ids = rule_ids("CREATE FUNCTION sys_exec RETURNS INTEGER SONAME 'lib_mysqludf_sys.so';");
+    assert!(ids.contains(&"MYSQL-UDF-SONAME".to_string()), "{ids:?}");
+    let ids = rule_ids("CREATE FUNCTION f(a INT) RETURNS INT DETERMINISTIC RETURN a + 1;");
+    assert!(!ids.contains(&"MYSQL-UDF-SONAME".to_string()), "{ids:?}");
 }

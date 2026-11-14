@@ -38,6 +38,56 @@ fn test_snowflake_reserved_keywords() {
 }
 
 #[test]
+fn each_built_in_dialect_gives_a_word_the_class_of_its_keyword_list() {
+    use lexega_syntax::dialect::{self, KeywordClass};
+    let cases = [
+        (
+            dialect::snowflake(),
+            "current",
+            Some(KeywordClass::Reserved),
+        ),
+        (
+            dialect::snowflake(),
+            "Join",
+            Some(KeywordClass::NotTableAlias),
+        ),
+        (
+            dialect::snowflake(),
+            "merge",
+            Some(KeywordClass::Unreserved),
+        ),
+        (
+            dialect::postgres(),
+            "where",
+            Some(KeywordClass::ReservedLabelAfterAs),
+        ),
+        (
+            dialect::postgres(),
+            "end",
+            Some(KeywordClass::ReservedBareLabel),
+        ),
+        (
+            dialect::postgres(),
+            "year",
+            Some(KeywordClass::LabelAfterAs),
+        ),
+        (dialect::mysql(), "key", Some(KeywordClass::Reserved)),
+        (dialect::mssql(), "plan", Some(KeywordClass::Reserved)),
+        (dialect::bigquery(), "rows", Some(KeywordClass::Reserved)),
+        (dialect::databricks(), "users", None),
+        (dialect::redshift(), "users", None),
+    ];
+    for (dialect, word, class) in cases {
+        assert_eq!(
+            dialect.keyword_class(word),
+            class,
+            "{} {word}",
+            dialect.name()
+        );
+    }
+}
+
+#[test]
 fn test_parsing_with_default_dialect() {
     // Test that parsing still works with default Snowflake dialect
     let sql = "SELECT * FROM users WHERE id > 10";
@@ -89,4 +139,79 @@ fn test_snowflake_operators() {
 
     // => for named arguments
     assert!(dialect.supports_named_args_operator());
+}
+
+#[test]
+fn a_date_part_is_named_alike_everywhere_and_abbreviated_per_dialect() {
+    use lexega_syntax::ast::DatePart;
+    for name in [
+        "snowflake",
+        "bigquery",
+        "postgresql",
+        "databricks",
+        "mysql",
+        "mssql",
+        "redshift",
+    ] {
+        let dialect = lexega_syntax::dialect_from_name(name).expect("dialect");
+        assert_eq!(dialect.date_part("day"), Some(DatePart::Day), "{name}");
+        assert_eq!(
+            dialect.date_part("Quarters"),
+            Some(DatePart::Quarter),
+            "{name}"
+        );
+        assert_eq!(dialect.date_part("nosuch"), None, "{name}");
+    }
+    // One abbreviation, three parts.
+    for (name, part) in [
+        ("snowflake", Some(DatePart::Minute)),
+        ("redshift", Some(DatePart::Minute)),
+        ("mssql", Some(DatePart::Month)),
+        ("bigquery", None),
+    ] {
+        let dialect = lexega_syntax::dialect_from_name(name).expect("dialect");
+        assert_eq!(dialect.date_part("m"), part, "{name}");
+    }
+    let mysql = lexega_syntax::dialect_from_name("mysql").expect("dialect");
+    assert_eq!(mysql.date_part("SQL_TSI_DAY"), Some(DatePart::Day));
+}
+
+#[test]
+fn an_interval_takes_the_units_it_took() {
+    use lexega_syntax::ast::DatePart;
+    let units = [
+        "DAY",
+        "HOUR",
+        "MINUTE",
+        "SECOND",
+        "MILLISECOND",
+        "MICROSECOND",
+        "MONTH",
+        "YEAR",
+        "WEEK",
+        "QUARTER",
+    ];
+    for unit in units {
+        for word in [
+            unit.to_string(),
+            format!("{unit}S"),
+            unit.to_ascii_lowercase(),
+        ] {
+            let part = DatePart::from_name(&word).expect("a part");
+            assert!(part.is_interval_unit(), "{word}");
+        }
+    }
+    for word in [
+        "DOW",
+        "NANOSECOND",
+        "ISOWEEK",
+        "EPOCH",
+        "HOUR_MINUTE",
+        "DATE",
+    ] {
+        assert!(
+            !DatePart::from_name(word).is_some_and(DatePart::is_interval_unit),
+            "{word}"
+        );
+    }
 }

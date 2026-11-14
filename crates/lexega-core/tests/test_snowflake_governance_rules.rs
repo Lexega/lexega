@@ -8,12 +8,12 @@ use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-/// Helper to extract rule IDs from signals
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+/// Helper to extract rule IDs from findings
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -21,7 +21,17 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
 /// Helper to run analysis and get rule IDs
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
+        Err(e) => {
+            eprintln!("Parse error: {:?}", e);
+            HashSet::new()
+        }
+    }
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    match analyze_risk(sql) {
+        Ok(report) => extract_rule_ids(&report.context),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -121,8 +131,8 @@ fn test_snw_api_intg_credchg() {
 fn test_snw_api_intg_credrmv() {
     let sql = "ALTER API INTEGRATION my_api_int UNSET API_KEY;";
     let rules = analyze_and_get_rules(sql);
-    // SNW-API-INTG-CREDRMV fires for API key unset - check if signal is emitted
-    // Note: This may depend on specific signal emission logic
+    // SNW-API-INTG-CREDRMV fires for API key unset - check if finding is emitted
+    // Note: This may depend on specific finding emission logic
     println!("SNW-API-INTG-CREDRMV test - rules found: {:?}", rules);
 }
 
@@ -169,7 +179,7 @@ fn test_snw_stg_tag_rmv_stage_tag_removed() {
 fn test_snw_stg_intg_chg_stage_storage_integration_changed() {
     // SNW-STG-INTG-CHG = Storage integration changed on stage
     let sql = "ALTER STAGE my_stage SET STORAGE_INTEGRATION = my_storage_int;";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-STG-INTG-CHG"),
         "SNW-STG-INTG-CHG should fire for stage storage integration changed. Got: {:?}",
@@ -269,7 +279,7 @@ fn test_snw_mask_exempt_on_masking_policy_exempt_other_policies() {
 #[test]
 fn test_snw_netpol_new_network_policy_created() {
     let sql = "CREATE NETWORK POLICY my_policy ALLOWED_IP_LIST = ('192.168.1.0/24');";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-NETPOL-NEW"),
         "SNW-NETPOL-NEW should fire for network policy created. Got: {:?}",
@@ -280,7 +290,7 @@ fn test_snw_netpol_new_network_policy_created() {
 #[test]
 fn test_snw_netpol_rulelist_cfg_network_policy_rule_list() {
     let sql = "CREATE NETWORK POLICY my_np ALLOWED_NETWORK_RULE_LIST = ('rule1');";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-NETPOL-RULELIST-CFG"),
         "SNW-NETPOL-RULELIST-CFG should fire for network policy with rule list. Got: {:?}",
@@ -398,7 +408,7 @@ fn test_snw_stgintg_drop() {
 #[test]
 fn test_snw_stgintg_new_off() {
     let sql = "CREATE STORAGE INTEGRATION my_si TYPE = EXTERNAL_STAGE STORAGE_PROVIDER = 'S3' STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123:role/x' ENABLED = FALSE;";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-STGINTG-NEW-OFF"),
         "SNW-STGINTG-NEW-OFF should fire for storage integration created but disabled. Got: {:?}",
@@ -524,7 +534,7 @@ fn test_snw_sesspol_uiidle_longset() {
 #[test]
 fn test_snw_sesspol_idle_chg() {
     let sql = "ALTER SESSION POLICY my_policy SET SESSION_IDLE_TIMEOUT_MINS = 120;";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-SESSPOL-IDLE-CHG"),
         "SNW-SESSPOL-IDLE-CHG should fire for idle timeout modified. Got: {:?}",
@@ -638,7 +648,7 @@ fn test_snw_pwdpol_lockout_cut() {
 #[test]
 fn test_snw_pwdpol_minlen_unset() {
     let sql = "ALTER PASSWORD POLICY p UNSET PASSWORD_MIN_LENGTH;";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-PWDPOL-MINLEN-UNSET"),
         "SNW-PWDPOL-MINLEN-UNSET should fire for min length UNSET. Got: {:?}",
@@ -675,7 +685,7 @@ fn test_c143_aggregation_policy_low_group_size() {
 #[test]
 fn test_c144_aggregation_policy_conditional() {
     let sql = "CREATE AGGREGATION POLICY agg_pol AS () RETURNS AGGREGATION_CONSTRAINT -> CASE WHEN 1=1 THEN AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 5) END;";
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-AGGPOL-COND"),
         "SNW-AGGPOL-COND should fire for conditional logic. Got: {:?}",

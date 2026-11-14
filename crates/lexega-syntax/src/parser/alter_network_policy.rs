@@ -20,6 +20,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{SyntaxAlterNetworkPolicy, SyntaxAlterNetworkPolicyAction};
 
 impl<'a> Parser<'a> {
@@ -182,39 +183,14 @@ impl<'a> Parser<'a> {
                         let tag_span = tag_tok.span;
 
                         // Parse tag assignments: tag1 = 'value1' [, tag2 = 'value2']
-                        let assignments_start = self.current_span().start;
-
-                        // Consume tag assignments (minimal parsing - just find span)
-                        loop {
-                            // Consume tag name (possibly qualified: db.schema.tag_name)
-                            self.parse_qualified_name_span()?;
-                            // Consume =
-                            self.advance();
-                            // Consume value
-                            self.advance();
-
-                            // Check for comma
-                            if let Some(tok) = self.peek_non_trivia() {
-                                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let assignments_end = self.current_span().start;
-                        let assignments_span = Span {
-                            start: assignments_start,
-                            end: assignments_end,
-                        };
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
 
                         let kind = AstAlterNetworkPolicyActionKind::SetTag {
                             set_span,
                             tag_span,
                             assignments_span,
+                            tags,
                         };
 
                         Ok(AstAlterNetworkPolicyAction {
@@ -347,33 +323,13 @@ impl<'a> Parser<'a> {
                         let tag_span = tag_tok.span;
 
                         // Parse tag names: tag1 [, tag2]
-                        let names_start = self.current_span().start;
-
-                        // Consume tag names (minimal parsing)
-                        loop {
-                            self.parse_qualified_name_span()?; // consume tag name (possibly qualified)
-
-                            if let Some(tok) = self.peek_non_trivia() {
-                                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let names_end = self.current_span().start;
-                        let names_span = Span {
-                            start: names_start,
-                            end: names_end,
-                        };
+                        let (names_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                         let kind = AstAlterNetworkPolicyActionKind::UnsetTag {
                             unset_span,
                             tag_span,
                             names_span,
+                            tags,
                         };
 
                         Ok(AstAlterNetworkPolicyAction {

@@ -11,9 +11,10 @@ use lexega_syntax::{
 };
 
 fn db_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = databricks();
-    config
+    FormatterConfig {
+        dialect: databricks(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) -> String {

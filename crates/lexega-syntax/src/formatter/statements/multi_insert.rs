@@ -12,6 +12,7 @@ use crate::ast::{
 };
 use crate::formatter::printer::Printer;
 use crate::formatter::FormatterError;
+use crate::lexer::Span;
 
 /// Format multi-table INSERT statement
 ///
@@ -110,7 +111,7 @@ fn format_into_clause(
     printer.push_keyword("INTO");
 
     // Target table
-    if let Some(table_span) = into_clause.target_table_span {
+    if let Some(table_span) = into_clause.target_table.as_ref().map(|t| t.span) {
         printer.emit_comments_before(table_span.start);
         printer.space();
         printer.push_span(table_span);
@@ -123,8 +124,15 @@ fn format_into_clause(
         printer.push_span(columns_span);
     }
 
-    // VALUES clause (if present)
-    if let Some(values_span) = into_clause.values_span {
+    // VALUES clause (if present), from the keyword through the last row
+    if let Some(keyword) = into_clause.values_keyword_span {
+        let values_span = Span {
+            start: keyword.start,
+            end: into_clause
+                .values_rows_spans
+                .last()
+                .map_or(keyword.end, |row| row.end),
+        };
         printer.emit_comments_before(values_span.start);
 
         if printer.config().multi_insert_values_on_newline {

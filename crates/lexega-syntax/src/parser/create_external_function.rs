@@ -218,6 +218,7 @@ impl<'a> Parser<'a> {
         if !is_lparen {
             return None;
         }
+        let from = self.idx;
         let lp = self.advance().expect_invariant("( consumed after peek");
         let start = lp.span.start;
         let mut end = lp.span.end;
@@ -233,6 +234,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Some(Span { start, end })
     }
 
@@ -250,22 +253,7 @@ impl<'a> Parser<'a> {
     /// returning its covering span. Used for `API_INTEGRATION = <name>` and
     /// translator UDF names.
     fn consume_qualified_value_span(&mut self) -> Option<Span> {
-        self.skip_trivia();
-        let first = self.advance()?;
-        let start = first.span.start;
-        let mut end = first.span.end;
-        loop {
-            let is_dot = matches!(
-                self.peek_non_trivia(),
-                Some(tok) if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot))
-            );
-            if !is_dot {
-                break;
-            }
-            self.advance().expect_invariant(". consumed after peek");
-            let Some(part) = self.advance() else { break };
-            end = part.span.end;
-        }
-        Some(Span { start, end })
+        self.take_name_span(crate::parser::core::NamePosition::Object)
+            .or_else(|| self.advance().map(|value| value.span))
     }
 }

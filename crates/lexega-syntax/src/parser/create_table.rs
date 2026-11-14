@@ -6,11 +6,12 @@
 
 use crate::ast::{
     AstCreateTable, AstCreateTableColumn, AstCreateTableConstraint, AstCreateTableVariant, AstExpr,
-    AstStmt, AstTimeTravel,
+    AstObjectRef, AstStmt, AstTimeTravel,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 /// Helper function to check if a token starts a table option
 #[inline]
@@ -76,18 +77,101 @@ pub(crate) fn is_column_tail_clause_lexeme(lexeme: &str) -> bool {
         || lexeme.eq_ignore_ascii_case("AUTO_INCREMENT")
 }
 
+/// A policy clause as read: the policy's name and the columns of the list
+/// written after it.
+pub(crate) struct PolicyClause {
+    /// The index past the clause.
+    pub(crate) next: usize,
+    pub(crate) policy: AstObjectRef,
+    pub(crate) columns: Vec<Span>,
+}
+
+impl PolicyClause {
+    /// The policy and columns of `clause`, empty where none was read.
+    pub(crate) fn parts(clause: Option<Self>) -> (Option<AstObjectRef>, Vec<Span>) {
+        clause
+            .map(|c| (Some(c.policy), c.columns))
+            .unwrap_or_default()
+    }
+}
+
+/// The policies a table's options name.
+#[derive(Default)]
+struct TablePolicies {
+    row_access: Option<PolicyClause>,
+    aggregation: Option<PolicyClause>,
+    join: Option<PolicyClause>,
+    row_filter: Option<PolicyClause>,
+}
+
+impl TablePolicies {
+    /// `self`, each policy it does not hold taken from `other`.
+    fn or(self, other: Self) -> Self {
+        Self {
+            row_access: self.row_access.or(other.row_access),
+            aggregation: self.aggregation.or(other.aggregation),
+            join: self.join.or(other.join),
+            row_filter: self.row_filter.or(other.row_filter),
+        }
+    }
+}
+
+/// `span`, widened to cover `held` where one is held.
+fn joined(held: Option<Span>, span: Span) -> Span {
+    held.map_or(span, |held| Span {
+        start: held.start.min(span.start),
+        end: held.end.max(span.end),
+    })
+}
+
+/// A `PARTITION OF parent …` clause as read.
+struct PartitionOfClause {
+    /// The index past the clause: its column list and its bound.
+    next: usize,
+    parent: AstObjectRef,
+}
+
+/// The tables the options of a table name as its sources.
+#[derive(Default)]
+struct TableSources {
+    copy: Option<AstObjectRef>,
+    partition_of: Option<AstObjectRef>,
+    inherits: Vec<AstObjectRef>,
+}
+
+impl TableSources {
+    /// `self`, each source it does not hold taken from `other`.
+    fn or(self, other: Self) -> Self {
+        Self {
+            copy: self.copy.or(other.copy),
+            partition_of: self.partition_of.or(other.partition_of),
+            inherits: if self.inherits.is_empty() {
+                other.inherits
+            } else {
+                self.inherits
+            },
+        }
+    }
+}
+
 impl Parser<'_> {
-    /// Parse column definitions and constraints within CREATE TABLE
-    fn parse_create_table_columns_and_constraints(
+    /// Parse column definitions and constraints within CREATE TABLE, and
+    /// the tables of its `LIKE table` items.
+    pub(crate) fn parse_create_table_columns_and_constraints(
         &mut self,
         start_idx: usize,
         end_idx: usize,
-    ) -> (Vec<AstCreateTableColumn>, Vec<AstCreateTableConstraint>) {
+    ) -> (
+        Vec<AstCreateTableColumn>,
+        Vec<AstCreateTableConstraint>,
+        Vec<crate::ast::AstTableLikeItem>,
+    ) {
         let mut columns = Vec::new();
         let mut constraints = Vec::new();
+        let mut like_elements = Vec::new();
 
         if end_idx <= start_idx {
-            return (columns, constraints);
+            return (columns, constraints, like_elements);
         }
 
         // Find comma separators for items
@@ -113,6 +197,10 @@ impl Parser<'_> {
 
         // Process each item
         for (item_start_idx, item_end_idx) in items_ranges {
+            if let Some(table) = self.like_element_in(item_start_idx, item_end_idx) {
+                like_elements.push(table);
+                continue;
+            }
             self.build_create_table_item(
                 item_start_idx,
                 item_end_idx,
@@ -121,7 +209,26 @@ impl Parser<'_> {
             );
         }
 
-        (columns, constraints)
+        (columns, constraints, like_elements)
+    }
+
+    /// The column-list item `LIKE table [INCLUDING …]` in tokens
+    /// `start..end`; `None` for any other item.
+    fn like_element_in(&self, start: usize, end: usize) -> Option<crate::ast::AstTableLikeItem> {
+        let like = self.tokens.get(start)?;
+        if !matches!(like.kind, TokenKind::Keyword(Keyword::Like)) {
+            return None;
+        }
+        let last = self.tokens.get(end.checked_sub(1)?)?;
+        self.object_ref_at(start + 1, self.id_gen.next())
+            .filter(|(next, _)| *next <= end)
+            .map(|(_, table)| crate::ast::AstTableLikeItem {
+                table,
+                span: Span {
+                    start: like.span.start,
+                    end: last.span.end,
+                },
+            })
     }
 
     /// Parse table variant (LIKE, CLONE, AS SELECT, etc.) and associated spans
@@ -144,11 +251,15 @@ impl Parser<'_> {
         Option<Span>,                       // clone_kind_span (Databricks DEEP/SHALLOW keyword)
         Option<Span>,                       // clone_tblproperties_span (Databricks)
         Option<Span>,                       // clone_location_span (Databricks)
-        Option<Span>, // clone_temporal_span (Databricks TIMESTAMP/VERSION AS OF)
+        Option<Span>,         // clone_temporal_span (Databricks TIMESTAMP/VERSION AS OF)
+        Option<AstObjectRef>, // like_source
+        Option<AstObjectRef>, // clone_source
     ) {
         let mut variant = AstCreateTableVariant::Plain;
         let mut like_source_span = None;
         let mut clone_source_span = None;
+        let mut like_source = None;
+        let mut clone_source = None;
         let mut ctas_query_span = None;
         let mut time_travel_at_span = None;
         let mut time_travel_before_span = None;
@@ -196,7 +307,11 @@ impl Parser<'_> {
             if tok.lexeme(self.source).eq_ignore_ascii_case("LIKE") {
                 let start = tok.span.start;
                 self.advance();
-                let mut end = start;
+                // The source's name is read whole: a part named like an
+                // option (`d1.copy.src`) does not end it.
+                self.skip_trivia();
+                like_source = self.parse_object_ref().ok();
+                let mut end = like_source.as_ref().map_or(start, |name| name.span.end);
                 while let Some(t) = self.peek() {
                     match t.kind {
                         TokenKind::Eof
@@ -218,6 +333,10 @@ impl Parser<'_> {
                 let start = tok.span.start;
                 self.advance();
                 let source_start_idx = self.idx;
+                // The source's name is read whole: a part named like a
+                // clause (`d1.version.src`) does not end it.
+                self.skip_trivia();
+                clone_source = self.parse_object_ref().ok();
 
                 // Capture source until time-travel or major clauses
                 while let Some(t) = self.peek() {
@@ -340,7 +459,8 @@ impl Parser<'_> {
                     if t.lexeme(self.source).eq_ignore_ascii_case("TBLPROPERTIES") {
                         let tblprops_start = t.span.start;
                         self.advance(); // consume TBLPROPERTIES
-                                        // Consume balanced parentheses
+                        self.record_option_list_secrets(self.idx);
+                        // Consume balanced parentheses
                         if let Some(lp) = self.peek() {
                             if matches!(
                                 lp.kind,
@@ -388,13 +508,21 @@ impl Parser<'_> {
                         }
                     }
                 }
-            } else if tok.lexeme(self.source).eq_ignore_ascii_case("AS") {
+            } else if tok.lexeme(self.source).eq_ignore_ascii_case("AS")
+                || (matches!(tok.kind, TokenKind::Keyword(Keyword::Select))
+                    && !self.should_stop_scan_at_statement_start(tok))
+            {
                 // CTAS: table options have already been parsed, now consume AS and the query
                 // According to Snowflake docs:
                 // CREATE TABLE name [(cols)] [CLUSTER BY ...] [COPY GRANTS] AS query
+                // MySQL writes the query without `AS` as well. Where a
+                // statement needs no terminator, a `SELECT` here is the next
+                // statement.
                 variant = AstCreateTableVariant::Ctas;
                 let as_start = tok.span.start;
-                self.advance(); // Consume AS
+                if tok.lexeme(self.source).eq_ignore_ascii_case("AS") {
+                    self.advance(); // Consume AS
+                }
 
                 // Check if we're at a Jinja block boundary ({% endif %}, {% endfor %}, etc.)
                 // This allows incomplete CTAS fragments like: CREATE TABLE x AS {% endif %}
@@ -553,6 +681,8 @@ impl Parser<'_> {
             clone_tblproperties_span,
             clone_location_span,
             clone_temporal_span,
+            like_source,
+            clone_source,
         )
     }
 
@@ -635,6 +765,175 @@ impl Parser<'_> {
         (time_travel_at_span, time_travel_before_span)
     }
 
+    /// The policy clause that `alternatives` open at `i`: the policy's name
+    /// after them and, where `columns_after` is written after the name, the
+    /// parenthesised column list that follows it. `None` where neither
+    /// alternative is written or no name follows.
+    fn policy_clause_at(
+        &self,
+        i: usize,
+        alternatives: &[&[&str]],
+        columns_after: Option<&[&str]>,
+    ) -> Option<PolicyClause> {
+        let (next, policy) =
+            self.object_ref_at(self.any_words_end(i, alternatives)?, self.id_gen.next())?;
+        let listed = columns_after
+            .and_then(|words| self.words_end(next, words))
+            .and_then(|open| Some((open, self.parens_end(open)?)));
+        Some(match listed {
+            Some((open, end)) => PolicyClause {
+                next: end,
+                policy,
+                columns: self.column_spans_in_parens(open),
+            },
+            None => PolicyClause {
+                next,
+                policy,
+                columns: Vec::new(),
+            },
+        })
+    }
+
+    /// `[WITH] MASKING POLICY name [USING (col, …)]` at `i`.
+    pub(crate) fn masking_policy_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(
+            i,
+            &[&["WITH", "MASKING", "POLICY"], &["MASKING", "POLICY"]],
+            Some(&["USING"]),
+        )
+    }
+
+    /// Databricks `MASK function [USING COLUMNS (col, …)]` at `i`.
+    pub(crate) fn mask_function_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(i, &[&["MASK"]], Some(&["USING", "COLUMNS"]))
+    }
+
+    /// `[WITH] PROJECTION POLICY name` at `i`.
+    pub(crate) fn projection_policy_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(
+            i,
+            &[&["WITH", "PROJECTION", "POLICY"], &["PROJECTION", "POLICY"]],
+            None,
+        )
+    }
+
+    /// `[WITH] ROW ACCESS POLICY name [ON (col, …)]` at `i`.
+    pub(crate) fn row_access_policy_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(
+            i,
+            &[
+                &["WITH", "ROW", "ACCESS", "POLICY"],
+                &["ROW", "ACCESS", "POLICY"],
+            ],
+            Some(&["ON"]),
+        )
+    }
+
+    /// Databricks `[WITH] ROW FILTER function [ON (col, …)]` at `i`.
+    fn row_filter_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(
+            i,
+            &[&["WITH", "ROW", "FILTER"], &["ROW", "FILTER"]],
+            Some(&["ON"]),
+        )
+    }
+
+    /// `[WITH] AGGREGATION POLICY name` at `i`.
+    pub(crate) fn aggregation_policy_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(
+            i,
+            &[
+                &["WITH", "AGGREGATION", "POLICY"],
+                &["AGGREGATION", "POLICY"],
+            ],
+            None,
+        )
+    }
+
+    /// `[WITH] JOIN POLICY name` at `i`.
+    pub(crate) fn join_policy_at(&self, i: usize) -> Option<PolicyClause> {
+        self.policy_clause_at(i, &[&["WITH", "JOIN", "POLICY"], &["JOIN", "POLICY"]], None)
+    }
+
+    /// The single-token names of the `(col, …)` that opens at `open`.
+    pub(crate) fn column_spans_in_parens(&self, open: usize) -> Vec<Span> {
+        self.parens_end(open)
+            .and_then(|end| self.parse_constraint_column_list(open, end))
+            .unwrap_or_default()
+    }
+
+    /// The index past the names the policy or tag option at `i` holds:
+    /// `ROW ACCESS POLICY name [ON (…)]`, `ROW FILTER name [ON (…)]`,
+    /// `AGGREGATION POLICY name`, `JOIN POLICY name`, `TAG ( name = value
+    /// [, …] )`, each with the `WITH` that may open it. `None` for any other
+    /// option, or where its names are not read whole.
+    fn option_names_end(&self, i: usize) -> Option<usize> {
+        use crate::parser::core::NamePosition;
+        if let Some(clause) = self
+            .row_access_policy_at(i)
+            .or_else(|| self.row_filter_at(i))
+            .or_else(|| self.aggregation_policy_at(i))
+            .or_else(|| self.join_policy_at(i))
+        {
+            return Some(clause.next);
+        }
+        let open = self.any_words_end(i, &[&["WITH", "TAG"], &["TAG"]])?;
+        let close_end = self.parens_end(open)?;
+        let tag = |j: usize| {
+            self.name_span_at(j, NamePosition::Object)
+                .and_then(|(next, _)| self.eq_value_end(next))
+        };
+        (self.comma_list_end(open + 1, tag)? + 1 == close_end).then_some(close_end)
+    }
+
+    /// The `PARTITION OF parent [(columns)] { FOR VALUES … | DEFAULT }` clause
+    /// at `i`. The bound is read through its parentheses (`IN (…)`,
+    /// `FROM (…) TO (…)`, `WITH (…)`); one that is not written that way ends
+    /// the clause where it was last read.
+    fn partition_of_at(&self, i: usize) -> Option<PartitionOfClause> {
+        let name_at = self.words_end(i, &["PARTITION", "OF"])?;
+        let (mut next, parent) = self.object_ref_at(name_at, self.id_gen.next())?;
+        if let Some(end) = self.parens_end(next) {
+            next = end;
+        }
+        if let Some(end) = self.words_end(next, &["DEFAULT"]) {
+            next = end;
+        } else if let Some(values) = self.words_end(next, &["FOR", "VALUES"]) {
+            next = values;
+            let listed = |at: usize| self.parens_end(at);
+            if let Some(end) = self
+                .any_words_end(next, &[&["IN"], &["WITH"]])
+                .and_then(listed)
+            {
+                next = end;
+            } else if let Some(end) = self
+                .words_end(next, &["FROM"])
+                .and_then(listed)
+                .and_then(|to| self.words_end(to, &["TO"]))
+                .and_then(listed)
+            {
+                next = end;
+            }
+        }
+        Some(PartitionOfClause { next, parent })
+    }
+
+    /// The tables of the `INHERITS (a, b)` clause written outside any
+    /// parentheses in tokens `start..end`.
+    fn inherits_in(&self, start: usize, end: usize) -> Vec<AstObjectRef> {
+        let mut i = start;
+        while i < end {
+            if let Some(after) = self.parens_end(i) {
+                i = after;
+            } else if self.word_at(i, "INHERITS") {
+                return self.object_ref_list_at(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        Vec::new()
+    }
+
     /// Parse table options (CLUSTER BY, COPY GRANTS, COPY TAGS, DATA_RETENTION, etc.)
     #[allow(clippy::type_complexity)]
     fn parse_create_table_options(
@@ -664,6 +963,9 @@ impl Parser<'_> {
         bool,                               // dist_key_present (Redshift)
         Option<crate::ast::AstSortKeySpec>, // sort_key (Redshift)
         Option<crate::ast::AstBackupMode>,  // backup (Redshift)
+        Vec<crate::ast::AstTagRef>,         // tags
+        TablePolicies,                      // the policies the options name
+        TableSources,                       // the tables the options name
     ) {
         let mut cluster_by_span = None;
         let mut cluster_by_exprs = None;
@@ -687,6 +989,9 @@ impl Parser<'_> {
         let mut dist_key_present = false;
         let mut sort_key: Option<crate::ast::AstSortKeySpec> = None;
         let mut backup: Option<crate::ast::AstBackupMode> = None;
+        let mut tags: Vec<crate::ast::AstTagRef> = Vec::new();
+        let mut policies = TablePolicies::default();
+        let mut sources = TableSources::default();
 
         if options_end_idx <= options_start_idx {
             return (
@@ -712,8 +1017,12 @@ impl Parser<'_> {
                 dist_key_present,
                 sort_key,
                 backup,
+                tags,
+                policies,
+                sources,
             );
         }
+        sources.inherits = self.inherits_in(options_start_idx, options_end_idx);
 
         // Find option starter keywords
         let mut i = options_start_idx;
@@ -722,6 +1031,18 @@ impl Parser<'_> {
             let tok = &self.tokens[i];
             if is_table_option_starter(tok.lexeme(self.source)) {
                 starter_indices.push(i);
+                // The names a policy or tag option holds are read whole, so
+                // no part of them starts an option (`TAG (gov.comment.t = 'x')`);
+                // nor does the bound of a partition.
+                if let Some(next) = self
+                    .partition_of_at(i)
+                    .map(|clause| clause.next)
+                    .or_else(|| self.option_names_end(i))
+                    .filter(|&next| next <= options_end_idx)
+                {
+                    i = next;
+                    continue;
+                }
             }
             i += 1;
         }
@@ -743,18 +1064,59 @@ impl Parser<'_> {
                 end: end_span,
             };
 
-            if lexeme.eq_ignore_ascii_case("CLUSTER") {
+            // A policy whose name is read whole; the options below hold the
+            // clauses whose names are not.
+            let in_options =
+                |clause: PolicyClause| (clause.next <= options_end_idx).then_some(clause);
+            if let Some(clause) = self.row_access_policy_at(start_idx).and_then(in_options) {
+                if self.word_at(start_idx, "WITH") {
+                    with_row_access_policy_span = Some(opt_span);
+                } else {
+                    row_access_policy_span = Some(opt_span);
+                }
+                policies.row_access = Some(clause);
+            } else if let Some(clause) = self.row_filter_at(start_idx).and_then(in_options) {
+                // A row filter is the row access policy of Databricks: its
+                // clause takes the span of one.
+                if self.word_at(start_idx, "WITH") {
+                    with_row_access_policy_span = Some(opt_span);
+                } else {
+                    row_access_policy_span = Some(opt_span);
+                }
+                policies.row_filter = Some(clause);
+            } else if let Some(clause) = self.aggregation_policy_at(start_idx).and_then(in_options)
+            {
+                aggregation_policy_span = Some(opt_span);
+                policies.aggregation = Some(clause);
+            } else if let Some(clause) = self.join_policy_at(start_idx).and_then(in_options) {
+                join_policy_span = Some(opt_span);
+                policies.join = Some(clause);
+            } else if lexeme.eq_ignore_ascii_case("CLUSTER") {
                 cluster_by_span = Some(opt_span);
                 // Try to parse CLUSTER BY expressions using smart parsing
                 cluster_by_exprs = self.parse_cluster_by_expressions(start_idx, end_idx);
+            } else if let Some(clause) = self
+                .partition_of_at(start_idx)
+                .filter(|clause| clause.next <= options_end_idx)
+            {
+                partition_by_span = Some(joined(partition_by_span, opt_span));
+                sources.partition_of = Some(clause.parent);
             } else if lexeme.eq_ignore_ascii_case("PARTITION") {
-                partition_by_span = Some(opt_span);
+                // A partition that is itself partitioned: both clauses.
+                partition_by_span = Some(joined(partition_by_span, opt_span));
             } else if lexeme.eq_ignore_ascii_case("COPY") {
-                // Distinguish COPY GRANTS from COPY TAGS
+                // COPY TAGS, COPY GRANTS, or BigQuery's COPY table
                 if start_idx + 1 < options_end_idx {
                     let next_lexeme = self.tokens[start_idx + 1].lexeme(self.source);
                     if next_lexeme.eq_ignore_ascii_case("TAGS") {
                         copy_tags_span = Some(opt_span);
+                    } else if next_lexeme.eq_ignore_ascii_case("GRANTS") {
+                        copy_grants_span = Some(opt_span);
+                    } else if let Some((_, table)) = self
+                        .object_ref_at(start_idx + 1, self.id_gen.next())
+                        .filter(|(next, _)| *next <= options_end_idx)
+                    {
+                        sources.copy = Some(table);
                     } else {
                         copy_grants_span = Some(opt_span);
                     }
@@ -781,8 +1143,14 @@ impl Parser<'_> {
                 join_policy_span = Some(opt_span);
             } else if lexeme.eq_ignore_ascii_case("STORAGE") {
                 storage_lifecycle_policy_span = Some(opt_span);
-            } else if lexeme.eq_ignore_ascii_case("TAG") {
+            } else if let Some(open) = self.any_words_end(start_idx, &[&["WITH", "TAG"], &["TAG"]])
+            {
                 tag_span = Some(opt_span);
+                if let Some((_, read)) =
+                    self.parenthesised_tag_list_at(open, TagListShape::Assignments)
+                {
+                    tags = read;
+                }
             } else if lexeme.eq_ignore_ascii_case("ENABLE_SCHEMA_EVOLUTION") {
                 enable_schema_evolution_span = Some(opt_span);
             } else if lexeme.eq_ignore_ascii_case("COMMENT") {
@@ -875,6 +1243,9 @@ impl Parser<'_> {
             dist_key_present,
             sort_key,
             backup,
+            tags,
+            policies,
+            sources,
         )
     }
     pub(crate) fn try_parse_create_table_stmt(&mut self) -> crate::error::ParseResult<AstStmt> {
@@ -885,8 +1256,11 @@ impl Parser<'_> {
             .ok_or_eof(self.current_span(), vec!["CREATE".to_string()])?; // CREATE
         let keyword_span = create_tok.span;
         let mut span = keyword_span;
-        let mut or_replace_span: Option<Span> = None;
+        // Databricks `REPLACE TABLE`: the leading keyword is the replace.
+        let mut or_replace_span: Option<Span> =
+            matches!(create_tok.kind, TokenKind::Keyword(Keyword::Replace)).then_some(keyword_span);
         let mut temp_kind_span: Option<Span> = None;
+        let mut persistence: Option<crate::ast::AstTablePersistence> = None;
         let mut table_kind: Option<crate::ast::AstTableKind> = None;
         let mut table_kind_span: Option<Span> = None;
 
@@ -897,26 +1271,35 @@ impl Parser<'_> {
         let retention_span: Option<Span> = None;
 
         let mut columns: Vec<AstCreateTableColumn> = Vec::new();
+        let mut like_elements: Vec<crate::ast::AstTableLikeItem> = Vec::new();
         let mut constraints: Vec<AstCreateTableConstraint> = Vec::new();
 
-        // Optional OR REPLACE / OR REFRESH (Databricks DLT)
+        // Optional OR REPLACE / OR ALTER (Snowflake) / OR REFRESH (Databricks
+        // DLT). `OR ALTER` alters a table that exists, and `OR REFRESH`
+        // declares a pipeline table that the pipeline updates, rather than
+        // replacing it: each is consumed, and is no `or_replace_span`.
         if let Some(tok) = self.peek() {
             if tok.lexeme(self.source).eq_ignore_ascii_case("OR") {
                 let or_tok = self
                     .advance()
                     .expect_invariant("OR keyword should be available after peek");
                 if let Some(rep_tok) = self.peek() {
-                    if rep_tok.lexeme(self.source).eq_ignore_ascii_case("REPLACE")
-                        || rep_tok.lexeme(self.source).eq_ignore_ascii_case("REFRESH")
-                    {
-                        let rep = self.advance().expect_invariant(
-                            "REPLACE/REFRESH keyword should be available after peek",
-                        );
+                    if rep_tok.lexeme(self.source).eq_ignore_ascii_case("REPLACE") {
+                        let rep = self
+                            .advance()
+                            .expect_invariant("REPLACE keyword should be available after peek");
                         or_replace_span = Some(Span {
                             start: or_tok.span.start,
                             end: rep.span.end,
                         });
                         span.end = rep.span.end;
+                    } else if rep_tok.lexeme(self.source).eq_ignore_ascii_case("ALTER")
+                        || rep_tok.lexeme(self.source).eq_ignore_ascii_case("REFRESH")
+                    {
+                        let word = self.advance().expect_invariant(
+                            "ALTER/REFRESH keyword should be available after peek",
+                        );
+                        span.end = word.span.end;
                     }
                 }
             }
@@ -976,6 +1359,7 @@ impl Parser<'_> {
                             "TEMP/TEMPORARY/VOLATILE keyword should be available after peek",
                         );
                         end_span = Some(t2.span);
+                        persistence = Some(crate::ast::AstTablePersistence::Temporary);
                     }
                 }
             } else if tok.lexeme(self.source).eq_ignore_ascii_case("TEMP")
@@ -987,8 +1371,22 @@ impl Parser<'_> {
                 let t = self
                     .advance()
                     .expect_invariant("Table type keyword (TEMP/TEMPORARY/VOLATILE/TRANSIENT) should be available after peek");
+                persistence = Some(if t.lexeme(self.source).eq_ignore_ascii_case("TRANSIENT") {
+                    crate::ast::AstTablePersistence::Transient
+                } else {
+                    crate::ast::AstTablePersistence::Temporary
+                });
                 start_span = Some(t.span);
                 end_span = Some(t.span);
+            }
+
+            // PostgreSQL `UNLOGGED`: a persistent table whose writes skip
+            // the write-ahead log. Consumed; it is not a temporary table.
+            if start_span.is_none() && tok.lexeme(self.source).eq_ignore_ascii_case("UNLOGGED") {
+                let t = self
+                    .advance()
+                    .expect_invariant("UNLOGGED keyword should be available after peek");
+                span.end = t.span.end;
             }
 
             // Set temp_kind_span if we found any table type keywords
@@ -1001,6 +1399,22 @@ impl Parser<'_> {
             }
         }
 
+        // Optional Databricks `STREAMING` modifier: a streaming table is a
+        // table, so the word is consumed and marks nothing; before `LIVE` it
+        // opens that modifier's span.
+        let mut streaming_span: Option<Span> = None;
+        if self
+            .peek()
+            .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case("STREAMING"))
+            && (self.word_at(self.idx + 1, "TABLE") || self.word_at(self.idx + 1, "LIVE"))
+        {
+            let streaming = self
+                .advance()
+                .expect_invariant("STREAMING keyword should be available after peek");
+            span.end = streaming.span.end;
+            streaming_span = Some(streaming.span);
+        }
+
         // Optional Databricks DLT modifier: LIVE TABLE
         if let Some(tok) = self.peek() {
             if tok.lexeme(self.source).eq_ignore_ascii_case("LIVE") {
@@ -1008,7 +1422,7 @@ impl Parser<'_> {
                     .advance()
                     .expect_invariant("LIVE keyword should be available after peek");
                 span.end = live_tok.span.end;
-                temp_kind_span = Some(match temp_kind_span {
+                temp_kind_span = Some(match temp_kind_span.or(streaming_span) {
                     Some(existing) => Span {
                         start: existing.start,
                         end: live_tok.span.end,
@@ -1091,14 +1505,11 @@ impl Parser<'_> {
         // (Jinja tokens are absorbed), but at a *name-part position* — the first
         // token, and each token right after a '.' — a clause/option keyword sitting
         // there IS the name and must be consumed, not treated as the start of a
-        // CLONE/COPY/CLUSTER/... clause. Missing that left name_span None for an
-        // unquoted keyword name (e.g. `clone`, `copy`, `tag`) and dropped the whole
-        // statement to OpaqueContent. name_span stays inclusive of the IF NOT
-        // EXISTS prefix, matching the AstCreateTable contract (no separate field).
-        let name_start_idx = self.idx;
-
+        // CLONE/COPY/CLUSTER/... clause; an unquoted keyword name (e.g. `clone`,
+        // `copy`, `tag`) is the name, not the start of a clause.
         // Consume an optional IF NOT EXISTS prefix so the scan lands on the name,
         // keeping the following part-position logic correct across dialects.
+        let mut if_not_exists_span = None;
         if self
             .peek()
             .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case("IF"))
@@ -1111,13 +1522,31 @@ impl Parser<'_> {
                 .get(self.idx + 2)
                 .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case("EXISTS"))
         {
+            let if_tok = self
+                .advance()
+                .expect_invariant("IF should be available after peek");
             self.advance();
-            self.advance();
-            self.advance();
+            let exists = self
+                .advance()
+                .expect_invariant("EXISTS should be available after peek");
+            span.end = exists.span.end;
+            if_not_exists_span = Some(Span {
+                start: if_tok.span.start,
+                end: exists.span.end,
+            });
+        }
+        let name_start_idx = self.idx;
+        // `IDENTIFIER(<expression>)` names the table by its argument.
+        let identifier_call = self.identifier_argument_at(name_start_idx);
+        if let Some((end, _)) = &identifier_call {
+            self.idx = *end;
         }
 
         let mut at_part_start = true;
         while let Some(tok) = self.peek() {
+            if identifier_call.is_some() {
+                break;
+            }
             if at_part_start
                 && (self.can_be_identifier_token(tok)
                     || matches!(tok.kind, TokenKind::JinjaExprOpen))
@@ -1126,7 +1555,9 @@ impl Parser<'_> {
                 at_part_start = false;
                 continue;
             }
-            if self.should_stop_scan_at_statement_start(tok) {
+            if self.should_stop_scan_at_statement_start(tok)
+                || self.ends_create_table_name_at(self.idx)
+            {
                 break;
             }
             match tok.kind {
@@ -1154,21 +1585,38 @@ impl Parser<'_> {
                     break
                 }
                 _ if is_table_option_starter(tok.lexeme(self.source)) => break,
+                // `OPTIONS (…)` / `TBLPROPERTIES (…)` written straight after the name.
+                _ if ["OPTIONS", "TBLPROPERTIES"]
+                    .iter()
+                    .any(|w| tok.lexeme(self.source).eq_ignore_ascii_case(w)) =>
+                {
+                    break
+                }
                 _ => {
                     let _ = self.advance();
                 }
             }
         }
         let name_end_idx = self.idx;
-        let mut name_span: Option<Span> = None;
+        let mut name: Option<crate::ast::AstObjectRef> = None;
         if name_end_idx > name_start_idx {
-            let first = &self.tokens[name_start_idx];
-            let last = &self.tokens[name_end_idx - 1];
-            name_span = Some(Span {
-                start: first.span.start,
-                end: last.span.end,
-            });
-            span.end = last.span.end;
+            let node_id = self.id_gen.next();
+            let mut read = self.object_ref_of_range(name_start_idx, name_end_idx, node_id);
+            match identifier_call {
+                Some((_, argument)) => read.identifier_arg = Some(Box::new(argument)),
+                // `identifier` written before its column list is a one-part name.
+                None if read.parts.is_none()
+                    && name_end_idx == name_start_idx + 1
+                    && self.word_at(name_start_idx, "IDENTIFIER") =>
+                {
+                    read.parts = Some(vec![Some(crate::ast::AstNamePart::Word(
+                        self.tokens[name_start_idx].span,
+                    ))]);
+                }
+                None => {}
+            }
+            span.end = read.span.end;
+            name = Some(read);
         }
 
         // Optional column list starting with '('. Capture balanced parentheses.
@@ -1236,10 +1684,17 @@ impl Parser<'_> {
                     .tokens
                     .get(self.idx + 1)
                     .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case("TEMPLATE"));
+            // A partition's bound (`FROM (…) TO (…)`) is part of its option.
+            if let Some(clause) = self.partition_of_at(self.idx) {
+                self.idx = clause.next;
+                continue;
+            }
             match tok.kind {
                 TokenKind::Keyword(Keyword::Like)
                 | TokenKind::Keyword(Keyword::As)
                 | TokenKind::Keyword(Keyword::From)
+                // MySQL's query written without `AS`.
+                | TokenKind::Keyword(Keyword::Select)
                 | TokenKind::Eof
                 | TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
                 | TokenKind::Operator(crate::lexer::Operator::Pipe) => break,
@@ -1256,6 +1711,13 @@ impl Parser<'_> {
                     break
                 }
                 _ => {
+                    // A data source's `OPTIONS (…)`, `TBLPROPERTIES (…)`.
+                    if ["OPTIONS", "TBLPROPERTIES"]
+                        .iter()
+                        .any(|w| tok.lexeme(self.source).eq_ignore_ascii_case(w))
+                    {
+                        self.record_property_list_secrets(self.idx + 1);
+                    }
                     let _ = self.advance();
                 }
             }
@@ -1286,6 +1748,9 @@ impl Parser<'_> {
         let mut dist_key_present: bool = options_result.19;
         let mut sort_key: Option<crate::ast::AstSortKeySpec> = options_result.20;
         let mut backup: Option<crate::ast::AstBackupMode> = options_result.21;
+        let mut tags: Vec<crate::ast::AstTagRef> = options_result.22;
+        let mut policies: TablePolicies = options_result.23;
+        let mut sources: TableSources = options_result.24;
 
         // Set table_options_span from parsed options
         let mut table_options_span = None;
@@ -1302,7 +1767,7 @@ impl Parser<'_> {
         // NOW check for variant keywords (LIKE, CLONE, AS, etc.)
         // Since table options are already consumed, we're positioned right at the variant keyword
         let variant_result = self.parse_create_table_variant(&mut span);
-        let variant: AstCreateTableVariant = variant_result.0;
+        let mut variant: AstCreateTableVariant = variant_result.0;
         let like_source_span: Option<Span> = variant_result.1;
         let clone_source_span: Option<Span> = variant_result.2;
         let ctas_query: Option<Result<Box<AstStmt>, Span>> = variant_result.3;
@@ -1317,6 +1782,11 @@ impl Parser<'_> {
         let clone_tblproperties_span: Option<Span> = variant_result.12;
         let clone_location_span: Option<Span> = variant_result.13;
         let clone_temporal_span: Option<Span> = variant_result.14;
+        let like_source: Option<AstObjectRef> = variant_result.15;
+        let clone_source: Option<AstObjectRef> = variant_result.16;
+        if variant == AstCreateTableVariant::Plain && sources.copy.is_some() {
+            variant = AstCreateTableVariant::Copy;
+        }
 
         // Scan for post-variant COPY GRANTS/TAGS (e.g., CREATE TABLE t LIKE s COPY GRANTS)
         // Only applies to LIKE/CLONE variants where options can follow the source table.
@@ -1355,6 +1825,9 @@ impl Parser<'_> {
                 aggregation_policy_span = aggregation_policy_span.or(post.8);
                 join_policy_span = join_policy_span.or(post.9);
                 storage_lifecycle_policy_span = storage_lifecycle_policy_span.or(post.10);
+                if tag_span.is_none() {
+                    tags = post.22;
+                }
                 tag_span = tag_span.or(post.11);
                 enable_schema_evolution_span = enable_schema_evolution_span.or(post.12);
                 table_comment_span = table_comment_span.or(post.13);
@@ -1366,6 +1839,8 @@ impl Parser<'_> {
                 dist_key_present = dist_key_present || post.19;
                 sort_key = sort_key.or(post.20);
                 backup = backup.or(post.21);
+                policies = policies.or(post.23);
+                sources = sources.or(post.24);
 
                 // Update table_options_span to include post-variant options
                 let post_first = &self.tokens[post_variant_start_idx];
@@ -1414,6 +1889,7 @@ impl Parser<'_> {
                         self.parse_create_table_columns_and_constraints(inner_start, inner_end);
                     columns = result.0;
                     constraints = result.1;
+                    like_elements = result.2;
                 }
             }
         }
@@ -1422,7 +1898,7 @@ impl Parser<'_> {
         // on the same column. This is valid syntax per the official documentation.
         // We parse and preserve all constraints without validation here.
 
-        let name_span = name_span.ok_or_else(|| {
+        let name = name.ok_or_else(|| {
             ParseError::new(
                 self.current_span(),
                 ParseErrorKind::InvalidStatement {
@@ -1438,6 +1914,11 @@ impl Parser<'_> {
                 },
             )
         })?;
+        let (row_access_policy, row_access_policy_columns) =
+            PolicyClause::parts(policies.row_access);
+        let (aggregation_policy, _) = PolicyClause::parts(policies.aggregation);
+        let (join_policy, _) = PolicyClause::parts(policies.join);
+        let (row_filter_function, row_filter_columns) = PolicyClause::parts(policies.row_filter);
         let stmt = AstCreateTable {
             node_id: self.id_gen.next(),
             span,
@@ -1445,10 +1926,12 @@ impl Parser<'_> {
             or_replace_span,
             scoped_span,
             temp_kind_span,
+            persistence,
             table_kind,
             table_kind_span,
             table_keyword_span,
-            name_span,
+            if_not_exists_span,
+            name,
             columns_span,
             semicolon_token: None,
             lparen_span,
@@ -1456,6 +1939,12 @@ impl Parser<'_> {
             variant,
             like_source_span,
             clone_source_span,
+            like_source,
+            clone_source,
+            copy_source: sources.copy,
+            partition_of: sources.partition_of,
+            inherits: sources.inherits,
+            like_elements,
             clone_kind,
             clone_kind_span,
             clone_tblproperties_span,
@@ -1480,10 +1969,17 @@ impl Parser<'_> {
             max_data_extension_time_in_days_span,
             default_ddl_collation_span,
             row_access_policy_span,
+            row_access_policy,
+            row_access_policy_columns,
             aggregation_policy_span,
+            aggregation_policy,
             join_policy_span,
+            join_policy,
+            row_filter_function,
+            row_filter_columns,
             storage_lifecycle_policy_span,
             tag_span,
+            tags,
             enable_schema_evolution_span,
             table_comment_span,
             with_row_access_policy_span,
@@ -1495,6 +1991,31 @@ impl Parser<'_> {
             constraints,
         };
         Ok(AstStmt::CreateTable(Box::new(stmt)))
+    }
+
+    /// Whether the token at `i`, after a `CREATE TABLE` name's first part,
+    /// starts what follows the name: MySQL's query written without `AS`
+    /// (`SELECT`, or `IGNORE` / `REPLACE` before it or before `AS`), a
+    /// table option written `word = value`, or PostgreSQL's `ON COMMIT …`,
+    /// `WITHOUT OIDS` or `TABLESPACE …`.
+    fn ends_create_table_name_at(&self, i: usize) -> bool {
+        let select = |at: usize| {
+            self.tokens
+                .get(at)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Select)))
+        };
+        let assigned = self.is_word_at(i)
+            && self
+                .tokens
+                .get(i + 1)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Operator(crate::lexer::Operator::Eq)));
+        select(i)
+            || ((self.word_at(i, "IGNORE") || self.word_at(i, "REPLACE"))
+                && (select(i + 1) || self.word_at(i + 1, "AS")))
+            || assigned
+            || (self.word_at(i, "ON") && self.word_at(i + 1, "COMMIT"))
+            || (self.word_at(i, "WITHOUT") && self.word_at(i + 1, "OIDS"))
+            || self.word_at(i, "TABLESPACE")
     }
 
     /// True when tokens at `i` start a `GENERATED ALWAYS` / `GENERATED BY
@@ -1516,6 +2037,19 @@ impl Parser<'_> {
                     .eq_ignore_ascii_case("DEFAULT"))
     }
 
+    /// The column definition written over the tokens `start_idx..end_idx`,
+    /// read as a `CREATE TABLE` column is; `None` where they are no column.
+    pub(crate) fn column_as_created(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> Option<AstCreateTableColumn> {
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+        self.build_create_table_item(start_idx, end_idx, &mut columns, &mut constraints);
+        columns.pop()
+    }
+
     fn build_create_table_item(
         &mut self,
         start_idx: usize,
@@ -1526,6 +2060,8 @@ impl Parser<'_> {
         if end_idx <= start_idx {
             return;
         }
+        // The item is read by its tokens, not by the expression parser.
+        self.record_unparsed_secrets(start_idx, end_idx);
         let first = &self.tokens[start_idx];
         let last = &self.tokens[end_idx - 1];
         let full_span = Span {
@@ -1540,18 +2076,45 @@ impl Parser<'_> {
                 j += 1;
                 continue;
             }
-            let is_constraint_keyword = t0.lexeme(self.source).eq_ignore_ascii_case("CONSTRAINT")
+            // PostgreSQL's `EXCLUDE [USING method] (…)` is a constraint, not a
+            // column named `exclude`.
+            let excludes = t0.lexeme(self.source).eq_ignore_ascii_case("EXCLUDE")
+                && self.tokens.get(j + 1).is_some_and(|next| {
+                    next.lexeme(self.source).eq_ignore_ascii_case("USING")
+                        || matches!(
+                            next.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                        )
+                });
+            // An index definition, MySQL's `{KEY | INDEX} [name] (…)` and
+            // `{FULLTEXT | SPATIAL} [KEY | INDEX] …`, T-SQL's `INDEX name …`,
+            // is an item of the table, not a column, where the dialect
+            // reserves the word that leads it (no column is named by it).
+            let lead = t0.lexeme(self.source);
+            let indexes = ["KEY", "INDEX", "FULLTEXT", "SPATIAL"]
+                .iter()
+                .any(|word| lead.eq_ignore_ascii_case(word))
+                && matches!(
+                    t0.kind,
+                    TokenKind::Keyword(_) | TokenKind::Identifier { .. }
+                )
+                && self.dialect.is_reserved_keyword(lead);
+            let is_constraint_keyword = indexes
+                || t0.lexeme(self.source).eq_ignore_ascii_case("CONSTRAINT")
                 || t0.lexeme(self.source).eq_ignore_ascii_case("PRIMARY")
                 || t0.lexeme(self.source).eq_ignore_ascii_case("UNIQUE")
                 || t0.lexeme(self.source).eq_ignore_ascii_case("FOREIGN")
-                || t0.lexeme(self.source).eq_ignore_ascii_case("CHECK");
+                || t0.lexeme(self.source).eq_ignore_ascii_case("CHECK")
+                || excludes;
             if is_constraint_keyword {
                 // Try to parse constraint details with smart fallback
                 let details = self.parse_constraint_details(start_idx, end_idx);
+                let expressions = self.constraint_expressions(start_idx, end_idx);
                 constraints.push(AstCreateTableConstraint {
                     node_id: self.id_gen.next(),
                     full_span,
                     details,
+                    expressions,
                 });
             } else {
                 // Column-level splitting for 3.3: name/type and key constraint spans.
@@ -1560,15 +2123,29 @@ impl Parser<'_> {
                 let mut collate_span: Option<Span> = None;
                 let mut not_null_span: Option<Span> = None;
                 let mut default_expr_span: Option<Span> = None;
+                // Where the `DEFAULT` keyword of `default_expr_span` is: after
+                // the `CONSTRAINT name` that names it, where one does.
+                let mut default_keyword_at: Option<u32> = None;
+                // Where a `CONSTRAINT name` naming the column's default starts.
+                let mut default_named_from: Option<u32> = None;
                 let mut identity_or_autoincrement_span: Option<Span> = None;
                 let mut generated_always_span: Option<Span> = None;
                 let mut virtual_expr_span: Option<Span> = None;
                 let mut storage_keyword_span: Option<Span> = None;
                 let mut inline_constraint_id: Option<crate::syntax::SyntaxInlineConstraintId> =
                     None;
+                let mut foreign_key: Option<crate::ast::AstConstraintDetails> = None;
+                let mut key: Option<crate::ast::AstColumnKey> = None;
+                let mut not_null_after_constraint = false;
                 let mut masking_policy_span: Option<Span> = None;
+                let mut masking_policy: Option<AstObjectRef> = None;
+                let mut masking_policy_using: Vec<Span> = Vec::new();
+                let mut projection_policy: Option<AstObjectRef> = None;
                 let mut tag_span: Option<Span> = None;
+                let mut tags: Vec<crate::ast::AstTagRef> = Vec::new();
                 let mut comment_span: Option<Span> = None;
+                // The parenthesized condition of the column's own `CHECK`.
+                let mut inline_check_span: Option<Span> = None;
 
                 // Simple heuristic pass over the item tokens.
                 let mut i = start_idx;
@@ -1596,6 +2173,16 @@ impl Parser<'_> {
                         || self.is_generated_clause_at(i, end_idx)
                     {
                         break;
+                    }
+                    // These clauses stay in the type run; their names are kept.
+                    if projection_policy.is_none() {
+                        projection_policy = self.projection_policy_at(i).map(|c| c.policy);
+                    }
+                    if masking_policy.is_none() {
+                        if let Some(clause) = self.mask_function_at(i) {
+                            masking_policy = Some(clause.policy);
+                            masking_policy_using = clause.columns;
+                        }
                     }
                     if type_start.is_none() {
                         type_start = Some(t.span.start);
@@ -1804,6 +2391,30 @@ impl Parser<'_> {
                         i = j2;
                         continue;
                     }
+                    // A projection policy or a Databricks mask written after
+                    // another clause: its name is kept, its tokens are read
+                    // past.
+                    if projection_policy.is_none() {
+                        if let Some(clause) = self
+                            .projection_policy_at(i)
+                            .filter(|clause| clause.next <= end_idx)
+                        {
+                            projection_policy = Some(clause.policy);
+                            i = clause.next;
+                            continue;
+                        }
+                    }
+                    if masking_policy.is_none() {
+                        if let Some(clause) = self
+                            .mask_function_at(i)
+                            .filter(|clause| clause.next <= end_idx)
+                        {
+                            masking_policy = Some(clause.policy);
+                            masking_policy_using = clause.columns;
+                            i = clause.next;
+                            continue;
+                        }
+                    }
                     // Column-level masking policy: [WITH] MASKING POLICY ...
                     // Triggers on MASKING, or on a leading WITH directly before it.
                     if masking_policy_span.is_none()
@@ -1817,6 +2428,17 @@ impl Parser<'_> {
                         let start = t.span.start;
                         let mut end = self.tokens[i].span.end;
                         let mut j2 = i + 1;
+                        // The policy's name is read whole: a part named like a
+                        // clause (`gov.comment.p`) does not end the clause.
+                        if let Some(clause) = self
+                            .masking_policy_at(i)
+                            .filter(|clause| clause.next <= end_idx)
+                        {
+                            j2 = clause.next;
+                            end = self.tokens[clause.next - 1].span.end;
+                            masking_policy = Some(clause.policy);
+                            masking_policy_using = clause.columns;
+                        }
                         while j2 < end_idx {
                             let t2 = &self.tokens[j2];
                             if is_column_tail_clause_lexeme(t2.lexeme(self.source))
@@ -1840,6 +2462,16 @@ impl Parser<'_> {
                                     .lexeme(self.source)
                                     .eq_ignore_ascii_case("TAG")))
                     {
+                        let tag_at = if t.lexeme(self.source).eq_ignore_ascii_case("TAG") {
+                            i
+                        } else {
+                            i + 1
+                        };
+                        if let Some((_, read)) =
+                            self.parenthesised_tag_list_at(tag_at + 1, TagListShape::Assignments)
+                        {
+                            tags = read;
+                        }
                         let start = t.span.start;
                         let mut end = t.span.end;
                         let mut j2 = i + 1;
@@ -1912,6 +2544,20 @@ impl Parser<'_> {
                             }
                         }
                     }
+                    // T-SQL names a column's default: `CONSTRAINT name DEFAULT …`.
+                    if default_expr_span.is_none()
+                        && default_named_from.is_none()
+                        && t.lexeme(self.source).eq_ignore_ascii_case("CONSTRAINT")
+                        && i + 2 < end_idx
+                        && self.can_be_identifier_token(&self.tokens[i + 1])
+                        && self.tokens[i + 2]
+                            .lexeme(self.source)
+                            .eq_ignore_ascii_case("DEFAULT")
+                    {
+                        default_named_from = Some(t.span.start);
+                        i += 2;
+                        continue;
+                    }
                     if t.lexeme(self.source).eq_ignore_ascii_case("DEFAULT") {
                         let start = t.span.start;
                         let mut j2 = i + 1;
@@ -1926,7 +2572,11 @@ impl Parser<'_> {
                             end = t2.span.end;
                             j2 += 1;
                         }
-                        default_expr_span = Some(Span { start, end });
+                        default_keyword_at = Some(start);
+                        default_expr_span = Some(Span {
+                            start: default_named_from.unwrap_or(start),
+                            end,
+                        });
                         i = j2;
                         continue;
                     }
@@ -2066,6 +2716,17 @@ impl Parser<'_> {
                                 }
                             }
 
+                            // A `NOT NULL` after the constraint is the column's.
+                            if depth == 0
+                                && t2.lexeme(self.source).eq_ignore_ascii_case("NOT")
+                                && self.tokens.get(j2 + 1).is_some_and(|next| {
+                                    j2 + 1 < end_idx
+                                        && next.lexeme(self.source).eq_ignore_ascii_case("NULL")
+                                })
+                            {
+                                not_null_after_constraint = true;
+                            }
+
                             // Stop at clauses that come AFTER constraints
                             if depth == 0
                                 && (t2.lexeme(self.source).eq_ignore_ascii_case("COMMENT")
@@ -2134,6 +2795,28 @@ impl Parser<'_> {
                             }
                         }
 
+                        if let Some(crate::cst::TokenId(references)) = references_keyword {
+                            foreign_key = self.foreign_key_at(
+                                references as usize + 1,
+                                end_idx,
+                                name_span.into_iter().collect(),
+                                constraint_name.map(|id| self.tokens[id.0 as usize].span),
+                            );
+                        }
+
+                        // A `PRIMARY KEY` or `UNIQUE` is a key of this column.
+                        key = constraint_type_keyword.and_then(|type_kw| {
+                            let word = self.tokens[type_kw.0 as usize].lexeme(self.source);
+                            if word.eq_ignore_ascii_case("PRIMARY") {
+                                Some(crate::ast::AstColumnKey::PrimaryKey)
+                            } else if word.eq_ignore_ascii_case("UNIQUE") {
+                                Some(crate::ast::AstColumnKey::Unique)
+                            } else {
+                                None
+                            }
+                        });
+
+                        inline_check_span = check_expr_span;
                         // Create syntax node only if we have a valid constraint type
                         if let Some(type_kw) = constraint_type_keyword {
                             let constraint_node = crate::syntax::SyntaxInlineConstraint {
@@ -2162,6 +2845,21 @@ impl Parser<'_> {
                     i += 1;
                 }
 
+                // The expressions the column holds, each after its keyword.
+                let default_expr = default_expr_span
+                    .and_then(|span| {
+                        self.expr_after_keyword(Span {
+                            start: default_keyword_at.unwrap_or(span.start),
+                            end: span.end,
+                        })
+                    })
+                    .map(Box::new);
+                let virtual_expr = virtual_expr_span
+                    .and_then(|span| self.expr_after_keyword(span))
+                    .map(Box::new);
+                let check_expr = inline_check_span
+                    .and_then(|span| self.expr_written_at(span))
+                    .map(Box::new);
                 columns.push(AstCreateTableColumn {
                     node_id: self.id_gen.next(),
                     full_span,
@@ -2175,13 +2873,173 @@ impl Parser<'_> {
                     virtual_expr_span,
                     storage_keyword_span,
                     inline_constraint_id,
+                    foreign_key,
+                    key,
+                    not_null: not_null_span.is_some() || not_null_after_constraint,
                     masking_policy_span,
+                    masking_policy,
+                    masking_policy_using,
+                    projection_policy,
                     tag_span,
+                    tags,
                     comment_span,
+                    default_expr,
+                    virtual_expr,
+                    check_expr,
+                    check_span: inline_check_span,
                 });
             }
             break;
         }
+    }
+
+    /// Every expression the constraint written over the tokens
+    /// `start_idx..end_idx` holds: a `CHECK`'s condition, an `EXCLUDE`'s
+    /// elements and `WHERE` predicate, a T-SQL `DEFAULT … FOR`'s value; none
+    /// for a key. `None` where one of them is not one expression, or a
+    /// string literal is written outside them.
+    pub(crate) fn constraint_expressions(
+        &mut self,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> Option<Vec<AstExpr>> {
+        use crate::lexer::{IdentifierKind, LiteralKind, Punctuation};
+        let end_idx = end_idx.min(self.tokens.len());
+        let source = self.source;
+        let tokens = self.tokens;
+        let word = |i: usize| (i < end_idx).then(|| tokens[i].lexeme(source));
+        let is = |i: usize, w: &str| word(i).is_some_and(|l| l.eq_ignore_ascii_case(w));
+        let opens = |i: usize| {
+            i < end_idx && matches!(tokens[i].kind, TokenKind::Punctuation(Punctuation::LParen))
+        };
+        // The `)` closing the `(` at `open`.
+        let closing = |open: usize| {
+            let mut depth = 0usize;
+            for (k, tok) in tokens.iter().enumerate().take(end_idx).skip(open) {
+                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                    depth += 1;
+                } else if matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+            }
+            None
+        };
+        // The first token from `from` to `to` that is `w` outside parentheses.
+        let outside = |from: usize, to: usize, w: &str| {
+            let mut depth = 0usize;
+            for (k, tok) in tokens.iter().enumerate().take(to).skip(from) {
+                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                    depth += 1;
+                } else if matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                    depth = depth.saturating_sub(1);
+                } else if depth == 0 && tok.lexeme(source).eq_ignore_ascii_case(w) {
+                    return Some(k);
+                }
+            }
+            None
+        };
+        let span_of = |from: usize, to: usize| {
+            (from < to).then(|| Span {
+                start: tokens[from].span.start,
+                end: tokens[to - 1].span.end,
+            })
+        };
+        let mut i = start_idx;
+        if is(i, "CONSTRAINT") {
+            i += 2;
+        }
+        // The token ranges read as expressions.
+        let mut read: Vec<(usize, usize)> = Vec::new();
+        if is(i, "CHECK") && opens(i + 1) {
+            read.push((i + 1, closing(i + 1)? + 1));
+        } else if is(i, "EXCLUDE") {
+            let mut open = i + 1;
+            if is(open, "USING") {
+                open += 2;
+            }
+            if !opens(open) {
+                return None;
+            }
+            let close = closing(open)?;
+            let mut from = open + 1;
+            while from < close {
+                let to = outside(from, close, ",").unwrap_or(close);
+                read.push((from, outside(from, to, "WITH")?));
+                from = to + 1;
+            }
+            if let Some(at) = outside(close + 1, end_idx, "WHERE") {
+                if !opens(at + 1) {
+                    return None;
+                }
+                read.push((at + 1, closing(at + 1)? + 1));
+            }
+        } else if is(i, "DEFAULT") {
+            read.push((i + 1, outside(i + 1, end_idx, "FOR")?));
+        } else if !(is(i, "PRIMARY") || is(i, "UNIQUE") || is(i, "FOREIGN") || is(i, "REFERENCES"))
+        {
+            return None;
+        }
+        let unread_literal = (start_idx..end_idx).any(|k| {
+            matches!(
+                tokens[k].kind,
+                TokenKind::Literal(LiteralKind::String | LiteralKind::StringFragment)
+                    | TokenKind::Unknown
+                    | TokenKind::Identifier {
+                        kind: IdentifierKind::DollarQuoteDelimiter,
+                        ..
+                    }
+            ) && !read.iter().any(|&(from, to)| from <= k && k < to)
+        });
+        if unread_literal {
+            return None;
+        }
+        read.into_iter()
+            .map(|(from, to)| self.expr_written_at(span_of(from, to)?))
+            .collect()
+    }
+
+    /// The value of the T-SQL `[CONSTRAINT name] DEFAULT <value> FOR
+    /// <column>` constraint written from `start_idx` to `end_idx`.
+    pub(crate) fn constraint_default(&self, start_idx: usize, end_idx: usize) -> Option<Span> {
+        let end_idx = end_idx.min(self.tokens.len());
+        let is = |i: usize, w: &str| {
+            i < end_idx && self.tokens[i].lexeme(self.source).eq_ignore_ascii_case(w)
+        };
+        let mut i = start_idx;
+        if is(i, "CONSTRAINT") {
+            i += 2;
+        }
+        if !is(i, "DEFAULT") {
+            return None;
+        }
+        let first = i + 1;
+        let mut depth = 0usize;
+        let mut last = None;
+        for k in first..end_idx {
+            let kind = &self.tokens[k].kind;
+            if matches!(
+                kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+            ) {
+                depth += 1;
+            } else if matches!(
+                kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+            ) {
+                depth = depth.saturating_sub(1);
+            } else if depth == 0 && is(k, "FOR") {
+                break;
+            }
+            last = Some(k);
+        }
+        let last = last?;
+        Some(Span {
+            start: self.tokens.get(first)?.span.start,
+            end: self.tokens.get(last)?.span.end,
+        })
     }
 
     /// Parse constraint details for PRIMARY KEY, UNIQUE, or FOREIGN KEY.
@@ -2191,7 +3049,7 @@ impl Parser<'_> {
     /// This method uses safe token access through bounds checking since it operates
     /// on a pre-determined token range from build_create_table_item. The range
     /// represents a single table constraint item isolated by comma separation.
-    fn parse_constraint_details(
+    pub(crate) fn parse_constraint_details(
         &mut self,
         start_idx: usize,
         end_idx: usize,
@@ -2283,8 +3141,34 @@ impl Parser<'_> {
             .lexeme(self.source)
             .eq_ignore_ascii_case("UNIQUE")
         {
-            // Expect: UNIQUE (col1, col2, ...)
+            // Expect: UNIQUE [KEY | INDEX | CLUSTERED | NONCLUSTERED]
+            // [index_name] [USING …] (col1, col2, ...); the index's name,
+            // where written, is the key's (MySQL).
             idx += 1;
+            let word = |i: usize, words: &[&str]| {
+                get_token(i).is_some_and(|tok| {
+                    words
+                        .iter()
+                        .any(|word| tok.lexeme(self.source).eq_ignore_ascii_case(word))
+                })
+            };
+            if word(idx, &["KEY", "INDEX", "CLUSTERED", "NONCLUSTERED"]) {
+                idx += 1;
+            }
+            let opens = get_token(idx + 1).is_some_and(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                )
+            });
+            let index_name = get_token(idx)
+                .filter(|tok| {
+                    self.can_be_identifier_token(tok)
+                        && !word(idx, &["USING"])
+                        && (opens || word(idx + 1, &["USING"]))
+                })
+                .map(|tok| tok.span);
+            let constraint_name = index_name.or(constraint_name);
 
             // Parse column list
             let columns = self.parse_constraint_column_list(idx, end_idx)?;
@@ -2326,54 +3210,7 @@ impl Parser<'_> {
 
             ref_idx += 1; // Skip REFERENCES keyword
 
-            // Parse referenced table name (can be qualified: db.schema.table)
-            let mut table_start: Option<u32> = None;
-            let mut table_end: Option<u32> = None;
-
-            while ref_idx < end_idx {
-                if let Some(tok) = get_token(ref_idx) {
-                    match &tok.kind {
-                        TokenKind::Identifier { .. }
-                        | TokenKind::Punctuation(crate::lexer::Punctuation::Dot) => {
-                            if table_start.is_none() {
-                                table_start = Some(tok.span.start);
-                            }
-                            table_end = Some(tok.span.end);
-                            ref_idx += 1;
-                        }
-                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => {
-                            break; // Found start of column list
-                        }
-                        TokenKind::Eof => {
-                            ref_idx += 1;
-                        }
-                        _ => {
-                            break;
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            let references_table = if let (Some(start), Some(end)) = (table_start, table_end) {
-                Span { start, end }
-            } else {
-                return None; // No table name found
-            };
-
-            // Parse referenced column list
-            let references_columns = self.parse_constraint_column_list(ref_idx, end_idx)?;
-
-            Some(crate::ast::AstConstraintDetails {
-                node_id: self.id_gen.next(),
-                name: constraint_name,
-                kind: crate::ast::AstConstraintKind::ForeignKey {
-                    columns,
-                    references_table,
-                    references_columns,
-                },
-            })
+            self.foreign_key_at(ref_idx, end_idx, columns, constraint_name)
         } else if constraint_type_tok
             .lexeme(self.source)
             .eq_ignore_ascii_case("CHECK")
@@ -2385,8 +3222,49 @@ impl Parser<'_> {
         }
     }
 
+    /// The foreign key `name [(ref_col, …)]` of `columns` whose referenced
+    /// table's name starts at token `target` (just past `REFERENCES`), read
+    /// within `tokens[..end_idx]`. `None` where no name starts there or a
+    /// column list opened after it cannot be read.
+    pub(crate) fn foreign_key_at(
+        &mut self,
+        target: usize,
+        end_idx: usize,
+        columns: Vec<Span>,
+        name: Option<Span>,
+    ) -> Option<crate::ast::AstConstraintDetails> {
+        if target >= end_idx {
+            return None;
+        }
+        let table_id = self.id_gen.next();
+        let (name_end, references_table) = self
+            .object_ref_at(target, table_id)
+            .filter(|(name_end, _)| *name_end <= end_idx)?;
+        let list_opens = name_end < end_idx
+            && matches!(
+                self.tokens[name_end].kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+            );
+        let references_columns = if list_opens {
+            self.parse_constraint_column_list(name_end, end_idx)?
+        } else {
+            Vec::new()
+        };
+        Some(crate::ast::AstConstraintDetails {
+            node_id: self.id_gen.next(),
+            name,
+            kind: crate::ast::AstConstraintKind::ForeignKey {
+                columns,
+                references_table,
+                references_columns,
+            },
+        })
+    }
+
     /// Helper to parse a parenthesized column list: (col1, col2, ...)
-    /// Returns spans for each column identifier.
+    /// Returns the span of each element's column name, its first
+    /// identifier: what follows it (`ASC`, `DESC`, an operator class) is
+    /// not a column.
     ///
     /// This method uses safe token access through bounds checking since it operates
     /// on a pre-determined token range.
@@ -2422,6 +3300,8 @@ impl Parser<'_> {
         idx += 1; // Skip opening paren
         let mut columns = Vec::new();
         let mut depth = 1;
+        // Whether the element at depth 1 has named no column yet.
+        let mut unnamed = true;
 
         while idx < end_idx && depth > 0 {
             if let Some(tok) = get_token(idx) {
@@ -2439,10 +3319,14 @@ impl Parser<'_> {
                     }
                     _ if self.can_be_identifier_token(tok) && depth == 1 => {
                         // Only collect identifiers/keywords at depth 1 (not nested)
-                        columns.push(tok.span);
+                        if unnamed {
+                            columns.push(tok.span);
+                            unnamed = false;
+                        }
                         idx += 1;
                     }
                     TokenKind::Punctuation(crate::lexer::Punctuation::Comma) => {
+                        unnamed |= depth == 1;
                         idx += 1;
                     }
                     TokenKind::Eof => {

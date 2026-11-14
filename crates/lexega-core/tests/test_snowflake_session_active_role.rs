@@ -14,18 +14,18 @@ use std::collections::HashSet;
 
 const RULE: &str = "SNW-SESSION-GRANT-UNDER-ACCOUNTADMIN";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
 }
 
 #[test]
@@ -76,6 +76,41 @@ fn active_role_normalized_case_insensitive() {
     // matches the normalized identifier, not the raw spelling).
     let ids = analyze_and_get_rules("use role accountadmin;\ngrant select on table t to role r;");
     assert!(ids.contains(RULE), "ids={:?}", ids);
+}
+
+/// The session a script's `USE` statements establish, folded on a thread of
+/// its own after that thread analysed a statement under `earlier`.
+fn session_fold_after(earlier: Option<lexega_core::dialect::DialectRef>) -> String {
+    std::thread::spawn(move || {
+        if let Some(dialect) = earlier {
+            let config = lexega_core::analyzer::AnalysisConfig {
+                dialect: Some(dialect),
+                ..Default::default()
+            };
+            lexega_core::api::analyze_risk_with_policy_config("SELECT 1", &config)
+                .expect("the earlier statement is analysed");
+        }
+        let sql = "USE ROLE Analyst;\nUSE DATABASE Prod;\nUSE SCHEMA \"Raw\";";
+        let _folding = lexega_core::set_normalization_dialect("snowflake");
+        let script = lexega_core::parse_sql(sql).expect("the script parses");
+        format!("{:?}", lexega_core::build_script_context_fold(&script, sql))
+    })
+    .join()
+    .expect("the thread finishes")
+}
+
+#[test]
+fn the_session_fold_is_the_same_whatever_its_thread_analysed_before() {
+    let alone = session_fold_after(None);
+    assert!(alone.contains("normalized: \"ANALYST\""), "{alone}");
+    for earlier in [
+        lexega_core::dialect::postgres(),
+        lexega_core::dialect::databricks(),
+        lexega_core::dialect::mssql(),
+    ] {
+        let name = earlier.name().to_string();
+        assert_eq!(session_fold_after(Some(earlier)), alone, "after {name}");
+    }
 }
 
 #[test]

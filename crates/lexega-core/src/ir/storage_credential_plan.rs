@@ -21,8 +21,9 @@
 //! - `provider.all_literal_values` carries every literal argument
 //!   flattened into a single `Vec<String>` for content-pattern rules
 //!   that fire regardless of which slot holds the suspicious value
-//!   (CRED-AWS-LEAK matches `AKIA*` / `ASIA*`; CRED-CONNSTR-LEAK
-//!   matches `*://*:*@*`).
+//!   (CRED-AWS-LEAK matches `AKIA*` / `ASIA*`).
+//! - `provider.url_password_literals` carries the password of each URL
+//!   a literal argument writes with user information (CRED-CONNSTR-LEAK).
 
 use crate::ast::{
     AlterStorageCredentialAction, AstAlterStorageCredential, AstCreateStorageCredential,
@@ -48,6 +49,9 @@ pub struct StorageCredentialPlan {
     /// content-pattern rules (CRED-CONNSTR-LEAK / CRED-PWD-LEAK) that
     /// flag URLs with embedded credentials in metadata fields.
     pub comment_value_span: Option<Span>,
+    /// The password of each URL the comment holds with user information,
+    /// decoded; one a placeholder overlaps is left out.
+    pub comment_url_password_literals: Vec<String>,
     pub node_id: NodeId,
     pub span: Span,
 }
@@ -88,6 +92,9 @@ pub struct StorageCredentialProvider {
     /// Every string-literal argument across all variant slots,
     /// flattened in source order. Drives content-pattern predicates.
     pub all_literal_values: Vec<String>,
+    /// The password of each URL a string-literal argument holds with user
+    /// information, decoded; one a placeholder overlaps is left out.
+    pub url_password_literals: Vec<String>,
 }
 
 /// IR-side closed enum mirroring the Databricks provider taxonomy. The
@@ -118,14 +125,23 @@ pub enum StorageCredentialProviderVariant {
 
 pub fn lower_create_storage_credential_to_storage_credential_plan(
     s: &AstCreateStorageCredential,
+    source: &str,
+    placeholders: &[Span],
 ) -> StorageCredentialPlan {
     StorageCredentialPlan {
         action: StorageCredentialAction::Create,
         credential_kind: lower_credential_kind(s.credential_kind),
         if_not_exists: s.if_not_exists,
-        provider: s.provider.as_ref().map(lower_provider),
+        provider: s
+            .provider
+            .as_ref()
+            .map(|p| lower_provider(p, source, placeholders)),
         actions: Vec::new(),
         comment_value_span: s.comment_value_span,
+        comment_url_password_literals: s
+            .comment_value_span
+            .map(|span| super::span_extract::url_password_literals(span, source, placeholders))
+            .unwrap_or_default(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -141,6 +157,7 @@ pub fn lower_drop_storage_credential_to_storage_credential_plan(
         provider: None,
         actions: Vec::new(),
         comment_value_span: None,
+        comment_url_password_literals: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -148,10 +165,12 @@ pub fn lower_drop_storage_credential_to_storage_credential_plan(
 
 pub fn lower_alter_storage_credential_to_storage_credential_plan(
     s: &AstAlterStorageCredential,
+    source: &str,
+    placeholders: &[Span],
 ) -> StorageCredentialPlan {
     let (provider, action) = match &s.action {
         AlterStorageCredentialAction::SetProvider { provider: p, .. } => (
-            Some(lower_provider(p)),
+            Some(lower_provider(p, source, placeholders)),
             IrStorageCredentialAlterAction::SetProvider,
         ),
         AlterStorageCredentialAction::RenameTo { .. } => {
@@ -168,6 +187,7 @@ pub fn lower_alter_storage_credential_to_storage_credential_plan(
         provider,
         actions: vec![action],
         comment_value_span: None,
+        comment_url_password_literals: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -181,7 +201,63 @@ fn lower_credential_kind(k: CredentialKind) -> StorageCredentialKindIr {
     }
 }
 
-fn lower_provider(p: &AstStorageCredentialProvider) -> StorageCredentialProvider {
+fn lower_provider(
+    p: &AstStorageCredentialProvider,
+    source: &str,
+    placeholders: &[Span],
+) -> StorageCredentialProvider {
+    let literal_spans: Vec<Span> = match &p.variant {
+        AstStorageCredentialProviderVariant::AwsIamRole {
+            role_arn_span,
+            role_arn_text,
+            ..
+        } => written_spans(&[(*role_arn_span, role_arn_text)]),
+        AstStorageCredentialProviderVariant::AzureManagedIdentity {
+            managed_identity_id_span,
+            managed_identity_id_text,
+            access_connector_id_span,
+            access_connector_id_text,
+            ..
+        } => {
+            let mut spans = written_spans(&[(*managed_identity_id_span, managed_identity_id_text)]);
+            if let Some(span) = access_connector_id_span {
+                spans.extend(written_spans(&[(*span, access_connector_id_text)]));
+            }
+            spans
+        }
+        AstStorageCredentialProviderVariant::AzureServicePrincipal {
+            directory_id_span,
+            directory_id_text,
+            application_id_span,
+            application_id_text,
+            client_secret_span,
+            client_secret_text,
+            ..
+        } => written_spans(&[
+            (*directory_id_span, directory_id_text),
+            (*application_id_span, application_id_text),
+            (*client_secret_span, client_secret_text),
+        ]),
+        AstStorageCredentialProviderVariant::CloudflareApiToken {
+            account_id_span,
+            account_id_text,
+            access_key_id_span,
+            access_key_id_text,
+            secret_access_key_span,
+            secret_access_key_text,
+            ..
+        } => written_spans(&[
+            (*account_id_span, account_id_text),
+            (*access_key_id_span, access_key_id_text),
+            (*secret_access_key_span, secret_access_key_text),
+        ]),
+        AstStorageCredentialProviderVariant::DatabricksGcpServiceAccount { .. }
+        | AstStorageCredentialProviderVariant::Unparsed { .. } => Vec::new(),
+    };
+    let url_password_literals = literal_spans
+        .into_iter()
+        .flat_map(|span| super::span_extract::url_password_literals(span, source, placeholders))
+        .collect();
     let variant = match &p.variant {
         AstStorageCredentialProviderVariant::AwsIamRole { role_arn_text, .. } => {
             StorageCredentialProviderVariant::AwsIamRole {
@@ -226,5 +302,15 @@ fn lower_provider(p: &AstStorageCredentialProvider) -> StorageCredentialProvider
     StorageCredentialProvider {
         variant,
         all_literal_values: p.all_literal_values.clone(),
+        url_password_literals,
     }
+}
+
+/// The spans of the arguments written as string literals: each whose text
+/// was read.
+fn written_spans(args: &[(Span, &Option<String>)]) -> Vec<Span> {
+    args.iter()
+        .filter(|(_, text)| text.is_some())
+        .map(|(span, _)| *span)
+        .collect()
 }

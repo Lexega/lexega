@@ -26,8 +26,7 @@ fn cfg(d: lexega_core::dialect::DialectRef) -> AnalysisConfig {
 fn rule_ids_d(sql: &str, d: lexega_core::dialect::DialectRef) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &cfg(d)).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -37,8 +36,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str, d: lexega_core::dialect::DialectRef) {
-    let mut config = FormatterConfig::default();
-    config.dialect = d.clone();
+    let config = FormatterConfig {
+        dialect: d.clone(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -93,7 +94,7 @@ fn test_no_spurious_role_creation_finding() {
     );
     assert!(
         ids.contains(&"INFO-PG-FDW-USER-MAPPING".to_string()),
-        "user mapping should fire its own info signal. Got: {ids:?}"
+        "user mapping should fire its own info finding. Got: {ids:?}"
     );
 }
 
@@ -163,7 +164,7 @@ fn test_alter_no_spurious_role_change_finding() {
     );
     assert!(
         ids.contains(&"INFO-PG-FDW-USER-MAPPING".to_string()),
-        "altering a user mapping should fire its own signal. Got: {ids:?}"
+        "altering a user mapping should fire its own finding. Got: {ids:?}"
     );
 }
 
@@ -222,7 +223,7 @@ fn test_drop_no_spurious_role_drop_and_not_truncated() {
     );
     assert!(
         ids.contains(&"INFO-PG-FDW-USER-MAPPING-DROP".to_string()),
-        "dropping a user mapping should fire its own signal. Got: {ids:?}"
+        "dropping a user mapping should fire its own finding. Got: {ids:?}"
     );
 }
 

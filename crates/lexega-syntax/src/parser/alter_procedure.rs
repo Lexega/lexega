@@ -21,6 +21,7 @@ use crate::ast::{AstAlterProcedure, AstAlterProcedureAction, AstAlterProcedureAc
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 // Reuse helpers from alter_function
 use super::alter_function::{consume_balanced_parens, parse_signature_type_list};
@@ -66,6 +67,7 @@ pub(crate) fn try_parse_alter_procedure(p: &mut Parser<'_>) -> ParseResult<AstSt
 
     // Parse action
     let mut extras: Vec<AstUnknownClause> = Vec::new();
+    p.record_setting_secrets(p.idx);
     let action = parse_alter_procedure_action(p, &mut extras)?;
     let action_span = action.span;
 
@@ -363,50 +365,13 @@ fn parse_set_tag_action_proc(
     let tag_tok = p.advance().expect_invariant("TAG verified by caller");
     let tag_span = tag_tok.span;
 
-    // Parse tag assignments: name = 'value' [, ...]
-    let assignments_start = p.current_span().start;
-    let mut end;
-
-    loop {
-        // Tag name (possibly qualified: db.schema.tag_name)
-        let _tag_name_span = p.parse_qualified_name_span()?;
-
-        // =
-        let eq_tok = p
-            .advance()
-            .ok_or_eof(p.current_span(), vec!["=".to_string()])?;
-        if !matches!(eq_tok.kind, TokenKind::Operator(Operator::Eq)) {
-            return Err(ParseError::new(
-                eq_tok.span,
-                ParseErrorKind::InvalidStatement {
-                    message: "Expected = after tag name".to_string(),
-                },
-            ));
-        }
-
-        // Value (string literal)
-        let value_tok = p
-            .advance()
-            .ok_or_eof(p.current_span(), vec!["tag value".to_string()])?;
-        end = value_tok.span.end;
-
-        // Check for comma (more assignments)
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                p.advance(); // consume comma
-                continue;
-            }
-        }
-        break;
-    }
+    let (assignments_span, tags) = p.parse_tag_list(TagListShape::Assignments)?;
 
     Ok(AstAlterProcedureActionKind::SetTag {
         set_span,
         tag_span,
-        assignments_span: Span {
-            start: assignments_start,
-            end,
-        },
+        assignments_span,
+        tags,
     })
 }
 
@@ -418,32 +383,13 @@ fn parse_unset_tag_action_proc(
     let tag_tok = p.advance().expect_invariant("TAG verified by caller");
     let tag_span = tag_tok.span;
 
-    // Parse tag names: name [, name, ...]
-    let tags_start = p.current_span().start;
-    let mut end;
-
-    loop {
-        // Tag name (possibly qualified: db.schema.tag_name)
-        let tag_name_span = p.parse_qualified_name_span()?;
-        end = tag_name_span.end;
-
-        // Check for comma
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                p.advance();
-                continue;
-            }
-        }
-        break;
-    }
+    let (tags_span, tags) = p.parse_tag_list(TagListShape::Names)?;
 
     Ok(AstAlterProcedureActionKind::UnsetTag {
         unset_span,
         tag_span,
-        tags_span: Span {
-            start: tags_start,
-            end,
-        },
+        tags_span,
+        tags,
     })
 }
 
@@ -510,6 +456,7 @@ fn parse_set_properties_proc(
 
 /// Consume tokens until statement end (semicolon or EOF).
 fn consume_to_statement_end_proc(p: &mut Parser<'_>, start: u32) -> ParseResult<Span> {
+    let from = p.idx;
     let mut end = start;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -518,5 +465,7 @@ fn consume_to_statement_end_proc(p: &mut Parser<'_>, start: u32) -> ParseResult<
         let t = p.advance().expect_invariant("token consumed after peek");
         end = t.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     Ok(Span { start, end })
 }

@@ -13,8 +13,8 @@
 //! regenerate is forced, and whether an inline password is present. Which
 //! combination is dangerous is a YAML verdict — re-keying the root,
 //! force-discarding undecryptable material, or a hardcoded service-account
-//! password. The password value is redacted at parse time and never appears
-//! here.
+//! password. Each password's value is in the facts and is masked in every
+//! report.
 //!
 //! Predicate example:
 //! ```yaml
@@ -25,6 +25,8 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+
+use super::PasswordLiteral;
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
@@ -52,6 +54,13 @@ pub struct MssqlServiceMasterKeyFacts {
     /// irreversibly.
     pub force: bool,
     /// `true` when an inline `{ OLD | NEW }_PASSWORD = '…'` is present — a
-    /// hardcoded service-account credential. The value is redacted.
+    /// hardcoded service-account credential.
     pub password_present: bool,
+    /// Each password literal written, decoded: doubled quotes undone and any
+    /// `N` prefix dropped. A value the engine rendered from a template or
+    /// substituted for a deploy variable is not listed. The value is masked
+    /// in every report; a custom rule message that interpolates it shows it
+    /// unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub password_literals: Vec<PasswordLiteral>,
 }

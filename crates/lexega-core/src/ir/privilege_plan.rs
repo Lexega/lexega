@@ -241,6 +241,9 @@ pub fn lower_grant_to_privilege_plan(g: &AstGrant) -> PrivilegePlan {
             },
             PrivilegeOptions::default(),
         ),
+        AstGrantShape::Membership { roles, .. } => {
+            (membership_shape(roles, g.span), PrivilegeOptions::default())
+        }
         AstGrantShape::Unparsed { body_span } => (
             PrivilegeShape::Unparsed {
                 body_span: *body_span,
@@ -255,6 +258,18 @@ pub fn lower_grant_to_privilege_plan(g: &AstGrant) -> PrivilegePlan {
         options,
         node_id: g.node_id,
         span: g.span,
+    }
+}
+
+/// A role membership grant carries no privilege, object or target: the plan
+/// holds its body, from the first role to the statement's end, as the
+/// span-only shape.
+fn membership_shape(roles: &[Span], statement: Span) -> PrivilegeShape {
+    PrivilegeShape::Unparsed {
+        body_span: Span {
+            start: roles.first().map_or(statement.start, |role| role.start),
+            end: statement.end,
+        },
     }
 }
 
@@ -274,6 +289,7 @@ pub fn lower_revoke_to_privilege_plan(r: &AstRevoke) -> PrivilegePlan {
             role_name_span: body.role_name_span,
             grantee: lower_grantee(&body.grantee),
         },
+        AstRevokeShape::Membership { roles, .. } => membership_shape(roles, r.span),
         AstRevokeShape::Unparsed { body_span } => PrivilegeShape::Unparsed {
             body_span: *body_span,
         },
@@ -363,7 +379,7 @@ pub fn lower_deny_to_privilege_plan(d: &AstDeny) -> PrivilegePlan {
     let privileges = lower_privilege_list(&d.privileges);
     let object = d.object_span.as_ref().map(|_| {
         // No DNY-* rule currently predicates on the securable's class
-        // or name; surface a placeholder `Account` to signal that some
+        // or name; surface a placeholder `Account` to indicate that some
         // ON clause was present. Promote to a typed shape when the
         // first rule needs it (see [`AstDeny::object_span`]).
         PrivilegeObject::Account

@@ -31,7 +31,7 @@ use crate::ast::{
     AstScript, AstStmt, JinjaInlineBlock, JinjaInlineComment, JinjaInlineFragment,
     JinjaInlineFragmentKind, JinjaInlinePunctuation,
 };
-use crate::dialect::{Dialect, SnowflakeDialect};
+use crate::dialect::{Dialect, LabelPosition, SnowflakeDialect};
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, Token, TokenKind};
 use crate::syntax::{
@@ -75,18 +75,26 @@ pub enum IdentifierContext {
 ///
 /// - **Recursive descent**: Each parsing method handles one grammar rule
 /// - **Lookahead**: Uses `peek()` to guide parsing decisions without consuming
-/// - **Backtracking**: Returns `Option<T>` to signal parse failure
+/// - **Backtracking**: Returns `Option<T>` to indicate parse failure
 /// - **Span tracking**: Every parsed node includes source location
 /// - **Mode context**: Explicit SQL vs Scripting mode tracking
 ///
-/// Recognizes a dollar-quote delimiter lexeme (`$$` or `$tag$`) as the lexer
-/// emits it (an `Identifier{Unquoted}` whose text starts and ends with `$`).
-/// Used by both the expression parser (reassembling a dollar-quoted string
-/// literal) and the routine-body parsers (matching the opening/closing
-/// delimiters of a `$$ … $$` / `$tag$ … $tag$` body). A plain identifier or a
-/// positional parameter (`$1`) never matches (those don't end with `$`).
+/// Whether a word is written as a dollar-quote delimiter (`$$` or `$tag$`):
+/// its text starts and ends with `$`. Read only where the dialect's lexer
+/// gives dollar quotes as words; a positional parameter (`$1`) never matches.
 pub(crate) fn is_dollar_quote_tag(lexeme: &str) -> bool {
     lexeme.len() >= 2 && lexeme.starts_with('$') && lexeme.ends_with('$')
+}
+
+/// Whether the lexer typed the token a dollar-quote delimiter.
+pub(crate) fn is_dollar_quote_delimiter(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Identifier {
+            kind: crate::lexer::IdentifierKind::DollarQuoteDelimiter,
+            ..
+        }
+    )
 }
 
 /// True when an object-property name (upper-cased) holds a secret value whose
@@ -107,6 +115,7 @@ pub fn is_credential_value_property(name_upper: &str) -> bool {
             | "OAUTH_CLIENT_SECRET"
             | "OAUTH_ACCESS_TOKEN"
             | "OAUTH_REFRESH_TOKEN"
+            | "API_KEY"
             | "CLIENT_SECRET"
             | "REFRESH_TOKEN"
             | "SECRET_STRING"
@@ -130,12 +139,30 @@ pub struct Parser<'a> {
     /// seen while parsing, so consumers that quote source text can mask
     /// them and a credential value never reaches an output.
     pub(crate) redaction_spans: Vec<crate::lexer::token::Span>,
+    /// Where each dollar-quoted region read as a routine's or a block's
+    /// body opens: code, whose comments are the code's. Any other
+    /// dollar-quoted region is a string, data whose text holds no comment.
+    pub(crate) dollar_bodies: Vec<u32>,
+    /// Each dollar-quoted routine body read as the statements of a routine
+    /// whose language is SQL ([`AstScript::read_bodies`]).
+    pub(crate) read_bodies: Vec<crate::lexer::token::Span>,
+    /// The values the statements read give settings and session variables
+    /// ([`AstScript::setting_values`]).
+    pub(crate) setting_values: Vec<crate::ast::SettingValue>,
+    /// The options bulk loads name ([`AstScript::bulk_options`]).
+    pub(crate) bulk_options: Vec<crate::ast::BulkOption>,
+    /// The variables statements take names from ([`AstScript::held_names`]).
+    pub(crate) held_names: Vec<Span>,
+    /// Statements read up to a token the parser does not bind, each with
+    /// the text after it that the recovery skipped.
+    pub(crate) cut_statements: Vec<crate::ast::CutStatement>,
     /// Byte-spans in the parsed text that a template stage produced for an
     /// UNRESOLVED reference (Jinja placeholder, undefined SnowSQL `&var`).
     /// A credential-value capture landing on one of these treats the value
     /// as "not a statically-known literal" — the value that will run is
     /// injected later — so it is not reported as a hard-coded value (the
-    /// span is still redacted). Empty unless a caller installs them.
+    /// span is still redacted). An object-name part holding one is a part a
+    /// template writes. Empty unless a caller installs them.
     pub(crate) placeholder_spans: Vec<crate::lexer::token::Span>,
     pub(crate) id_gen: Rc<crate::ast::NodeIdGenerator>,
     /// Current parsing mode (SQL, Scripting, or Expression)
@@ -146,6 +173,40 @@ pub struct Parser<'a> {
     /// currently being parsed. Non-zero enables `?` parameter markers in
     /// expression position (ODBC SQL is parameterized).
     pub(crate) odbc_depth: u32,
+    /// Where the name of the call an ODBC `{fn …}` escape wraps starts,
+    /// while it is read: its arguments follow ODBC's grammar, not the
+    /// dialect's.
+    pub(crate) odbc_call: Option<u32>,
+    /// Nesting depth of T-SQL `WHILE` bodies being parsed. Non-zero allows
+    /// `BREAK` / `CONTINUE` in a block or `IF` inside one, whose statements
+    /// are read in block context.
+    pub(crate) while_body_depth: u32,
+    /// Nesting depth of blocks being read inside a dollar-quoted routine or
+    /// `DO` body. Non-zero reads `SELECT … INTO [STRICT] target, …` as a
+    /// variable target list (PL/pgSQL), where `INTO` would otherwise name a
+    /// new table, and a statement led by `PERFORM` as a query.
+    pub(crate) dollar_body_block_depth: u32,
+    /// Whether the body being read is one an `END` closes (a block's, an
+    /// `IF`'s, a loop's), where a block closes at such an `END`
+    /// ([`Self::closes_block_at`]).
+    pub(crate) in_end_closed_body: bool,
+    /// Declared-column lists read where a call is read (a `WITH (…)` schema
+    /// after it in an expression, a `COLUMNS (…)` argument), keyed by the
+    /// clause's span, for the table reference holding the call to take.
+    pub(crate) declared_columns:
+        std::collections::HashMap<Span, Vec<crate::ast::AstTableFunctionColumn>>,
+    /// Index in the script's token list of `tokens[0]`: non-zero for a
+    /// parser reading a copy of part of the script, so the token ids it
+    /// writes index the script's tokens.
+    pub(crate) token_id_base: u32,
+    /// The index of the last `END` keyword of `tokens`, found once
+    /// ([`Self::end_written_after`]).
+    last_end: std::cell::OnceCell<Option<usize>>,
+    /// The reads of block bodies and statements that failed, by the tokens
+    /// they stood at.
+    pub(crate) failed_reads: crate::parser::scripting::FailedReads,
+    /// The tokens of text no reader parsed already read for secrets.
+    pub(crate) unparsed_secrets_read: crate::parser::principal::UnparsedSecretsRead,
 }
 
 std::thread_local! {
@@ -184,6 +245,343 @@ const PARSE_STACK_BUDGET: usize = MIN_PARSE_STACK_BYTES - 2 * 1024 * 1024;
 /// wasm32 has no threads and a small linear-memory stack (1 MiB by default).
 #[cfg(target_arch = "wasm32")]
 const PARSE_STACK_BUDGET: usize = 384 * 1024;
+
+/// The kind of statement a word leads ([`STATEMENT_LEADERS`]), by which
+/// [`Parser::starts_statement`] decides, for what is being read, whether the
+/// word ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leader {
+    /// `SELECT`.
+    Select,
+    /// `WITH`: also a clause's or an option list's word.
+    With,
+    /// `VALUES`: a query only where one is due.
+    Values,
+    /// `INSERT`, `UPDATE`, `DELETE`, `MERGE`.
+    Dml,
+    /// `CREATE`, `DROP`, `TRUNCATE`.
+    Ddl,
+    /// `ALTER`.
+    Alter,
+    /// `GRANT`, `REVOKE`, `DENY`.
+    Access,
+    /// `BEGIN`: a transaction or a block.
+    Begin,
+    /// `COMMIT`, `ROLLBACK`.
+    Transaction,
+    /// `USE`, `SHOW`, `DESCRIBE`.
+    Session,
+    /// `COPY`: also `COPY GRANTS` in a `CREATE`.
+    Copy,
+    /// `CALL`.
+    Call,
+    /// `EXECUTE`: also `EXECUTE AS` and a trigger's `EXECUTE FUNCTION`.
+    Execute,
+    /// `DECLARE`.
+    Declare,
+    /// `LET`.
+    Let,
+    /// `IF`, `WHILE`, `REPEAT`, `LOOP`: a compound statement; also `IF (…)`,
+    /// `REPEAT (…)`.
+    Compound,
+    /// `FOR`: a loop; also `FOR UPDATE`, `FOR XML`, `DEFAULT … FOR col`.
+    For,
+    /// `CASE`: a statement or an expression.
+    Case,
+    /// `RETURN`, `RAISE`, `BREAK`, `CONTINUE`.
+    Jump,
+    /// `OPEN`, `FETCH`, `CLOSE`: a cursor statement. A query's row limit
+    /// (`FETCH NEXT 5 ROWS ONLY`) leads none.
+    Cursor,
+    /// `END`, `ELSE`, `TRY`, `CATCH`: a block's part.
+    BlockPart,
+    /// `SET`, `OUTPUT`: a T-SQL statement after a complete clause.
+    ClauseEnd,
+    /// T-SQL's `GO`, `PRINT`, `EXEC`, `RECONFIGURE`, `{ ENABLE | DISABLE }
+    /// TRIGGER`, `BULK INSERT`, a label (`name:`), and the words it reserves
+    /// that lead a statement only ([`TSQL_STATEMENT_WORDS`]), written as
+    /// names; a sqlcmd command line (`:r file`).
+    TsqlWord,
+    /// BigQuery's `EXPORT`, `LOAD`, `ASSERT`, written as names.
+    BigQueryWord,
+}
+
+/// The keywords that lead a statement, each with the kind it leads.
+const STATEMENT_LEADERS: &[(Keyword, Leader)] = &[
+    (Keyword::Select, Leader::Select),
+    (Keyword::With, Leader::With),
+    (Keyword::Values, Leader::Values),
+    (Keyword::Insert, Leader::Dml),
+    (Keyword::Update, Leader::Dml),
+    (Keyword::Delete, Leader::Dml),
+    (Keyword::Merge, Leader::Dml),
+    (Keyword::Create, Leader::Ddl),
+    (Keyword::Drop, Leader::Ddl),
+    (Keyword::Truncate, Leader::Ddl),
+    (Keyword::Alter, Leader::Alter),
+    (Keyword::Grant, Leader::Access),
+    (Keyword::Revoke, Leader::Access),
+    (Keyword::Deny, Leader::Access),
+    (Keyword::Begin, Leader::Begin),
+    (Keyword::Commit, Leader::Transaction),
+    (Keyword::Rollback, Leader::Transaction),
+    (Keyword::Use, Leader::Session),
+    (Keyword::Show, Leader::Session),
+    (Keyword::Describe, Leader::Session),
+    (Keyword::Copy, Leader::Copy),
+    (Keyword::Call, Leader::Call),
+    (Keyword::Execute, Leader::Execute),
+    (Keyword::Declare, Leader::Declare),
+    (Keyword::Let, Leader::Let),
+    (Keyword::If, Leader::Compound),
+    (Keyword::While, Leader::Compound),
+    (Keyword::For, Leader::For),
+    (Keyword::Repeat, Leader::Compound),
+    (Keyword::Loop, Leader::Compound),
+    (Keyword::Case, Leader::Case),
+    (Keyword::Return, Leader::Jump),
+    (Keyword::Raise, Leader::Jump),
+    (Keyword::Break, Leader::Jump),
+    (Keyword::Continue, Leader::Jump),
+    (Keyword::Open, Leader::Cursor),
+    (Keyword::Fetch, Leader::Cursor),
+    (Keyword::Close, Leader::Cursor),
+    (Keyword::End, Leader::BlockPart),
+    (Keyword::Else, Leader::BlockPart),
+    (Keyword::Try, Leader::BlockPart),
+    (Keyword::Catch, Leader::BlockPart),
+    (Keyword::Set, Leader::ClauseEnd),
+    (Keyword::Output, Leader::ClauseEnd),
+];
+
+/// What the parser is reading when it asks whether a token starts a
+/// statement ([`Parser::starts_statement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementContext {
+    /// A statement past a clause that may end it, where the dialect needs
+    /// no terminator (T-SQL): the word is not the clause's alias, argument
+    /// or option.
+    Unterminated,
+    /// As [`Self::Unterminated`], past a T-SQL `ALTER TABLE` action, whose
+    /// `WITH` (`WITH VALUES`, `WITH (…)`) and `FOR` (`DEFAULT … FOR col`,
+    /// `PERIOD FOR`) are its own.
+    ActionTail,
+    /// A statement that did not parse, skipped at the top level.
+    Recovery,
+    /// A statement that did not parse, skipped by the tolerant parse.
+    TolerantRecovery,
+    /// A statement in a body that did not parse, skipped.
+    BodyRecovery,
+    /// A compound statement's header with its keyword missing, which ends
+    /// where its body's first statement starts.
+    CompoundHeader,
+    /// A `FOR` loop's header, which is a statement where one starts it.
+    LoopQuery,
+    /// An option, property or name list read to its end, or an expression
+    /// the parser gave up on.
+    OptionTail,
+    /// A declaration read to its end: at a `BEGIN`, and where the dialect
+    /// needs no terminator, at any statement.
+    Declaration,
+    /// A compound statement opening where a statement starts (after `;`, a
+    /// label, `THEN`, `ELSE`, `DO`, `LOOP`, `BEGIN` or `REPEAT`).
+    CompoundOpener,
+}
+
+impl Leader {
+    /// Whether a statement this word leads starts, for what `context`
+    /// reads; `unterminated` whether the dialect's statements need no
+    /// terminator.
+    fn starts_in(self, context: StatementContext, unterminated: bool) -> bool {
+        use Leader::*;
+        match context {
+            StatementContext::Unterminated => match self {
+                Select | With | Dml | Ddl | Alter | Access | Begin | Transaction | Session
+                | Copy | Call | Execute | Declare | Let | Compound | For | Case | Jump | Cursor
+                | BlockPart | ClauseEnd | TsqlWord => unterminated,
+                Values | BigQueryWord => false,
+            },
+            StatementContext::ActionTail => match self {
+                With | For => false,
+                Select | Values | Dml | Ddl | Alter | Access | Begin | Transaction | Session
+                | Copy | Call | Execute | Declare | Let | Compound | Case | Jump | Cursor
+                | BlockPart | ClauseEnd | TsqlWord | BigQueryWord => {
+                    Leader::starts_in(self, StatementContext::Unterminated, unterminated)
+                }
+            },
+            StatementContext::Recovery => match self {
+                Select | Dml | Ddl | Alter | Session | Begin | Declare => true,
+                With | Values | Access | Transaction | Copy | Call | Execute | Let | Compound
+                | For | Case | Jump | Cursor | BlockPart | ClauseEnd | TsqlWord | BigQueryWord => {
+                    false
+                }
+            },
+            StatementContext::TolerantRecovery => match self {
+                Select | With | Dml | Ddl | Access | Begin | Transaction | Session | Copy
+                | Call | Declare | Let | Compound | For | Case | Jump | BlockPart => true,
+                Values | Alter | Execute | Cursor | ClauseEnd | TsqlWord | BigQueryWord => false,
+            },
+            // A common table expression starts a statement in a body only
+            // after a `;` where terminators are optional.
+            StatementContext::BodyRecovery | StatementContext::CompoundHeader => match self {
+                Select | Dml | Ddl | Begin | Call | Execute | Declare | Let | Compound | For
+                | Jump | Cursor => true,
+                With => !unterminated,
+                Case => context == StatementContext::BodyRecovery,
+                Values | Alter | Access | Transaction | Session | Copy | BlockPart | ClauseEnd
+                | TsqlWord | BigQueryWord => false,
+            },
+            StatementContext::LoopQuery => match self {
+                Select | With | Values | Dml | Execute => true,
+                Ddl | Alter | Access | Begin | Transaction | Session | Copy | Call | Declare
+                | Let | Compound | For | Case | Jump | Cursor | BlockPart | ClauseEnd
+                | TsqlWord | BigQueryWord => false,
+            },
+            StatementContext::OptionTail => match self {
+                Select | Dml | Ddl | Alter | Access | Begin | Transaction | BigQueryWord => true,
+                With | Values | Session | Copy | Call | Execute | Declare | Let | Compound
+                | For | Case | Jump | Cursor | BlockPart | ClauseEnd | TsqlWord => false,
+            },
+            StatementContext::Declaration => {
+                self == Begin
+                    || Leader::starts_in(self, StatementContext::Unterminated, unterminated)
+            }
+            StatementContext::CompoundOpener => match self {
+                Compound | For => true,
+                Select | With | Values | Dml | Ddl | Alter | Access | Begin | Transaction
+                | Session | Copy | Call | Execute | Declare | Let | Case | Jump | Cursor
+                | BlockPart | ClauseEnd | TsqlWord | BigQueryWord => false,
+            },
+        }
+    }
+}
+
+/// T-SQL's reserved words that lead a statement only. Where the dialect
+/// reserves one it is never an alias or an argument, so a statement without
+/// a terminator ends before it.
+const TSQL_STATEMENT_WORDS: &[&str] = &[
+    "BACKUP",
+    "CHECKPOINT",
+    "DBCC",
+    "DEALLOCATE",
+    "GOTO",
+    "KILL",
+    "RAISERROR",
+    "READTEXT",
+    "RESTORE",
+    "REVERT",
+    "SAVE",
+    "SETUSER",
+    "SHUTDOWN",
+    "UPDATETEXT",
+    "WAITFOR",
+    "WRITETEXT",
+];
+
+/// The shapes a name position takes ([`Parser::read_object_name`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamePosition {
+    /// An object's or a routine's name: every shape.
+    Object,
+    /// A data type's name: no dashed part (`x::int-1` subtracts) and no
+    /// `IDENTIFIER(…)`.
+    DataType,
+    /// A FROM clause's table name led by the keyword `TABLE` written
+    /// without a call (`FROM table`): an object's shapes, that keyword its
+    /// first part.
+    TableWord,
+}
+
+/// The dotted name `name` without its last part, and that part's span
+/// (`OWNED BY s.t.c` read as the table `s.t` and the column `c`). `None`
+/// where the name has no parts, an omitted part, or only one part.
+pub(crate) fn split_last_part(
+    name: crate::ast::AstObjectRef,
+) -> Option<(crate::ast::AstObjectRef, Span)> {
+    let mut parts = name.parts?;
+    let last = parts.pop()??.span();
+    let end = parts.last()?.as_ref()?.span().end;
+    let templated = parts
+        .iter()
+        .flatten()
+        .any(|part| matches!(part, crate::ast::AstNamePart::Templated { .. }));
+    let table = crate::ast::AstObjectRef {
+        node_id: name.node_id,
+        span: Span {
+            start: name.span.start,
+            end,
+        },
+        parts: Some(parts),
+        identifier_arg: None,
+        name_kind: if templated {
+            crate::ast::AstTableNameKind::Templated
+        } else {
+            crate::ast::AstTableNameKind::Catalog
+        },
+    };
+    Some((table, last))
+}
+
+/// How a property's value is read ([`Parser::parse_property`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropertyValue {
+    /// One token or a parenthesised group.
+    Any,
+    /// An object name where one starts, else as `Any`.
+    Name,
+}
+
+/// A property clause read by [`Parser::parse_property`].
+pub(crate) struct PropertyClause {
+    /// From the key through the value.
+    pub(crate) span: Span,
+    /// The value, where it was read as a name.
+    pub(crate) name: Option<Span>,
+}
+
+/// The span of the `KEY [= value]` property at the current token,
+/// consumed ([`Parser::parse_property`]).
+pub(crate) fn parse_property_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+    Ok(p.parse_property(PropertyValue::Any)?.span)
+}
+
+/// What an `{% if %}` / `{% for %}` block written against a templated part
+/// is ([`Parser::templated_part_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateBlock {
+    /// One more template piece of the part: in a name a block begins.
+    Piece,
+    /// The end of the part: in any other name, an alias or an expression.
+    Ends,
+}
+
+/// An object name read from the token stream ([`Parser::object_ref_at`]).
+struct ObjectNameRead {
+    /// Index just past the name.
+    next: usize,
+    /// Byte offset where its last part ends.
+    end: u32,
+    /// Each part (`None` for an omitted part); `None` where a part is
+    /// `IDENTIFIER(…)`.
+    parts: Option<Vec<Option<crate::ast::AstNamePart>>>,
+    /// The kind the last part's token says, or `Templated` where a template
+    /// writes some part.
+    kind: crate::ast::AstTableNameKind,
+    /// The indices of the `(` and `)` of a first part `IDENTIFIER(…)`.
+    identifier_call: Option<(usize, usize)>,
+}
+
+/// The first part of a name, read with its dashed segments
+/// ([`Parser::dashed_part`]).
+pub(crate) struct DashedPart {
+    /// Index of the part's last token.
+    pub(crate) last: usize,
+    /// The part's span, without a `.` its last token holds.
+    pub(crate) span: Span,
+    /// The `.` after the part where its last token holds it: the next part
+    /// follows.
+    pub(crate) dot: Option<Span>,
+}
 
 /// Decrements the depth counter on drop, so unwinding on any path —
 /// including `?` early returns — never leaks a depth tick. Clears the stack
@@ -269,27 +667,131 @@ impl<'a> Parser<'a> {
             idx: 0,
             recovery_errors: Vec::new(),
             redaction_spans: Vec::new(),
+            dollar_bodies: Vec::new(),
+            read_bodies: Vec::new(),
+            setting_values: Vec::new(),
+            bulk_options: Vec::new(),
+            held_names: Vec::new(),
+            cut_statements: Vec::new(),
             placeholder_spans: Vec::new(),
             id_gen: Rc::new(crate::ast::NodeIdGenerator::new()),
             mode: ParserMode::Sql,
             syntax_arena: crate::syntax::SyntaxArena::new(),
             odbc_depth: 0,
+            odbc_call: None,
+            while_body_depth: 0,
+            dollar_body_block_depth: 0,
+            in_end_closed_body: false,
+            declared_columns: std::collections::HashMap::new(),
+            token_id_base: 0,
+            last_end: std::cell::OnceCell::new(),
+            failed_reads: crate::parser::scripting::FailedReads::default(),
+            unparsed_secrets_read: crate::parser::principal::UnparsedSecretsRead::default(),
         }
+    }
+
+    /// Whether an `END` keyword is written after token `at`: a block that
+    /// `BEGIN` opens there closes only at one.
+    pub(crate) fn end_written_after(&self, at: usize) -> bool {
+        self.last_end
+            .get_or_init(|| {
+                self.tokens
+                    .iter()
+                    .rposition(|t| matches!(t.kind, TokenKind::Keyword(Keyword::End)))
+            })
+            .is_some_and(|end| end > at)
     }
 
     /// Install the template-placeholder spans for this parse (formatter
     /// parses never set them).
     pub(crate) fn set_placeholder_spans(&mut self, spans: &[crate::lexer::token::Span]) {
         self.placeholder_spans = spans.to_vec();
+        // In order, so a place is found by search.
+        self.placeholder_spans.sort_by_key(|p| (p.start, p.end));
+    }
+
+    /// The zero-width placeholder from byte `from` to byte `to`, both
+    /// included: where the render wrote nothing for an expression it could
+    /// not resolve.
+    pub(crate) fn rendered_nothing_between(&self, from: u32, to: u32) -> Option<Span> {
+        let first = self.placeholder_spans.partition_point(|p| p.start < from);
+        self.placeholder_spans[first..]
+            .iter()
+            .take_while(|p| p.start <= to)
+            .find(|p| p.start == p.end)
+            .copied()
+    }
+
+    /// The table a template that rendered nothing names at `span` (zero
+    /// width): one part, what the render wrote.
+    pub(crate) fn rendered_nothing_table(&mut self, span: Span) -> crate::ast::AstTableRef {
+        let name = crate::ast::AstObjectRef {
+            node_id: self.id_gen.next(),
+            span,
+            parts: Some(vec![Some(crate::ast::AstNamePart::Templated {
+                span,
+                name: crate::ast::AstTemplatedName {
+                    pieces: vec![crate::ast::AstNamePiece::Rendered(span)],
+                },
+            })]),
+            identifier_arg: None,
+            name_kind: crate::ast::AstTableNameKind::Templated,
+        };
+        crate::parser::sql_stmt::build_table_ref(
+            self.id_gen.next(),
+            span,
+            name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// True when `span` overlaps a template-placeholder span — the text at
     /// `span` is a render artifact standing in for an injected value, not
     /// content the author wrote.
     pub(crate) fn span_overlaps_placeholder(&self, span: crate::lexer::token::Span) -> bool {
-        self.placeholder_spans
-            .iter()
-            .any(|p| p.start < span.end && span.start < p.end)
+        self.placeholder_spans.iter().any(|p| p.overlaps(span))
+    }
+
+    /// The `[=] '…'` password literal after the keyword at `keyword_idx`:
+    /// the value is always redacted, in any spelling and a string a
+    /// template writes into included, and the literal's span (quotes and any
+    /// prefix included) is returned unless a placeholder overlaps it.
+    pub(crate) fn password_literal_after(
+        &mut self,
+        keyword_idx: usize,
+    ) -> Option<crate::lexer::token::Span> {
+        let idx = self.value_idx_after(keyword_idx)?;
+        let literal = self.literal_at(self.hashed_value_idx(idx)?)?;
+        self.redaction_spans.push(literal.content);
+        // Recorded: a quoted string lexed as one token, not a hash call's
+        // argument nor a prefix written apart.
+        let first = &self.tokens[literal.first];
+        let recorded = literal.first == idx
+            && matches!(
+                first.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::String)
+            )
+            && !self.span_overlaps_placeholder(first.span);
+        recorded.then_some(first.span)
     }
 
     /// Promote a dynamic-SQL string argument that overlaps a rendered
@@ -338,30 +840,61 @@ impl<'a> Parser<'a> {
     /// Get the TokenId for the current token (before advance).
     #[inline]
     pub(crate) fn current_token_id(&self) -> crate::cst::TokenId {
-        crate::cst::TokenId(self.idx as u32)
+        self.token_id_at(self.idx)
     }
 
     /// Get the TokenId for the most recently advanced token.
     /// Call this AFTER advance() to get the ID of the token just consumed.
     #[inline]
     pub(crate) fn last_token_id(&self) -> crate::cst::TokenId {
-        crate::cst::TokenId((self.idx.saturating_sub(1)) as u32)
+        self.token_id_at(self.idx.saturating_sub(1))
+    }
+
+    /// The span of the token last consumed; `None` before the first.
+    pub(crate) fn last_consumed_span(&self) -> Option<Span> {
+        self.idx
+            .checked_sub(1)
+            .and_then(|last| self.tokens.get(last))
+            .map(|tok| tok.span)
+    }
+
+    /// The TokenId of `tokens[idx]`.
+    #[inline]
+    pub(crate) fn token_id_at(&self, idx: usize) -> crate::cst::TokenId {
+        crate::cst::TokenId(self.token_id_base + idx as u32)
+    }
+
+    /// Whether `tok` opens or closes a dollar quote: a dollar-quote delimiter
+    /// where the dialect's lexer types them (it reads dollar quotes, or
+    /// writes a `$$` string as words), else an unquoted word written `$$` or
+    /// `$tag$`.
+    pub(crate) fn delimits_dollar_quote(&self, tok: &Token) -> bool {
+        if self.dialect.supports_dollar_quoted_strings()
+            || self.dialect.dollar_strings_written_as_words()
+        {
+            return is_dollar_quote_delimiter(&tok.kind);
+        }
+        matches!(
+            tok.kind,
+            TokenKind::Identifier {
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
+            }
+        ) && is_dollar_quote_tag(tok.lexeme(self.source))
     }
 
     /// Reassemble a dollar-quoted run (`$$ … $$` / `$tag$ … $tag$`) starting at
     /// the current position into one span covering opener through matching
     /// closer, consuming every token in the run.
     ///
-    /// PRECONDITION: the next token to be advanced is a dollar-quote opener — an
-    /// `Identifier` whose lexeme satisfies [`is_dollar_quote_tag`]. Callers gate
-    /// on `dialect.supports_dollar_quoted_strings()` and confirm the opener via a
-    /// peek before calling.
+    /// PRECONDITION: the next token to be advanced is a dollar-quote delimiter
+    /// ([`is_dollar_quote_delimiter`]), confirmed by a peek before calling.
     ///
-    /// Under that dialect gate the lexer emits a dollar-quoted region as
-    /// opening-delimiter + inner SQL tokens + closing-delimiter so routine bodies
-    /// become analyzable statements; wherever the run is a STRING LITERAL instead
-    /// (expression position, `COMMENT ON … IS`, …) it must collapse back to a
-    /// single span. The matching closer is the next token whose lexeme equals the
+    /// The lexer emits a dollar-quoted region as opening-delimiter + inner SQL
+    /// tokens + closing-delimiter so routine bodies become analyzable
+    /// statements; wherever the run is a STRING LITERAL instead (expression
+    /// position, `COMMENT ON … IS`, …) it must collapse back to a single span.
+    /// The matching closer is the next delimiter whose lexeme equals the
     /// opener's — the lexer's opaque close-scan guarantees the inner region holds
     /// no occurrence of the tag, so the first match is the true closer. On EOF
     /// without a closer (unterminated) the span ends at the last consumed token.
@@ -377,7 +910,7 @@ impl<'a> Parser<'a> {
         let mut end = open.span.end;
         loop {
             let step = self.peek().map(|t| {
-                let is_close = matches!(t.kind, TokenKind::Identifier { .. })
+                let is_close = is_dollar_quote_delimiter(&t.kind)
                     && t.lexeme(self.source) == &self.source[open_lo..open_hi];
                 (t.span, is_close)
             });
@@ -808,6 +1341,8 @@ impl<'a> Parser<'a> {
         // Skip tokens until a top-level statement boundary:
         // - Semicolon at depth 0
         // - Next statement keyword (SELECT, INSERT, CREATE, …) at depth 0
+        // - Semicolon inside a nesting never closed, any statement after it
+        // - Batch separator (T-SQL `GO`) at any depth
         // - EOF
         // Depth tracking keeps a SELECT inside a CTE body or subquery from
         // being read as a new statement, which would otherwise fragment one
@@ -831,7 +1366,31 @@ impl<'a> Parser<'a> {
                 TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
                     | TokenKind::Punctuation(crate::lexer::Punctuation::RBracket)
             ) {
-                depth = depth.saturating_sub(1);
+                // A closer with no opener in the skipped text (a recovery
+                // that starts inside a nesting) opens nothing.
+                depth = (depth - 1).max(0);
+            }
+
+            // A batch separator ends the batch, and what it holds, at any
+            // depth; so does a sqlcmd command line, which the client takes.
+            if (self.is_batch_separator(t) || self.is_sqlcmd_command(t)) && t.span.start > start {
+                break;
+            }
+
+            // A `;` inside a nesting the statement never closes ends it
+            // where any statement starts after it: the unclosed opener does
+            // not take the rest of the script.
+            if depth > 0
+                && matches!(
+                    t.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                )
+                && crate::parser::principal::next_non_trivia_idx(self.tokens, self.idx + 1)
+                    .is_some_and(|next| self.leads_statement(next))
+            {
+                end = t.span.end;
+                self.advance();
+                break;
             }
 
             // Boundaries are only meaningful at the top level.
@@ -846,22 +1405,7 @@ impl<'a> Parser<'a> {
                 }
 
                 // Check if this looks like the start of a new statement
-                let is_stmt_keyword = matches!(
-                    t.kind,
-                    TokenKind::Keyword(Keyword::Select)
-                        | TokenKind::Keyword(Keyword::Insert)
-                        | TokenKind::Keyword(Keyword::Update)
-                        | TokenKind::Keyword(Keyword::Delete)
-                        | TokenKind::Keyword(Keyword::Merge)
-                        | TokenKind::Keyword(Keyword::Create)
-                        | TokenKind::Keyword(Keyword::Drop)
-                        | TokenKind::Keyword(Keyword::Alter)
-                        | TokenKind::Keyword(Keyword::Show)
-                        | TokenKind::Keyword(Keyword::Truncate)
-                        | TokenKind::Keyword(Keyword::Use)
-                        | TokenKind::Keyword(Keyword::Begin)
-                        | TokenKind::Keyword(Keyword::Declare)
-                );
+                let is_stmt_keyword = self.starts_statement(self.idx, StatementContext::Recovery);
 
                 if is_stmt_keyword && t.span.start > start {
                     // A WITH statement's own main query head (the first
@@ -915,6 +1459,8 @@ impl<'a> Parser<'a> {
             eprintln!("DEBUG: Tokens around error: {:?}", tokens_around);
         }
 
+        // A secret in text no statement read is masked like a parsed one.
+        self.record_unparsed_secrets(saved_idx, self.idx);
         // Create opaque content node that will be emitted verbatim
         AstStmt::OpaqueContent {
             node_id: self.id_gen.next(),
@@ -932,6 +1478,9 @@ impl<'a> Parser<'a> {
         // Using a dynamic cap prevents legitimate large scripts (thousands of statements)
         // from failing while still catching "no progress" parser bugs.
         let max_loops = self.tokens.len().saturating_add(128).max(1000);
+        // The statement last read, until a `;` ends it: text after it that
+        // starts no statement and does not parse is its unread tail.
+        let mut unterminated: Option<crate::ast::NodeId> = None;
         loop {
             loop_count += 1;
             if loop_count > max_loops {
@@ -964,6 +1513,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
             ) {
                 let _ = self.advance();
+                unterminated = None;
                 continue;
             }
             // For scripting blocks (BEGIN/DECLARE...BEGIN), parse via the dedicated
@@ -973,64 +1523,14 @@ impl<'a> Parser<'a> {
             // degrade to OpaqueContent (see stmt_or_opaque/opaque_recover).
             let saved_idx = self.idx;
             let stmt_start = tok.span.start;
+            let before = unterminated.take();
             let stmt = match &tok.kind {
                 TokenKind::Keyword(Keyword::Declare) => {
-                    let result = if self.dialect.declare_starts_block() {
-                        // Snowflake/PG/MySQL: DECLARE...BEGIN...END is a single block
-                        self.try_parse_scripting_block()
-                    } else {
-                        // BigQuery/MSSQL/Databricks: DECLARE is an independent top-level statement
-                        crate::parser::scripting::try_parse_declare_stmt(self)
-                    };
+                    let result = self.parse_declare_statement();
                     self.stmt_or_opaque(result, saved_idx, stmt_start)
                 }
                 TokenKind::Keyword(Keyword::Begin) => {
-                    // Need to disambiguate: BEGIN TRANSACTION/WORK vs BEGIN TRY vs BEGIN...END block
-                    // Per Snowflake docs:
-                    //   - BEGIN [WORK | TRANSACTION] [NAME <name>] - transaction control
-                    //   - BEGIN ... END - scripting block
-                    // MSSQL:
-                    //   - BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH - error handling
-                    // Transaction if followed by: semicolon, WORK, TRANSACTION, NAME, or EOF
-                    // Otherwise it's a scripting block
-                    let _ = self.advance(); // Skip BEGIN
-                    self.skip_trivia();
-
-                    let is_transaction = if let Some(next_tok) = self.peek_non_trivia() {
-                        match &next_tok.kind {
-                            // Explicit transaction keywords
-                            TokenKind::Keyword(Keyword::Transaction)
-                            | TokenKind::Keyword(Keyword::Work) => true,
-                            // Semicolon = standalone BEGIN; transaction
-                            TokenKind::Punctuation(crate::lexer::Punctuation::Semi) => true,
-                            // NAME identifier for named transactions (BEGIN NAME T1)
-                            TokenKind::Identifier { .. } => {
-                                next_tok.lexeme(self.source).eq_ignore_ascii_case("NAME")
-                            }
-                            // Anything else = scripting block body
-                            _ => false,
-                        }
-                    } else {
-                        // No token after BEGIN = EOF, assume transaction
-                        true
-                    };
-
-                    let is_try = if let Some(next_tok) = self.peek_non_trivia() {
-                        matches!(next_tok.kind, TokenKind::Keyword(Keyword::Try))
-                    } else {
-                        false
-                    };
-
-                    self.idx = saved_idx; // Restore position
-
-                    let result = if is_transaction {
-                        self.try_parse_begin_transaction_stmt()
-                    } else if is_try {
-                        crate::parser::scripting::try_parse_mssql_try_catch(self)
-                    } else {
-                        // It's a BEGIN...END block
-                        self.try_parse_block_stmt()
-                    };
+                    let result = self.parse_begin_statement();
                     self.stmt_or_opaque(result, saved_idx, stmt_start)
                 }
                 // Jinja comment at statement level: {# comment #}
@@ -1053,11 +1553,7 @@ impl<'a> Parser<'a> {
                 // Top-level label detection: identifier/keyword followed by colon followed by loop/block keyword
                 // e.g., outer: BEGIN SELECT 1; END outer;
                 TokenKind::Identifier { .. } | TokenKind::Keyword(..)
-                    if crate::parser::scripting::is_label_before_loop_at(
-                        self.tokens,
-                        self.idx,
-                        self.source,
-                    ) =>
+                    if crate::parser::scripting::is_label_before_loop_at(self, self.idx) =>
                 {
                     let begin_start = tok.span.start;
                     let result =
@@ -1086,19 +1582,416 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Just push the statement directly
+            let tail = if let AstStmt::OpaqueContent { span, .. } = &stmt {
+                Some(*span)
+            } else {
+                None
+            };
+            unterminated = self.note_statement_read(before, saved_idx, &stmt, tail);
+            let stmt = self.sent_by_psql_gexec(stmt);
             stmts.push(stmt);
         }
 
+        self.record_string_literal_secrets();
         // Move the syntax arena into the AstScript
         let syntax_arena = std::mem::take(&mut self.syntax_arena);
+        let (redaction_spans, secret_places) = self.take_secrets();
 
         Ok(AstScript {
             node_id: self.id_gen.next(),
+            cut_statements: self.take_cut_statements(&stmts),
             stmts,
             syntax_arena,
-            redaction_spans: std::mem::take(&mut self.redaction_spans),
+            redaction_spans,
+            secret_places,
+            template_blocks: self.template_blocks(),
+            comment_spans: self.comment_spans(),
+            read_bodies: self.take_read_bodies(),
+            setting_values: std::mem::take(&mut self.setting_values),
+            bulk_options: std::mem::take(&mut self.bulk_options),
+            held_names: std::mem::take(&mut self.held_names),
         })
+    }
+
+    /// The template blocks of the source ([`AstScript::template_blocks`]),
+    /// read from its tokens: a `set` tag that assigns no `=` value opens one,
+    /// as does a `filter` or a `call` tag; its end tag closes the innermost
+    /// block it opened. A tag's first word is its keyword, which a template
+    /// may use as a name anywhere else (`{% if filter %}`).
+    fn template_blocks(&self) -> Vec<crate::ast::TemplateBlock> {
+        use crate::ast::{TemplateBlock, TemplateBlockHolds};
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Tag {
+            Set,
+            Filter,
+            Call,
+        }
+        let tokens = self.tokens;
+        let mut blocks = Vec::new();
+        // Each block open, innermost last: its tag, what it holds and
+        // where its text starts.
+        let mut open: Vec<(Tag, TemplateBlockHolds, u32)> = Vec::new();
+        let mut k = 0;
+        while k < tokens.len() {
+            if !matches!(tokens[k].kind, TokenKind::JinjaStmtOpen) {
+                k += 1;
+                continue;
+            }
+            let start = tokens[k].span.start;
+            let close = tokens[k + 1..]
+                .iter()
+                .position(|t| matches!(t.kind, TokenKind::JinjaStmtClose))
+                .map(|at| k + 1 + at);
+            let Some(close) = close else {
+                break;
+            };
+            let tag = &tokens[k + 1..close];
+            let assigns = tag
+                .iter()
+                .any(|t| matches!(t.kind, TokenKind::Operator(Operator::Eq)));
+            let after = tokens[close].span.end;
+            let opens = |tag: Tag, holds: TemplateBlockHolds| Some((tag, holds, after));
+            let first = tag.first().map(|t| &t.kind);
+            let is = |kind: TokenKind| first == Some(&kind);
+            let opened = if is(TokenKind::JinjaSet) {
+                (!assigns).then_some((Tag::Set, TemplateBlockHolds::Value, after))
+            } else if is(TokenKind::JinjaFilter) {
+                opens(Tag::Filter, TemplateBlockHolds::Value)
+            } else if is(TokenKind::JinjaCall) {
+                opens(Tag::Call, TemplateBlockHolds::Caller)
+            } else {
+                None
+            };
+            let closes = if is(TokenKind::JinjaEndSet) {
+                Some(Tag::Set)
+            } else if is(TokenKind::JinjaEndFilter) {
+                Some(Tag::Filter)
+            } else if is(TokenKind::JinjaEndCall) {
+                Some(Tag::Call)
+            } else {
+                None
+            };
+            if let Some(opened) = opened {
+                open.push(opened);
+            }
+            if let Some(closed) = closes {
+                // Blocks opened inside it and not closed end with it.
+                if let Some(at) = open.iter().rposition(|(tag, _, _)| *tag == closed) {
+                    blocks.extend(open.drain(at..).map(|(_, holds, from)| TemplateBlock {
+                        body: Span {
+                            start: from,
+                            end: start,
+                        },
+                        holds,
+                    }));
+                }
+            }
+            k = close + 1;
+        }
+        let end = self.source.len() as u32;
+        blocks.extend(open.into_iter().map(|(_, holds, from)| TemplateBlock {
+            body: Span { start: from, end },
+            holds,
+        }));
+        blocks.sort_by_key(|block| (block.body.start, block.body.end));
+        blocks
+    }
+
+    /// The secrets recorded, apart from the places a secret is written as
+    /// a variable or a placeholder ([`AstScript::secret_places`]): a span
+    /// that is one such token, or a `:` bind marker and the name after it.
+    fn take_secrets(&mut self) -> (Vec<Span>, Vec<Span>) {
+        let tokens = self.tokens;
+        let place = |span: &Span| {
+            let at = tokens.partition_point(|t| t.span.start < span.start);
+            match tokens.get(at..) {
+                Some([first, rest @ ..]) if first.span.start == span.start => {
+                    let one = first.span.end == span.end
+                        && matches!(
+                            first.kind,
+                            TokenKind::Placeholder
+                                | TokenKind::Identifier {
+                                    kind: crate::lexer::IdentifierKind::AtVariable,
+                                    ..
+                                }
+                        );
+                    let bound = matches!(first.kind, TokenKind::Punctuation(Punctuation::Colon))
+                        && rest.first().is_some_and(|name| {
+                            name.span.start == first.span.end
+                                && name.span.end == span.end
+                                && matches!(name.kind, TokenKind::Identifier { .. })
+                        });
+                    one || bound
+                }
+                Some(_) | None => false,
+            }
+        };
+        let (secrets, mut places): (Vec<Span>, Vec<Span>) =
+            std::mem::take(&mut self.redaction_spans)
+                .into_iter()
+                .partition(|span| !place(span));
+        places.sort_by_key(|span| (span.start, span.end));
+        places.dedup();
+        (secrets, places)
+    }
+
+    /// The routine bodies read as SQL statements, in source order, each
+    /// once ([`AstScript::read_bodies`]).
+    fn take_read_bodies(&mut self) -> Vec<Span> {
+        let mut bodies = std::mem::take(&mut self.read_bodies);
+        bodies.sort_by_key(|span| (span.start, span.end));
+        bodies.dedup();
+        bodies
+    }
+
+    /// Notes the dollar-quoted body at `span`, delimiters included, of a
+    /// routine in `language`, which the parser read as `body`: the body is
+    /// read where the language is SQL and `body` is statements that parse.
+    pub(crate) fn note_routine_body(
+        &mut self,
+        span: Span,
+        language: &crate::ast::AstRoutineLanguage,
+        body: Option<&AstStmt>,
+    ) {
+        let statements = body.is_some_and(|body| {
+            !matches!(body, AstStmt::Error { .. } | AstStmt::OpaqueContent { .. })
+        });
+        if statements && *language == crate::ast::AstRoutineLanguage::Sql {
+            self.read_bodies.push(span);
+        }
+    }
+
+    /// The spans of the comments the lexer attached to this parser's
+    /// tokens, in source order, each once: those of the code, none inside a
+    /// dollar-quoted string. A comment inside dollar quotes is the code's
+    /// where the innermost region holding it is a body
+    /// ([`Self::dollar_bodies`]).
+    fn comment_spans(&self) -> Vec<Span> {
+        // Each dollar-quoted region, as (where it opens, where it ends): an
+        // opener is closed by the next delimiter written as it is.
+        let mut regions: Vec<(u32, u32)> = Vec::new();
+        let mut open: Vec<(&str, u32)> = Vec::new();
+        for tok in self.tokens {
+            if !is_dollar_quote_delimiter(&tok.kind) {
+                continue;
+            }
+            let lexeme = tok.lexeme(self.source);
+            match open.last() {
+                Some(&(opener, start)) if opener == lexeme => {
+                    open.pop();
+                    regions.push((start, tok.span.end));
+                }
+                Some(_) | None => open.push((lexeme, tok.span.start)),
+            }
+        }
+        let end = self.source.len() as u32;
+        regions.extend(open.into_iter().map(|(_, start)| (start, end)));
+        regions.sort_unstable();
+        let mut bodies = self.dollar_bodies.clone();
+        bodies.sort_unstable();
+        // The regions nest or stand apart: the comments, in source order,
+        // are each read against the regions open where they start.
+        let mut next = 0usize;
+        let mut holding: Vec<(u32, u32)> = Vec::new();
+        crate::lexer::comment_spans(self.tokens)
+            .into_iter()
+            .filter(|comment| {
+                while let Some(&region) = regions.get(next).filter(|r| r.0 <= comment.start) {
+                    while holding.last().is_some_and(|open| open.1 <= region.0) {
+                        holding.pop();
+                    }
+                    holding.push(region);
+                    next += 1;
+                }
+                while holding.last().is_some_and(|open| open.1 < comment.end) {
+                    holding.pop();
+                }
+                holding
+                    .last()
+                    .is_none_or(|(start, _)| bodies.binary_search(start).is_ok())
+            })
+            .collect()
+    }
+
+    /// Notes the statement `read`, read from token `from`, after
+    /// `unterminated`, the statement last read with no `;` after it. Where
+    /// `read` is text kept unread (`tail`) and the token at `from` continues
+    /// an expression (an operator or other symbol the lexer does not read,
+    /// a placeholder, or a word the lexer marks an operator), that statement
+    /// was cut there and the cut is recorded. Returns the statement left
+    /// unterminated after `read`: the innermost one that ends where `read`
+    /// does, which is the one a cut at the next token cuts.
+    pub(crate) fn note_statement_read(
+        &mut self,
+        unterminated: Option<crate::ast::NodeId>,
+        from: usize,
+        read: &AstStmt,
+        tail: Option<Span>,
+    ) -> Option<crate::ast::NodeId> {
+        let cut = unterminated.zip(tail).filter(|_| {
+            self.tokens.get(from).is_some_and(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Operator(_)
+                        | TokenKind::Unknown
+                        | TokenKind::Placeholder
+                        | TokenKind::Identifier {
+                            word_operator: Some(_),
+                            ..
+                        }
+                )
+            })
+        });
+        if let Some((stmt, tail)) = cut {
+            self.cut_statements
+                .push(crate::ast::CutStatement { stmt, tail });
+        }
+        if matches!(read, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. })
+            || self.consumed_semicolon()
+        {
+            return None;
+        }
+        let mut last = read;
+        while let Some(inner) = last
+            .bodies()
+            .iter()
+            .filter_map(|body| body.stmts.last())
+            .find(|inner| inner.span().end == last.span().end)
+        {
+            last = inner;
+        }
+        Some(last.node_id())
+    }
+
+    /// `stmt` as the query of a psql `\gexec`, where the `;` that ends it
+    /// carries that command (`TriviaKind::PsqlMetaCommand`); `stmt` itself
+    /// otherwise, and where it was not read.
+    fn sent_by_psql_gexec(&mut self, stmt: AstStmt) -> AstStmt {
+        let at = match self.consumed_semicolon() {
+            true => self.idx.checked_sub(1),
+            false => Some(self.idx),
+        };
+        let command_span = at
+            .and_then(|at| self.tokens.get(at))
+            .filter(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                )
+            })
+            .and_then(|tok| {
+                tok.leading_trivia.iter().find(|trivia| {
+                    trivia.kind
+                        == crate::lexer::TriviaKind::PsqlMetaCommand(
+                            crate::lexer::token::PsqlMetaCommand::Gexec,
+                        )
+                })
+            })
+            .map(|trivia| trivia.span);
+        let read = !matches!(stmt, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. });
+        match command_span {
+            Some(command_span) if read => AstStmt::PsqlGexec(Box::new(crate::ast::AstPsqlGexec {
+                node_id: self.id_gen.next(),
+                span: stmt.span(),
+                query: Box::new(stmt),
+                command_span,
+            })),
+            Some(_) | None => stmt,
+        }
+    }
+
+    /// Whether the token last consumed is a `;`: the statement just read
+    /// took its terminator.
+    pub(crate) fn consumed_semicolon(&self) -> bool {
+        self.idx
+            .checked_sub(1)
+            .and_then(|last| self.tokens.get(last))
+            .is_some_and(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                )
+            })
+    }
+
+    /// The cuts recorded of statements `stmts` hold at any depth: a
+    /// statement read in a read that then failed is not in the script.
+    fn take_cut_statements(&mut self, stmts: &[AstStmt]) -> Vec<crate::ast::CutStatement> {
+        let mut cuts = std::mem::take(&mut self.cut_statements);
+        if cuts.is_empty() {
+            return cuts;
+        }
+        let mut held = std::collections::BTreeSet::new();
+        let mut pending: Vec<&AstStmt> = stmts.iter().collect();
+        while let Some(stmt) = pending.pop() {
+            held.insert(stmt.node_id());
+            pending.extend(stmt.bodies().into_iter().flat_map(|body| body.stmts));
+        }
+        cuts.retain(|cut| held.contains(&cut.stmt));
+        cuts
+    }
+
+    /// The statement a `DECLARE` begins: where the dialect makes
+    /// `DECLARE … BEGIN … END` one block (Snowflake, PostgreSQL, MySQL), that
+    /// block; else the declaration alone.
+    pub(crate) fn parse_declare_statement(&mut self) -> crate::error::ParseResult<AstStmt> {
+        if self.dialect.declare_starts_block() {
+            self.try_parse_scripting_block()
+        } else {
+            crate::parser::scripting::try_parse_declare_stmt(self)
+        }
+    }
+
+    /// The statement a `BEGIN` begins: a transaction (`BEGIN`, `BEGIN WORK`,
+    /// `BEGIN TRANSACTION`, `BEGIN NAME t`, T-SQL's `BEGIN TRAN`), T-SQL's
+    /// `BEGIN TRY … END CATCH`, or a `BEGIN … END` block.
+    pub(crate) fn parse_begin_statement(&mut self) -> crate::error::ParseResult<AstStmt> {
+        let saved_idx = self.idx;
+        // Need to disambiguate: BEGIN TRANSACTION/WORK vs BEGIN TRY vs BEGIN...END block
+        // Per Snowflake docs:
+        //   - BEGIN [WORK | TRANSACTION] [NAME <name>] - transaction control
+        //   - BEGIN ... END - scripting block
+        // MSSQL:
+        //   - BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH - error handling
+        // Transaction if followed by: semicolon, WORK, TRANSACTION, NAME, or EOF
+        // Otherwise it's a scripting block
+        let _ = self.advance(); // Skip BEGIN
+        self.skip_trivia();
+
+        // A transaction where WORK, TRANSACTION, `;`, NAME, TRAN or DISTRIBUTED
+        // follows, or nothing does; any other word begins a block.
+        let is_transaction = match self.peek_non_trivia() {
+            Some(next_tok) => {
+                matches!(
+                    next_tok.kind,
+                    TokenKind::Keyword(Keyword::Transaction)
+                        | TokenKind::Keyword(Keyword::Work)
+                        | TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                ) || (matches!(next_tok.kind, TokenKind::Identifier { .. }) && {
+                    let lex = next_tok.lexeme(self.source);
+                    lex.eq_ignore_ascii_case("NAME")
+                        || lex.eq_ignore_ascii_case("TRAN")
+                        || lex.eq_ignore_ascii_case("DISTRIBUTED")
+                })
+            }
+            None => true,
+        };
+
+        let is_try = if let Some(next_tok) = self.peek_non_trivia() {
+            matches!(next_tok.kind, TokenKind::Keyword(Keyword::Try))
+        } else {
+            false
+        };
+
+        self.idx = saved_idx; // Restore position
+
+        if is_transaction {
+            self.try_parse_begin_transaction_stmt()
+        } else if is_try {
+            crate::parser::scripting::try_parse_mssql_try_catch(self)
+        } else {
+            self.try_parse_block_stmt()
+        }
     }
 
     /// Parse a statement, returning a Result with error information.
@@ -1321,25 +2214,50 @@ impl<'a> Parser<'a> {
                     stmt: None,
                 })
             }
+            // A sqlcmd command line, which the client runs.
+            TokenKind::Punctuation(Punctuation::Colon) | TokenKind::Operator(Operator::Bang)
+                if self.is_sqlcmd_command(first) =>
+            {
+                let line = sqlcmd_command_line(self.source, self.tokens, first, self.dialect)
+                    .ok_or_else(|| {
+                        ParseError::unexpected_eof(
+                            self.current_span(),
+                            vec!["sqlcmd command".to_string()],
+                        )
+                    })?;
+                self.idx = line.past;
+                Ok(AstStmt::SqlcmdCommand {
+                    node_id: self.id_gen.next(),
+                    span: Span {
+                        start: first.span.start,
+                        end: line.end,
+                    },
+                    name_span: line.name_span,
+                    action: line.action,
+                })
+            }
             // MSSQL batch separator: GO
             // Keep it as opaque content so formatter preserves it verbatim,
             // but parse it explicitly to avoid fallback-error recovery paths.
-            TokenKind::Identifier { .. }
-                if self.dialect.supports_go_batch_separator()
-                    && first.lexeme(self.source).eq_ignore_ascii_case("GO") =>
-            {
+            TokenKind::Identifier { .. } if self.is_batch_separator(first) => {
                 let go_tok = self.advance().ok_or_else(|| {
                     ParseError::unexpected_eof(self.current_span(), vec!["GO".to_string()])
                 })?;
 
-                // Optional repeat count: GO <positive_integer>
+                // Optional repeat count on its line: GO <positive_integer>
                 let mut count_span: Option<Span> = None;
                 let mut end = go_tok.span.end;
                 if let Some(next_tok) = self.peek_non_trivia() {
-                    if matches!(
-                        next_tok.kind,
-                        TokenKind::Literal(crate::lexer::LiteralKind::Number)
-                    ) {
+                    let same_line = self
+                        .source
+                        .get(go_tok.span.end as usize..next_tok.span.start as usize)
+                        .is_some_and(|gap| !gap.contains('\n'));
+                    if same_line
+                        && matches!(
+                            next_tok.kind,
+                            TokenKind::Literal(crate::lexer::LiteralKind::Number)
+                        )
+                    {
                         let count_tok = self.advance().ok_or_else(|| {
                             ParseError::unexpected_eof(
                                 self.current_span(),
@@ -1370,9 +2288,22 @@ impl<'a> Parser<'a> {
             {
                 self.try_parse_stage_file_command()
             }
+            // MySQL's administration statements, each by its whole shape.
+            TokenKind::Keyword(_) | TokenKind::Identifier { .. }
+                if crate::parser::scripting::mysql_admin_at(self, self.idx).is_some() =>
+            {
+                crate::parser::scripting::try_parse_mysql_admin(self)
+            }
             // SET session variable statement
             TokenKind::Keyword(Keyword::Set) => {
-                if self.dialect.supports_mysql_set_grammar() {
+                let after_set =
+                    crate::parser::principal::next_non_trivia_idx(self.tokens, self.idx + 1);
+                if after_set
+                    .is_some_and(|i| crate::parser::scripting::set_variable_keyword_at(self, i))
+                {
+                    // `SET VAR x = …` assigns in every dialect.
+                    self.try_parse_set_variable_stmt()
+                } else if self.dialect.supports_mysql_set_grammar() {
                     self.try_parse_mysql_set_stmt()
                 } else if self.dialect.supports_session_config_set() {
                     self.try_parse_pg_set_stmt()
@@ -1386,7 +2317,8 @@ impl<'a> Parser<'a> {
                         matches!(
                             next.kind,
                             TokenKind::Identifier {
-                                kind: crate::lexer::IdentifierKind::Unquoted
+                                kind: crate::lexer::IdentifierKind::Unquoted,
+                                ..
                             } // `SET TRANSACTION ISOLATION LEVEL <level>` — TRANSACTION
                               // is a keyword, not an unquoted identifier, so it needs an
                               // explicit gate to reach the set-option parser.
@@ -1410,7 +2342,7 @@ impl<'a> Parser<'a> {
             | TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => {
                 self.try_parse_set_or_select_stmt()
             }
-            // MySQL `TABLE tbl [ORDER BY ...] [LIMIT ...]` — query-bearing,
+            // `TABLE tbl [ORDER BY ...] [LIMIT ...]` (MySQL, PostgreSQL) — query-bearing,
             // routed through the query parser (recognized in set-operand).
             TokenKind::Keyword(Keyword::Table) if self.dialect.supports_table_query_statement() => {
                 self.try_parse_set_or_select_stmt()
@@ -1789,13 +2721,33 @@ impl<'a> Parser<'a> {
                         self.idx = saved_idx;
                         crate::parser::dynamic_table::try_parse_alter_dynamic_table(self)
                     } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Function)) {
-                        // ALTER FUNCTION
+                        // ALTER FUNCTION: a restated definition (T-SQL) is
+                        // read as CREATE FUNCTION is.
+                        let restates = crate::parser::scripting::is_module_definition_at(
+                            self.tokens,
+                            self.idx + 1,
+                        );
                         self.idx = saved_idx;
-                        crate::parser::alter_function::try_parse_alter_function(self)
-                    } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Procedure)) {
-                        // ALTER PROCEDURE
+                        if restates {
+                            crate::parser::scripting::parse_create_function(self)
+                        } else {
+                            crate::parser::alter_function::try_parse_alter_function(self)
+                        }
+                    } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Procedure))
+                        || tok.lexeme(self.source).eq_ignore_ascii_case("PROC")
+                    {
+                        // ALTER PROC[EDURE]: a restated definition (T-SQL) is
+                        // read as CREATE PROCEDURE is.
+                        let restates = crate::parser::scripting::is_module_definition_at(
+                            self.tokens,
+                            self.idx + 1,
+                        );
                         self.idx = saved_idx;
-                        crate::parser::alter_procedure::try_parse_alter_procedure(self)
+                        if restates {
+                            self.try_parse_create_procedure()
+                        } else {
+                            crate::parser::alter_procedure::try_parse_alter_procedure(self)
+                        }
                     } else if matches!(tok.kind, TokenKind::Identifier { .. })
                         && tok.lexeme(self.source).eq_ignore_ascii_case("SEQUENCE")
                     {
@@ -1803,9 +2755,15 @@ impl<'a> Parser<'a> {
                         self.idx = saved_idx;
                         self.try_parse_alter_sequence_stmt()
                     } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Trigger)) {
-                        // ALTER TRIGGER (PostgreSQL)
                         self.idx = saved_idx;
-                        self.try_parse_alter_pg_trigger_stmt()
+                        // The same justified gate as CREATE TRIGGER: T-SQL's
+                        // ALTER TRIGGER restates the definition and is read as
+                        // its CREATE is; elsewhere it is PostgreSQL's.
+                        if self.dialect.trigger_lists_table_before_timing() {
+                            crate::parser::scripting::try_parse_create_mssql_trigger(self)
+                        } else {
+                            self.try_parse_alter_pg_trigger_stmt()
+                        }
                     } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Type)) {
                         // ALTER TYPE (PostgreSQL)
                         self.idx = saved_idx;
@@ -2120,27 +3078,8 @@ impl<'a> Parser<'a> {
                         let table_saved = self.idx;
                         self.advance(); // skip TABLE
                         self.skip_trivia();
-                        // Skip table name (may be schema.table)
-                        while let Some(t) = self.peek_non_trivia() {
-                            if matches!(
-                                t.kind,
-                                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-                            ) {
-                                self.advance();
-                                if let Some(dot) = self.peek_non_trivia() {
-                                    if matches!(
-                                        dot.kind,
-                                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-                                    ) {
-                                        self.advance(); // skip dot
-                                        continue;
-                                    }
-                                }
-                                break;
-                            } else {
-                                break;
-                            }
-                        }
+                        // Skip the table's name
+                        self.take_name_span(NamePosition::Object);
                         self.skip_trivia();
                         // ENABLE/DISABLE is the trigger-state form ONLY when the
                         // tail is TRIGGER. ENABLE/DISABLE ROW LEVEL SECURITY is a
@@ -2237,7 +3176,11 @@ impl<'a> Parser<'a> {
                 // Redshift:   COPY table FROM 's3://...' <inline-credential auth>
                 // PostgreSQL: COPY table FROM/TO 'file' [WITH (...)]
                 // Snowflake:  COPY INTO table FROM/TO ...
-                if self.dialect.copy_has_inline_credentials() {
+                // A COPY whose rows follow it (`FROM STDIN`) is PostgreSQL's,
+                // in any dialect.
+                if self.copy_rows_after(self.idx).is_some() {
+                    self.try_parse_pg_copy_stmt()
+                } else if self.dialect.copy_has_inline_credentials() {
                     self.try_parse_redshift_copy_stmt()
                 } else if self.dialect.supports_copy_to_from_table() {
                     self.try_parse_pg_copy_stmt()
@@ -2259,10 +3202,17 @@ impl<'a> Parser<'a> {
                 // Route to unified INSERT parser that auto-detects multi-insert
                 self.try_parse_insert_stmt_in_mode()
             }
+            // Databricks `REPLACE TABLE`: a create that replaces the table.
+            TokenKind::Keyword(Keyword::Replace) if self.word_at(self.idx + 1, "TABLE") => {
+                self.try_parse_create_table_stmt()
+            }
             // MySQL REPLACE [INTO] — statement-position only, so no
             // collision with the REPLACE() function.
             TokenKind::Keyword(Keyword::Replace) => self.try_parse_replace_into_stmt(),
             // Transaction control statements
+            TokenKind::Keyword(Keyword::Start) if self.word_at(self.idx + 1, "TRANSACTION") => {
+                crate::parser::scripting::try_parse_start_transaction_stmt(self)
+            }
             TokenKind::Keyword(Keyword::Commit) => self.try_parse_commit_stmt(),
             TokenKind::Keyword(Keyword::Rollback) => self.try_parse_rollback_stmt(),
             // Procedure call
@@ -2279,6 +3229,10 @@ impl<'a> Parser<'a> {
             //   MSSQL:      EXEC[UTE] proc_name @p1=val — procedure invocation
             //   PostgreSQL: EXECUTE name [(args)]  — prepared statement execution
             //   Snowflake:  EXECUTE IMMEDIATE expr — dynamic SQL
+            // Snowflake `EXECUTE TASK name`, by its shape.
+            TokenKind::Keyword(Keyword::Execute) if crate::parser::task::execute_task_at(self) => {
+                crate::parser::task::try_parse_execute_task_stmt(self)
+            }
             TokenKind::Keyword(Keyword::Execute) => {
                 if self.dialect.supports_exec_procedure_call() {
                     self.try_parse_mssql_exec_stmt()
@@ -2319,7 +3273,24 @@ impl<'a> Parser<'a> {
             // PostgreSQL: COMMENT ON
             TokenKind::Keyword(Keyword::Comment) => self.try_parse_comment_on_stmt(),
             // PostgreSQL: DO $$ ... $$
-            TokenKind::Keyword(Keyword::Do) => self.try_parse_do_block_stmt(),
+            // PostgreSQL's anonymous block takes a body string or LANGUAGE;
+            // any other DO is MySQL's expression list. A `$tag$` word is a
+            // body's opener even where the dialect lexes only `$$`.
+            TokenKind::Keyword(Keyword::Do) => {
+                let block = self.peek_ahead(1).is_some_and(|next| {
+                    self.delimits_dollar_quote(next)
+                        || is_dollar_quote_tag(next.lexeme(self.source))
+                        || matches!(
+                            next.kind,
+                            TokenKind::Literal(crate::lexer::LiteralKind::String)
+                                | TokenKind::Keyword(Keyword::Language)
+                        )
+                });
+                match block {
+                    true => self.try_parse_do_block_stmt(),
+                    false => self.try_parse_mysql_do_stmt(),
+                }
+            }
             TokenKind::Keyword(Keyword::Create) => {
                 // Peek ahead to check what type of CREATE statement this is
                 let saved_idx = self.idx;
@@ -2479,6 +3450,7 @@ impl<'a> Parser<'a> {
                     .get(self.idx + 2)
                     .map(|t| {
                         self.can_be_identifier_token(t)
+                            || matches!(t.kind, TokenKind::JinjaExprOpen)
                             || t.lexeme(self.source).eq_ignore_ascii_case("IF")
                     })
                     .unwrap_or(false);
@@ -2509,6 +3481,26 @@ impl<'a> Parser<'a> {
                     // routing only needs to reach it. These are treated as
                     // table-kind modifiers ONLY when immediately followed by TABLE,
                     // so a bare `CREATE EVENT <name>` is left for other handlers.
+                    self.try_parse_create_table_stmt()
+                } else if create_type_lexeme
+                    .map(|s| s.eq_ignore_ascii_case("STREAMING"))
+                    .unwrap_or(false)
+                    && create_type_next_lexeme
+                        .map(|s| s.eq_ignore_ascii_case("TABLE") || s.eq_ignore_ascii_case("LIVE"))
+                        .unwrap_or(false)
+                {
+                    // Databricks `CREATE [OR REFRESH] STREAMING [LIVE] TABLE`.
+                    self.try_parse_create_table_stmt()
+                } else if create_type_lexeme
+                    .map(|s| s.eq_ignore_ascii_case("LIVE"))
+                    .unwrap_or(false)
+                    && create_type_next_lexeme
+                        .map(|s| s.eq_ignore_ascii_case("TABLE"))
+                        .unwrap_or(false)
+                {
+                    // Databricks `CREATE [OR REFRESH] TEMPORARY LIVE TABLE`: the
+                    // modifier skip above reads `LIVE` before `TEMPORARY`, so a
+                    // `LIVE` after it is the type lexeme here.
                     self.try_parse_create_table_stmt()
                 } else if create_type_lexeme
                     .map(|s| s.eq_ignore_ascii_case("EVENT"))
@@ -3190,7 +4182,7 @@ impl<'a> Parser<'a> {
                     self.idx = saved_idx;
                     self.try_parse_create_connection()
                 } else if create_type_lexeme
-                    .map(|s| s.eq_ignore_ascii_case("PROCEDURE"))
+                    .map(|s| s.eq_ignore_ascii_case("PROCEDURE") || s.eq_ignore_ascii_case("PROC"))
                     .unwrap_or(false)
                 {
                     if create_type_next_lexeme
@@ -3211,8 +4203,13 @@ impl<'a> Parser<'a> {
                     .map(|s| s.eq_ignore_ascii_case("FUNCTION"))
                     .unwrap_or(false)
                 {
-                    // Use the scripting parser's CREATE FUNCTION parser
-                    crate::parser::scripting::parse_create_function(self)
+                    if crate::parser::scripting::loadable_function_at(self) {
+                        // MySQL's function from a shared library.
+                        crate::parser::scripting::try_parse_mysql_loadable_function(self)
+                    } else {
+                        // Use the scripting parser's CREATE FUNCTION parser
+                        crate::parser::scripting::parse_create_function(self)
+                    }
                 } else if create_type_lexeme
                     .map(|s| s.eq_ignore_ascii_case("DATABASE"))
                     .unwrap_or(false)
@@ -3333,9 +4330,14 @@ impl<'a> Parser<'a> {
                     .map(|s| s.eq_ignore_ascii_case("RULE"))
                     .unwrap_or(false)
                 {
-                    // CREATE [OR REPLACE] RULE (PostgreSQL)
+                    // CREATE [OR REPLACE] RULE: PostgreSQL's `AS ON <event>`,
+                    // or T-SQL's `AS <condition>`.
                     self.idx = saved_idx;
-                    self.try_parse_pg_create_rule_stmt()
+                    if self.create_rule_is_condition() {
+                        self.try_parse_mssql_create_rule_stmt()
+                    } else {
+                        self.try_parse_pg_create_rule_stmt()
+                    }
                 } else if create_type_lexeme
                     .map(|s| s.eq_ignore_ascii_case("AGGREGATE"))
                     .unwrap_or(false)
@@ -3532,6 +4534,14 @@ impl<'a> Parser<'a> {
             {
                 self.try_parse_pg_lock_table_stmt()
             }
+            // Handle UNLOCK TABLES / UNLOCK TABLE (MySQL)
+            TokenKind::Identifier { .. }
+                if first.lexeme(self.source).eq_ignore_ascii_case("UNLOCK")
+                    && (self.word_at(self.idx + 1, "TABLES")
+                        || self.word_at(self.idx + 1, "TABLE")) =>
+            {
+                self.try_parse_mysql_unlock_tables_stmt()
+            }
             // Handle REASSIGN OWNED (PostgreSQL role management)
             TokenKind::Identifier { .. }
                 if first.lexeme(self.source).eq_ignore_ascii_case("REASSIGN") =>
@@ -3573,6 +4583,12 @@ impl<'a> Parser<'a> {
                 if first.lexeme(self.source).eq_ignore_ascii_case("REINDEX") =>
             {
                 self.try_parse_reindex_stmt()
+            }
+            // SAVEPOINT, T-SQL SAVE TRAN, RELEASE [SAVEPOINT]
+            TokenKind::Identifier { .. }
+                if crate::parser::scripting::is_savepoint_stmt_at(self) =>
+            {
+                crate::parser::scripting::try_parse_savepoint_stmt(self)
             }
             // Handle PREPARE (PostgreSQL prepared statements)
             TokenKind::Identifier { .. }
@@ -3742,6 +4758,13 @@ impl<'a> Parser<'a> {
             {
                 self.try_parse_mssql_add_signature_stmt()
             }
+            // Handle T-SQL { ENABLE | DISABLE } TRIGGER (ENABLE is a Keyword,
+            // DISABLE an Identifier). Guard on the TRIGGER that follows.
+            TokenKind::Keyword(Keyword::Enable) | TokenKind::Identifier { .. }
+                if crate::parser::scripting::is_mssql_trigger_state_at(self, self.idx) =>
+            {
+                crate::parser::scripting::try_parse_mssql_trigger_state(self)
+            }
             // Handle SETUSER ['username'] (T-SQL legacy database-context
             // impersonation — SETUSER is an Identifier). Statement-leading, so a
             // bare lexeme match suffices.
@@ -3763,6 +4786,19 @@ impl<'a> Parser<'a> {
                 ) =>
             {
                 self.try_parse_mssql_key_stmt()
+            }
+            // Cursor statements, read as inside a block.
+            TokenKind::Keyword(Keyword::Open) => {
+                crate::parser::scripting::try_parse_open_cursor_stmt(self)
+            }
+            TokenKind::Keyword(Keyword::Close) => {
+                crate::parser::scripting::try_parse_close_cursor_stmt(self)
+            }
+            TokenKind::Keyword(Keyword::Fetch) => {
+                crate::parser::scripting::try_parse_fetch_cursor_stmt(self)
+            }
+            TokenKind::Identifier { .. } if crate::parser::scripting::is_cursor_move_at(self) => {
+                crate::parser::scripting::try_parse_fetch_cursor_stmt(self)
             }
             // Handle IMPORT FOREIGN SCHEMA (PostgreSQL FDW bulk import — IMPORT
             // and SCHEMA are Identifiers, FOREIGN is a Keyword). Structural
@@ -3852,6 +4888,12 @@ impl<'a> Parser<'a> {
             {
                 crate::parser::scripting::try_parse_mssql_reconfigure(self)
             }
+            // CHECKPOINT, KILL, SHUTDOWN where the dialect reserves the word
+            TokenKind::Identifier { .. }
+                if crate::parser::scripting::mssql_server_command_end(self, self.idx).is_some() =>
+            {
+                crate::parser::scripting::try_parse_mssql_server_command(self)
+            }
             // Handle REVERT (MSSQL end-of-impersonation — Identifier, not Keyword)
             TokenKind::Identifier { .. }
                 if first.lexeme(self.source).eq_ignore_ascii_case("REVERT")
@@ -3890,7 +4932,7 @@ impl<'a> Parser<'a> {
             // Handle MSSQL label declaration: identifier followed by colon at statement level
             TokenKind::Identifier { .. }
                 if self.dialect.supports_statement_labels()
-                    && crate::parser::scripting::is_mssql_label_at(self.tokens, self.idx) =>
+                    && crate::parser::scripting::is_mssql_label_at(self, self.idx) =>
             {
                 crate::parser::scripting::try_parse_mssql_label(self)
             }
@@ -3956,6 +4998,8 @@ impl<'a> Parser<'a> {
                         break_span: ctrl_tok.span,
                         break_token: Some(ctrl_token_id),
                         label_token,
+                        when_span: None,
+                        condition: None,
                         semicolon_token,
                     })
                 } else {
@@ -3965,6 +5009,8 @@ impl<'a> Parser<'a> {
                         continue_span: ctrl_tok.span,
                         continue_token: Some(ctrl_token_id),
                         label_token,
+                        when_span: None,
+                        condition: None,
                         semicolon_token,
                     })
                 }
@@ -4065,11 +5111,13 @@ impl<'a> Parser<'a> {
                     begin_start,
                 )
             }
+            TokenKind::Keyword(Keyword::Begin) => self.parse_begin_statement(),
+            TokenKind::Keyword(Keyword::Declare) => self.parse_declare_statement(),
             TokenKind::Keyword(Keyword::While) => {
                 // Dialect gate (justified): MSSQL WHILE has no DO/END WHILE — its grammar
                 // is structurally incompatible with Snowflake WHILE...DO...END WHILE.
                 if self.dialect.uses_block_scoped_control_flow() {
-                    crate::parser::scripting::try_parse_mssql_while(self)
+                    crate::parser::scripting::try_parse_mssql_while(self, None)
                 } else {
                     let begin_start = first.span.start;
                     crate::parser::scripting::try_parse_while_stmt_in_block(self, begin_start, None)
@@ -4231,24 +5279,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check if token is a statement-starting keyword.
-    /// Used to detect statement boundaries in multi-statement scripts.
+    /// [`Self::starts_statement`] at the end of an option, property or name
+    /// list ([`StatementContext::OptionTail`]), for `tok`.
     pub(crate) fn is_statement_keyword(&self, tok: &Token) -> bool {
-        let lexeme = tok.lexeme(self.source);
-        lexeme.eq_ignore_ascii_case("ALTER")
-            || lexeme.eq_ignore_ascii_case("CREATE")
-            || lexeme.eq_ignore_ascii_case("DROP")
-            || lexeme.eq_ignore_ascii_case("SELECT")
-            || lexeme.eq_ignore_ascii_case("INSERT")
-            || lexeme.eq_ignore_ascii_case("UPDATE")
-            || lexeme.eq_ignore_ascii_case("DELETE")
-            || lexeme.eq_ignore_ascii_case("TRUNCATE")
-            || lexeme.eq_ignore_ascii_case("MERGE")
-            || lexeme.eq_ignore_ascii_case("GRANT")
-            || lexeme.eq_ignore_ascii_case("REVOKE")
-            || lexeme.eq_ignore_ascii_case("EXPORT")
-            || lexeme.eq_ignore_ascii_case("LOAD")
-            || lexeme.eq_ignore_ascii_case("ASSERT")
+        self.starts_statement(
+            self.tokens
+                .partition_point(|t| t.span.start < tok.span.start),
+            StatementContext::OptionTail,
+        )
     }
 
     /// Get a human-readable description of a token.
@@ -4634,6 +5672,7 @@ impl<'a> Parser<'a> {
         &mut self,
         closing_kind: &crate::ast::JinjaBlockKind,
     ) -> Vec<crate::ast::AstStmt> {
+        let start_idx = self.idx;
         let start = self.peek().map(|t| t.span.start).unwrap_or(0);
         let mut end = start;
 
@@ -4670,6 +5709,7 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.record_unparsed_secrets(start_idx, self.idx);
         // Return opaque content statement if we consumed anything
         if end > start {
             #[cfg(debug_assertions)]
@@ -4784,6 +5824,7 @@ impl<'a> Parser<'a> {
             );
 
             let start_pos = tok.span.start;
+            let start_idx = self.idx;
             let stmt_result = self.parse_statement();
 
             match stmt_result {
@@ -4875,6 +5916,7 @@ impl<'a> Parser<'a> {
                         }
                     }
 
+                    self.record_unparsed_secrets(start_idx, self.idx);
                     // Create opaque content for the incomplete statement
                     #[cfg(debug_assertions)]
                     if std::env::var("LEXEGA_DEBUG_PARSE").is_ok() {
@@ -5013,14 +6055,24 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.record_string_literal_secrets();
         // Move the syntax arena into the AstScript
         let syntax_arena = std::mem::take(&mut self.syntax_arena);
+        let (redaction_spans, secret_places) = self.take_secrets();
 
         let ast = AstScript {
             node_id: self.id_gen.next(),
+            cut_statements: self.take_cut_statements(&stmts),
             stmts,
             syntax_arena,
-            redaction_spans: std::mem::take(&mut self.redaction_spans),
+            redaction_spans,
+            secret_places,
+            template_blocks: self.template_blocks(),
+            comment_spans: self.comment_spans(),
+            read_bodies: self.take_read_bodies(),
+            setting_values: std::mem::take(&mut self.setting_values),
+            bulk_options: std::mem::take(&mut self.bulk_options),
+            held_names: std::mem::take(&mut self.held_names),
         };
 
         if errors.is_empty() {
@@ -5102,7 +6154,11 @@ impl<'a> Parser<'a> {
 
             // Check for recovery points - but SKIP the first token!
             // We must advance at least one token to avoid infinite loops.
-            if !is_first_token && self.is_recovery_point(tok) {
+            let recovery_point = matches!(
+                tok.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+            ) || self.starts_statement(i, StatementContext::TolerantRecovery);
+            if !is_first_token && recovery_point {
                 // If it's a semicolon, include it in the error region but sync after
                 if matches!(
                     tok.kind,
@@ -5124,46 +6180,243 @@ impl<'a> Parser<'a> {
         (end_pos, sync_idx, partial_tokens)
     }
 
-    /// Check if a token is a valid recovery point (statement boundary).
-    fn is_recovery_point(&self, tok: &Token) -> bool {
-        use crate::lexer::Punctuation;
+    /// [`Self::starts_statement`] where the dialect's statements need no
+    /// terminator ([`StatementContext::Unterminated`]), for `tok`: a scanner
+    /// that would read to a `;` stops at a statement's first word, a `GO`,
+    /// or a clause word no alias may take (`OUTPUT` after a target table).
+    pub(crate) fn should_stop_scan_at_statement_start(&self, tok: &Token) -> bool {
+        self.ends_unterminated_at(tok, StatementContext::Unterminated)
+    }
 
-        match &tok.kind {
-            // Semicolons end statements
-            TokenKind::Punctuation(Punctuation::Semi) => true,
+    /// As [`Self::should_stop_scan_at_statement_start`], for what `context`
+    /// reads ([`StatementContext::Unterminated`] or one narrowing it).
+    pub(crate) fn ends_unterminated_at(&self, tok: &Token, context: StatementContext) -> bool {
+        self.dialect.uses_optional_statement_terminators()
+            && self.starts_statement(
+                self.tokens
+                    .partition_point(|t| t.span.start < tok.span.start),
+                context,
+            )
+    }
 
-            // Statement-starting keywords indicate a new statement
-            TokenKind::Keyword(kw) => self.is_statement_starting_keyword(kw),
+    /// Whether the token at `at` starts a statement, for what `context`
+    /// reads: its word leads a statement ([`STATEMENT_LEADERS`] and the
+    /// dialects' words written as names), and a statement of that kind ends
+    /// what `context` reads there. In a compound statement's header an
+    /// assignment starts one too (`SET …`, a name before `:=`), and a word
+    /// before `(` where an operand starts is a call (`= IF(…)`).
+    pub(crate) fn starts_statement(&self, at: usize, context: StatementContext) -> bool {
+        let Some(tok) = self.tokens.get(at) else {
+            return false;
+        };
+        let next_is = |kind: TokenKind| {
+            crate::parser::principal::next_non_trivia_idx(self.tokens, at + 1)
+                .is_some_and(|n| self.tokens[n].kind == kind)
+        };
+        match context {
+            StatementContext::CompoundHeader => {
+                let assigns = matches!(tok.kind, TokenKind::Keyword(Keyword::Set))
+                    || (matches!(
+                        tok.kind,
+                        TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                    ) && next_is(TokenKind::Operator(Operator::ColonEq)));
+                if assigns {
+                    return true;
+                }
+                let operand_ended = || {
+                    self.tokens[..at]
+                        .iter()
+                        .rev()
+                        .find(|t| !crate::parser::principal::is_skippable(t))
+                        .is_some_and(|b| {
+                            matches!(
+                                b.kind,
+                                TokenKind::Punctuation(Punctuation::RParen | Punctuation::RBracket)
+                                    | TokenKind::Identifier { .. }
+                                    | TokenKind::Literal(_)
+                            )
+                        })
+                };
+                if next_is(TokenKind::Punctuation(Punctuation::LParen)) && !operand_ended() {
+                    return false;
+                }
+            }
+            StatementContext::CompoundOpener => {
+                let statement_position = self.tokens[..at]
+                    .iter()
+                    .rev()
+                    .find(|t| !crate::parser::principal::is_skippable(t))
+                    .is_some_and(|prev| {
+                        matches!(
+                            prev.kind,
+                            TokenKind::Punctuation(Punctuation::Semi | Punctuation::Colon)
+                                | TokenKind::Operator(Operator::GtGt)
+                                | TokenKind::Keyword(
+                                    Keyword::Then
+                                        | Keyword::Else
+                                        | Keyword::Do
+                                        | Keyword::Loop
+                                        | Keyword::Begin
+                                        | Keyword::Repeat
+                                )
+                        )
+                    });
+                if !statement_position {
+                    return false;
+                }
+            }
+            StatementContext::Unterminated
+            | StatementContext::ActionTail
+            | StatementContext::Recovery
+            | StatementContext::TolerantRecovery
+            | StatementContext::BodyRecovery
+            | StatementContext::LoopQuery
+            | StatementContext::OptionTail
+            | StatementContext::Declaration => {}
+        }
+        self.leader_at(at).is_some_and(|leader| {
+            leader.starts_in(context, self.dialect.uses_optional_statement_terminators())
+        })
+    }
 
-            _ => false,
+    /// Whether the word at `at` leads a statement, whatever is being read
+    /// there ([`Self::leader_at`]).
+    pub(crate) fn leads_statement(&self, at: usize) -> bool {
+        self.leader_at(at).is_some()
+    }
+
+    /// Whether `tok` is the dialect's batch separator ([`is_batch_separator`]).
+    pub(crate) fn is_batch_separator(&self, tok: &Token) -> bool {
+        is_batch_separator(self.source, self.tokens, tok, self.dialect)
+    }
+
+    /// Whether `tok` starts a sqlcmd command line ([`sqlcmd_command_line`]).
+    pub(crate) fn is_sqlcmd_command(&self, tok: &Token) -> bool {
+        sqlcmd_command_line(self.source, self.tokens, tok, self.dialect).is_some()
+    }
+
+    /// The kind of statement the word at `at` leads ([`Self::statement_leader`]),
+    /// where it leads one there: `WITH (` opens an options list (`… WITH
+    /// (DATA_COMPRESSION = PAGE)`), never a common table expression, which
+    /// names itself first.
+    fn leader_at(&self, at: usize) -> Option<Leader> {
+        let tok = self.tokens.get(at)?;
+        let options = matches!(tok.kind, TokenKind::Keyword(Keyword::With))
+            && crate::parser::principal::next_non_trivia_idx(self.tokens, at + 1).is_some_and(
+                |n| {
+                    matches!(
+                        self.tokens[n].kind,
+                        TokenKind::Punctuation(Punctuation::LParen)
+                    )
+                },
+            );
+        match options {
+            true => None,
+            false => self.statement_leader(at),
         }
     }
 
-    /// Dialect-aware boundary detection for scanners that would otherwise consume
-    /// until semicolon/EOF.
-    ///
-    /// For MSSQL, semicolons are optional in many scripts. Open-ended statement
-    /// scanners should stop when the next top-level token clearly starts a new
-    /// statement, a GO batch separator, or a clause boundary token that must not
-    /// be consumed as an alias (e.g., OUTPUT after DELETE/UPDATE target table).
-    pub(crate) fn should_stop_scan_at_statement_start(&self, tok: &Token) -> bool {
-        if !self.dialect.uses_optional_statement_terminators() {
-            return false;
+    /// The kind of statement the word at `at` leads, if it leads one: a
+    /// keyword of [`STATEMENT_LEADERS`] (`FETCH` where it reads a cursor),
+    /// a dialect's word written as a name, a sqlcmd command line, or a
+    /// parenthesised query ([`Self::parenthesised_query_leads_at`]).
+    fn statement_leader(&self, at: usize) -> Option<Leader> {
+        let tok = self.tokens.get(at)?;
+        let lex = tok.lexeme(self.source);
+        // `{ ENABLE | DISABLE } TRIGGER`; the word alone is a name.
+        if (lex.eq_ignore_ascii_case("ENABLE") || lex.eq_ignore_ascii_case("DISABLE"))
+            && crate::parser::scripting::is_mssql_trigger_state_at(self, at)
+        {
+            return Some(Leader::TsqlWord);
         }
+        if matches!(tok.kind, TokenKind::Keyword(Keyword::Fetch))
+            && !crate::parser::scripting::fetch_reads_cursor_at(self, at)
+        {
+            return None;
+        }
+        if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+            return self
+                .parenthesised_query_leads_at(at)
+                .then_some(Leader::Select);
+        }
+        if let TokenKind::Keyword(kw) = tok.kind {
+            return STATEMENT_LEADERS
+                .iter()
+                .find(|(keyword, _)| *keyword == kw)
+                .map(|(_, leader)| *leader);
+        }
+        if self.is_sqlcmd_command(tok) {
+            return Some(Leader::TsqlWord);
+        }
+        if !matches!(tok.kind, TokenKind::Identifier { .. }) {
+            return None;
+        }
+        let is = |word: &str| lex.eq_ignore_ascii_case(word);
+        // `BULK INSERT`; `BULK` alone (`OPENROWSET(BULK …)`) starts nothing.
+        let bulk_insert = is("BULK")
+            && self.dialect.supports_bulk_insert_statement()
+            && crate::parser::scripting::is_mssql_bulk_insert_at(self.tokens, at);
+        let label = self.dialect.supports_statement_labels()
+            && crate::parser::scripting::is_mssql_label_at(self, at);
+        if self.is_batch_separator(tok)
+            || is("PRINT")
+            || is("EXEC")
+            || is("RECONFIGURE")
+            || bulk_insert
+            || label
+            || (TSQL_STATEMENT_WORDS.iter().any(|word| is(word))
+                && self.dialect.is_reserved_keyword(lex))
+        {
+            Some(Leader::TsqlWord)
+        } else if is("EXPORT") || is("LOAD") || is("ASSERT") {
+            Some(Leader::BigQueryWord)
+        } else {
+            None
+        }
+    }
 
-        match &tok.kind {
-            TokenKind::Keyword(kw) => {
-                self.is_statement_starting_keyword(kw) || matches!(kw, Keyword::Output)
-            }
-            TokenKind::Identifier { .. } => {
-                let lex = tok.lexeme(self.source);
-                lex.eq_ignore_ascii_case("GO")
-                    || lex.eq_ignore_ascii_case("PRINT")
-                    || lex.eq_ignore_ascii_case("EXEC")
-                    || lex.eq_ignore_ascii_case("RECONFIGURE")
-            }
-            _ => false,
-        }
+    /// Whether `tok` is a session variable `$name`, where the dialect reads
+    /// it so: one unquoted word, `$` then a name (`$$…` is a string or a
+    /// name).
+    pub(crate) fn is_session_variable(&self, tok: &Token) -> bool {
+        self.dialect.dollar_name_is_session_variable()
+            && matches!(
+                tok.kind,
+                TokenKind::Identifier {
+                    kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
+                }
+            )
+            && tok
+                .lexeme(self.source)
+                .strip_prefix('$')
+                .and_then(|name| name.chars().next())
+                .is_some_and(|c| c != '$')
+    }
+
+    /// Whether the `(` at `at` opens a parenthesised query that starts a
+    /// statement, where the dialect's statements need no terminator: a
+    /// name or a literal ends the operand before it, `SELECT` or `WITH`
+    /// follows it, and neither a call's arguments nor a table hint is a
+    /// query (`ORDER BY a`↵`(SELECT …)`; `f((SELECT …))` is a call).
+    fn parenthesised_query_leads_at(&self, at: usize) -> bool {
+        self.dialect.uses_optional_statement_terminators()
+            && crate::parser::principal::next_non_trivia_idx(self.tokens, at + 1).is_some_and(|q| {
+                matches!(
+                    self.tokens[q].kind,
+                    TokenKind::Keyword(Keyword::Select | Keyword::With)
+                )
+            })
+            && self.tokens[..at]
+                .iter()
+                .rev()
+                .find(|t| !crate::parser::principal::is_skippable(t))
+                .is_some_and(|before| {
+                    matches!(
+                        before.kind,
+                        TokenKind::Identifier { .. } | TokenKind::Literal(_)
+                    )
+                })
     }
 
     /// Context-sensitive identifier check that centralizes dialect-aware parsing rules.
@@ -5188,26 +6441,14 @@ impl<'a> Parser<'a> {
             IdentifierContext::Generic => is_unquoted_identifier,
             IdentifierContext::AfterDot => tok.kind.can_be_identifier_after_dot(),
             IdentifierContext::Alias => {
-                let is_unquoted_alias = match &tok.kind {
-                    TokenKind::Identifier { .. } => {
-                        let lexeme = tok.lexeme(self.source);
-                        self.dialect.keyword_can_be_unquoted_alias(lexeme)
-                    }
-                    TokenKind::Keyword(_) => {
-                        let lexeme = tok.lexeme(self.source);
-                        self.dialect.keyword_can_be_unquoted_alias(lexeme)
-                    }
-                    _ => false,
-                };
-
-                if !is_unquoted_alias {
-                    return false;
-                }
-
-                if self.should_stop_scan_at_statement_start(tok) {
-                    return false;
-                }
-                true
+                matches!(
+                    tok.kind,
+                    TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                ) && crate::dialect::can_be_label(
+                    self.dialect,
+                    tok.lexeme(self.source),
+                    LabelPosition::TableAlias { after_as: true },
+                )
             }
         }
     }
@@ -5218,119 +6459,1602 @@ impl<'a> Parser<'a> {
     }
 
     #[inline]
-    pub(crate) fn can_be_alias_token(&self, tok: &Token) -> bool {
-        self.can_be_identifier_in_context(tok, IdentifierContext::Alias)
-    }
-
-    #[inline]
     pub(crate) fn can_be_identifier_after_dot_token(&self, tok: &Token) -> bool {
         self.can_be_identifier_in_context(tok, IdentifierContext::AfterDot)
     }
 
-    /// Parse a dot-separated qualified name (e.g., `db.schema.name`).
-    ///
-    /// Accepts identifiers (quoted or unquoted) and string literals.
-    /// For identifiers, continues consuming `.identifier` pairs for qualified names.
-    /// For string literals, returns the literal span directly (no dot-chaining).
-    /// Uses `can_be_identifier_token` for the first part and
-    /// `can_be_identifier_after_dot_token` for parts after a dot.
-    pub(crate) fn parse_qualified_name_span(&mut self) -> ParseResult<Span> {
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-
-        // String literals are valid in some name positions (e.g., USING SHARE 'provider.share1')
-        if matches!(
-            first.kind,
-            TokenKind::Literal(crate::lexer::LiteralKind::String)
-        ) {
-            return Ok(first.span);
+    /// Whether the word at token `at` names what precedes it at `position`:
+    /// a word the dialect's keyword table allows there
+    /// ([`crate::dialect::can_be_label`]), and, written without `AS`, no
+    /// word that starts a clause there, starts the next statement, or ends
+    /// the block being read.
+    pub(crate) fn can_be_label(&self, at: usize, position: LabelPosition) -> bool {
+        let Some(tok) = self.tokens.get(at) else {
+            return false;
+        };
+        if !matches!(
+            tok.kind,
+            TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+        ) || !crate::dialect::can_be_label(self.dialect, tok.lexeme(self.source), position)
+        {
+            return false;
         }
+        let bare = match position {
+            LabelPosition::ColumnLabel { after_as: false } => !self.starts_column_clause_at(at),
+            LabelPosition::TableAlias { after_as: false } => !self.starts_table_clause_at(at),
+            LabelPosition::ColumnLabel { after_as: true }
+            | LabelPosition::TableAlias { after_as: true }
+            | LabelPosition::StatementLabel => return true,
+        };
+        bare && !self.starts_statement(at, StatementContext::Unterminated)
+            && !self.closes_block_at(at)
+    }
 
-        if !self.can_be_identifier_token(first) {
-            return Err(ParseError::new(
+    /// Whether a clause of the select list, or the clause after it, starts
+    /// at token `at`, where a column's label written without `AS` would be.
+    fn starts_column_clause_at(&self, at: usize) -> bool {
+        let Some(tok) = self.tokens.get(at) else {
+            return false;
+        };
+        let lexeme = tok.lexeme(self.source);
+        // A trailing `EXCLUDE (…)` is the projection's exclusion clause where
+        // the dialect has one.
+        let exclusion = self.dialect.supports_projection_exclude()
+            && matches!(tok.kind, TokenKind::Keyword(Keyword::Exclude))
+            && self.tokens.get(at + 1).is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                )
+            });
+        crate::parser::select::is_clause_keyword_lexeme(lexeme)
+            || self.dialect.is_clause_boundary_keyword(lexeme)
+            || exclusion
+    }
+
+    /// Whether token `at` is the `END` that closes the body being read (a
+    /// block's, an `IF`'s, a loop's): an `END` in such a body followed by
+    /// what follows a body's `END` (the end, `;`, the keyword it closes, a
+    /// label, another `END`, a dollar-quote delimiter).
+    pub(crate) fn closes_block_at(&self, at: usize) -> bool {
+        if !self.in_end_closed_body
+            || !self
+                .tokens
+                .get(at)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::End)))
+        {
+            return false;
+        }
+        let Some(next) = crate::parser::principal::next_non_trivia_idx(self.tokens, at + 1) else {
+            return true;
+        };
+        let tok = &self.tokens[next];
+        let ends = |i: usize| {
+            crate::parser::principal::next_non_trivia_idx(self.tokens, i + 1).is_none_or(|n| {
+                matches!(
+                    self.tokens[n].kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                )
+            })
+        };
+        matches!(
+            tok.kind,
+            TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                | TokenKind::Keyword(
+                    Keyword::End
+                        | Keyword::If
+                        | Keyword::Loop
+                        | Keyword::While
+                        | Keyword::For
+                        | Keyword::Repeat
+                        | Keyword::Case
+                )
+        ) || self.delimits_dollar_quote(tok)
+            || (matches!(tok.kind, TokenKind::Identifier { .. }) && ends(next))
+    }
+
+    /// The name at the current token ([`Self::read_object_name`]), or one
+    /// string literal standing for it (`FROM SHARE 'provider.share1'`),
+    /// consumed; its span.
+    pub(crate) fn parse_qualified_name_span(&mut self) -> ParseResult<Span> {
+        if let Some(literal) = self.peek_non_trivia().filter(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::String)
+            )
+        }) {
+            self.advance();
+            return Ok(literal.span);
+        }
+        self.parse_object_name_span()
+    }
+
+    /// The object name at the current token ([`Self::read_object_name`]),
+    /// consumed; its span, from its first part to its last.
+    /// Where no name starts, the first token is consumed and named in the
+    /// error.
+    pub(crate) fn parse_object_name_span(&mut self) -> ParseResult<Span> {
+        if let Some(span) = self.take_name_span(NamePosition::Object) {
+            return Ok(span);
+        }
+        Err(self.missing_name_error())
+    }
+
+    /// The object name at the current token, consumed
+    /// ([`Self::parse_object_ref_with_argument`]). Where no name starts, the
+    /// first token is consumed and named in the error.
+    pub(crate) fn parse_required_object_ref(&mut self) -> ParseResult<crate::ast::AstObjectRef> {
+        self.skip_trivia();
+        match self.parse_object_ref_with_argument(NamePosition::Object) {
+            Some(name) => Ok(name),
+            None => Err(self.missing_name_error()),
+        }
+    }
+
+    /// The error for a name that does not start at the current token; the
+    /// token is consumed.
+    fn missing_name_error(&mut self) -> ParseError {
+        match self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])
+        {
+            Ok(first) => ParseError::new(
                 first.span,
                 ParseErrorKind::InvalidStatement {
                     message: format!("Expected identifier, found '{}'", first.lexeme(self.source)),
                 },
-            ));
+            ),
+            Err(at_end) => at_end,
         }
+    }
 
-        let start = first.span.start;
-        let mut end = first.span.end;
+    /// The name at the current token, read with the shapes `position`
+    /// takes, consumed; its span. `None`, consuming nothing, where no name
+    /// starts there.
+    pub(crate) fn take_name_span(&mut self, position: NamePosition) -> Option<Span> {
+        self.skip_trivia();
+        let (next, span) = self.name_span_at(self.idx, position)?;
+        self.idx = next;
+        Some(span)
+    }
 
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                if let Some(next) = self.peek_non_trivia() {
-                    if self.can_be_identifier_after_dot_token(next) {
-                        let n = self
-                            .advance()
-                            .expect_invariant("identifier consumed after dot");
-                        end = n.span.end;
-                    } else {
-                        break;
-                    }
+    /// The object name at the current token, consumed; its span. Where no
+    /// name starts there, the single token (a reserved word) is taken as the
+    /// name. `expected` names what is missing at the end of input.
+    pub(crate) fn take_name_or_token_span(&mut self, expected: &str) -> ParseResult<Span> {
+        if let Some(span) = self.take_name_span(NamePosition::Object) {
+            return Ok(span);
+        }
+        let token = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec![expected.to_string()])?;
+        Ok(token.span)
+    }
+
+    /// The name whose first token is `self.tokens[start]`, read with the
+    /// shapes `position` takes, without consuming: the index just past it
+    /// and its span. `None` where no name starts there.
+    pub(crate) fn name_span_at(
+        &self,
+        start: usize,
+        position: NamePosition,
+    ) -> Option<(usize, Span)> {
+        let read = self.read_object_name(start, position)?;
+        Some((
+            read.next,
+            Span {
+                start: self.tokens[start].span.start,
+                end: read.end,
+            },
+        ))
+    }
+
+    /// What kind of name the token naming an object makes the reference.
+    pub(crate) fn table_name_kind(&self, tok: &Token) -> crate::ast::AstTableNameKind {
+        use crate::ast::AstTableNameKind;
+        use crate::lexer::IdentifierKind;
+        let TokenKind::Identifier { kind, .. } = &tok.kind else {
+            return AstTableNameKind::Catalog;
+        };
+        match kind {
+            IdentifierKind::TempTable if tok.lexeme(self.source).starts_with("##") => {
+                AstTableNameKind::GlobalTemp
+            }
+            IdentifierKind::TempTable => AstTableNameKind::LocalTemp,
+            IdentifierKind::AtVariable => AstTableNameKind::TableVariable,
+            // Where `#` starts a temporary table's name, it does so
+            // delimited too (`[#t]`, `"##t"`).
+            IdentifierKind::Quoted if self.dialect.hash_is_identifier_prefix() => {
+                let delimited = tok.lexeme(self.source).get(1..).unwrap_or("");
+                if delimited.starts_with("##") {
+                    AstTableNameKind::GlobalTemp
+                } else if delimited.starts_with('#') {
+                    AstTableNameKind::LocalTemp
                 } else {
-                    break;
+                    AstTableNameKind::Catalog
                 }
+            }
+            IdentifierKind::Unquoted
+            | IdentifierKind::Quoted
+            | IdentifierKind::DollarQuoteDelimiter => AstTableNameKind::Catalog,
+        }
+    }
+
+    /// The object name whose first token is `self.tokens[start]`, read
+    /// without consuming: `part ('.' part)*`, a part being an identifier, a
+    /// part a template writes some of ([`Self::templated_part_at`]) or
+    /// (first) `IDENTIFIER(…)`; T-SQL writes an omitted part as an empty
+    /// slot (`db..t`). Returns the index just past the name, or `None`
+    /// where no name starts at `start`. A name with an `IDENTIFIER(…)` part
+    /// has no `parts`. The name carries `node_id`.
+    pub(crate) fn object_ref_at(
+        &self,
+        start: usize,
+        node_id: crate::ast::NodeId,
+    ) -> Option<(usize, crate::ast::AstObjectRef)> {
+        let read = self.read_object_name(start, NamePosition::Object)?;
+        let name = crate::ast::AstObjectRef {
+            node_id,
+            span: Span {
+                start: self.tokens[start].span.start,
+                end: read.end,
+            },
+            name_kind: read.kind,
+            parts: read.parts,
+            identifier_arg: None,
+        };
+        Some((read.next, name))
+    }
+
+    /// The name at the current token when a template writes some part of
+    /// it ([`Self::object_ref_at`]), consumed; `None`, consuming nothing,
+    /// for any other name.
+    pub(crate) fn parse_templated_object_ref(&mut self) -> Option<crate::ast::AstObjectRef> {
+        let read = self.read_object_name(self.idx, NamePosition::Object)?;
+        if read.kind != crate::ast::AstTableNameKind::Templated {
+            return None;
+        }
+        let node_id = self.id_gen.next();
+        let (next, name) = self.object_ref_at(self.idx, node_id)?;
+        self.idx = next;
+        Some(name)
+    }
+
+    /// The name part at token `i` a template writes some of: words and
+    /// `{{ … }}` expressions or `${NAME}` deployment markers written against
+    /// each other with nothing between them, at least one an expression or
+    /// marker (`t_{{ s }}`, `{{ s }}_t`, `{{ s }}`, `${DB}`). Returns the index just past it and its span; `None` where
+    /// no such part starts at `i`. A word is an unquoted identifier or a
+    /// keyword; first, also a T-SQL temporary table's name (`#t_` of
+    /// `#t_{{ s }}`); after
+    /// the first piece, also a number (`{{ s }}2`).
+    pub(crate) fn templated_part_at(
+        &self,
+        i: usize,
+    ) -> Option<(usize, Span, crate::ast::AstTemplatedName)> {
+        self.template_part_at(i, TemplateBlock::Ends)
+    }
+
+    /// [`Self::templated_part_at`], where `blocks` says whether an
+    /// `{% if %}…{% endif %}` or `{% for %}…{% endfor %}` block is one more
+    /// template piece ([`Self::template_block_end`]) or ends the part.
+    fn template_part_at(
+        &self,
+        i: usize,
+        blocks: TemplateBlock,
+    ) -> Option<(usize, Span, crate::ast::AstTemplatedName)> {
+        use crate::ast::AstNamePiece;
+        use crate::lexer::IdentifierKind;
+        let mut pieces = Vec::new();
+        let mut at = i;
+        let mut end: Option<u32> = None;
+        while let Some(tok) = self.tokens.get(at) {
+            if end.is_some_and(|e| tok.span.start != e) {
+                break;
+            }
+            let word = matches!(
+                tok.kind,
+                TokenKind::Identifier {
+                    kind: IdentifierKind::Unquoted,
+                    ..
+                } | TokenKind::Keyword(_)
+            ) || (end.is_none()
+                && matches!(
+                    tok.kind,
+                    TokenKind::Identifier {
+                        kind: IdentifierKind::TempTable,
+                        ..
+                    }
+                ))
+                || (end.is_some()
+                    && matches!(
+                        tok.kind,
+                        TokenKind::Literal(crate::lexer::LiteralKind::Number)
+                    ));
+            if matches!(tok.kind, TokenKind::JinjaExprOpen) {
+                let close = at
+                    + self.tokens[at..]
+                        .iter()
+                        .position(|t| matches!(t.kind, TokenKind::JinjaExprClose))?;
+                let close_end = self.tokens[close].span.end;
+                pieces.push(AstNamePiece::Template(Span {
+                    start: tok.span.start,
+                    end: close_end,
+                }));
+                at = close + 1;
+                end = Some(close_end);
+            } else if let Some(next) = (blocks == TemplateBlock::Piece)
+                .then(|| self.template_block_end(at))
+                .flatten()
+                .or_else(|| self.deployment_marker_end(at))
+            {
+                let close_end = self.tokens[next - 1].span.end;
+                pieces.push(AstNamePiece::Template(Span {
+                    start: tok.span.start,
+                    end: close_end,
+                }));
+                at = next;
+                end = Some(close_end);
+            } else if word {
+                pieces.push(AstNamePiece::Word(tok.span));
+                at += 1;
+                end = Some(tok.span.end);
             } else {
                 break;
             }
         }
-
-        Ok(Span { start, end })
+        let end = end?;
+        pieces
+            .iter()
+            .any(|p| matches!(p, AstNamePiece::Template(_)))
+            .then(|| {
+                (
+                    at,
+                    Span {
+                        start: self.tokens[i].span.start,
+                        end,
+                    },
+                    crate::ast::AstTemplatedName { pieces },
+                )
+            })
     }
 
-    /// Check if a keyword typically starts a new statement.
-    fn is_statement_starting_keyword(&self, kw: &Keyword) -> bool {
+    /// The index just past the deployment marker `${NAME}` whose `$` is
+    /// token `at`: `$`, `{`, a name (`[A-Za-z_][A-Za-z0-9_]*`) and `}`
+    /// written against each other. `None` where no marker starts there.
+    fn deployment_marker_end(&self, at: usize) -> Option<usize> {
+        use crate::lexer::IdentifierKind;
+        let [dollar, open, name, close] = self.tokens.get(at..at + 4)? else {
+            return None;
+        };
+        let adjacent = dollar.span.end == open.span.start
+            && open.span.end == name.span.start
+            && name.span.end == close.span.start;
+        let name_text = name.lexeme(self.source);
+        let name_is_word = matches!(
+            name.kind,
+            TokenKind::Identifier {
+                kind: IdentifierKind::Unquoted,
+                ..
+            } | TokenKind::Keyword(_)
+        ) && name_text
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name_text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let marker = adjacent
+            && name_is_word
+            && dollar.lexeme(self.source) == "$"
+            && open.kind == TokenKind::Punctuation(Punctuation::LCurly)
+            && close.kind == TokenKind::Punctuation(Punctuation::RCurly);
+        marker.then_some(at + 4)
+    }
+
+    /// The index just past the `{% if %}…{% endif %}` or `{% for %}…{%
+    /// endfor %}` block whose `{%` is token `at`, the blocks nested in it
+    /// included; `None` where no such block opens there or it never closes.
+    fn template_block_end(&self, at: usize) -> Option<usize> {
+        let keyword = |i: usize| self.tokens.get(i + 1).map(|t| &t.kind);
+        let opens = |i: usize| matches!(keyword(i), Some(TokenKind::JinjaIf | TokenKind::JinjaFor));
+        let closes = |i: usize| {
+            matches!(
+                keyword(i),
+                Some(TokenKind::JinjaEndIf | TokenKind::JinjaEndFor)
+            )
+        };
+        let is_open = |i: usize| {
+            self.tokens
+                .get(i)
+                .is_some_and(|t| matches!(t.kind, TokenKind::JinjaStmtOpen))
+        };
+        if !is_open(at) || !opens(at) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for i in at..self.tokens.len() {
+            if !is_open(i) {
+                continue;
+            }
+            if opens(i) {
+                depth += 1;
+            } else if closes(i) {
+                depth -= 1;
+                if depth == 0 {
+                    let close = i + self.tokens[i..]
+                        .iter()
+                        .position(|t| matches!(t.kind, TokenKind::JinjaStmtClose))?;
+                    return Some(close + 1);
+                }
+            }
+        }
+        None
+    }
+
+    /// The name part the word at token `i` of rendered text is, where the
+    /// render wrote some of it for an expression it could not resolve
+    /// ([`Self::span_overlaps_placeholder`]): its characters split into what
+    /// was written and what the render wrote. `None` for any other token.
+    fn rendered_template_part(&self, i: usize) -> Option<crate::ast::AstNamePart> {
+        use crate::ast::AstNamePiece;
+        let tok = self.tokens.get(i)?;
+        if !matches!(
+            tok.kind,
+            TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+        ) || !self.span_overlaps_placeholder(tok.span)
+        {
+            return None;
+        }
+        let mut written: Vec<Span> = self
+            .placeholder_spans
+            .iter()
+            .filter(|p| p.overlaps(tok.span))
+            .map(|p| Span {
+                start: p.start.max(tok.span.start),
+                end: p.end.min(tok.span.end),
+            })
+            .collect();
+        written.sort_by_key(|s| s.start);
+        let mut pieces = Vec::new();
+        let mut at = tok.span.start;
+        for span in written {
+            if span.start > at {
+                pieces.push(AstNamePiece::Word(Span {
+                    start: at,
+                    end: span.start,
+                }));
+            }
+            if span.end > at {
+                pieces.push(AstNamePiece::Rendered(Span {
+                    start: span.start.max(at),
+                    end: span.end,
+                }));
+                at = span.end;
+            }
+        }
+        if at < tok.span.end {
+            pieces.push(AstNamePiece::Word(Span {
+                start: at,
+                end: tok.span.end,
+            }));
+        }
+        Some(crate::ast::AstNamePart::Templated {
+            span: tok.span,
+            name: crate::ast::AstTemplatedName { pieces },
+        })
+    }
+
+    /// The identifier at the current token when a template writes some of
+    /// it ([`Self::templated_part_at`]), consumed; `None`, consuming
+    /// nothing, for any other token.
+    pub(crate) fn parse_templated_identifier(&mut self) -> Option<crate::ast::AstIdentifier> {
+        let (next, span, name) = self.templated_part_at(self.idx)?;
+        self.idx = next;
+        Some(crate::ast::AstIdentifier {
+            node_id: self.id_gen.next(),
+            span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: Some(Box::new(name)),
+        })
+    }
+
+    /// A bare alias at the current token that a template begins: read as
+    /// [`Self::parse_templated_identifier`] only where a word is written
+    /// against the template (`{{ s }}_b`); a template alone there may be
+    /// any text.
+    pub(crate) fn parse_template_led_alias(&mut self) -> Option<crate::ast::AstIdentifier> {
+        let (next, span, name) = self.templated_part_at(self.idx).filter(|(_, _, name)| {
+            name.pieces
+                .iter()
+                .any(|p| matches!(p, crate::ast::AstNamePiece::Word(_)))
+        })?;
+        self.idx = next;
+        Some(crate::ast::AstIdentifier {
+            node_id: self.id_gen.next(),
+            span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: Some(Box::new(name)),
+        })
+    }
+
+    /// Consumes `name [(…)] (',' name [(…)])*` at the current token —
+    /// object names ([`Self::object_ref_at`]), each with the argument list a
+    /// routine's name may carry — and returns the span from the first name
+    /// to the last, and each name with its argument list. `None`, consuming
+    /// nothing, where no name starts here.
+    pub(crate) fn parse_object_name_list(
+        &mut self,
+    ) -> Option<(Span, Vec<crate::ast::AstDropTarget>)> {
+        let start = self.idx;
+        let (mut next, mut name) = self.object_ref_at(start, self.id_gen.next())?;
+        let mut targets = Vec::new();
+        loop {
+            let at = |i: usize, p: Punctuation| {
+                self.tokens
+                    .get(i)
+                    .is_some_and(|t| matches!(&t.kind, TokenKind::Punctuation(q) if *q == p))
+            };
+            let mut signature = None;
+            let mut params = Vec::new();
+            let mut closed = true;
+            if at(next, Punctuation::LParen) {
+                match self.closing_paren_index(next) {
+                    Some(close) => {
+                        let span = Span {
+                            start: self.tokens[next].span.start,
+                            end: self.tokens[close].span.end,
+                        };
+                        params = crate::parser::procedure_params::parse_dropped_routine_args(
+                            span,
+                            self.source,
+                            &self.id_gen,
+                        );
+                        signature = Some(span);
+                        next = close + 1;
+                    }
+                    None => closed = false,
+                }
+            }
+            targets.push(crate::ast::AstDropTarget {
+                name,
+                signature,
+                params,
+            });
+            if !closed || !at(next, Punctuation::Comma) {
+                break;
+            }
+            match self.object_ref_at(next + 1, self.id_gen.next()) {
+                Some((after, following)) => {
+                    next = after;
+                    name = following;
+                }
+                None => break,
+            }
+        }
+        self.idx = next;
+        let span = Span {
+            start: self.tokens[start].span.start,
+            end: self.tokens[next - 1].span.end,
+        };
+        Some((span, targets))
+    }
+
+    /// Consumes what follows a statement's parsed clauses up to its
+    /// terminator (`;`, `|`, the end) or a token `stop` accepts, and returns
+    /// its span. Under a dialect whose statements need no terminator a
+    /// statement ends where its grammar does: nothing is consumed.
+    pub(crate) fn consume_unparsed_tail(&mut self, stop: impl Fn(&str) -> bool) -> Option<Span> {
+        if self.dialect.uses_optional_statement_terminators() {
+            return None;
+        }
+        let start = self.idx;
+        while let Some(tok) = self.peek_non_trivia() {
+            let ends = matches!(
+                tok.kind,
+                TokenKind::Eof
+                    | TokenKind::Punctuation(Punctuation::Semi)
+                    | TokenKind::Operator(Operator::Pipe)
+            );
+            if ends || stop(tok.lexeme(self.source)) {
+                break;
+            }
+            self.advance();
+        }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(start, self.idx);
+        (self.idx > start).then(|| Span {
+            start: self.tokens[start].span.start,
+            end: self.tokens[self.idx - 1].span.end,
+        })
+    }
+
+    /// The token index a statement's clauses stop at, where its grammar
+    /// reads them up to `grammar_end`: there under a dialect whose
+    /// statements need no terminator; elsewhere no bound, the statement
+    /// running to its terminator.
+    pub(crate) fn clauses_bound(&self, grammar_end: usize) -> usize {
+        if self.dialect.uses_optional_statement_terminators() {
+            grammar_end
+        } else {
+            usize::MAX
+        }
+    }
+
+    /// Whether the token at `i` is the word `word`, in any case.
+    pub(crate) fn word_at(&self, i: usize, word: &str) -> bool {
+        self.tokens
+            .get(i)
+            .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case(word))
+    }
+
+    /// The index past `words`, written in order from `i`.
+    pub(crate) fn words_end(&self, i: usize, words: &[&str]) -> Option<usize> {
+        words
+            .iter()
+            .enumerate()
+            .all(|(k, word)| self.word_at(i + k, word))
+            .then_some(i + words.len())
+    }
+
+    /// The index past whichever of `alternatives` is written at `i`.
+    pub(crate) fn any_words_end(&self, i: usize, alternatives: &[&[&str]]) -> Option<usize> {
+        alternatives
+            .iter()
+            .find_map(|words| self.words_end(i, words))
+    }
+
+    /// Whether the token at `i` is a word: an identifier or a keyword.
+    pub(crate) fn is_word_at(&self, i: usize) -> bool {
+        self.tokens
+            .get(i)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Identifier { .. } | TokenKind::Keyword(_)))
+    }
+
+    /// The index past the `(…)` that opens at `i`.
+    pub(crate) fn parens_end(&self, i: usize) -> Option<usize> {
+        let opens = self
+            .tokens
+            .get(i)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)));
+        if !opens {
+            return None;
+        }
+        self.closing_paren_index(i).map(|close| close + 1)
+    }
+
+    /// The index past an option's value at `i`: a literal with its sign (a
+    /// number with the word or `%` written against it, `5MB`, `0x1F`,
+    /// `10%`, is one value), a string a template writes into (its fragments
+    /// and templates are one value, [`Self::one_literal_at`]), a name, a
+    /// word, or a parenthesised list.
+    pub(crate) fn option_value_end(&self, i: usize) -> Option<usize> {
+        let tok = self.tokens.get(i)?;
+        let signed = matches!(
+            tok.kind,
+            TokenKind::Operator(Operator::Plus | Operator::Minus)
+        );
+        let number = if signed { i + 1 } else { i };
+        if self.tokens.get(number).is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::Number)
+            )
+        }) {
+            let adjacent = self.tokens.get(number + 1).is_some_and(|t| {
+                t.span.start == self.tokens[number].span.end
+                    && matches!(
+                        t.kind,
+                        TokenKind::Identifier { .. } | TokenKind::Operator(Operator::Percent)
+                    )
+            });
+            return Some(number + 1 + usize::from(adjacent));
+        }
+        if signed {
+            return None;
+        }
+        if matches!(
+            tok.kind,
+            TokenKind::Literal(crate::lexer::LiteralKind::StringFragment)
+        ) {
+            return Some(self.one_literal_at(i).map_or(i + 1, |literal| literal.past));
+        }
+        if matches!(tok.kind, TokenKind::Literal(_)) {
+            return Some(i + 1);
+        }
+        if let Some(end) = self.parens_end(i) {
+            return Some(end);
+        }
+        if self.is_word_at(i) {
+            return Some(self.object_name_end(i).unwrap_or(i + 1));
+        }
+        None
+    }
+
+    /// The index past `= value` at `i`.
+    pub(crate) fn eq_value_end(&self, i: usize) -> Option<usize> {
+        let eq = self
+            .tokens
+            .get(i)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Operator(Operator::Eq)));
+        if eq {
+            self.option_value_end(i + 1)
+        } else {
+            None
+        }
+    }
+
+    /// The index past `item (, item)*` at `i`, each item read by `item`.
+    pub(crate) fn comma_list_end(
+        &self,
+        i: usize,
+        item: impl Fn(usize) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut end = item(i)?;
+        while self
+            .tokens
+            .get(end)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::Comma)))
+        {
+            match item(end + 1) {
+                Some(next) => end = next,
+                None => break,
+            }
+        }
+        Some(end)
+    }
+
+    /// The index past an option `name [= value] [(…)]` at `i`, `name` a
+    /// word.
+    pub(crate) fn option_item_end(&self, i: usize) -> Option<usize> {
+        if !self.is_word_at(i) {
+            return None;
+        }
+        let end = self.eq_value_end(i + 1).unwrap_or(i + 1);
+        Some(self.parens_end(end).unwrap_or(end))
+    }
+
+    /// The index past `WITH item (, item)*` at `i`, each item read by
+    /// `item`; `None` where the `WITH` begins a common table expression
+    /// (`WITH name [(…)] AS`).
+    pub(crate) fn with_list_end(
+        &self,
+        i: usize,
+        item: impl Fn(usize) -> Option<usize>,
+    ) -> Option<usize> {
+        if !self.word_at(i, "WITH") {
+            return None;
+        }
+        let end = self.comma_list_end(i + 1, item)?;
+        (!self.word_at(end, "AS")).then_some(end)
+    }
+
+    /// The index just past the object name at `start`
+    /// ([`Self::object_ref_at`]); `None` where no name starts there.
+    pub(crate) fn object_name_end(&self, start: usize) -> Option<usize> {
+        self.read_object_name(start, NamePosition::Object)
+            .map(|read| read.next)
+    }
+
+    /// The name part that starts at `first`: an unquoted word, with any
+    /// `-segment` runs written against it and each other, a segment being a
+    /// word, a keyword or a number, or a number and the word written against
+    /// it (`my-project`, `my-order-project`, `proj-123`, `proj-1a`). A number
+    /// the lexer read with the `.` after it (`123.` in
+    /// `proj-123.ds`) ends the part, and that `.` separates it from the next.
+    /// Only a name position asks: `a-b` elsewhere stays a subtraction.
+    pub(crate) fn dashed_part(&self, first: usize) -> Option<DashedPart> {
+        let unquoted_word = |t: &Token| {
+            matches!(
+                t.kind,
+                TokenKind::Identifier {
+                    kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
+                }
+            )
+        };
+        let head = self.tokens.get(first)?;
+        let mut part = DashedPart {
+            last: first,
+            span: head.span,
+            dot: None,
+        };
+        if !unquoted_word(head) {
+            return Some(part);
+        }
+        while let (Some(dash), Some(segment)) = (
+            self.tokens.get(part.last + 1),
+            self.tokens.get(part.last + 2),
+        ) {
+            let number = matches!(
+                segment.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::Number)
+            );
+            if !matches!(dash.kind, TokenKind::Operator(Operator::Minus))
+                || part.span.end != dash.span.start
+                || dash.span.end != segment.span.start
+                || !(number
+                    || unquoted_word(segment)
+                    || matches!(segment.kind, TokenKind::Keyword(_)))
+            {
+                break;
+            }
+            part.last += 2;
+            part.span.end = segment.span.end;
+            if number && segment.lexeme(self.source).ends_with('.') {
+                let dot = Span {
+                    start: segment.span.end - 1,
+                    end: segment.span.end,
+                };
+                part.span.end = dot.start;
+                part.dot = Some(dot);
+                break;
+            }
+            // Digits then letters (`1a`) lex as a number and a word.
+            if let Some(word) = self.tokens.get(part.last + 1).filter(|word| {
+                number
+                    && word.span.start == part.span.end
+                    && (unquoted_word(word) || matches!(word.kind, TokenKind::Keyword(_)))
+            }) {
+                part.last += 1;
+                part.span.end = word.span.end;
+            }
+        }
+        Some(part)
+    }
+
+    /// The name whose first token is `self.tokens[start]`, read with the
+    /// shapes `position` takes ([`Self::object_ref_at`]); `None` where no
+    /// name starts there.
+    fn read_object_name(&self, start: usize, position: NamePosition) -> Option<ObjectNameRead> {
+        let object = matches!(position, NamePosition::Object | NamePosition::TableWord);
+        let mut i = start;
+        let mut parts: Option<Vec<Option<crate::ast::AstNamePart>>> = Some(Vec::new());
+        let mut kind = crate::ast::AstTableNameKind::Catalog;
+        let mut templated = false;
+        let mut identifier_call = None;
+        let mut after_dot = false;
+        // Blocks are template pieces only of a name a block begins.
+        let blocks = match self.template_block_end(start) {
+            Some(_) => TemplateBlock::Piece,
+            None => TemplateBlock::Ends,
+        };
+        let end =
+            loop {
+                let tok = self.tokens.get(i)?;
+                // The part read this round took the `.` after it (`proj-123.`).
+                let mut dot_taken = false;
+                if after_dot && matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
+                    // Omitted part: the dot that follows is read next round.
+                    if let Some(p) = parts.as_mut() {
+                        p.push(None);
+                    }
+                    i += 1;
+                    continue;
+                }
+                let templated_part = match self.template_part_at(i, blocks) {
+                    Some((next, span, name)) => {
+                        Some((next, crate::ast::AstNamePart::Templated { span, name }))
+                    }
+                    None => self.rendered_template_part(i).map(|part| (i + 1, part)),
+                };
+                // `TABLE` leading a FROM clause's name stands for a part.
+                let table_word = position == NamePosition::TableWord && i == start;
+                if let Some((next, part)) = templated_part {
+                    if let Some(p) = parts.as_mut() {
+                        p.push(Some(part));
+                    }
+                    templated = true;
+                    // The part's last token.
+                    i = next - 1;
+                } else if object
+                    && !after_dot
+                    && tok.lexeme(self.source).eq_ignore_ascii_case("IDENTIFIER")
+                    && self.tokens.get(i + 1).is_some_and(|t| {
+                        matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen))
+                    })
+                {
+                    let close = self.closing_paren_index(i + 1)?;
+                    identifier_call = Some((i + 1, close));
+                    i = close;
+                    parts = None;
+                } else if ((after_dot || table_word) && self.can_be_identifier_after_dot_token(tok))
+                    || (!after_dot && self.can_be_identifier_token(tok))
+                {
+                    // BigQuery's region qualifier after the project
+                    // (`proj.region-us.INFORMATION_SCHEMA.JOBS`) is dashed too.
+                    let dashed = object && (!after_dot || self.word_at(i, "REGION"));
+                    let span = if !dashed {
+                        tok.span
+                    } else {
+                        let part = self.dashed_part(i)?;
+                        i = part.last;
+                        dot_taken = part.dot.is_some();
+                        part.span
+                    };
+                    if let Some(p) = parts.as_mut() {
+                        p.push(Some(crate::ast::AstNamePart::Word(span)));
+                    }
+                    kind = self.table_name_kind(tok);
+                } else {
+                    return None;
+                }
+                let part_end = self.tokens.get(i)?.span.end;
+                i += 1;
+                if !dot_taken {
+                    let dot = self.tokens.get(i).is_some_and(|t| {
+                        matches!(t.kind, TokenKind::Punctuation(Punctuation::Dot))
+                    });
+                    // `t.*` is the name `t` and a qualified star.
+                    let star = self
+                        .tokens
+                        .get(i + 1)
+                        .is_some_and(|t| matches!(t.kind, TokenKind::Operator(Operator::Star)));
+                    if !dot || star {
+                        break part_end;
+                    }
+                    i += 1;
+                }
+                after_dot = true;
+            };
+        if identifier_call.is_some() {
+            kind = crate::ast::AstTableNameKind::Catalog;
+        } else if templated {
+            kind = crate::ast::AstTableNameKind::Templated;
+        }
+        // A name that holds a `{% … %}` block is one template piece.
+        if parts.is_some()
+            && self.tokens[start..i]
+                .iter()
+                .any(|t| matches!(t.kind, TokenKind::JinjaStmtOpen))
+        {
+            let whole = Span {
+                start: self.tokens[start].span.start,
+                end,
+            };
+            parts = Some(vec![Some(crate::ast::AstNamePart::Templated {
+                span: whole,
+                name: crate::ast::AstTemplatedName {
+                    pieces: vec![crate::ast::AstNamePiece::Template(whole)],
+                },
+            })]);
+        }
+        Some(ObjectNameRead {
+            next: i,
+            end,
+            parts,
+            kind,
+            identifier_call,
+        })
+    }
+
+    /// The object name `self.tokens[start..end]` (`start < end`) spells
+    /// ([`Self::object_ref_at`]); where the tokens are not one name, a
+    /// reference with no parts whose span covers them all.
+    pub(crate) fn object_ref_of_range(
+        &self,
+        start: usize,
+        end: usize,
+        node_id: crate::ast::NodeId,
+    ) -> crate::ast::AstObjectRef {
+        match self.object_ref_at(start, node_id) {
+            Some((name_end, name)) if name_end == end => name,
+            Some(_) | None => crate::ast::AstObjectRef {
+                node_id,
+                span: Span {
+                    start: self.tokens[start].span.start,
+                    end: self.tokens[end - 1].span.end,
+                },
+                parts: None,
+                identifier_arg: None,
+                name_kind: crate::ast::AstTableNameKind::Catalog,
+            },
+        }
+    }
+
+    /// The names of the list `( name {, name}* )` whose `(` is token `open`,
+    /// each read as [`Self::object_ref_at`] reads one. Empty where the token
+    /// is not a `(`, the list is empty, anything in it is not a name, or it
+    /// is the one word `ALL` or `NONE` (a bare word is no list).
+    pub(crate) fn object_ref_list_at(&self, open: usize) -> Vec<crate::ast::AstObjectRef> {
+        let mut names = Vec::new();
+        let opens = self
+            .tokens
+            .get(open)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)));
+        if !opens {
+            return names;
+        }
+        let mut at = open + 1;
+        loop {
+            let Some((next, name)) = self.object_ref_at(at, self.id_gen.next()) else {
+                return Vec::new();
+            };
+            names.push(name);
+            let after = self.tokens.get(next).map(|t| &t.kind);
+            if matches!(after, Some(TokenKind::Punctuation(Punctuation::RParen))) {
+                let keyword = names.len() == 1
+                    && next == open + 2
+                    && ["ALL", "NONE"]
+                        .iter()
+                        .any(|word| self.word_at(open + 1, word));
+                return if keyword { Vec::new() } else { names };
+            }
+            if !matches!(after, Some(TokenKind::Punctuation(Punctuation::Comma))) {
+                return Vec::new();
+            }
+            at = next + 1;
+        }
+    }
+
+    /// The name of the stage whose `@` is token `at`, read as
+    /// [`Self::object_ref_at`] reads one, with the stage name kind: the
+    /// index just past it and the name. `None` where the token is not `@`
+    /// or no name follows it (`@~`, `@%t`).
+    pub(crate) fn stage_name_at(&self, at: usize) -> Option<(usize, crate::ast::AstObjectRef)> {
+        let is_at = self
+            .tokens
+            .get(at)
+            .is_some_and(|t| t.kind == TokenKind::Unknown && t.lexeme(self.source) == "@");
+        if !is_at {
+            return None;
+        }
+        let (next, mut name) = self.object_ref_at(at + 1, self.id_gen.next())?;
+        name.name_kind = crate::ast::AstTableNameKind::Stage;
+        Some((next, name))
+    }
+
+    /// The stage reference `@name[/path]` whose `@` is token `at`
+    /// ([`Self::stage_name_at`]): the path is what is written against the
+    /// name with no gap, up to a `;`, `,` or parenthesis. `None` where no
+    /// name follows the `@`.
+    pub(crate) fn stage_ref_at(&self, at: usize) -> Option<crate::ast::AstStageRef> {
+        let (mut next, name) = self.stage_name_at(at)?;
+        let mut end = name.span.end;
+        while let Some(tok) = self.tokens.get(next) {
+            let ends_path = tok.span.start != end
+                || matches!(
+                    tok.kind,
+                    TokenKind::Eof
+                        | TokenKind::Punctuation(
+                            Punctuation::Semi
+                                | Punctuation::Comma
+                                | Punctuation::LParen
+                                | Punctuation::RParen
+                        )
+                );
+            if ends_path {
+                break;
+            }
+            end = tok.span.end;
+            next += 1;
+        }
+        let path = (end > name.span.end).then_some(Span {
+            start: name.span.end,
+            end,
+        });
+        Some(crate::ast::AstStageRef { name, path })
+    }
+
+    /// The file format named by `FORMAT_NAME = name` written inside the
+    /// parentheses opened by token `open`, outside any nested ones: a name
+    /// as [`Self::object_ref_at`] reads one, or a string, whose span the
+    /// reference takes. `None` where none is written.
+    pub(crate) fn format_name_in(&self, open: usize) -> Option<crate::ast::AstObjectRef> {
+        let close = self.closing_paren_index(open).unwrap_or(self.tokens.len());
+        let mut depth = 0usize;
+        for at in open + 1..close {
+            let tok = self.tokens.get(at)?;
+            if matches!(
+                tok.kind,
+                TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+            ) {
+                return None;
+            }
+            if tok.kind == TokenKind::Punctuation(Punctuation::LParen) {
+                depth += 1;
+            } else if tok.kind == TokenKind::Punctuation(Punctuation::RParen) {
+                depth = depth.saturating_sub(1);
+            }
+            let names = depth == 0
+                && self.word_at(at, "FORMAT_NAME")
+                && self
+                    .tokens
+                    .get(at + 1)
+                    .is_some_and(|t| t.kind == TokenKind::Operator(Operator::Eq));
+            if !names {
+                continue;
+            }
+            let value = self.tokens.get(at + 2)?;
+            if value.kind == TokenKind::Literal(crate::lexer::LiteralKind::String) {
+                return Some(crate::ast::AstObjectRef {
+                    node_id: self.id_gen.next(),
+                    span: value.span,
+                    parts: None,
+                    identifier_arg: None,
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
+                });
+            }
+            return self
+                .object_ref_at(at + 2, self.id_gen.next())
+                .map(|(_, name)| name);
+        }
+        None
+    }
+
+    /// Index of the `)` that closes the `(` at `open`.
+    pub(crate) fn closing_paren_index(&self, open: usize) -> Option<usize> {
+        let mut depth: usize = 0;
+        for (i, t) in self.tokens.iter().enumerate().skip(open) {
+            if matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                depth += 1;
+            } else if matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse an object name at the current token ([`Self::object_ref_at`]).
+    pub(crate) fn parse_object_ref(&mut self) -> ParseResult<crate::ast::AstObjectRef> {
+        let node_id = self.id_gen.next();
+        match self.object_ref_at(self.idx, node_id) {
+            Some((end, name)) => {
+                self.idx = end;
+                Ok(name)
+            }
+            None => Err(ParseError::new(
+                self.current_span(),
+                ParseErrorKind::InvalidStatement {
+                    message: "Expected an object name".to_string(),
+                },
+            )),
+        }
+    }
+
+    /// The object name at the current token, read at `position`
+    /// ([`Self::object_ref_at`]) and consumed, with the argument of a first
+    /// part `IDENTIFIER(…)` where it is one expression; `None`, consuming
+    /// nothing, where no name starts there.
+    pub(crate) fn parse_object_ref_with_argument(
+        &mut self,
+        position: NamePosition,
+    ) -> Option<crate::ast::AstObjectRef> {
+        let start = self.idx;
+        let read = self.read_object_name(start, position)?;
+        let identifier_arg = read
+            .identifier_call
+            .and_then(|call| self.call_argument(call))
+            .map(Box::new);
+        self.idx = read.next;
+        Some(crate::ast::AstObjectRef {
+            node_id: self.id_gen.next(),
+            span: Span {
+                start: self.tokens[start].span.start,
+                end: read.end,
+            },
+            name_kind: read.kind,
+            parts: read.parts,
+            identifier_arg,
+        })
+    }
+
+    /// The `KEY [= value]` property at the current token, consumed. The
+    /// value is one token or a parenthesised group, or, for
+    /// [`PropertyValue::Name`], the object name that starts there
+    /// ([`Self::take_name_span`]) when one does.
+    pub(crate) fn parse_property(&mut self, value: PropertyValue) -> ParseResult<PropertyClause> {
+        let key = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["property".to_string()])?;
+        let start = key.span.start;
+        let mut end = key.span.end;
+        let mut name = None;
+        if self
+            .peek_non_trivia()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Operator(Operator::Eq)))
+        {
+            let eq = self
+                .advance()
+                .expect_invariant("= consumed after match in parse_property");
+            end = eq.span.end;
+            if value == PropertyValue::Name {
+                name = self.take_name_span(NamePosition::Object);
+            }
+            if let Some(read) = name {
+                end = read.end;
+            } else if let Some(val) = self.peek_non_trivia() {
+                if matches!(val.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                    let open = self.idx;
+                    let Some(close) = self.closing_paren_index(open) else {
+                        while self.advance().is_some() {}
+                        return Err(ParseError::new(
+                            self.current_span(),
+                            ParseErrorKind::InvalidStatement {
+                                message: "Unmatched parenthesis".to_string(),
+                            },
+                        ));
+                    };
+                    self.idx = close + 1;
+                    // The group is not read: its secrets are recorded as
+                    // unparsed text's are.
+                    self.record_unparsed_secrets(open + 1, self.idx);
+                    end = self.tokens[close].span.end;
+                } else {
+                    let token = self
+                        .advance()
+                        .expect_invariant("property value consumed after peek in parse_property");
+                    end = token.span.end;
+                }
+            }
+        }
+        Ok(PropertyClause {
+            span: Span { start, end },
+            name,
+        })
+    }
+
+    /// The `IDENTIFIER(…)` that is the first part of the object name at
+    /// token `start` ([`Self::object_ref_at`]): the index just past its `)`
+    /// and its argument. `None` where no such name starts there or the
+    /// argument is not one expression.
+    pub(crate) fn identifier_argument_at(
+        &mut self,
+        start: usize,
+    ) -> Option<(usize, crate::ast::AstExpr)> {
+        let call = self
+            .read_object_name(start, NamePosition::Object)?
+            .identifier_call?;
+        let argument = self.call_argument(call)?;
+        Some((call.1 + 1, argument))
+    }
+
+    /// The expression between the `(` and `)` at `open` and `close`, where
+    /// it is one expression and fills them; nothing consumed.
+    fn call_argument(&mut self, (open, close): (usize, usize)) -> Option<crate::ast::AstExpr> {
+        let saved = self.idx;
+        self.idx = open + 1;
+        let argument = self.parse_expr().ok();
+        let whole = self.idx == close;
+        self.idx = saved;
+        let argument = argument.filter(|_| whole)?;
+        // A name taken from a variable is the variable's value.
+        if let crate::ast::AstExpr::SessionVarRef { span, .. }
+        | crate::ast::AstExpr::ScriptingVarRef { span, .. } = &argument
+        {
+            self.held_names.push(*span);
+        }
+        Some(argument)
+    }
+}
+
+/// Whether `tok`, one of `tokens` (the lexer's, comments attached as
+/// trivia), is the dialect's batch separator: T-SQL `GO`, in any case, with
+/// an optional repeat count (`GO 5`), and nothing else on its line but
+/// whitespace and comments of either kind, before or after it.
+///
+/// sqlcmd and SSMS end the batch at such a line: the `GO` line "can contain
+/// comments", and SSMS also reads comments before a command, where sqlcmd
+/// wants the command first. A comment before `GO` counts, so that no tool
+/// that ends the batch there finds the line joined to a statement. Anywhere
+/// else `go` is a name (`AS go`, `sales.go`, `GO;`).
+pub(crate) fn is_batch_separator(
+    source: &str,
+    tokens: &[Token],
+    tok: &Token,
+    dialect: &dyn Dialect,
+) -> bool {
+    let Some(at) = go_line_start(source, tokens, tok, dialect) else {
+        return false;
+    };
+    let starts_line = |from: u32, next: &Token| {
+        source
+            .get(from as usize..next.span.start as usize)
+            .is_some_and(|gap| gap.contains('\n'))
+    };
+    let mut after = tokens[at + 1..].iter().filter(|t| occupies_text(t));
+    let mut end = tok.span.end;
+    let mut next = after.next();
+    if let Some(count) = next.filter(|t| {
         matches!(
-            kw,
-            // DML
-            Keyword::Select
-                | Keyword::Insert
-                | Keyword::Update
-                | Keyword::Delete
-                | Keyword::Merge
-                | Keyword::With
-            // DDL
-                | Keyword::Create
-                | Keyword::Drop
-                | Keyword::Truncate
-            // DCL
-                | Keyword::Grant
-                | Keyword::Revoke
-                | Keyword::Deny
-            // Transaction control
-                | Keyword::Begin
-                | Keyword::Commit
-                | Keyword::Rollback
-            // Session/utility
-                | Keyword::Use
-                | Keyword::Show
-                | Keyword::Describe
-                | Keyword::Copy
-                | Keyword::Call
-            // Scripting
-                | Keyword::Declare
-                | Keyword::Let
-                | Keyword::If
-                | Keyword::Case
-                | Keyword::Loop
-                | Keyword::While
-                | Keyword::For
-                | Keyword::Repeat
-                | Keyword::Return
-                | Keyword::Raise
-                | Keyword::Break
-                | Keyword::Continue
-            // Block delimiters (prevent END/ELSE from being consumed as aliases)
-                | Keyword::End
-                | Keyword::Else
-                | Keyword::Try
-                | Keyword::Catch
-        )
+            t.kind,
+            TokenKind::Literal(crate::lexer::LiteralKind::Number)
+        ) && t.lexeme(source).bytes().all(|b| b.is_ascii_digit())
+            && !starts_line(end, t)
+    }) {
+        end = count.span.end;
+        next = after.next();
     }
+    next.is_none_or(|t| starts_line(end, t))
+}
+
+/// The index of `tok` in `tokens` where `tok` is an unquoted T-SQL `GO` that
+/// starts its line: nothing but whitespace and comments before it there.
+/// Every batch separator ([`is_batch_separator`]) starts such a line; so do
+/// `GO;` and `GO 5 x`, which are not separators.
+pub(crate) fn go_line_start(
+    source: &str,
+    tokens: &[Token],
+    tok: &Token,
+    dialect: &dyn Dialect,
+) -> Option<usize> {
+    if !matches!(tok.kind, TokenKind::Identifier { .. })
+        || !dialect.supports_go_batch_separator()
+        || !tok.lexeme(source).eq_ignore_ascii_case("GO")
+    {
+        return None;
+    }
+    line_start_index(source, tokens, tok)
+}
+
+/// The index of `tok` in `tokens` where nothing but whitespace and comments
+/// stands before it on its line.
+fn line_start_index(source: &str, tokens: &[Token], tok: &Token) -> Option<usize> {
+    let first = tokens.partition_point(|t| t.span.start < tok.span.start);
+    let at = first
+        + tokens[first..]
+            .iter()
+            .take_while(|t| t.span.start == tok.span.start)
+            .position(|t| t.span == tok.span)?;
+    let line_start = source
+        .get(..tok.span.start as usize)?
+        .rfind('\n')
+        .map_or(0, |nl| nl + 1);
+    let after_previous = tokens[..at]
+        .iter()
+        .rev()
+        .find(|t| occupies_text(t))
+        .is_none_or(|previous| previous.span.end as usize <= line_start);
+    after_previous.then_some(at)
+}
+
+/// What a sqlcmd command does, by its name ([`SQLCMD_COMMANDS`]).
+#[derive(Debug, Clone, Copy)]
+enum SqlcmdVerb {
+    /// Sets or shows the client's state, naming what its arguments say.
+    Client(SqlcmdNames),
+    Include,
+    Connect,
+    Edit,
+    /// `:exit`, which sends a query where one is written in its parentheses.
+    Exit,
+}
+
+/// The commands sqlcmd reads after a `:` at the start of a line, each with
+/// what it does. `!!` is read apart: it may be written without the `:`.
+const SQLCMD_COMMANDS: &[(&str, SqlcmdVerb)] = &[
+    ("CONNECT", SqlcmdVerb::Connect),
+    ("ED", SqlcmdVerb::Edit),
+    ("ERROR", SqlcmdVerb::Client(SqlcmdNames::File)),
+    ("EXIT", SqlcmdVerb::Exit),
+    ("HELP", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    ("LIST", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    ("LISTVAR", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    (
+        "ON",
+        SqlcmdVerb::Client(SqlcmdNames::Choice(&[
+            &["error", "exit"],
+            &["error", "ignore"],
+        ])),
+    ),
+    ("OUT", SqlcmdVerb::Client(SqlcmdNames::File)),
+    ("PERFTRACE", SqlcmdVerb::Client(SqlcmdNames::File)),
+    ("QUIT", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    ("R", SqlcmdVerb::Include),
+    ("RESET", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    ("SERVERLIST", SqlcmdVerb::Client(SqlcmdNames::Nothing)),
+    ("SETVAR", SqlcmdVerb::Client(SqlcmdNames::Variable)),
+    (
+        "XML",
+        SqlcmdVerb::Client(SqlcmdNames::Choice(&[&["on"], &["off"]])),
+    ),
+];
+
+/// What the arguments of a command that sets the client's state name, as
+/// sqlcmd's grammar writes them ("sqlcmd utility", "Commands"); a line
+/// written otherwise names nothing.
+#[derive(Debug, Clone, Copy)]
+enum SqlcmdNames {
+    /// No argument: `:quit`, `:help`, `:list`, `:listvar`, `:serverlist`,
+    /// `:reset`.
+    Nothing,
+    /// One file, `stderr` or `stdout`: `:out`, `:error`, `:perftrace`.
+    File,
+    /// One of these word sequences: `:on error exit|ignore`, `:xml on|off`.
+    Choice(&'static [&'static [&'static str]]),
+    /// A variable's name first, one word, then its value, which may be
+    /// anything: `:setvar name value`.
+    Variable,
+}
+
+/// A sqlcmd command line ([`sqlcmd_command_line`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SqlcmdLine {
+    /// The index past the last token that starts on the line.
+    pub(crate) past: usize,
+    /// Where that token ends.
+    pub(crate) end: u32,
+    /// The command's name, `!!` for an operating-system command.
+    pub(crate) name_span: Span,
+    pub(crate) action: crate::ast::SqlcmdAction,
+}
+
+/// The line of a sqlcmd command that `tok` starts, where the dialect's
+/// batch separator is sqlcmd's `GO`: `tok` with nothing but whitespace and
+/// comments before it on its line, and either a `:` with the command's name
+/// written right after it (`:r file`, `:setvar name value`, `:on error
+/// exit`, `:connect server`, `:List`), or `!!` with or without the `:`
+/// before it (`!! dir`, `:!! dir`). sqlcmd runs such a line itself,
+/// wherever it stands, and sends to the server none of it but the query of
+/// `:exit(query)`. Names are read in any case.
+pub(crate) fn sqlcmd_command_line(
+    source: &str,
+    tokens: &[Token],
+    tok: &Token,
+    dialect: &dyn Dialect,
+) -> Option<SqlcmdLine> {
+    use crate::ast::SqlcmdAction;
+    let bang = |t: &Token| matches!(t.kind, TokenKind::Operator(Operator::Bang));
+    let colon = matches!(tok.kind, TokenKind::Punctuation(Punctuation::Colon));
+    if !(colon || bang(tok)) || !dialect.supports_go_batch_separator() {
+        return None;
+    }
+    let at = line_start_index(source, tokens, tok)?;
+    let name_at = at + usize::from(colon);
+    let first = tokens
+        .get(name_at)
+        .filter(|name| !colon || name.span.start == tok.span.end)?;
+    let (name_span, args_at, verb) = if bang(first) {
+        let second = tokens
+            .get(name_at + 1)
+            .filter(|t| bang(t) && t.span.start == first.span.end)?;
+        let span = Span {
+            start: first.span.start,
+            end: second.span.end,
+        };
+        (span, name_at + 2, None)
+    } else if colon {
+        // A name sqlcmd does not know is a line it rejects: it names nothing.
+        let verb = SQLCMD_COMMANDS
+            .iter()
+            .find(|(name, _)| first.lexeme(source).eq_ignore_ascii_case(name))
+            .map(|(_, verb)| *verb)
+            .or_else(|| {
+                matches!(
+                    first.kind,
+                    TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                )
+                .then_some(SqlcmdVerb::Client(SqlcmdNames::Nothing))
+            })?;
+        (first.span, name_at + 1, Some(verb))
+    } else {
+        return None;
+    };
+    let line_end = source
+        .get(name_span.end as usize..)?
+        .find('\n')
+        .map_or(source.len(), |nl| name_span.end as usize + nl);
+    let past = args_at
+        + tokens
+            .get(args_at..)?
+            .iter()
+            .take_while(|t| occupies_text(t) && (t.span.start as usize) < line_end)
+            .count();
+    let args = &tokens[args_at..past];
+    let spanning = |args: &[Token]| {
+        Some(Span {
+            start: args.first()?.span.start,
+            end: args.last()?.span.end,
+        })
+    };
+    // The first argument: its tokens written with no space between them.
+    let first_argument_tokens = || {
+        let written = args
+            .iter()
+            .zip(args.iter().skip(1))
+            .take_while(|(t, next)| next.span.start == t.span.end)
+            .count();
+        args.get(..=written).unwrap_or_default()
+    };
+    let first_argument = || spanning(first_argument_tokens());
+    // The only argument: one, written with no space inside it, and no
+    // `=`, `;` or `@` in it (a connection string is no file).
+    let only_argument = || {
+        let first = first_argument_tokens();
+        (first.len() == args.len())
+            .then(|| spanning(first))
+            .flatten()
+            .filter(|file| {
+                source
+                    .get(file.start as usize..file.end as usize)
+                    .is_some_and(|text| !text.contains(['=', ';', '@']))
+            })
+    };
+    let action = match verb {
+        None => SqlcmdAction::OsCommand,
+        Some(SqlcmdVerb::Client(SqlcmdNames::Nothing)) => SqlcmdAction::Client { named: None },
+        Some(SqlcmdVerb::Client(SqlcmdNames::File)) => SqlcmdAction::Client {
+            named: only_argument(),
+        },
+        Some(SqlcmdVerb::Client(SqlcmdNames::Choice(choices))) => {
+            let chosen = choices.iter().any(|words| {
+                words.len() == args.len()
+                    && words
+                        .iter()
+                        .zip(args)
+                        .all(|(word, arg)| arg.lexeme(source).eq_ignore_ascii_case(word))
+            });
+            SqlcmdAction::Client {
+                named: chosen.then(|| spanning(args)).flatten(),
+            }
+        }
+        // The name is one word: `PW=x` written together is no name.
+        Some(SqlcmdVerb::Client(SqlcmdNames::Variable)) => SqlcmdAction::Client {
+            named: match first_argument_tokens() {
+                [name]
+                    if matches!(
+                        name.kind,
+                        TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                    ) =>
+                {
+                    Some(name.span)
+                }
+                _ => None,
+            },
+        },
+        Some(SqlcmdVerb::Edit) => SqlcmdAction::Edit,
+        Some(SqlcmdVerb::Include) => SqlcmdAction::Include {
+            file_span: only_argument(),
+        },
+        // The server's name runs to the first space: `srv\inst`,
+        // `$(server)`, `tcp:srv,1433`. An option (`-P…`) is no server, and
+        // neither is text holding `=`, `;` or `@` (a connection string).
+        Some(SqlcmdVerb::Connect) => {
+            let option = args
+                .first()
+                .is_some_and(|t| matches!(t.kind, TokenKind::Operator(Operator::Minus)));
+            let server = first_argument().filter(|server| {
+                !option
+                    && source
+                        .get(server.start as usize..server.end as usize)
+                        .is_some_and(|text| !text.contains(['=', ';', '@']))
+            });
+            SqlcmdAction::Connect {
+                server_span: server,
+            }
+        }
+        // `:exit(query)`; `:exit` and `:exit()` send nothing.
+        Some(SqlcmdVerb::Exit) => {
+            let parenthesised = args.len() > 2
+                && matches!(args[0].kind, TokenKind::Punctuation(Punctuation::LParen))
+                && matches!(
+                    args[args.len() - 1].kind,
+                    TokenKind::Punctuation(Punctuation::RParen)
+                );
+            match parenthesised
+                .then(|| spanning(&args[1..args.len() - 1]))
+                .flatten()
+            {
+                Some(query_span) => SqlcmdAction::ExitQuery { query_span },
+                None => SqlcmdAction::Client { named: None },
+            }
+        }
+    };
+    Some(SqlcmdLine {
+        past,
+        end: args.last().map_or(name_span.end, |t| t.span.end),
+        name_span,
+        action,
+    })
+}
+
+/// Whether `tok` holds source text: not the end of input, nor a token the
+/// lexer adds without text.
+fn occupies_text(tok: &Token) -> bool {
+    tok.span.start < tok.span.end
 }
 
 // ============================================================================
@@ -5393,6 +8117,388 @@ mod recovery_fragmentation_tests {
             script.stmts
         );
         assert!(matches!(script.stmts.last(), Some(AstStmt::Select(_))));
+    }
+
+    // A FROM names at least one table, and a comma in its list another.
+    #[test]
+    fn a_from_with_no_table_does_not_parse() {
+        let unread = |name: &str, sql: &str| {
+            let dialect = crate::dialect::dialect_from_name(name).expect("a dialect");
+            let tokens = crate::lexer::tokenize_with_dialect(sql, dialect.as_ref()).tokens;
+            let mut parser = Parser::with_dialect(sql, &tokens, dialect.as_ref());
+            let script = parser.try_parse_script().expect("a script");
+            !parser.get_recovery_errors().is_empty()
+                || script
+                    .stmts
+                    .iter()
+                    .any(|s| matches!(s, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. }))
+        };
+        for (name, sql) in [
+            ("snowflake", "SELECT (SELECT FROM)"),
+            ("bigquery", "SELECT (SELECT FROM)"),
+            ("snowflake", "SELECT 1 FROM WHERE 1 = 1"),
+            ("snowflake", "SELECT * FROM (SELECT FROM) t"),
+            ("postgres", "SELECT id FROM users, WHERE id = 1"),
+            ("mysql", "SELECT id FROM users, ORDER BY id"),
+            ("snowflake", "SELECT 1 FROM"),
+            ("snowflake", "SELECT a FROM users,"),
+        ] {
+            assert!(unread(name, sql), "[{name}] {sql} was read");
+        }
+        for (name, sql) in [
+            ("postgres", "SELECT FROM users"),
+            ("snowflake", "SELECT (SELECT id FROM users)"),
+            (
+                "snowflake",
+                "SELECT 1 FROM users u, orders o WHERE u.id = o.id",
+            ),
+        ] {
+            assert!(!unread(name, sql), "[{name}] {sql} was not read");
+        }
+    }
+
+    // Where a table is due, a template that rendered nothing leaves a
+    // zero-width placeholder: the table is a name the template writes.
+    #[test]
+    fn a_template_rendering_nothing_where_a_table_is_due_is_a_templated_name() {
+        let read = |sql: &str, at: u32| {
+            let tokens = tokenize(sql).tokens;
+            let mut parser = Parser::new(sql, &tokens);
+            // A control-flow placeholder has no position: 0..0.
+            parser.set_placeholder_spans(&[Span { start: 0, end: 0 }, Span { start: at, end: at }]);
+            let script = parser.try_parse_script().expect("a script");
+            let mut names = Vec::new();
+            let mut opaque = !parser.get_recovery_errors().is_empty();
+            for stmt in &script.stmts {
+                opaque |= matches!(stmt, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. });
+                let AstStmt::Select(select) = stmt else {
+                    continue;
+                };
+                for item in &select.from {
+                    if let crate::ast::FromItemKind::TableRef(table) = &item.kind {
+                        names.push((table.name.name_kind, table.name.parts.clone()));
+                    }
+                }
+            }
+            (opaque, names)
+        };
+        let rendered = |at: u32| {
+            let span = Span { start: at, end: at };
+            vec![Some(crate::ast::AstNamePart::Templated {
+                span,
+                name: crate::ast::AstTemplatedName {
+                    pieces: vec![crate::ast::AstNamePiece::Rendered(span)],
+                },
+            })]
+        };
+        for (sql, at) in [
+            ("SELECT a FROM  WHERE status = NULL", 14),
+            ("SELECT a FROM  ORDER BY a", 14),
+            ("SELECT a FROM ;", 14),
+            ("SELECT a FROM ", 14),
+        ] {
+            let (opaque, names) = read(sql, at);
+            assert!(!opaque, "{sql} was not read");
+            assert_eq!(
+                names,
+                [(crate::ast::AstTableNameKind::Templated, Some(rendered(at)))],
+                "{sql}"
+            );
+        }
+        // The second table of a list, and a subquery's.
+        let (opaque, names) = read("SELECT a FROM users,  WHERE a = 1", 21);
+        assert!(!opaque);
+        assert_eq!(names.len(), 2);
+        assert_eq!(
+            names[1],
+            (crate::ast::AstTableNameKind::Templated, Some(rendered(21)))
+        );
+        let (opaque, _) = read("SELECT (SELECT a FROM ) AS c FROM users", 22);
+        assert!(!opaque);
+        // A placeholder elsewhere leaves the empty FROM unread; one before a
+        // table written after it is not the table.
+        let (opaque, _) = read("SELECT a FROM  WHERE status = NULL", 9);
+        assert!(opaque);
+        let (opaque, names) = read("SELECT a FROM  users WHERE a = 1", 14);
+        assert!(!opaque);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, crate::ast::AstTableNameKind::Catalog);
+    }
+
+    // An interval's count is an expression where the dialect writes one so
+    // (BigQuery, MySQL, Databricks), with its unit after it.
+    #[test]
+    fn an_interval_counts_an_expression() {
+        let forms = [
+            (
+                "bigquery",
+                "SELECT DATE_SUB(CURRENT_DATE(), INTERVAL threshold_days DAY)",
+            ),
+            (
+                "bigquery",
+                "DELETE FROM d.events WHERE event_date < DATE_SUB(CURRENT_DATE(), \
+                 INTERVAL threshold_days DAY)",
+            ),
+            (
+                "bigquery",
+                "SELECT DATE_ADD(d, INTERVAL n + 1 MONTH) FROM d.t",
+            ),
+            ("bigquery", "SELECT DATE_ADD(d, INTERVAL -n DAY) FROM d.t"),
+            (
+                "mysql",
+                "SELECT DATE_ADD(o.created, INTERVAL o.days DAY) FROM orders o",
+            ),
+            ("databricks", "SELECT d + INTERVAL n DAYS FROM t"),
+            ("bigquery", "SELECT DATE_ADD(d, INTERVAL 3 DAY) FROM d.t"),
+            ("snowflake", "SELECT d + INTERVAL '1 day' FROM t"),
+        ];
+        for (name, sql) in forms {
+            let dialect = crate::dialect::dialect_from_name(name).expect("a dialect");
+            let tokens = crate::lexer::tokenize_with_dialect(sql, dialect.as_ref()).tokens;
+            let mut parser = Parser::with_dialect(sql, &tokens, dialect.as_ref());
+            let script = parser.try_parse_script().expect("a script");
+            assert!(
+                parser.get_recovery_errors().is_empty()
+                    && !script.stmts.iter().any(|s| matches!(
+                        s,
+                        AstStmt::OpaqueContent { .. } | AstStmt::Error { .. }
+                    )),
+                "[{name}] {sql}: {:?}",
+                parser.get_recovery_errors()
+            );
+        }
+    }
+
+    // A bind parameter, written as its dialect writes one, is an operand
+    // wherever an operand starts, in a script's statement and in a block.
+    #[test]
+    fn a_bind_parameter_is_an_operand_wherever_one_starts() {
+        let forms = [
+            ("snowflake", "SELECT * FROM users WHERE id = ?"),
+            (
+                "snowflake",
+                "SELECT COALESCE(name, :v) AS n FROM users GROUP BY COALESCE(name, :v)",
+            ),
+            (
+                "snowflake",
+                "INSERT INTO users (id, name) VALUES (?, :name)",
+            ),
+            ("snowflake", "BEGIN SELECT * FROM users WHERE id = ?; END"),
+            (
+                "databricks",
+                "SELECT * FROM users WHERE id = :id AND name = ?",
+            ),
+            ("mysql", "SELECT * FROM users WHERE id = ? LIMIT ?"),
+            ("mysql", "UPDATE users SET name = ? WHERE id = ?"),
+            (
+                "postgres",
+                "SELECT * FROM users WHERE id = $1 AND name = $2",
+            ),
+            ("mssql", "SELECT * FROM users WHERE id = @p AND name = ?"),
+            (
+                "bigquery",
+                "SELECT * FROM d.users WHERE id = @id AND name = ?",
+            ),
+        ];
+        for (name, sql) in forms {
+            let dialect = crate::dialect::dialect_from_name(name).expect("a dialect");
+            let tokens = crate::lexer::tokenize_with_dialect(sql, dialect.as_ref()).tokens;
+            let mut parser = Parser::with_dialect(sql, &tokens, dialect.as_ref());
+            let script = parser.try_parse_script().expect("a script");
+            assert!(
+                parser.get_recovery_errors().is_empty()
+                    && !script.stmts.iter().any(|s| matches!(
+                        s,
+                        AstStmt::OpaqueContent { .. } | AstStmt::Error { .. }
+                    )),
+                "[{name}] {sql}: {:?}",
+                parser.get_recovery_errors()
+            );
+        }
+    }
+
+    // A statement read up to a token the parser does not bind is recorded
+    // with the text after it, which stays the skipped node that follows it.
+    #[test]
+    fn a_statement_cut_at_an_unbound_token_is_recorded_with_its_tail() {
+        fn spans(stmt: &AstStmt, out: &mut Vec<(crate::ast::NodeId, Span)>) {
+            out.push((stmt.node_id(), stmt.span()));
+            for body in stmt.bodies() {
+                for s in body.stmts {
+                    spans(s, out);
+                }
+            }
+        }
+        let cuts = |name: &str, sql: &str| -> Vec<(String, String)> {
+            let dialect = crate::dialect::dialect_from_name(name).expect("a dialect");
+            let tokens = crate::lexer::tokenize_with_dialect(sql, dialect.as_ref()).tokens;
+            let mut parser = Parser::with_dialect(sql, &tokens, dialect.as_ref());
+            let script = parser.try_parse_script().expect("a script");
+            let mut all = Vec::new();
+            for s in &script.stmts {
+                spans(s, &mut all);
+            }
+            let text = |span: Span| sql[span.start as usize..span.end as usize].to_string();
+            script
+                .cut_statements
+                .iter()
+                .map(|cut| {
+                    let (_, stmt) = all
+                        .iter()
+                        .find(|(id, _)| *id == cut.stmt)
+                        .expect("the cut statement is in the script");
+                    (text(*stmt), text(cut.tail))
+                })
+                .collect()
+        };
+        let pair = |stmt: &str, tail: &str| vec![(stmt.to_string(), tail.to_string())];
+        // PostgreSQL's postfix factorial `!` is an operator the parser does
+        // not read; MySQL's `@v := 1` where a value stands it reads, and
+        // nothing is cut.
+        assert_eq!(
+            cuts("mysql", "UPDATE users SET flag = @n := 1 WHERE id = 1;"),
+            Vec::new()
+        );
+        assert_eq!(
+            cuts(
+                "postgres",
+                "DELETE FROM users WHERE id = 5 ! AND tenant = 2"
+            ),
+            pair("DELETE FROM users WHERE id = 5", "! AND tenant = 2")
+        );
+        assert_eq!(
+            cuts(
+                "postgres",
+                "SELECT 1;\nUPDATE users SET flag = 5 ! WHERE id = 1;\nSELECT 2;"
+            ),
+            pair("UPDATE users SET flag = 5", "! WHERE id = 1;")
+        );
+        // In a block's body and in a branch's: the tail is the body's error
+        // node.
+        assert_eq!(
+            cuts(
+                "postgres",
+                "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN UPDATE users SET flag = 1 WHERE id = 5 ! AND tenant = 2; END $$"
+            ),
+            pair("UPDATE users SET flag = 1 WHERE id = 5", "! AND tenant = 2;")
+        );
+        assert_eq!(
+            cuts(
+                "postgres",
+                "DO $$ BEGIN IF true THEN UPDATE users SET flag = 5 ! WHERE id = 1; END IF; END $$;"
+            ),
+            pair("UPDATE users SET flag = 5", "! WHERE id = 1;")
+        );
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE PROCEDURE p() BEGIN UPDATE t SET flag = @n := 1 WHERE id = 1; END"
+            ),
+            Vec::new()
+        );
+        // Text no statement parser reads, kept as written up to its `;`, is
+        // the tail too: here a word operator with no operand after it.
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE PROCEDURE p() BEGIN UPDATE t SET flag = a DIV WHERE id = 1; END"
+            ),
+            pair("UPDATE t SET flag = a", "DIV WHERE id = 1")
+        );
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE PROCEDURE p() BEGIN IF 1 = 1 THEN DELETE FROM t WHERE a XOR; END IF; END"
+            ),
+            pair("DELETE FROM t WHERE a", "XOR")
+        );
+        // A symbol the lexer does not read: psql's `\gx`, SnowSQL's `!set`.
+        // psql's `\g` ends the statement as `;` does.
+        assert_eq!(
+            cuts("postgres", "DELETE FROM users \\gx"),
+            pair("DELETE FROM users", "\\gx")
+        );
+        assert_eq!(cuts("postgres", "DELETE FROM users \\g"), Vec::new());
+        assert_eq!(
+            cuts(
+                "snowflake",
+                "DELETE FROM users\n!set variable_substitution=true"
+            ),
+            pair("DELETE FROM users", "!set variable_substitution=true")
+        );
+        // The cut is the statement read short, not the branch, handler,
+        // event or trigger whose one statement it is.
+        assert_eq!(
+            cuts(
+                "mssql",
+                "CREATE PROCEDURE p AS BEGIN IF 1 = 1 UPDATE users SET flag = id ! 1 WHERE id = 1; END"
+            ),
+            pair("UPDATE users SET flag = id", "! 1 WHERE id = 1;")
+        );
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION UPDATE t SET flag = a DIV WHERE id = 1; SELECT 1; END"
+            ),
+            pair("UPDATE t SET flag = a", "DIV WHERE id = 1")
+        );
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO UPDATE t SET flag = a DIV WHERE id = 1"
+            ),
+            pair("UPDATE t SET flag = a", "DIV WHERE id = 1")
+        );
+        assert_eq!(
+            cuts(
+                "mysql",
+                "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW UPDATE u SET flag = a DIV WHERE id = 1"
+            ),
+            pair("UPDATE u SET flag = a", "DIV WHERE id = 1")
+        );
+        // Not cut: a `;` ends the statement, the text after it starts a
+        // statement of its own, or the statement ends at a word, a label or
+        // a client directive that does not continue an expression.
+        for (name, sql) in [
+            ("mssql", "DELETE FROM users\nTHROW 50000, 'x', 1"),
+            ("mssql", "UPDATE users SET a = 1\nKILL 52"),
+            ("mssql", "DELETE FROM users\n:setvar x y"),
+            ("mssql", "DELETE FROM users\n:r other.sql"),
+            ("mssql", "DELETE FROM users\n$(Tail)"),
+            ("mssql", "DELETE FROM users\nretry:\nPRINT 'x'"),
+            ("mssql", "ALTER ROLE db_owner ADD MEMBER bob\n:setvar x y"),
+            ("databricks", "DELETE FROM users\nOPTIMIZE users"),
+            ("databricks", "DELETE FROM users\nVACUUM users"),
+            (
+                "mssql",
+                "DELETE FROM users WHERE id = 1 FROBNICATE TABLE orders",
+            ),
+            (
+                "mssql",
+                "CREATE PROCEDURE p AS BEGIN DELETE FROM users\nTHROW 50000, 'x', 1; END",
+            ),
+            (
+                "mysql",
+                "UPDATE users SET flag = 1 WHERE id = 1; SOUNDS LIKE 'x';",
+            ),
+            ("mssql", "DELETE FROM users WHERE id = 1 SELECT 1"),
+            (
+                "mssql",
+                "DELETE FROM users WHERE id = 1 CREATE FROBNICATE users",
+            ),
+            ("postgres", "UPDATE users SET flag = 1 WHERE id = 1"),
+            // A statement whose parser took its `;` is ended by it.
+            (
+                "postgres",
+                "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN SELECT 1; r.a := 1; END $$;",
+            ),
+            (
+                "postgres",
+                "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; r.a := 1; END $$;",
+            ),
+        ] {
+            assert_eq!(cuts(name, sql), Vec::new(), "[{name}] {sql}");
+        }
     }
 }
 
@@ -5564,18 +8670,16 @@ mod tolerant_parse_tests {
         let result = parser.parse_tolerant();
 
         // Find error node and check it has token info
-        if let Some(stmt) = result
+        if let Some(AstStmt::Error { partial_tokens, .. }) = result
             .ast
             .stmts
             .iter()
             .find(|s| matches!(&s, AstStmt::Error { .. }))
         {
-            if let AstStmt::Error { partial_tokens, .. } = &stmt {
-                assert!(
-                    !partial_tokens.is_empty(),
-                    "Error should have partial token info"
-                );
-            }
+            assert!(
+                !partial_tokens.is_empty(),
+                "Error should have partial token info"
+            );
         }
     }
 }

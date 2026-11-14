@@ -15,9 +15,10 @@ use lexega_syntax::{format_sql_with_config, parse_sql_with_dialect, FormatterCon
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn parse_mssql(sql: &str) -> Vec<AstStmt> {
@@ -254,4 +255,70 @@ BEGIN
     INSERT INTO AuditLog (Action, Timestamp) VALUES ('CHANGE', GETDATE());
 END;"#;
     format_verify_and_assert_variant(sql, "CreateMssqlTrigger");
+}
+
+#[test]
+fn a_trigger_reads_its_with_options_and_execute_as_mode() {
+    use lexega_syntax::ast::ExecuteAsMode;
+    for (sql, options, mode) in [
+        (
+            "ALTER TRIGGER dbo.zz_tr ON u WITH EXECUTE AS OWNER AFTER INSERT AS UPDATE a SET name = 'x'",
+            Some("WITH EXECUTE AS OWNER"),
+            Some(ExecuteAsMode::Owner),
+        ),
+        (
+            "CREATE TRIGGER dbo.zz_tr ON u WITH ENCRYPTION, EXECUTE AS CALLER AFTER INSERT AS UPDATE a SET name = 'x'",
+            Some("WITH ENCRYPTION, EXECUTE AS CALLER"),
+            Some(ExecuteAsMode::Caller),
+        ),
+        // A named user names a principal no mode states.
+        (
+            "CREATE TRIGGER dbo.zz_tr ON u WITH EXECUTE AS 'bob' AFTER INSERT AS UPDATE a SET name = 'x'",
+            Some("WITH EXECUTE AS 'bob'"),
+            None,
+        ),
+        (
+            "CREATE TRIGGER dbo.zz_tr ON u AFTER INSERT AS UPDATE a SET name = 'x'",
+            None,
+            None,
+        ),
+    ] {
+        let stmts = parse_mssql(sql);
+        let Some(AstStmt::CreateMssqlTrigger(trigger)) = stmts.first() else {
+            panic!("{sql}: {stmts:?}");
+        };
+        let written = trigger
+            .options_span
+            .map(|span| &sql[span.start as usize..span.end as usize]);
+        assert_eq!(written, options, "{sql}");
+        assert_eq!(trigger.execute_as_mode, mode, "{sql}");
+        let formatted = format_sql_with_config(sql, &mssql_config()).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*mssql())
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+    }
+}
+
+#[test]
+fn a_trigger_lists_the_events_it_fires_on() {
+    use lexega_syntax::ast::MssqlTriggerEvent as E;
+    for (sql, events) in [
+        (
+            "CREATE TRIGGER dbo.t ON dbo.x AFTER INSERT AS BEGIN SELECT 1; END;",
+            vec![E::Insert],
+        ),
+        (
+            "CREATE TRIGGER dbo.t ON dbo.x FOR UPDATE, DELETE AS BEGIN SELECT 1; END;",
+            vec![E::Update, E::Delete],
+        ),
+        (
+            "CREATE TRIGGER t ON DATABASE FOR CREATE_TABLE AS BEGIN SELECT 1; END;",
+            vec![E::Named],
+        ),
+    ] {
+        let stmts = parse_mssql(sql);
+        let AstStmt::CreateMssqlTrigger(trigger) = &stmts[0] else {
+            panic!("a trigger expected: {sql}");
+        };
+        assert_eq!(trigger.events, events, "{sql}");
+    }
 }

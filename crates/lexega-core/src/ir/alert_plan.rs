@@ -148,8 +148,9 @@ pub fn lower_drop_alert_to_alert_plan(s: &AstDrop, source: &str) -> AlertPlan {
     AlertPlan {
         action: AlertAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_name(source, name)),
         options: AlertOptions {
             or_replace: false,
             if_not_exists: false,
@@ -173,6 +174,20 @@ fn project_alter_action(kind: &AstAlterAlertActionKind) -> AlertAlterActionShape
         K::ModifyAction { .. } => AlertAlterActionKindIr::ModifyAction,
     };
     AlertAlterActionShape { kind: kind_ir }
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> AlertTarget {
+    let Some((db, schema, name_text)) = crate::ir::utils::written_name_parts(source, name) else {
+        return target_from_span(source, name.span);
+    };
+    AlertTarget {
+        name: name_text,
+        schema,
+        db,
+        span: name.span,
+    }
 }
 
 fn target_from_span(source: &str, span: Span) -> AlertTarget {

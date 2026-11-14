@@ -57,9 +57,15 @@ impl<'a> Parser<'a> {
         let mut end = command_span.end;
 
         // 3. Consume the remainder (`( args )`, `WITH <options>`) up to a
-        //    depth-0 semicolon or EOF. Operands carry no governance signal.
+        //    depth-0 semicolon or EOF; where the dialect needs no terminator,
+        //    up to where the grammar ends. Operands carry nothing a rule reads.
+        let after_args = self.parens_end(self.idx).unwrap_or(self.idx);
+        let grammar_end = self
+            .with_list_end(after_args, |i| self.option_item_end(i))
+            .unwrap_or(after_args);
+        let bound = self.clauses_bound(grammar_end);
         let mut depth: u32 = 0;
-        while let Some(tok) = self.peek_non_trivia() {
+        while let Some(tok) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             match tok.kind {
                 TokenKind::Punctuation(Punctuation::Semi) if depth == 0 => break,
                 TokenKind::Eof => break,

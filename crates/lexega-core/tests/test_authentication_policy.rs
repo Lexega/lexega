@@ -7,15 +7,22 @@
 //! - CREATE AUTHENTICATION POLICY parsing
 //! - ALTER AUTHENTICATION POLICY parsing
 //! - DROP AUTHENTICATION POLICY parsing
-//! - Semantic extraction and signal generation
+//! - Semantic extraction and finding generation
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use lexega_core::{format_sql_with_config, FormatterConfig};
 
-/// Helper to check if a signal with given rule ID is present
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| {
+/// Helper to check if a finding with given rule ID is present
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.findings.iter().any(|s| {
+        let RuleMatch::Analysis(ref p) = s;
+        p.matched_rule == rule_id
+    })
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.context.iter().any(|s| {
         let RuleMatch::Analysis(ref p) = s;
         p.matched_rule == rule_id
     })
@@ -70,7 +77,7 @@ fn test_create_authentication_policy_with_all_options() {
 }
 
 #[test]
-fn test_create_authentication_policy_risk_signals() {
+fn test_create_authentication_policy_risk_findings() {
     let sql = r#"
         CREATE AUTHENTICATION POLICY weak_auth_policy
             AUTHENTICATION_METHODS = ('PASSWORD');
@@ -78,10 +85,10 @@ fn test_create_authentication_policy_risk_signals() {
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Should generate "created" signal (SNW-AUTHPOL-NEW)
+    // Should generate "created" context entry (SNW-AUTHPOL-NEW)
     assert!(
-        has_signal(&report, "SNW-AUTHPOL-NEW"),
-        "Should generate SNW-AUTHPOL-NEW signal for policy creation"
+        has_context(&report, "SNW-AUTHPOL-NEW"),
+        "Should generate SNW-AUTHPOL-NEW finding for policy creation"
     );
 }
 
@@ -135,7 +142,7 @@ fn test_alter_authentication_policy_rename() {
 }
 
 #[test]
-fn test_alter_authentication_policy_mfa_changed_signal() {
+fn test_alter_authentication_policy_mfa_changed_finding() {
     let sql = r#"
         ALTER AUTHENTICATION POLICY my_auth_policy
             SET MFA_ENROLLMENT = OPTIONAL;
@@ -143,15 +150,15 @@ fn test_alter_authentication_policy_mfa_changed_signal() {
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Should generate "mfa_changed" signal (SNW-AUTHPOL-MFA-CHG)
+    // Should generate "mfa_changed" finding (SNW-AUTHPOL-MFA-CHG)
     assert!(
-        has_signal(&report, "SNW-AUTHPOL-MFA-CHG"),
-        "Should generate SNW-AUTHPOL-MFA-CHG signal for MFA change"
+        has_finding(&report, "SNW-AUTHPOL-MFA-CHG"),
+        "Should generate SNW-AUTHPOL-MFA-CHG finding for MFA change"
     );
 }
 
 #[test]
-fn test_alter_authentication_policy_methods_changed_signal() {
+fn test_alter_authentication_policy_methods_changed_finding() {
     let sql = r#"
         ALTER AUTHENTICATION POLICY my_auth_policy
             SET AUTHENTICATION_METHODS = ('PASSWORD');
@@ -159,15 +166,15 @@ fn test_alter_authentication_policy_methods_changed_signal() {
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Should generate "methods_changed" signal (SNW-AUTHPOL-METHODS-CHG)
+    // Should generate "methods_changed" finding (SNW-AUTHPOL-METHODS-CHG)
     assert!(
-        has_signal(&report, "SNW-AUTHPOL-METHODS-CHG"),
-        "Should generate SNW-AUTHPOL-METHODS-CHG signal for authentication methods change"
+        has_finding(&report, "SNW-AUTHPOL-METHODS-CHG"),
+        "Should generate SNW-AUTHPOL-METHODS-CHG finding for authentication methods change"
     );
 }
 
 #[test]
-fn test_alter_authentication_policy_security_integrations_changed_signal() {
+fn test_alter_authentication_policy_security_integrations_changed_finding() {
     let sql = r#"
         ALTER AUTHENTICATION POLICY my_auth_policy
             SET SECURITY_INTEGRATIONS = ('new_sso_integration');
@@ -175,10 +182,10 @@ fn test_alter_authentication_policy_security_integrations_changed_signal() {
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Should generate "security_integrations_changed" signal (SNW-AUTHPOL-SECINTG-CHG)
+    // Should generate "security_integrations_changed" finding (SNW-AUTHPOL-SECINTG-CHG)
     assert!(
-        has_signal(&report, "SNW-AUTHPOL-SECINTG-CHG"),
-        "Should generate SNW-AUTHPOL-SECINTG-CHG signal for security integrations change"
+        has_finding(&report, "SNW-AUTHPOL-SECINTG-CHG"),
+        "Should generate SNW-AUTHPOL-SECINTG-CHG finding for security integrations change"
     );
 }
 
@@ -209,15 +216,15 @@ fn test_drop_authentication_policy_if_exists() {
 }
 
 #[test]
-fn test_drop_authentication_policy_risk_signal() {
+fn test_drop_authentication_policy_risk_finding() {
     let sql = "DROP AUTHENTICATION POLICY my_auth_policy;";
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Should generate "dropped" signal (SNW-AUTHPOL-DROP)
+    // Should generate "dropped" finding (SNW-AUTHPOL-DROP)
     assert!(
-        has_signal(&report, "SNW-AUTHPOL-DROP"),
-        "Should generate SNW-AUTHPOL-DROP signal for policy drop"
+        has_finding(&report, "SNW-AUTHPOL-DROP"),
+        "Should generate SNW-AUTHPOL-DROP finding for policy drop"
     );
 }
 

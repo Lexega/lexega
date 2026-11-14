@@ -4,11 +4,13 @@
 //! The recognition build: every source is analyzed with the facts its own
 //! structure determines, and templates are analyzed as written.
 
+use std::path::Path;
 use std::process;
+use std::sync::Arc;
 
 use lexega_core::analyzer::{AnalysisConfig, AnalysisReport};
-use lexega_core::catalog::CatalogIndex;
 use lexega_core::dialect::DialectRef;
+use lexega_core::ir::DialectCatalogs;
 use lexega_core::rules::Rule;
 use lexega_core::template::{
     has_jinja_syntax, render_substituted, RenderArtifacts, SubstitutionConfig, UnresolvedVariables,
@@ -20,11 +22,25 @@ use crate::extension::{
     Capability, Extension, FormatRenderOptions, FormatRenderer, PolicyGate, PolicySetup, Session,
     SessionOptions,
 };
-use crate::io::{load_catalog_index_from_uri, load_variable_context};
+use crate::io::{load_variable_context, resolve_dialect, SessionCatalogs};
 use crate::usage::print_top_usage;
 
 /// Why a template comes back unrendered.
 const NOT_RENDERED: &str = "this build does not render templates";
+
+/// Commands this build refuses by name, each with what it does.
+const FULL_BUILD_COMMANDS: &[(&str, &str)] = &[
+    ("diff", "Semantic diff between two commits"),
+    (
+        "init",
+        "Project setup (a baseline report, a policy and a CI workflow)",
+    ),
+    ("policy", "Policy enforcement"),
+    ("policy-lint", "Policy file validation"),
+    ("dashboard", "The local results dashboard"),
+    ("mcp", "The MCP server that gates SQL for AI agents"),
+    ("license", "License management"),
+];
 
 /// The extension of the recognition build. It provides no [`Capability`].
 pub struct Recognition;
@@ -76,8 +92,21 @@ impl Extension for Recognition {
         Ok(Box::new(Unrendered))
     }
 
-    fn run_command(&self, _command: &str, _args: &[String]) -> bool {
-        false
+    fn reads_dialect(&self, command: &str) -> bool {
+        FULL_BUILD_COMMANDS.iter().any(|(name, _)| *name == command)
+    }
+
+    fn run_command(&self, command: &str, _args: &[String]) -> bool {
+        let Some((_, what)) = FULL_BUILD_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == command)
+        else {
+            return false;
+        };
+        eprintln!("Error: `{}` is not a command of this build.", command);
+        eprintln!();
+        eprintln!("{} is part of the full build: https://lexega.com", what);
+        process::exit(1);
     }
 
     fn usage(&self, program: &str) {
@@ -89,7 +118,7 @@ impl Extension for Recognition {
 struct Unrendered;
 
 impl FormatRenderer for Unrendered {
-    fn render(&mut self, _source: &str) -> Result<String, String> {
+    fn render(&mut self, _path: Option<&Path>, _source: &str) -> Result<String, String> {
         Err(NOT_RENDERED.to_string())
     }
 }
@@ -99,10 +128,16 @@ pub struct RecognitionSession {
     vars: VariableContext,
     substitution: SubstitutionConfig,
     unresolved: UnresolvedVariables,
-    custom_rules: Option<Vec<Rule>>,
+    custom_rules: Option<Arc<[Rule]>>,
+    masking: Arc<lexega_core::rules::MaskingPolicy>,
+    /// The dialects' function catalogs every analysis of the run reads.
+    function_catalogs: DialectCatalogs,
     trace_mode: bool,
     verbose_mode: bool,
-    catalog: Option<CatalogIndex>,
+    catalog: Option<SessionCatalogs>,
+    /// Where a table named without a database or schema is looked for,
+    /// where the run says.
+    default_schema: Option<lexega_core::ir::SessionContext>,
     dialect: Option<DialectRef>,
 }
 
@@ -115,9 +150,10 @@ impl RecognitionSession {
             options.env_allowlist,
         )
         .map_err(|e| format!("Error loading variables: {}", e))?;
+        let dialect = options.dialect_name.and_then(resolve_dialect);
         let catalog = match options.catalog_path {
             Some(path) => Some(
-                load_catalog_index_from_uri(path, options.catalog_provider)
+                SessionCatalogs::load(path, options.catalog_provider, &[], &dialect)
                     .map_err(|e| format!("Failed to load catalog: {}", e))?,
             ),
             None => None,
@@ -126,10 +162,13 @@ impl RecognitionSession {
             vars,
             substitution: options.substitution.clone(),
             unresolved: UnresolvedVariables::default(),
-            custom_rules: options.custom_rules,
+            custom_rules: options.custom_rules.map(Arc::from),
+            masking: options.masking,
+            function_catalogs: DialectCatalogs::default(),
             trace_mode: options.trace_mode,
             verbose_mode: options.verbose_mode,
             catalog,
+            default_schema: options.default_schema.cloned(),
             dialect: None,
         })
     }
@@ -141,7 +180,18 @@ impl Session for RecognitionSession {
     }
 
     fn set_dialect(&mut self, dialect: Option<DialectRef>) {
+        if let Some(catalog) = self.catalog.as_mut() {
+            catalog.select(&dialect);
+        }
         self.dialect = dialect;
+    }
+
+    fn renders_templates(&self) -> bool {
+        false
+    }
+
+    fn compares_changes(&self) -> bool {
+        false
     }
 
     fn render(&self, input: &str) -> Result<RenderArtifacts, String> {
@@ -170,15 +220,24 @@ impl Session for RecognitionSession {
         render: &RenderArtifacts,
         source_file: Option<&str>,
     ) -> Result<AnalysisReport, String> {
+        let session = self.default_schema.as_ref();
         let config = AnalysisConfig {
             custom_rules: self.custom_rules.clone(),
+            masking: self.masking.clone(),
+            function_catalogs: self.function_catalogs.clone(),
             trace_mode: self.trace_mode,
             verbose_mode: self.verbose_mode,
+            session_db: session.and_then(|session| session.db.clone()),
+            session_schema: session.and_then(|session| session.schema.clone()),
             dialect: self.dialect.clone(),
-            ..Default::default()
         };
+        let catalog = self
+            .catalog
+            .as_ref()
+            .map(SessionCatalogs::current)
+            .transpose()?;
         Engine::recognition()
-            .analyze_risk_with_source_map(render, &config, self.catalog.as_ref(), source_file)
+            .analyze_risk_with_source_map(render, &config, catalog.map(Arc::as_ref), source_file)
             .map_err(|e| format!("Analysis error: {}", e))
     }
 }

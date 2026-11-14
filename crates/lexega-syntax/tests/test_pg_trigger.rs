@@ -35,7 +35,7 @@ fn parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -361,4 +361,46 @@ fn test_create_or_replace_constraint_trigger() {
     let sql = "CREATE OR REPLACE CONSTRAINT TRIGGER fancy AFTER UPDATE ON t DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION fancy_func()";
     assert!(parses_as(sql, |s| matches!(s, AstStmt::CreatePgTrigger(_))));
     format_and_verify(sql);
+}
+
+#[test]
+fn a_trigger_when_condition_is_read_as_an_expression() {
+    // (statement, the condition inside WHEN ( … ), where it parses)
+    let cases = [
+        (
+            "CREATE TRIGGER t BEFORE UPDATE ON a FOR EACH ROW WHEN (OLD.b IS DISTINCT FROM NEW.b) EXECUTE FUNCTION f()",
+            Some("OLD.b IS DISTINCT FROM NEW.b"),
+        ),
+        (
+            "CREATE TRIGGER t AFTER INSERT ON a FOR EACH ROW WHEN (g('x') IS NULL AND (NEW.c > 0)) EXECUTE FUNCTION f()",
+            Some("g('x') IS NULL AND (NEW.c > 0)"),
+        ),
+        (
+            "CREATE TRIGGER t AFTER INSERT ON a FOR EACH ROW WHEN (NEW.c > ) EXECUTE FUNCTION f()",
+            None,
+        ),
+        (
+            "CREATE TRIGGER t AFTER INSERT ON a FOR EACH ROW EXECUTE FUNCTION f()",
+            None,
+        ),
+    ];
+    for (sql, condition) in cases {
+        let script = parse_sql(sql).expect("should parse");
+        let AstStmt::CreatePgTrigger(trigger) = &script.stmts[0] else {
+            panic!("a trigger: {:?}", script.stmts[0]);
+        };
+        let text = |s: lexega_syntax::lexer::Span| &sql[s.start as usize..s.end as usize];
+        assert_eq!(
+            trigger.when_expr.as_ref().map(|e| text(e.span())),
+            condition,
+            "{sql}"
+        );
+        // The span keeps covering `WHEN ( … )` whether or not it parsed.
+        let when = trigger.when_condition.map(text);
+        assert_eq!(
+            when.map(|w| w.starts_with("WHEN (") && w.ends_with(')')),
+            sql.contains("WHEN").then_some(true),
+            "{sql}"
+        );
+    }
 }

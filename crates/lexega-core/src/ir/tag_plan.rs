@@ -238,8 +238,9 @@ pub fn lower_drop_tag_to_tag_plan(s: &AstDrop, source: &str) -> TagPlan {
     TagPlan {
         action: TagAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_name(source, name)),
         options: TagOptions {
             or_replace: false,
             if_not_exists: false,
@@ -263,29 +264,33 @@ pub fn lower_undrop_tag_to_tag_plan(s: &AstUndropTag, source: &str) -> TagPlan {
     }
 }
 
-/// Resolve the unquoted text of each ALLOWED_VALUES string literal.
+/// The value of each ALLOWED_VALUES string literal.
 fn literal_values(values: &AstTagAllowedValues, source: &str) -> Vec<String> {
     values
         .value_spans
         .iter()
-        .map(|span| unquote_literal(span_text(source, *span)))
+        .map(|span| super::span_extract::literal_value_or_text(span_text(source, *span)))
         .collect()
-}
-
-/// Strip surrounding `'…'` quotes and fold `''` escapes if present;
-/// otherwise return the input unchanged.
-fn unquote_literal(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        raw[1..raw.len() - 1].replace("''", "'")
-    } else {
-        raw.to_string()
-    }
 }
 
 fn span_text(source: &str, span: Span) -> &str {
     source
         .get(span.start as usize..span.end as usize)
         .unwrap_or("")
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> TagTarget {
+    let Some((db, schema, name_text)) = crate::ir::utils::written_name_parts(source, name) else {
+        return target_from_span(source, name.span);
+    };
+    TagTarget {
+        name: name_text,
+        schema,
+        db,
+        span: name.span,
+    }
 }
 
 fn target_from_span(source: &str, span: Span) -> TagTarget {

@@ -107,19 +107,23 @@ pub struct StatementFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<HandlerFacts>,
 
-    /// Dynamic-SQL call sites at this statement. Populated for:
+    /// Dynamic-SQL call sites at this statement, at the top level of a
+    /// script or in a procedure, function or trigger body alike. Populated
+    /// for:
     ///
-    /// - Statements that ARE a dynamic-SQL surface (top-level
-    ///   `EXECUTE IMMEDIATE`, T-SQL `EXEC` / `sp_executesql`,
-    ///   PostgreSQL `PREPARE`) — one entry per statement classifying
-    ///   argument shape and parameterization.
+    /// - Statements that run SQL text (`EXECUTE IMMEDIATE`, PL/pgSQL
+    ///   `EXECUTE`, T-SQL `EXEC (…)` / `sp_executesql`, MySQL `PREPARE …
+    ///   FROM`) — one entry classifying argument shape and parameterization.
+    /// - Calls of a routine (`CALL`, T-SQL `EXEC proc`) whose body runs an
+    ///   argument as SQL — one entry per argument that reaches it.
     /// - Query statements (SELECT / INSERT / UPDATE / DELETE / MERGE)
     ///   whose expressions invoke cross-server dynamic-SQL functions
     ///   (`dblink_exec`, etc.) — one entry per call site.
     ///
-    /// For dynamic SQL inside a procedure or function body, see
-    /// `ddl.procedure.body.dynamic_sql_calls` /
-    /// `ddl.function.body.dynamic_sql_calls`.
+    /// A routine's `CREATE` also lists the calls its body makes, under
+    /// `ddl.procedure.body.dynamic_sql_calls`,
+    /// `ddl.function.body.dynamic_sql_calls` or
+    /// `ddl.trigger_body.dynamic_sql_calls`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dynamic_sql_calls: Vec<super::ddl::DynamicSqlCall>,
 
@@ -350,6 +354,8 @@ pub enum StatementKind {
     CreateTask,
     AlterTask,
     DropTask,
+    /// Snowflake `EXECUTE TASK`: runs a task now.
+    ExecuteTask,
 
     // ───────────── Snowflake / dialect-specific ─────────────
     CreateDynamicTable,
@@ -641,7 +647,8 @@ pub enum StatementKind {
     PgReindex,
     /// PostgreSQL `DO [LANGUAGE name] $$ ... $$` — anonymous procedural code block.
     DoBlock,
-    /// PostgreSQL `ANALYZE [VERBOSE] [table [(column, ...)]]` — refreshes table statistics.
+    /// `ANALYZE` — refreshes table statistics: PostgreSQL `ANALYZE [VERBOSE]
+    /// [table [(column, ...)]]`, MySQL `ANALYZE TABLE t, …`.
     AnalyzeStmt,
     /// PostgreSQL `CLUSTER [VERBOSE] [table [USING index]]` — physically
     /// reorders a table according to an index.
@@ -729,6 +736,29 @@ pub enum StatementKind {
     /// T-SQL `RECONFIGURE [WITH OVERRIDE]` — applies pending
     /// `sp_configure` server option changes to the running configuration.
     Reconfigure,
+    /// T-SQL server command: `CHECKPOINT`, `KILL` or `SHUTDOWN`.
+    MssqlServerCommand,
+    /// MySQL `OPTIMIZE TABLE t, …` — reorganizes the tables' storage.
+    OptimizeTable,
+    /// MySQL `CHECK TABLE t, …` — checks the tables for errors.
+    CheckTable,
+    /// MySQL `CHECKSUM TABLE t, …` — reports the tables' checksums.
+    ChecksumTable,
+    /// MySQL `REPAIR [NO_WRITE_TO_BINLOG | LOCAL] TABLE t, … [QUICK]
+    /// [EXTENDED] [USE_FRM]` — repairs the tables.
+    RepairTable,
+    /// MySQL `FLUSH …` — reloads or clears server state: the grant tables
+    /// (`PRIVILEGES`), logs, caches, or tables (`TABLES … WITH READ LOCK`).
+    Flush,
+    /// MySQL `KILL [CONNECTION | QUERY] id` — ends a session or its statement.
+    Kill,
+    /// MySQL `ALTER INSTANCE …` — rotates encryption keys, reloads TLS or the
+    /// keyring, enables or disables the redo log.
+    AlterInstance,
+    /// MySQL `XA …` — a distributed transaction's step.
+    XaTransaction,
+    /// MySQL `RENAME USER a TO b, …` — renames accounts.
+    RenameUser,
     MssqlBulkInsert,
     MssqlSetOption,
     /// T-SQL `DROP TRIGGER [IF EXISTS] name [, …] [ON { DATABASE |
@@ -736,6 +766,10 @@ pub enum StatementKind {
     /// from PostgreSQL `DROP TRIGGER … ON <table>` because the syntax
     /// and scope differ (database/server vs table).
     MssqlDropTrigger,
+    /// T-SQL `{ ENABLE | DISABLE } TRIGGER { name [, …] | ALL } ON
+    /// { object | DATABASE | ALL SERVER }` — turns DML, DDL or logon
+    /// triggers on or off.
+    MssqlTriggerState,
     /// T-SQL `CREATE EXTERNAL MODEL` — register an external AI
     /// endpoint (SQL Server 2025).
     MssqlCreateExternalModel,
@@ -805,13 +839,16 @@ pub enum StatementKind {
     /// `DECLARE { EXIT | CONTINUE } HANDLER FOR condition_value [, ...]
     /// statement` — Databricks/MySQL scripting exception handler.
     DeclareHandler,
+    /// `ASSERT condition [, message]` outside BigQuery (PL/pgSQL's
+    /// assertion). BigQuery's `ASSERT` is `bq_assert`.
+    Assert,
 
     // ───────────── Unresolvable / opaque ─────────────
     /// Statement type could not be determined.
     Opaque,
 }
 
-/// Severity tier for rules and signals.
+/// Severity tier for rules and findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -822,12 +859,101 @@ pub enum RiskLevel {
     High,
     Critical,
 }
+
+/// Take `other` into `kept` where `kept` has none. Two readings of one
+/// statement that both derive a carrier derive the same one.
+fn absorb_carrier<T: PartialEq + std::fmt::Debug>(kept: &mut Option<T>, other: Option<T>) {
+    match (kept.as_ref(), other) {
+        (None, other) => *kept = other,
+        (Some(kept), Some(other)) => debug_assert_eq!(
+            kept, &other,
+            "two readings of one statement derive one carrier differently"
+        ),
+        (Some(_), None) => {}
+    }
+}
+
 impl StatementFacts {
+    /// Add to these facts what `other`, another reading of the same
+    /// statement, holds: each carrier these facts lack, every entry of each
+    /// list, and its query where the query holds something. The statement's
+    /// kind and span stay these facts'.
+    pub(crate) fn absorb(&mut self, other: StatementFacts) {
+        let StatementFacts {
+            kind: _,
+            source_span: _,
+            query,
+            ddl,
+            privilege,
+            policy,
+            policy_attachment,
+            integration,
+            use_stmt,
+            pg_copy,
+            mssql_backup,
+            mssql_restore,
+            mssql_dbcc,
+            mssql_key_management,
+            mssql_security_policy,
+            mssql_key_backup,
+            mssql_assembly,
+            mssql_add_signature,
+            mssql_service_master_key,
+            pg_default_privileges,
+            comment,
+            handler,
+            dynamic_sql_calls,
+            mssql_exec,
+            impersonation,
+            execute_immediate_from,
+            audit,
+            security_object,
+            algebra,
+            script_context,
+            diff,
+        } = other;
+        absorb_carrier(
+            &mut self.query,
+            query.filter(|query| !query.holds_nothing()),
+        );
+        absorb_carrier(&mut self.ddl, ddl);
+        absorb_carrier(&mut self.privilege, privilege);
+        absorb_carrier(&mut self.policy, policy);
+        absorb_carrier(&mut self.policy_attachment, policy_attachment);
+        absorb_carrier(&mut self.integration, integration);
+        absorb_carrier(&mut self.use_stmt, use_stmt);
+        absorb_carrier(&mut self.pg_copy, pg_copy);
+        absorb_carrier(&mut self.mssql_backup, mssql_backup);
+        absorb_carrier(&mut self.mssql_restore, mssql_restore);
+        absorb_carrier(&mut self.mssql_dbcc, mssql_dbcc);
+        absorb_carrier(&mut self.mssql_key_management, mssql_key_management);
+        absorb_carrier(&mut self.mssql_security_policy, mssql_security_policy);
+        absorb_carrier(&mut self.mssql_key_backup, mssql_key_backup);
+        absorb_carrier(&mut self.mssql_assembly, mssql_assembly);
+        absorb_carrier(&mut self.mssql_add_signature, mssql_add_signature);
+        absorb_carrier(&mut self.mssql_service_master_key, mssql_service_master_key);
+        absorb_carrier(&mut self.pg_default_privileges, pg_default_privileges);
+        absorb_carrier(&mut self.comment, comment);
+        absorb_carrier(&mut self.handler, handler);
+        self.dynamic_sql_calls.extend(dynamic_sql_calls);
+        absorb_carrier(&mut self.mssql_exec, mssql_exec);
+        absorb_carrier(&mut self.impersonation, impersonation);
+        absorb_carrier(&mut self.execute_immediate_from, execute_immediate_from);
+        absorb_carrier(&mut self.audit, audit);
+        absorb_carrier(&mut self.security_object, security_object);
+        self.algebra.absorb(algebra);
+        if self.script_context == ScriptContext::default() {
+            self.script_context = script_context;
+        }
+        absorb_carrier(&mut self.diff, diff);
+    }
+
     /// Visit every credential VALUE in these facts — stage credential
     /// values, principal passwords, security-object password/secret
-    /// literals, secret-keyed user-mapping option values,
-    /// storage-credential secrets and literals, and credential-named
-    /// security-integration property values. The single definition of
+    /// literals, secret-keyed user-mapping and external-table option
+    /// values, storage-credential secrets and literals, credential-named
+    /// security-integration property values, and the T-SQL key statements'
+    /// password literals. The single definition of
     /// "which fact fields hold secrets"; masking and secret-collection
     /// both walk it.
     fn for_each_credential_value_mut(&mut self, f: &mut dyn FnMut(&mut String)) {
@@ -838,6 +964,9 @@ impl StatementFacts {
                         f(v);
                     }
                 }
+                for password in &mut stage.url_password_literals {
+                    f(&mut password.value);
+                }
             }
             if let Some(principal) = &mut ddl.principal {
                 if let Some(v) = &mut principal.password_literal {
@@ -846,14 +975,36 @@ impl StatementFacts {
             }
             if let Some(um) = &mut ddl.user_mapping {
                 for opt in &mut um.options {
-                    if crate::parser::user_mapping::is_secret_option_key(&opt.key.raw) {
+                    if lexega_syntax::secrets::is_secret_name(&opt.key.raw) {
                         if let Some(v) = &mut opt.value_literal {
                             f(v);
                         }
                     }
                 }
             }
+            if let Some(bq) = &mut ddl.bq_options {
+                // The clause's list of every literal holds a secret option's
+                // value too.
+                let mut secrets = Vec::new();
+                for opt in &mut bq.options {
+                    if lexega_syntax::secrets::is_secret_name(&opt.key.raw) {
+                        secrets.push(opt.value_literal.clone());
+                        f(&mut opt.value_literal);
+                    }
+                }
+                for lit in &mut bq.all_literal_values {
+                    if secrets.contains(&lit.value) {
+                        f(&mut lit.value);
+                    }
+                    for password in &mut lit.url_password_literals {
+                        f(&mut password.value);
+                    }
+                }
+            }
             if let Some(sc) = &mut ddl.storage_credential {
+                for password in &mut sc.comment_url_password_literals {
+                    f(&mut password.value);
+                }
                 if let Some(provider) = &mut sc.provider {
                     use super::ddl::StorageCredentialProviderVariantFacts as V;
                     match &mut provider.variant {
@@ -877,6 +1028,24 @@ impl StatementFacts {
                     for lit in &mut provider.all_literal_values {
                         f(&mut lit.value);
                     }
+                    for password in &mut provider.url_password_literals {
+                        f(&mut password.value);
+                    }
+                }
+            }
+        }
+        if let Some(query) = &mut self.query {
+            let entries = query
+                .openrowset_calls
+                .iter_mut()
+                .chain(&mut query.opendatasource_calls)
+                .flat_map(|call| &mut call.string_args)
+                .flat_map(|arg| &mut arg.connection_string);
+            for entry in entries {
+                if lexega_syntax::secrets::is_secret_name(&entry.key.raw) {
+                    if let Some(v) = &mut entry.value_literal {
+                        f(v);
+                    }
                 }
             }
         }
@@ -887,6 +1056,23 @@ impl StatementFacts {
             if let Some(v) = &mut so.secret_literal {
                 f(v);
             }
+        }
+        let key_passwords = [
+            self.mssql_key_management
+                .as_mut()
+                .map(|k| &mut k.password_literals),
+            self.mssql_key_backup
+                .as_mut()
+                .map(|k| &mut k.password_literals),
+            self.mssql_add_signature
+                .as_mut()
+                .map(|k| &mut k.password_literals),
+            self.mssql_service_master_key
+                .as_mut()
+                .map(|k| &mut k.password_literals),
+        ];
+        for literal in key_passwords.into_iter().flatten().flatten() {
+            f(&mut literal.value);
         }
         if let Some(intg) = &mut self.integration {
             if let super::integration::IntegrationVariantFacts::Security(s) = &mut intg.variant {
@@ -909,12 +1095,227 @@ impl StatementFacts {
         }
     }
 
-    /// Mask every credential VALUE in place, and return the values that
-    /// were masked. Applied to the facts COPY that leaves the engine on
-    /// an output surface (report `statement_signals` / fact
-    /// explanations) — rule evaluation always runs on the unmasked
-    /// facts, because value predicates (key-prefix patterns, dummy-value
-    /// lists) need the real text. No serialized surface does.
+    /// Visit each string these facts hold that is made of the text of a
+    /// string literal of the statement and records no place of its own: a
+    /// setting's value, a URL, a path, a host, a tag's value, an option's
+    /// literal, a value a column is compared with or holds. Each is made
+    /// of the statement's text, so a report masks it wherever the
+    /// statement holds a literal it does not show.
+    pub(crate) fn for_each_literal_text_mut(&mut self, f: &mut dyn FnMut(&mut String)) {
+        fn each(text: &mut Option<String>, f: &mut dyn FnMut(&mut String)) {
+            if let Some(text) = text {
+                f(text);
+            }
+        }
+        if let Some(ddl) = &mut self.ddl {
+            if let Some(account) = &mut ddl.account {
+                for parameter in account
+                    .parameters_set
+                    .iter_mut()
+                    .chain(&mut account.parameters_unset)
+                {
+                    f(&mut parameter.value);
+                }
+            }
+            if let Some(assert) = &mut ddl.bq_assert {
+                each(&mut assert.description, f);
+            }
+            let bodies = [
+                ddl.bq_create_model.as_mut().and_then(|model| {
+                    each(&mut model.remote_connection, f);
+                    model.body.as_mut()
+                }),
+                ddl.bq_export_data
+                    .as_mut()
+                    .and_then(|export| export.body.as_mut()),
+            ];
+            for body in bodies.into_iter().flatten() {
+                each(&mut body.where_clause, f);
+                each(&mut body.having_clause, f);
+                each(&mut body.qualify_clause, f);
+            }
+            if let Some(options) = &mut ddl.bq_options {
+                for option in &mut options.options {
+                    f(&mut option.value_literal);
+                }
+                for literal in &mut options.all_literal_values {
+                    f(&mut literal.value);
+                }
+            }
+            if let Some(service) = &mut ddl.cortex_search_service {
+                each(&mut service.embedding_model, f);
+            }
+            let definers = [
+                ddl.view.as_mut().and_then(|v| v.definer.as_mut()),
+                ddl.create_trigger.as_mut().and_then(|t| t.definer.as_mut()),
+                ddl.event.as_mut().and_then(|e| e.definer.as_mut()),
+                ddl.function.as_mut().and_then(|g| g.definer.as_mut()),
+                ddl.procedure.as_mut().and_then(|p| p.definer.as_mut()),
+            ];
+            for definer in definers.into_iter().flatten() {
+                each(&mut definer.user, f);
+                each(&mut definer.host, f);
+            }
+            if let Some(function) = &mut ddl.function {
+                each(&mut function.loadable_library, f);
+            }
+            if let Some(external) = &mut ddl.external_function {
+                each(&mut external.endpoint_url, f);
+            }
+            if let Some(repository) = &mut ddl.git_repository {
+                each(&mut repository.origin, f);
+            }
+            if let Some(load) = &mut ddl.mysql_load_data {
+                each(&mut load.infile_path, f);
+            }
+            if let Some(rule) = &mut ddl.network_rule {
+                rule.value_list.iter_mut().for_each(&mut *f);
+                for entry in &mut rule.value_entries {
+                    f(&mut entry.raw);
+                }
+            }
+            if let Some(principal) = &mut ddl.principal {
+                each(&mut principal.mysql_host, f);
+            }
+            if let Some(session) = &mut ddl.session {
+                for parameter in &mut session.set_params {
+                    f(&mut parameter.value);
+                }
+            }
+            if let Some(tag) = &mut ddl.tag {
+                tag.allowed_values
+                    .iter_mut()
+                    .chain(&mut tag.allowed_values_removed)
+                    .for_each(&mut *f);
+            }
+            if let Some(mapping) = &mut ddl.user_mapping {
+                for option in &mut mapping.options {
+                    each(&mut option.value_literal, f);
+                }
+            }
+            if let Some(application) = &mut ddl.application {
+                each(&mut application.source_name, f);
+            }
+            if let Some(listing) = &mut ddl.listing {
+                each(&mut listing.shared_object, f);
+            }
+            if let Some(volume) = &mut ddl.volume {
+                for location in &mut volume.storage_locations {
+                    each(&mut location.provider, f);
+                    each(&mut location.encryption_type, f);
+                }
+            }
+            if let Some(credential) = &mut ddl.storage_credential {
+                each(&mut credential.comment, f);
+                if let Some(provider) = &mut credential.provider {
+                    for literal in &mut provider.all_literal_values {
+                        f(&mut literal.value);
+                    }
+                    use super::ddl::StorageCredentialProviderVariantFacts as V;
+                    match &mut provider.variant {
+                        V::AwsIamRole { role_arn } => each(role_arn, f),
+                        V::AzureManagedIdentity {
+                            managed_identity_id,
+                            access_connector_id,
+                        } => {
+                            each(managed_identity_id, f);
+                            each(access_connector_id, f);
+                        }
+                        V::AzureServicePrincipal {
+                            directory_id,
+                            application_id,
+                            client_secret,
+                        } => {
+                            each(directory_id, f);
+                            each(application_id, f);
+                            each(client_secret, f);
+                        }
+                        V::CloudflareApiToken {
+                            account_id,
+                            access_key_id,
+                            secret_access_key,
+                        } => {
+                            each(account_id, f);
+                            each(access_key_id, f);
+                            each(secret_access_key, f);
+                        }
+                        V::DatabricksGcpServiceAccount | V::Unparsed => {}
+                    }
+                }
+            }
+        }
+        if let Some(from) = &mut self.execute_immediate_from {
+            each(&mut from.location, f);
+        }
+        if let Some(integration) = &mut self.integration {
+            for tag in &mut integration.set_tags {
+                each(&mut tag.value, f);
+            }
+            if let super::integration::IntegrationVariantFacts::Security(security) =
+                &mut integration.variant
+            {
+                for property in &mut security.set_properties {
+                    each(&mut property.value, f);
+                    each(&mut property.value_normalized, f);
+                }
+            }
+        }
+        if let Some(policy) = &mut self.policy {
+            for tag in &mut policy.set_tags {
+                each(&mut tag.value, f);
+            }
+            if let super::policy::PolicyVariantFacts::Network(network) = &mut policy.variant {
+                for entry in network
+                    .allowed_ip_lists
+                    .iter_mut()
+                    .chain(&mut network.blocked_ip_lists)
+                {
+                    f(&mut entry.raw);
+                }
+            }
+        }
+        if let Some(query) = &mut self.query {
+            for export in &mut query.file_exports {
+                f(&mut export.file_path);
+            }
+            for call in query
+                .openrowset_calls
+                .iter_mut()
+                .chain(&mut query.opendatasource_calls)
+            {
+                for argument in &mut call.string_args {
+                    f(&mut argument.value);
+                    for entry in &mut argument.connection_string {
+                        each(&mut entry.value_literal, f);
+                    }
+                }
+            }
+            for constraint in &mut query.column_constraints {
+                constraint
+                    .eq_values
+                    .iter_mut()
+                    .chain(&mut constraint.not_eq_values)
+                    .for_each(&mut *f);
+                for bound in constraint
+                    .lower_bounds
+                    .iter_mut()
+                    .chain(&mut constraint.upper_bounds)
+                {
+                    f(&mut bound.value);
+                }
+            }
+            for column in &mut query.output_columns {
+                column.constraints.for_each_literal_text_mut(f);
+            }
+        }
+    }
+
+    /// Mask every credential VALUE in place and return the values masked.
+    /// Applied to the facts COPY that leaves the engine on an output
+    /// surface (report `statement_traces` / fact explanations) — rule
+    /// evaluation always runs on the unmasked facts, because value
+    /// predicates (key-prefix patterns, dummy-value lists) need the real
+    /// text.
     pub(crate) fn mask_credential_values(&mut self) -> Vec<String> {
         let mut masked = Vec::new();
         self.for_each_credential_value_mut(&mut |v| {

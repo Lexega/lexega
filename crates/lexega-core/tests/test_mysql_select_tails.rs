@@ -25,9 +25,10 @@ use std::collections::HashSet;
 // ============================================================================
 
 fn mysql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mysql();
-    config
+    FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) {
@@ -58,9 +59,10 @@ fn single_select(sql: &str) -> Box<lexega_core::ast::AstSelect> {
 }
 
 fn mysql_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mysql());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mysql()),
+        ..Default::default()
+    }
 }
 
 /// Variant name from Debug output — avoids a `_ =>` arm on `AstStmt`.
@@ -252,7 +254,7 @@ fn test_into_outfile_ast_structure() {
             assert_eq!(of.kind, AstIntoFileKind::Outfile);
             assert!(of.options_span.is_some(), "export options expected");
         }
-        AstSelectIntoTarget::ScriptingVars(_) | AstSelectIntoTarget::NewTable(_) => {
+        AstSelectIntoTarget::ScriptingVars { .. } | AstSelectIntoTarget::NewTable(_) => {
             panic!("expected OutFile target")
         }
     }
@@ -266,7 +268,7 @@ fn test_into_dumpfile_and_trailing_position() {
             assert_eq!(of.kind, AstIntoFileKind::Dumpfile);
             assert!(of.options_span.is_none(), "DUMPFILE takes no options");
         }
-        AstSelectIntoTarget::ScriptingVars(_) | AstSelectIntoTarget::NewTable(_) => {
+        AstSelectIntoTarget::ScriptingVars { .. } | AstSelectIntoTarget::NewTable(_) => {
             panic!("expected OutFile target")
         }
     }
@@ -410,10 +412,10 @@ fn mysql_rule_ids(sql: &str) -> HashSet<String> {
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &mysql_analysis_config())
         .unwrap_or_else(|e| panic!("analysis failed for {:?}: {:?}", sql, e));
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|m| match m {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|m| match m {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }

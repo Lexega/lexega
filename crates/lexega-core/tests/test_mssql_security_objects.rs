@@ -9,24 +9,25 @@ use lexega_core::api::analyze_risk_with_policy_config;
 use lexega_core::{dialect::mssql, parse_sql_with_dialect, AstStmt, MsSqlDialect};
 
 fn analyze(sql: &str) -> Vec<(String, RiskLevel)> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|s| match s {
             RuleMatch::Analysis(g) => (g.matched_rule.clone(), g.risk_level),
         })
         .collect()
 }
 
-fn fires(signals: &[(String, RiskLevel)], rule_id: &str) -> bool {
-    signals.iter().any(|(id, _)| id == rule_id)
+fn fires(findings: &[(String, RiskLevel)], rule_id: &str) -> bool {
+    findings.iter().any(|(id, _)| id == rule_id)
 }
 
-fn fires_with_level(signals: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
-    signals.iter().any(|(id, l)| id == rule_id && *l == level)
+fn fires_with_level(findings: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
+    findings.iter().any(|(id, l)| id == rule_id && *l == level)
 }
 
 fn assert_not_opaque(sql: &str) {
@@ -43,16 +44,16 @@ fn assert_not_opaque(sql: &str) {
 fn create_master_key_with_password_fires_info_and_cred_leak() {
     let sql = "CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'S3cret!Pass';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires(&signals, "INFO-MSSQL-CRYPTO-NEW"),
+        fires(&findings, "INFO-MSSQL-CRYPTO-NEW"),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        fires_with_level(&signals, "CRED-PWD-LEAK", RiskLevel::Critical),
+        fires_with_level(&findings, "CRED-PWD-LEAK", RiskLevel::Critical),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -61,25 +62,25 @@ fn create_symmetric_key_fires_info() {
     let sql = "CREATE SYMMETRIC KEY ssn_key WITH ALGORITHM = AES_256 \
                ENCRYPTION BY CERTIFICATE ssn_cert;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires(&signals, "INFO-MSSQL-CRYPTO-NEW"),
+        fires(&findings, "INFO-MSSQL-CRYPTO-NEW"),
         "Got: {:?}",
-        signals
+        findings
     );
     // Certificate-protected key: no literal secret in SQL text.
-    assert!(!fires(&signals, "CRED-PWD-LEAK"), "Got: {:?}", signals);
+    assert!(!fires(&findings, "CRED-PWD-LEAK"), "Got: {:?}", findings);
 }
 
 #[test]
 fn create_certificate_fires_info() {
     let sql = "CREATE CERTIFICATE signing_cert WITH SUBJECT = 'module signing';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires(&signals, "INFO-MSSQL-CRYPTO-NEW"),
+        fires(&findings, "INFO-MSSQL-CRYPTO-NEW"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -87,11 +88,11 @@ fn create_certificate_fires_info() {
 fn drop_certificate_fires_high() {
     let sql = "DROP CERTIFICATE signing_cert;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-CRYPTO-DROP", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-CRYPTO-DROP", RiskLevel::High),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -99,21 +100,21 @@ fn drop_certificate_fires_high() {
 fn drop_master_key_fires_high() {
     let sql = "DROP MASTER KEY;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-CRYPTO-DROP"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(fires(&findings, "MSSQL-CRYPTO-DROP"), "Got: {:?}", findings);
 }
 
 #[test]
 fn alter_master_key_regenerate_fires_chg() {
     let sql = "ALTER MASTER KEY REGENERATE WITH ENCRYPTION BY PASSWORD = 'N3w!Passw0rd';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-CRYPTO-CHG", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-CRYPTO-CHG", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "CRED-PWD-LEAK"), "Got: {:?}", signals);
+    assert!(fires(&findings, "CRED-PWD-LEAK"), "Got: {:?}", findings);
 }
 
 #[test]
@@ -122,45 +123,77 @@ fn create_database_scoped_credential_with_secret_fires_cred_rules() {
         "CREATE DATABASE SCOPED CREDENTIAL blob_cred WITH IDENTITY = 'SHARED ACCESS SIGNATURE', \
                SECRET = 'sv=2024-01-01&sig=abc123';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-CRED-NEW", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-CRED-NEW", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "CRED-PWD-LEAK"), "Got: {:?}", signals);
+    assert!(fires(&findings, "CRED-PWD-LEAK"), "Got: {:?}", findings);
 }
 
 #[test]
 fn create_server_credential_fires_cred_new() {
     let sql = "CREATE CREDENTIAL agent_proxy WITH IDENTITY = 'corp\\svc_agent', SECRET = 'pw!1';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-CRED-NEW"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(fires(&findings, "MSSQL-CRED-NEW"), "Got: {:?}", findings);
 }
 
 #[test]
 fn drop_credential_fires_medium() {
     let sql = "DROP CREDENTIAL agent_proxy;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-CRED-DROP", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-CRED-DROP", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(!fires(&signals, "MSSQL-CRYPTO-DROP"), "Got: {:?}", signals);
+    assert!(
+        !fires(&findings, "MSSQL-CRYPTO-DROP"),
+        "Got: {:?}",
+        findings
+    );
+}
+
+#[test]
+fn drop_database_encryption_key_is_not_drop_database() {
+    for sql in [
+        "DROP DATABASE ENCRYPTION KEY;",
+        "drop database encryption key",
+        "USE finance;\nGO\nDROP DATABASE ENCRYPTION KEY;",
+    ] {
+        assert_not_opaque(sql);
+        let findings = analyze(sql);
+        assert!(!fires(&findings, "DB-DROP"), "{sql}: {findings:?}");
+        assert!(
+            fires_with_level(&findings, "MSSQL-DEK-DROP", RiskLevel::High),
+            "{sql}: {findings:?}"
+        );
+        assert!(
+            !fires(&findings, "MSSQL-CRYPTO-DROP"),
+            "{sql}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn drop_database_by_name_still_drops_the_database() {
+    let findings = analyze("DROP DATABASE finance;");
+    assert!(fires(&findings, "DB-DROP"), "Got: {findings:?}");
+    assert!(!fires(&findings, "MSSQL-DEK-DROP"), "Got: {findings:?}");
 }
 
 #[test]
 fn alter_database_not_hijacked_by_scoped_lookahead() {
     // Plain ALTER DATABASE must keep routing to the database parser.
     let sql = "ALTER DATABASE finance SET TRUSTWORTHY ON;";
-    let signals = analyze(sql);
-    assert!(!fires(&signals, "MSSQL-CRYPTO-CHG"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(!fires(&findings, "MSSQL-CRYPTO-CHG"), "Got: {:?}", findings);
     assert!(
-        fires(&signals, "MSSQL-DB-TRUSTWORTHY-ON"),
+        fires(&findings, "MSSQL-DB-TRUSTWORTHY-ON"),
         "Got: {:?}",
-        signals
+        findings
     );
 }

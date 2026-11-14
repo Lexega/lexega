@@ -18,7 +18,7 @@ use crate::ast::AstStmt;
 use crate::ast::{
     AstAlterAuthenticationPolicy, AstAlterAuthenticationPolicyAction,
     AstAlterAuthenticationPolicyActionKind, AstCreateAuthenticationPolicy,
-    AstDropAuthenticationPolicy, AstUnknownClause, UnknownKind,
+    AstDropAuthenticationPolicy, AstObjectRef, AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
@@ -167,13 +167,16 @@ impl<'a> Parser<'a> {
         // Policy name
         let policy_name_span = self.parse_qualified_name_span()?;
         let mut authentication_methods_span = None;
+        let mut authentication_method_spans = Vec::new();
         let mut client_types_span = None;
         let mut client_policy_span = None;
         let mut mfa_enrollment_span = None;
+        let mut mfa_enrollment_value_span = None;
         let mut mfa_policy_span = None;
         let mut pat_policy_span = None;
         let mut workload_identity_policy_span = None;
         let mut security_integrations_span = None;
+        let mut security_integrations = Vec::new();
         let mut comment_span = None;
         let mut extras = Vec::new();
 
@@ -195,8 +198,11 @@ impl<'a> Parser<'a> {
                     match lexeme_upper.as_str() {
                         "AUTHENTICATION_METHODS" => {
                             self.advance();
+                            // `=` is the next token, the list's `(` the one after.
+                            let open = self.idx + 1;
                             let span = self.parse_property_with_paren_list(prop_start)?;
                             authentication_methods_span = Some(span);
+                            authentication_method_spans = self.list_value_spans(open);
                             last_prop_end = span.end;
                         }
                         "CLIENT_TYPES" => {
@@ -215,6 +221,8 @@ impl<'a> Parser<'a> {
                             self.advance();
                             let span = self.parse_simple_property_value(prop_start)?;
                             mfa_enrollment_span = Some(span);
+                            mfa_enrollment_value_span =
+                                self.tokens.get(self.idx - 1).map(|tok| tok.span);
                             last_prop_end = span.end;
                         }
                         "MFA_POLICY" => {
@@ -237,8 +245,10 @@ impl<'a> Parser<'a> {
                         }
                         "SECURITY_INTEGRATIONS" => {
                             self.advance();
-                            let span = self.parse_security_integrations_value(prop_start)?;
+                            let (span, integrations) =
+                                self.parse_security_integrations_value(prop_start)?;
                             security_integrations_span = Some(span);
+                            security_integrations = integrations;
                             last_prop_end = span.end;
                         }
                         _ => {
@@ -320,13 +330,16 @@ impl<'a> Parser<'a> {
             policy_span,
             policy_name_span,
             authentication_methods_span,
+            authentication_method_spans,
             client_types_span,
             client_policy_span,
             mfa_enrollment_span,
+            mfa_enrollment_value_span,
             mfa_policy_span,
             pat_policy_span,
             workload_identity_policy_span,
             security_integrations_span,
+            security_integrations,
             comment_span,
             extras,
         };
@@ -849,13 +862,15 @@ impl<'a> Parser<'a> {
                             .advance()
                             .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
                         let eq_span = Some(eq_tok.span);
-                        let value_span = self.parse_security_integrations_value_span()?;
+                        let (value_span, integrations) =
+                            self.parse_security_integrations_value_span()?;
                         Ok(
                             AstAlterAuthenticationPolicyActionKind::SetSecurityIntegrations {
                                 set_span,
                                 property_span,
                                 eq_span,
                                 value_span,
+                                integrations,
                             },
                         )
                     }
@@ -1028,32 +1043,56 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse SECURITY_INTEGRATIONS value: = (list) | = all | = none
-    fn parse_security_integrations_value(&mut self, prop_start: u32) -> ParseResult<Span> {
+    fn parse_security_integrations_value(
+        &mut self,
+        prop_start: u32,
+    ) -> ParseResult<(Span, Vec<AstObjectRef>)> {
         let _eq_tok = self
             .advance()
             .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
-        let value_span = self.parse_security_integrations_value_span()?;
-        Ok(Span {
-            start: prop_start,
-            end: value_span.end,
-        })
+        let (value_span, integrations) = self.parse_security_integrations_value_span()?;
+        Ok((
+            Span {
+                start: prop_start,
+                end: value_span.end,
+            },
+            integrations,
+        ))
     }
 
-    /// Parse the value portion of SECURITY_INTEGRATIONS: (list) | all | none
-    fn parse_security_integrations_value_span(&mut self) -> ParseResult<Span> {
+    /// Parse the value portion of SECURITY_INTEGRATIONS: (list) | all | none.
+    /// Returns the value's span and the integrations a list names.
+    fn parse_security_integrations_value_span(&mut self) -> ParseResult<(Span, Vec<AstObjectRef>)> {
         let next_tok = self
             .peek_non_trivia()
             .ok_or_eof(self.current_span(), vec!["value or (".to_string()])?;
 
         if matches!(next_tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-            self.parse_paren_list_span()
+            let integrations = self.object_ref_list_at(self.idx);
+            Ok((self.parse_paren_list_span()?, integrations))
         } else {
             // ALL or NONE (or other identifier)
             let value_tok = self
                 .advance()
                 .expect_invariant("SECURITY_INTEGRATIONS value token available after peek");
-            Ok(value_tok.span)
+            Ok((value_tok.span, Vec::new()))
         }
+    }
+
+    /// The span of each value of the flat list `( v {, v}* )` whose `(` is
+    /// token `open`.
+    fn list_value_spans(&self, open: usize) -> Vec<Span> {
+        let mut spans = Vec::new();
+        for tok in self.tokens.iter().skip(open + 1) {
+            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                break;
+            }
+            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
+                continue;
+            }
+            spans.push(tok.span);
+        }
+        spans
     }
 
     /// Parse balanced parentheses and return span of the entire group
@@ -1108,6 +1147,7 @@ impl<'a> Parser<'a> {
             "SECURITY_INTEGRATIONS",
         ];
 
+        let from = self.idx;
         let mut last_end = self.current_span().start;
 
         while let Some(tok) = self.peek_non_trivia() {
@@ -1129,6 +1169,8 @@ impl<'a> Parser<'a> {
             last_end = consumed.span.end;
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(last_end)
     }
 }

@@ -324,3 +324,193 @@ fn test_reconfigure_not_mssql_dialect() {
         );
     }
 }
+
+// ─── CHECKPOINT / KILL / SHUTDOWN ───────────────────────────────────────────
+
+// Each server command is one statement, kept as written, and `fmt` prints
+// it back byte for byte; one written without `;` ends where its grammar
+// does, before the next statement.
+#[test]
+fn a_server_command_is_one_statement_kept_as_written() {
+    for command in [
+        "CHECKPOINT",
+        "CHECKPOINT 10",
+        "KILL 52",
+        "KILL 52 WITH STATUSONLY",
+        "KILL 'D5499C66-E398-45CA-BF7E-DC9C194B48CF' WITH COMMIT",
+        "KILL QUERY NOTIFICATION SUBSCRIPTION ALL",
+        "KILL QUERY NOTIFICATION SUBSCRIPTION 73",
+        "KILL STATS JOB 12",
+        "SHUTDOWN",
+        "SHUTDOWN WITH NOWAIT",
+    ] {
+        let sql = format!("{command};");
+        let script = parse_sql_with_dialect(&sql, &MsSqlDialect).expect("should parse");
+        let spans: Vec<_> = script
+            .stmts
+            .iter()
+            .map(|s| match s {
+                AstStmt::MssqlServerCommand { span, .. } => {
+                    &sql[span.start as usize..span.end as usize]
+                }
+                other => panic!("{sql}: {other:?}"),
+            })
+            .collect();
+        assert_eq!(spans, [command], "{sql}");
+        let formatted = format_sql_with_config(&sql, &mssql_config()).expect("should format");
+        assert_eq!(formatted.trim_end(), sql, "{sql}");
+
+        let after = format!("DELETE FROM users\n{command}\nDELETE FROM orders");
+        let script = parse_sql_with_dialect(&after, &MsSqlDialect).expect("should parse");
+        assert_eq!(script.stmts.len(), 3, "{after}");
+        assert!(
+            matches!(script.stmts[1], AstStmt::MssqlServerCommand { .. }),
+            "{after}: {:?}",
+            script.stmts[1]
+        );
+        assert_format_roundtrip(&after);
+    }
+    // Elsewhere the words are names.
+    let script = parse_sql_with_dialect("CHECKPOINT;", &lexega_syntax::SnowflakeDialect);
+    if let Ok(script) = script {
+        assert!(!script
+            .stmts
+            .iter()
+            .any(|s| matches!(s, AstStmt::MssqlServerCommand { .. })));
+    }
+}
+
+/// The kinds of the statements `sql` reads as, none of them skipped.
+fn statement_kinds(sql: &str) -> Vec<String> {
+    let script = parse_sql_with_dialect(sql, &MsSqlDialect).expect("parses");
+    script
+        .stmts
+        .iter()
+        .map(|stmt| {
+            assert!(
+                !matches!(stmt, AstStmt::OpaqueContent { .. }),
+                "{sql}: {stmt:?}"
+            );
+            format!("{stmt:?}")
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn an_unterminated_batch_reads_each_statement_after_options_exec_and_output() {
+    for (sql, kinds) in [
+        (
+            "CREATE TABLE dbo.t (id INT) WITH (DATA_COMPRESSION = PAGE) DELETE FROM u",
+            &["CreateTable", "Delete"][..],
+        ),
+        (
+            "CREATE TABLE dbo.t (id INT) WITH (DATA_COMPRESSION = PAGE, XML_COMPRESSION = ON) DELETE FROM u",
+            &["CreateTable", "Delete"][..],
+        ),
+        (
+            "EXEC dbo.p SAVE TRAN sp1 DELETE FROM o",
+            &["MssqlExec", "Savepoint", "Delete"][..],
+        ),
+        (
+            "INSERT INTO a (id) OUTPUT inserted.id EXEC dbo.p DELETE FROM o",
+            &["Insert", "Delete"][..],
+        ),
+        // OUTPUT is written before the source, where it stands.
+        (
+            "INSERT INTO a (id) OUTPUT inserted.id SELECT id FROM o",
+            &["Insert"][..],
+        ),
+        // A common table expression still starts a statement.
+        (
+            "CREATE TABLE t (id INT) WITH x AS (SELECT 1 AS a) SELECT a FROM x",
+            &["CreateTable", "Select"][..],
+        ),
+    ] {
+        assert_eq!(statement_kinds(sql), kinds, "{sql}");
+        assert_format_roundtrip(sql);
+    }
+}
+
+#[test]
+fn a_trigger_predicate_update_col_is_an_operand_of_a_condition() {
+    let sql = "CREATE TRIGGER tr ON t AFTER UPDATE AS \
+               IF UPDATE(a) AND EXISTS (SELECT 1 FROM inserted) INSERT INTO b (id) SELECT id FROM inserted";
+    assert_eq!(statement_kinds(sql), ["CreateMssqlTrigger"]);
+    assert_format_roundtrip(sql);
+    assert_eq!(
+        statement_kinds(
+            "CREATE TRIGGER tr ON t AFTER UPDATE AS IF UPDATE(a) OR UPDATE(b) PRINT 'x'"
+        ),
+        ["CreateMssqlTrigger"]
+    );
+}
+
+#[test]
+fn a_compound_assignment_is_read_as_the_operation_it_assigns() {
+    use lexega_syntax::ast::BinaryOperator;
+    for (sql, operator) in [
+        (
+            "UPDATE users SET flags |= 4 WHERE id = 1",
+            BinaryOperator::BitwiseOr,
+        ),
+        ("UPDATE users SET flags &= 4", BinaryOperator::BitwiseAnd),
+        ("UPDATE users SET flags += 1", BinaryOperator::Plus),
+    ] {
+        let script = parse_sql_with_dialect(sql, &MsSqlDialect).expect("parses");
+        let Some(AstStmt::Update(update)) = script.stmts.first() else {
+            panic!("{sql}: {:?}", script.stmts);
+        };
+        let assignment = &update.set_assignments[0];
+        let lexega_syntax::AstExpr::BinaryOp {
+            left,
+            operator: read,
+            ..
+        } = assignment.value.as_ref()
+        else {
+            panic!("{sql}: {:?}", assignment.value);
+        };
+        assert_eq!(format!("{read:?}"), format!("{operator:?}"), "{sql}");
+        assert!(
+            matches!(left.as_ref(), lexega_syntax::AstExpr::Ident { .. }),
+            "{sql}: the column read"
+        );
+        assert_format_roundtrip(sql);
+    }
+    let sql = "DECLARE @f INT = 1; SET @f |= 4; SET @f &= 6; UPDATE u SET id = @f WHERE id = 1";
+    statement_kinds(sql);
+    assert_format_roundtrip(sql);
+}
+
+#[test]
+fn a_tsql_create_rule_is_read_with_its_condition() {
+    for sql in [
+        "CREATE RULE r AS @value > 0",
+        "CREATE RULE dbo.list_rule AS @list IN ('1389', '0736', '0877')",
+        "CREATE RULE range_rule AS @range >= 1000 AND @range < 20000",
+    ] {
+        let script = parse_sql_with_dialect(sql, &MsSqlDialect).expect("parses");
+        let Some(AstStmt::MssqlCreateRule(rule)) = script.stmts.first() else {
+            panic!("{sql}: {:?}", script.stmts);
+        };
+        let name = &sql[rule.name.start as usize..rule.name.end as usize];
+        assert!(sql.starts_with(&format!("CREATE RULE {name} AS ")), "{sql}");
+        assert_eq!(rule.condition.span().end as usize, sql.len(), "{sql}");
+        assert_format_roundtrip(sql);
+    }
+    assert_eq!(
+        statement_kinds("CREATE RULE range_rule AS @range >= 1000; DELETE FROM dbo.archive;"),
+        ["MssqlCreateRule", "Delete"]
+    );
+    // PostgreSQL's rule, `AS ON <event>`, is its own statement.
+    let pg = lexega_syntax::dialect::postgres();
+    let script = parse_sql_with_dialect("CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING", &*pg)
+        .expect("parses");
+    assert!(matches!(
+        script.stmts.first(),
+        Some(AstStmt::PgCreateRule(_))
+    ));
+}

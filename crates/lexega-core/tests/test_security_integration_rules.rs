@@ -14,18 +14,18 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
 }
 
 fn assert_formats_safe(sql: &str) {

@@ -41,6 +41,8 @@ pub enum TaskAction {
     Create,
     Alter,
     Drop,
+    /// Snowflake `EXECUTE TASK`: runs the task now.
+    Execute,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +189,27 @@ pub fn lower_drop_task_to_task_plan(s: &AstDropTask, source: &str) -> TaskPlan {
             or_alter: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
+        },
+        create_options: None,
+        alter_actions: Vec::new(),
+        node_id: s.node_id,
+        span: s.span,
+    }
+}
+
+/// `EXECUTE TASK name [RETRY LAST]`.
+pub(crate) fn lower_execute_task_to_task_plan(
+    s: &crate::ast::AstExecuteTask,
+    source: &str,
+) -> TaskPlan {
+    TaskPlan {
+        action: TaskAction::Execute,
+        target: Some(target_from_span(source, s.name)),
+        options: TaskOptions {
+            or_replace: false,
+            or_alter: false,
+            if_not_exists: false,
+            if_exists: false,
         },
         create_options: None,
         alter_actions: Vec::new(),

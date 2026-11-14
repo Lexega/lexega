@@ -10,7 +10,7 @@
 //! attachment slice is handled by [`super::PolicyAttachmentPlan`]; this
 //! plan covers only the generic `SET/UNSET` parameter forms.
 
-use crate::ast::{AstAlterAccount, AstAlterAccountActionKind, NodeId};
+use crate::ast::{AstAccountPolicyKind, AstAlterAccount, AstAlterAccountActionKind, NodeId};
 use crate::ir::utils::slice_span;
 use crate::lexer::token::Span;
 
@@ -53,6 +53,27 @@ pub fn lower_alter_account_params_to_plan(
                 span: s.span,
             })
         }
+        AstAlterAccountActionKind::SetPolicy { kind, policy } => {
+            let word = match kind {
+                AstAccountPolicyKind::Password => "PASSWORD",
+                AstAccountPolicyKind::Session => "SESSION",
+                AstAccountPolicyKind::Packages => "PACKAGES",
+            };
+            let bare = |name: String| AccountParameterIr {
+                name,
+                value: String::new(),
+            };
+            Some(AccountPlan {
+                parameters_set: vec![
+                    bare(word.to_string()),
+                    bare("POLICY".to_string()),
+                    bare(upper(source, Some(policy.span))),
+                ],
+                parameters_unset: Vec::new(),
+                node_id: s.node_id,
+                span: s.span,
+            })
+        }
         AstAlterAccountActionKind::Unset {
             property_name_spans,
             ..
@@ -78,15 +99,11 @@ pub fn lower_alter_account_params_to_plan(
 
 /// Slice a span, trim, strip a trailing list comma (the shared property
 /// value scanner includes the separator when a property is followed by
-/// another), strip surrounding single quotes, and upper-case.
+/// another), read a string literal's value, and upper-case.
 fn upper(source: &str, span: Option<Span>) -> String {
     span.and_then(|sp| slice_span(source, sp))
         .map(|t| {
-            t.trim()
-                .trim_end_matches(',')
-                .trim()
-                .trim_matches('\'')
-                .trim()
+            crate::ir::span_extract::literal_value_or_text(t.trim().trim_end_matches(','))
                 .to_ascii_uppercase()
         })
         .unwrap_or_default()

@@ -107,6 +107,7 @@ fn try_parse_privilege_body(p: &mut Parser<'_>) -> ParseResult<AstPrivilegeGrant
         objects: vec![object],
         grantees,
         with_grant_option,
+        as_principal: None,
     })
 }
 
@@ -244,13 +245,9 @@ fn parse_mysql_grant_object(p: &mut Parser<'_>) -> ParseResult<AstGrantObject> {
         });
     }
 
-    // <name> [.<name>|.*]
-    let name_start = first_span.start;
-    let mut name_end = first_span.end;
-    // Consume first name token.
-    let _first = p.advance().expect_invariant("name token");
-
-    // Look for `.*` (all-in-db) or `.<name>` (qualified table).
+    // <name> [.*]: the name, then `.*` (all in the database).
+    let name = p.parse_object_name_span()?;
+    let mut name_end = name.end;
     let mut saw_wildcard = false;
     if peek_token_kind(p, TokenKind::Punctuation(Punctuation::Dot)) {
         let _ = p.advance(); // .
@@ -258,16 +255,11 @@ fn parse_mysql_grant_object(p: &mut Parser<'_>) -> ParseResult<AstGrantObject> {
             let star = p.advance().expect_invariant("star after dot");
             name_end = star.span.end;
             saw_wildcard = true;
-        } else if let Some(t) = p.peek_non_trivia() {
-            if matches!(t.kind, TokenKind::Identifier { .. } | TokenKind::Keyword(_)) {
-                let next = p.advance().expect_invariant("qualified name segment");
-                name_end = next.span.end;
-            }
         }
     }
 
     let name_span = Span {
-        start: name_start,
+        start: name.start,
         end: name_end,
     };
 
@@ -319,15 +311,9 @@ fn parse_mysql_grantee(p: &mut Parser<'_>) -> ParseResult<AstGrantee> {
     let _user = p.advance().expect_invariant("user");
 
     // Optional `@<host>` (MySQL `'user'@'host'`).
-    if peek_token_kind(p, TokenKind::Operator(Operator::At)) {
-        let _at = p.advance().expect_invariant("@");
-        if let Some(host) = p.peek_non_trivia() {
-            let host_is_str = matches!(host.kind, TokenKind::Literal(LiteralKind::String));
-            if host_is_str || p.can_be_identifier_token(host) {
-                let host_tok = p.advance().expect_invariant("host");
-                end = host_tok.span.end;
-            }
-        }
+    if let Some((host_end, _)) = p.mysql_account_host_at(p.idx) {
+        p.idx = host_end;
+        end = p.tokens[host_end - 1].span.end;
     }
 
     // Project to Role grantee with role_keyword_span = None. MySQL users

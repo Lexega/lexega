@@ -29,39 +29,16 @@ use crate::ast::{
     AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::parser::core::{parse_property_clause, Parser};
+use crate::parser::tag::TagListShape;
 
 // ============================================================================
 // Shared helpers (mirror the warehouse ones)
 // ============================================================================
 
-fn parse_property_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let key_tok = p
-        .advance()
-        .ok_or_eof(p.current_span(), vec!["property".to_string()])?;
-    let start = key_tok.span.start;
-    let mut end = key_tok.span.end;
-
-    if let Some(tok) = p.peek_non_trivia() {
-        if matches!(tok.kind, TokenKind::Operator(Operator::Eq)) {
-            let eq = p.advance().expect_invariant("= consumed");
-            end = eq.span.end;
-            if let Some(val) = p.peek_non_trivia() {
-                if matches!(val.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance();
-                    end = skip_to_matching_paren(p)?;
-                } else {
-                    let v = p.advance().expect_invariant("value consumed after =");
-                    end = v.span.end;
-                }
-            }
-        }
-    }
-    Ok(Span { start, end })
-}
-
 fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
+    let from = p.idx;
     let mut depth = 1;
     while let Some(tok) = p.advance() {
         match tok.kind {
@@ -69,7 +46,11 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             TokenKind::Punctuation(Punctuation::RParen) => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(tok.span.end);
+                    let end = tok.span.end;
+                    // The text is not read: its secrets are recorded as
+                    // unparsed text's are.
+                    p.record_unparsed_secrets(from, p.idx);
+                    return Ok(end);
                 }
             }
             _ => {}
@@ -85,6 +66,7 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
 
 /// Skip to statement end (semicolon or EOF), handling balanced parens.
 fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = p.current_span().end;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -100,6 +82,8 @@ fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
             }
         }
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }
 
@@ -372,29 +356,16 @@ fn parse_alter_pipe_action(
             if matches!(next.kind, TokenKind::Keyword(Keyword::Tag)) {
                 // SET TAG <tag_name> = '<value>' [, ...]
                 let tag_tok = p.advance().expect_invariant("TAG consumed");
-                let mut end = tag_tok.span.end;
-                if let Some(lparen) = p.peek_non_trivia() {
-                    if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        p.advance();
-                        end = skip_to_matching_paren(p)?;
-                    } else {
-                        // No parens — consume tag assignments until semicolon
-                        while let Some(tok) = p.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            let t = p.advance().unwrap();
-                            end = t.span.end;
-                        }
-                    }
-                }
+                let (list_span, tags) =
+                    p.parse_tag_list_in_optional_parens(TagListShape::Assignments)?;
                 AstAlterPipeActionKind::SetTag {
                     set_span: set_tok.span,
                     tag_span: tag_tok.span,
                     assignments_span: Span {
                         start: tag_tok.span.start,
-                        end,
+                        end: list_span.end,
                     },
+                    tags,
                 }
             } else {
                 // SET property = value [...]
@@ -432,29 +403,15 @@ fn parse_alter_pipe_action(
         if let Some(next) = p.peek_non_trivia() {
             if matches!(next.kind, TokenKind::Keyword(Keyword::Tag)) {
                 let tag_tok = p.advance().expect_invariant("TAG consumed");
-                let mut end = tag_tok.span.end;
-                if let Some(lparen) = p.peek_non_trivia() {
-                    if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        p.advance();
-                        end = skip_to_matching_paren(p)?;
-                    } else {
-                        // No parens — consume tag names until semicolon
-                        while let Some(tok) = p.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            let t = p.advance().unwrap();
-                            end = t.span.end;
-                        }
-                    }
-                }
+                let (list_span, tags) = p.parse_tag_list_in_optional_parens(TagListShape::Names)?;
                 AstAlterPipeActionKind::UnsetTag {
                     unset_span: unset_tok.span,
                     tag_span: tag_tok.span,
                     names_span: Span {
                         start: tag_tok.span.start,
-                        end,
+                        end: list_span.end,
                     },
+                    tags,
                 }
             } else {
                 // UNSET without TAG — unknown, consume rest
@@ -472,6 +429,7 @@ fn parse_alter_pipe_action(
                     unset_span: unset_tok.span,
                     tag_span: unset_tok.span,
                     names_span: rest,
+                    tags: Vec::new(),
                 }
             }
         } else {
@@ -479,6 +437,7 @@ fn parse_alter_pipe_action(
                 unset_span: unset_tok.span,
                 tag_span: unset_tok.span,
                 names_span: unset_tok.span,
+                tags: Vec::new(),
             }
         }
     } else if tok.lexeme(p.source).eq_ignore_ascii_case("REFRESH") {

@@ -16,7 +16,7 @@ use super::plan::{
     CteBody, FilterKind, GroupingSpec, JoinKind, MergeAction, MergeBranch, MergeBranchKind,
     RelPlan, SetOpKind,
 };
-use super::scalar::{FieldStep, QuantifiedRhs, ScalarExpr};
+use super::scalar::{FieldStep, QuantifiedRhs, Quantifier, ScalarExpr};
 
 // ────────────────────────────────────────────────────────────────────────
 // Public API
@@ -127,6 +127,7 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
 
         RelPlan::Filter {
             input,
+            computed,
             predicate,
             kind,
             ..
@@ -139,6 +140,9 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
             };
             write!(f, "[{}] ", kind_tag)?;
             write_scalar(f, predicate)?;
+            if !computed.is_empty() {
+                write!(f, " computed({})", computed.len())?;
+            }
             writeln!(f)?;
             write_plan(f, input, depth + 1)
         }
@@ -149,6 +153,7 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
             aggregates,
             having,
             output_columns,
+            computed,
             ..
         } => {
             f.write_str("Aggregate")?;
@@ -164,6 +169,9 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
                 f.write_str(" ")?;
                 f.write_str("having")?;
             }
+            if !computed.is_empty() {
+                write!(f, " computed({})", computed.len())?;
+            }
             writeln!(f)?;
             write_plan(f, input, depth + 1)
         }
@@ -172,6 +180,7 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
             input,
             windows,
             window_outputs,
+            computed,
             ..
         } => {
             f.write_str("Window")?;
@@ -181,6 +190,9 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
                 windows.len(),
                 window_outputs.len()
             )?;
+            if !computed.is_empty() {
+                write!(f, " computed({})", computed.len())?;
+            }
             writeln!(f)?;
             write_plan(f, input, depth + 1)
         }
@@ -296,7 +308,7 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
         } => {
             f.write_str("Insert")?;
             write!(f, "[{}]", target.name)?;
-            if *overwrite {
+            if overwrite.is_some() {
                 f.write_str(" ")?;
                 f.write_str("ovwr")?;
             }
@@ -372,11 +384,15 @@ fn write_plan(f: &mut fmt::Formatter<'_>, plan: &RelPlan, depth: usize) -> fmt::
             target,
             source,
             branches,
+            returning,
             ..
         } => {
             f.write_str("Merge")?;
             write!(f, "[{}]", target.name)?;
             write!(f, " <{} branches>", branches.len())?;
+            if returning.is_some() {
+                f.write_str(" ret")?;
+            }
             writeln!(f)?;
             write_plan(f, source, depth + 1)?;
             for b in branches {
@@ -720,6 +736,10 @@ fn write_scalar(f: &mut fmt::Formatter<'_>, expr: &ScalarExpr) -> fmt::Result {
             f.write_str("chain")?;
             write!(f, "[{}]/{}", op, operands.len())
         }
+        ScalarExpr::OperatorChain { operands, .. } => {
+            f.write_str("opchain")?;
+            write!(f, "/{}", operands.len())
+        }
         ScalarExpr::Like { kind, negated, .. } => {
             f.write_str("like")?;
             write!(f, "[{}{}]", if *negated { "NOT " } else { "" }, kind)
@@ -777,6 +797,20 @@ fn write_scalar(f: &mut fmt::Formatter<'_>, expr: &ScalarExpr) -> fmt::Result {
                 QuantifiedRhs::List(items) => write!(f, " /{}", items.len()),
             }
         }
+        ScalarExpr::RowCmp {
+            op,
+            quantifier,
+            left,
+            ..
+        } => {
+            f.write_str("rowcmp")?;
+            write!(f, "[{}]/{}", op, left.len())?;
+            match quantifier {
+                None => f.write_str(" subq"),
+                Some(Quantifier::Any) => f.write_str(" any subq"),
+                Some(Quantifier::All) => f.write_str(" all subq"),
+            }
+        }
         ScalarExpr::WindowFn { .. } => f.write_str("winfn"),
         ScalarExpr::FieldAccess { path, cast, .. } => {
             f.write_str("field")?;
@@ -811,7 +845,7 @@ fn write_grouping_tag(f: &mut fmt::Formatter<'_>, g: &GroupingSpec) -> fmt::Resu
         GroupingSpec::Cube(_) => f.write_str("cube"),
         GroupingSpec::Rollup(_) => f.write_str("rollup"),
         GroupingSpec::GroupingSets(_) => f.write_str("sets"),
-        GroupingSpec::All(_) => f.write_str("all"),
+        GroupingSpec::All { .. } => f.write_str("all"),
     }
 }
 
@@ -850,11 +884,11 @@ fn write_merge_branch_tag(f: &mut fmt::Formatter<'_>, b: &MergeBranch) -> fmt::R
     f.write_str(" ")?;
     match &b.action {
         MergeAction::Insert { .. } => f.write_str("ins"),
-        MergeAction::InsertStar => f.write_str("insstar"),
-        MergeAction::InsertAllByName => f.write_str("insname"),
+        MergeAction::InsertStar { .. } => f.write_str("insstar"),
+        MergeAction::InsertAllByName { .. } => f.write_str("insname"),
         MergeAction::Update { .. } => f.write_str("upd"),
-        MergeAction::UpdateSetStar => f.write_str("updstar"),
-        MergeAction::UpdateAllByName => f.write_str("updname"),
+        MergeAction::UpdateSetStar { .. } => f.write_str("updstar"),
+        MergeAction::UpdateAllByName { .. } => f.write_str("updname"),
         MergeAction::Delete => f.write_str("del"),
         MergeAction::DoNothing => f.write_str("nop"),
     }
@@ -868,6 +902,8 @@ fn write_opaque_reason(f: &mut fmt::Formatter<'_>, r: &super::strict::OpaqueReas
         R::NonSelectTopLevel => f.write_str("nonselecttop"),
         R::CatalogMissing { .. } => f.write_str("catmiss"),
         R::ExpressionTooDeep { .. } => f.write_str("exprdepth"),
+        R::ExpressionTooLarge { .. } => f.write_str("exprsize"),
+        R::NestingTooDeep { .. } => f.write_str("nestdepth"),
     }
 }
 
@@ -940,6 +976,7 @@ mod tests {
         let mut alloc = ColumnIdAllocator::new();
         let s = scan(&mut alloc, "t", 2);
         let f = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(s),
             predicate: ScalarExpr::BinOp {
                 op: crate::ir::scalar::BinOpKind::Cmp(crate::ir::scalar::ComparisonOp::Eq),

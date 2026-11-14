@@ -73,8 +73,9 @@ pub fn lower_drop_data_metric_function_to_plan(
     DataMetricFunctionPlan {
         action: DataMetricFunctionAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         is_secure: false,
         options: DataMetricFunctionOptions {
             or_replace: false,

@@ -222,8 +222,10 @@ fn revoke_multi_grantee_with_as_principal() {
 // ── Formatter guard ──────────────────────────────────────────────────
 
 fn format_and_verify_mssql(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
+    let config = FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted =
         format_sql_with_config(sql, &config).unwrap_or_else(|e| panic!("Format failed: {}", e));
     verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())

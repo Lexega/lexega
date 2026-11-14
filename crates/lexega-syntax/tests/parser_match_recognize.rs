@@ -91,10 +91,7 @@ fn test_match_recognize_with_measures() {
 
     let mr = sel.from[0].match_recognize.as_ref().unwrap();
     assert_eq!(mr.measures.len(), 3);
-    assert_eq!(
-        mr.measures[0].alias.span.start < mr.measures[0].alias.span.end,
-        true
-    );
+    assert!(mr.measures[0].alias.span.start < mr.measures[0].alias.span.end);
 }
 
 #[test]

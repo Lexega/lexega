@@ -629,6 +629,156 @@ END;
     );
 }
 
+// The language a procedure's body is written in is read from its LANGUAGE
+// clause, before or after the body, wherever it stands among the header's
+// clauses: SQL and PL/pgSQL are SQL, any other name is kept as written, and a
+// procedure without the clause is in SQL, every dialect's default.
+#[test]
+fn a_procedure_records_the_language_of_its_body() {
+    use lexega_syntax::ast::AstRoutineLanguage;
+    use lexega_syntax::dialect::{
+        bigquery, databricks, mssql, mysql, postgres, redshift, snowflake,
+    };
+    use lexega_syntax::parse_sql_with_dialect;
+
+    let other = |name: &str| AstRoutineLanguage::Other(name.to_string());
+    let sql = AstRoutineLanguage::Sql;
+    let cases = [
+        (
+            snowflake(),
+            "create procedure p() returns string language sql as $$ begin return 'x'; end $$",
+            sql.clone(),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string as $$ begin return 'x'; end $$",
+            sql.clone(),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string as begin return 'x'; end",
+            sql.clone(),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string language javascript comment = 'SQL helper' as $$ return 1; $$",
+            other("javascript"),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns table (sql_text varchar) language javascript as $$ return 1; $$",
+            other("javascript"),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string language python runtime_version='3.11' packages=('sqlalchemy') handler='run_sql' as $$\ndef run_sql(s):\n    return 1\n$$",
+            other("python"),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string language java runtime_version = '11' handler = 'A.run' as $$ class A {} $$",
+            other("java"),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string language scala runtime_version = '2.12' handler = 'A.run' as $$ object A {} $$",
+            other("scala"),
+        ),
+        (
+            snowflake(),
+            "create procedure p() returns string execute as caller language javascript as $$ return 1; $$",
+            other("javascript"),
+        ),
+        (
+            postgres(),
+            "create procedure p() language plpgsql as $$ begin perform 1; end $$",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() as $$ begin perform 1; end $$ language plpgsql",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() language sql as $$ insert into t values (1); $$",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() as $$ insert into t values (1); $$ language sql",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() language plv8 as $$ return 1; $$",
+            other("plv8"),
+        ),
+        (
+            postgres(),
+            "create procedure p() as $$ return 1 $$ language plpython3u",
+            other("plpython3u"),
+        ),
+        (
+            redshift(),
+            "create procedure p() as $$ begin perform 1; end $$ language plpgsql",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() as $$ begin perform 1; end $$ language 'plpgsql'",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() language \"plpgsql\" as $$ begin perform 1; end $$",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() language 'sql' as $$ insert into t values (1); $$",
+            sql.clone(),
+        ),
+        (
+            postgres(),
+            "create procedure p() as $$ return 1 $$ language 'plpython3u'",
+            other("'plpython3u'"),
+        ),
+        (
+            redshift(),
+            "create procedure p() as $$ begin perform 1; end $$ language 'plpgsql'",
+            sql.clone(),
+        ),
+        (
+            databricks(),
+            "create procedure p() language sql as begin select 1; end",
+            sql.clone(),
+        ),
+        (bigquery(), "create procedure p() begin select 1; end", sql.clone()),
+        (
+            bigquery(),
+            "create procedure p() with connection c options(engine='SPARK') language python as 'print(1)'",
+            other("python"),
+        ),
+        (
+            mysql(),
+            "create procedure p() language sql begin select 1; end",
+            sql.clone(),
+        ),
+        (mysql(), "create procedure p() begin select 1; end", sql.clone()),
+        (mssql(), "create procedure p as select 1", sql.clone()),
+        (mssql(), "create procedure p as begin select 1 end", sql.clone()),
+    ];
+    for (dialect, src, expected) in cases {
+        let script =
+            parse_sql_with_dialect(src, &*dialect).unwrap_or_else(|e| panic!("{src}: {e}"));
+        let Some(AstStmt::CreateProcedure(procedure)) = script.stmts.first() else {
+            panic!("{src}: {:?}", script.stmts);
+        };
+        assert_eq!(procedure.language, expected, "{src}");
+    }
+}
+
 #[test]
 fn parse_procedure_with_migration_logic() {
     let src = r#"

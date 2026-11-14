@@ -45,8 +45,7 @@ fn fact_rule_ids_snowflake(sql: &str) -> Vec<String> {
 fn risk_rule_ids_snowflake(sql: &str) -> Vec<String> {
     let report = analyze_risk(sql).expect("analyze_risk succeeds");
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()
 }
@@ -78,8 +77,7 @@ fn risk_rule_ids_pg(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &pg_config())
         .expect("analyze_risk_with_policy_config (pg) succeeds");
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()
 }
@@ -111,8 +109,7 @@ fn risk_rule_ids_mssql(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &mssql_config())
         .expect("analyze_risk_with_policy_config (mssql) succeeds");
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()
 }
@@ -773,4 +770,53 @@ fn info_mssql_hint_silent_without_hint() {
         "ids={:?}",
         ids
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// The context list: an info-level rule's entry is reported apart from
+// the findings.
+// ─────────────────────────────────────────────────────────────────────
+
+fn ids_of(entries: &[lexega_core::analyzer::RuleMatch]) -> Vec<&str> {
+    entries.iter().filter_map(|entry| entry.rule_id()).collect()
+}
+
+#[test]
+fn an_info_level_rule_is_reported_as_context() {
+    let report = analyze_risk("UNDROP SCHEMA app; DELETE FROM t;").expect("analyze_risk succeeds");
+    assert_eq!(
+        ids_of(&report.context),
+        ["INFO-SCHEMA-UNDROP"],
+        "{report:#?}"
+    );
+    assert!(ids_of(&report.findings).contains(&"DML-WRITE-UNBOUNDED"));
+    assert!(!ids_of(&report.findings).contains(&"INFO-SCHEMA-UNDROP"));
+    assert_eq!(
+        report.summary.total_reported_findings,
+        report.findings.len()
+    );
+    assert_eq!(report.summary.info_count, 1);
+    assert_eq!(report.validate(), Ok(()));
+}
+
+#[test]
+fn a_custom_rule_is_context_by_its_level() {
+    let yaml = "rules:\n  \
+        - id: MY-CONTEXT\n    risk_level: info\n    message: a delete\n    \
+        triggers:\n      all_of:\n        - kind: delete\n  \
+        - id: MY-FINDING\n    risk_level: low\n    message: a delete\n    \
+        triggers:\n      all_of:\n        - kind: delete\n";
+    let loaded = lexega_core::rules::load_v1_rules(yaml).expect("rules load");
+    let config = AnalysisConfig {
+        custom_rules: Some(
+            lexega_core::rules::build_v1_rule_corpus(loaded, false)
+                .expect("corpus builds")
+                .into(),
+        ),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config("DELETE FROM t WHERE id = 1;", &config)
+        .expect("analyze_risk succeeds");
+    assert_eq!(ids_of(&report.context), ["MY-CONTEXT"]);
+    assert_eq!(ids_of(&report.findings), ["MY-FINDING"]);
 }

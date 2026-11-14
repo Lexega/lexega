@@ -99,6 +99,7 @@ fn try_parse_privilege_body(p: &mut Parser<'_>) -> ParseResult<AstPrivilegeGrant
         grantees,
         // BigQuery IAM has no WITH GRANT OPTION equivalent.
         with_grant_option: None,
+        as_principal: None,
     })
 }
 
@@ -210,11 +211,8 @@ fn parse_bq_grantee(p: &mut Parser<'_>) -> ParseResult<AstGrantee> {
     // `"\"ALLUSERS\""`), so consumers can match the principal name without
     // escaping the outer quotes. Non-string identifiers
     // (the bare-name fallback) keep the full span.
-    let name_span = if is_string && consumed.span.end > consumed.span.start + 1 {
-        Span {
-            start: consumed.span.start + 1,
-            end: consumed.span.end - 1,
-        }
+    let name_span = if is_string {
+        crate::parser::principal::inner_literal_span(consumed.span, p.source, p.dialect)
     } else {
         consumed.span
     };

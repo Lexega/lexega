@@ -6,7 +6,7 @@ use lexega_syntax::ast::{
     AstSelectItem, AstTimeTravelClause, AstTimeTravelKind, CaseBranch, IfBranch,
     ProjectionItemKind,
 };
-use lexega_syntax::{parse_sql, parse_stmt_from_str, AstExpr, AstStmt};
+use lexega_syntax::{parse_sql, parse_sql_with_dialect, parse_stmt_from_str, AstExpr, AstStmt};
 
 // Helper to unwrap ProjectionItem to SelectItem for tests
 fn as_select_item(item: &lexega_syntax::ast::ProjectionItem) -> &AstSelectItem {
@@ -638,12 +638,16 @@ END;
             let body = &b.body;
             assert_eq!(decls.len(), 1);
             match &decls[0] {
-                AstStmt::Declare {
-                    name,
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        name,
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(
                         name.span.end > name.span.start,
                         "DECLARE name span should be non-empty"
@@ -689,12 +693,16 @@ END;
             let body = &b.body;
             assert_eq!(decls.len(), 1);
             match &decls[0] {
-                AstStmt::Declare {
-                    name,
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        name,
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(
                         name.span.end > name.span.start,
                         "DECLARE name span should be non-empty"
@@ -738,12 +746,16 @@ END;
             let body = &b.body;
             assert_eq!(decls.len(), 1);
             match &decls[0] {
-                AstStmt::Declare {
-                    name,
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        name,
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(
                         name.span.end > name.span.start,
                         "DECLARE name span should be non-empty"
@@ -788,12 +800,16 @@ END;
             let body = &b.body;
             assert_eq!(decls.len(), 1);
             match &decls[0] {
-                AstStmt::Declare {
-                    name,
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        name,
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(
                         name.span.end > name.span.start,
                         "DECLARE name span should be non-empty"
@@ -841,11 +857,15 @@ END;
             assert_eq!(decls.len(), 3);
             // w INTEGER;
             match &decls[0] {
-                AstStmt::Declare {
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     let type_span = type_span.expect("expected type span for w");
                     let type_text = &src[type_span.start as usize..type_span.end as usize];
                     assert_eq!(type_text.trim(), "INTEGER");
@@ -858,11 +878,15 @@ END;
             }
             // x DEFAULT 0;
             match &decls[1] {
-                AstStmt::Declare {
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(type_span.is_none(), "expected no explicit type for x");
                     let def_span = default_expr_span.expect("expected DEFAULT expr for x");
                     let def_text = &src[def_span.start as usize..def_span.end as usize];
@@ -872,11 +896,15 @@ END;
             }
             // y := 1;
             match &decls[2] {
-                AstStmt::Declare {
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     assert!(type_span.is_none(), "expected no explicit type for y");
                     let def_span = default_expr_span.expect("expected initializer expr for y");
                     let def_text = &src[def_span.start as usize..def_span.end as usize];
@@ -1664,7 +1692,9 @@ fn parse_pipe_chain_with_truncate_and_select() {
             match &stmts[0] {
                 AstStmt::Truncate(tr) => {
                     let target_span = tr
-                        .target_table_span
+                        .target_table
+                        .as_ref()
+                        .map(|t| t.span)
                         .expect("expected target table span for TRUNCATE in pipe");
                     let target_text = &src[target_span.start as usize..target_span.end as usize];
                     assert_eq!(target_text, "my_table");
@@ -1739,7 +1769,9 @@ fn parse_flow_stmt_truncate_pipe_chain() {
             match &stmts[0] {
                 AstStmt::Truncate(tr) => {
                     let target_span = tr
-                        .target_table_span
+                        .target_table
+                        .as_ref()
+                        .map(|t| t.span)
                         .expect("expected target table span for TRUNCATE in flow helper");
                     let target_text = &src[target_span.start as usize..target_span.end as usize];
                     assert_eq!(target_text, "my_table");
@@ -1774,7 +1806,9 @@ fn parse_pipe_chain_with_select_and_insert() {
                     let body_text = &src[body_span.start as usize..body_span.end as usize];
                     assert_eq!(body_text, "VALUES (1)");
                     let table_span = ins
-                        .target_table_span()
+                        .target_table
+                        .as_ref()
+                        .map(|t| t.span)
                         .expect("expected target table span in pipe chain");
                     let table_text = &src[table_span.start as usize..table_span.end as usize];
                     assert_eq!(table_text, "my_table");
@@ -1797,7 +1831,11 @@ fn parse_basic_insert_stmt() {
             let body_span = ins.body_span.expect("expected body span for INSERT");
             let body_text = &src[body_span.start as usize..body_span.end as usize];
             assert_eq!(body_text, "VALUES (1, 'a')");
-            let table_span = ins.target_table_span().expect("expected target table span");
+            let table_span = ins
+                .target_table
+                .as_ref()
+                .map(|t| t.span)
+                .expect("expected target table span");
             let table_text = &src[table_span.start as usize..table_span.end as usize];
             assert_eq!(table_text, "my_table");
         }
@@ -1907,11 +1945,13 @@ fn parse_basic_merge_stmt() {
     assert_eq!(script.stmts.len(), 1);
     match &script.stmts[0] {
         AstStmt::Merge(m) => {
-            // target_table_span covers only the table reference tokens
+            // target_table covers only the table reference tokens
             // (not the INTO keyword); the formatter emits INTO explicitly.
             let target_span = m
-                .target_table_span
-                .expect("expected target_table_span for MERGE");
+                .target_table
+                .as_ref()
+                .expect("expected target_table for MERGE")
+                .span;
             let target_text = &src[target_span.start as usize..target_span.end as usize];
             assert_eq!(target_text, "target");
 
@@ -2249,7 +2289,11 @@ fn parse_truncate_basic() {
             let table_text = &src[table_span.start as usize..table_span.end as usize];
             assert_eq!(table_text.to_ascii_uppercase(), "TABLE");
 
-            let target_span = tr.target_table_span.expect("expected target table span");
+            let target_span = tr
+                .target_table
+                .as_ref()
+                .map(|t| t.span)
+                .expect("expected target table span");
             let target_text = &src[target_span.start as usize..target_span.end as usize];
             assert_eq!(target_text, "my_table");
         }
@@ -2269,7 +2313,11 @@ fn parse_truncate_if_exists_qualified() {
             let if_exists_text = &src[if_exists_span.start as usize..if_exists_span.end as usize];
             assert_eq!(if_exists_text.to_ascii_uppercase(), "IF EXISTS");
 
-            let target_span = tr.target_table_span.expect("expected target table span");
+            let target_span = tr
+                .target_table
+                .as_ref()
+                .map(|t| t.span)
+                .expect("expected target table span");
             let target_text = &src[target_span.start as usize..target_span.end as usize];
             assert_eq!(target_text, "db.schema.\"MyTable\"");
         }
@@ -2292,7 +2340,7 @@ fn parse_create_table_basic() {
             let table_kw_text =
                 &src[ct.table_keyword_span.start as usize..ct.table_keyword_span.end as usize];
             assert_eq!(table_kw_text.to_ascii_uppercase(), "TABLE");
-            let name_text = &src[ct.name_span.start as usize..ct.name_span.end as usize];
+            let name_text = &src[ct.name.span.start as usize..ct.name.span.end as usize];
             assert_eq!(name_text, "mytable");
             let cols_span = ct.columns_span.expect("expected columns span");
             let cols_text = &src[cols_span.start as usize..cols_span.end as usize];
@@ -2331,6 +2379,43 @@ fn parse_create_table_with_or_replace_temp_and_comment() {
             assert_eq!(comment_text, "COMMENT = 'foo'");
         }
         _ => panic!("expected CREATE TABLE statement"),
+    }
+}
+
+#[test]
+fn parse_create_table_persistence_follows_its_modifiers() {
+    use lexega_syntax::ast::AstTablePersistence::{Temporary, Transient};
+    let snowflake = [
+        ("CREATE TABLE t (a INT)", None),
+        ("CREATE TEMP TABLE t (a INT)", Some(Temporary)),
+        ("CREATE TEMPORARY TABLE t (a INT)", Some(Temporary)),
+        ("CREATE VOLATILE TABLE t (a INT)", Some(Temporary)),
+        ("CREATE LOCAL TEMPORARY TABLE t (a INT)", Some(Temporary)),
+        ("CREATE GLOBAL TEMP TABLE t (a INT)", Some(Temporary)),
+        (
+            "CREATE OR REPLACE TRANSIENT TABLE t (a INT)",
+            Some(Transient),
+        ),
+    ];
+    for (src, expected) in snowflake {
+        let script = parse_sql(src).expect("script");
+        match &script.stmts[0] {
+            AstStmt::CreateTable(ct) => assert_eq!(ct.persistence, expected, "{src}"),
+            other => panic!("expected CREATE TABLE for {src}, got {other:?}"),
+        }
+    }
+    let databricks = lexega_syntax::dialect::databricks();
+    for (src, expected) in [
+        ("CREATE OR REFRESH LIVE TABLE t AS SELECT 1", None),
+        ("CREATE OR REFRESH STREAMING LIVE TABLE t AS SELECT 1", None),
+        ("CREATE OR REFRESH STREAMING TABLE t AS SELECT 1", None),
+        ("CREATE TEMPORARY LIVE TABLE t AS SELECT 1", Some(Temporary)),
+    ] {
+        let script = parse_sql_with_dialect(src, databricks.as_ref()).expect("script");
+        match &script.stmts[0] {
+            AstStmt::CreateTable(ct) => assert_eq!(ct.persistence, expected, "{src}"),
+            other => panic!("expected CREATE TABLE for {src}, got {other:?}"),
+        }
     }
 }
 
@@ -2625,7 +2710,8 @@ fn parse_create_table_with_tag_and_with_tag() {
         _ => panic!("expected CREATE TABLE"),
     }
 
-    // WITH TAG option: tag_span anchored at TAG token but includes full clause
+    // WITH TAG option: tag_span is the whole clause, its WITH included, and
+    // no other field holds the WITH.
     let src2 = "CREATE TABLE t (c NUMBER) WITH TAG (k = 'v')";
     let script2 = parse_sql(src2).expect("script2");
     assert_eq!(script2.stmts.len(), 1);
@@ -2638,7 +2724,8 @@ fn parse_create_table_with_tag_and_with_tag() {
             assert_eq!(opts_text, "WITH TAG (k = 'v')");
             let tag_span = ct.tag_span.expect("expected TAG span for WITH TAG");
             let tag_text = &src2[tag_span.start as usize..tag_span.end as usize];
-            assert_eq!(tag_text, "TAG (k = 'v')");
+            assert_eq!(tag_text, "WITH TAG (k = 'v')");
+            assert!(ct.with_contact_span.is_none());
         }
         _ => panic!("expected CREATE TABLE"),
     }
@@ -2681,16 +2768,11 @@ fn parse_create_table_with_row_access_policy_and_with_row_access_policy() {
             let with_row_span = ct
                 .with_row_access_policy_span
                 .expect("expected WITH ROW ACCESS POLICY span");
-            // Current parser anchors the WITH span at the `WITH` token but
-            // stops at the next starter (`ROW`), so the span is just "WITH".
+            // The clause written with WITH is one span, its WITH included;
+            // the clause written without it is `row_access_policy_span`.
             let with_row_text = &src2[with_row_span.start as usize..with_row_span.end as usize];
-            assert_eq!(with_row_text, "WITH");
-            // The actual ROW ACCESS POLICY clause is captured in `row_access_policy_span`.
-            let row_span = ct
-                .row_access_policy_span
-                .expect("expected ROW ACCESS POLICY span for WITH ROW");
-            let row_text = &src2[row_span.start as usize..row_span.end as usize];
-            assert_eq!(row_text, "ROW ACCESS POLICY my_policy ON (c)");
+            assert_eq!(with_row_text, "WITH ROW ACCESS POLICY my_policy ON (c)");
+            assert!(ct.row_access_policy_span.is_none());
         }
         _ => panic!("expected CREATE TABLE"),
     }
@@ -4465,11 +4547,15 @@ END;
             let decls = &b.decls;
             assert_eq!(decls.len(), 1);
             match &decls[0] {
-                AstStmt::Declare {
-                    type_span,
-                    default_expr_span,
-                    ..
-                } => {
+                AstStmt::Declare { variables, .. } => {
+                    let [lexega_syntax::ast::AstDeclaredVariable {
+                        type_span,
+                        default_expr_span,
+                        ..
+                    }] = variables.as_slice()
+                    else {
+                        panic!("expected one declared variable");
+                    };
                     let type_text = type_span
                         .as_ref()
                         .map(|s| &src[s.start as usize..s.end as usize]);
@@ -4594,7 +4680,7 @@ END;
         AstStmt::CreateFunction(func_stmt) => {
             let name_span = func_stmt.name_span;
             let params_span = func_stmt.params_span;
-            let returns_span = func_stmt.returns_span;
+            let returns_span = func_stmt.returns.expect("RETURNS is written").span;
             let body_span = func_stmt.body_span;
             let name = &src[name_span.start as usize..name_span.end as usize];
             assert_eq!(name, "add_two");
@@ -4658,7 +4744,7 @@ END;
 
     match &script.stmts[0] {
         AstStmt::CreateFunction(func_stmt) => {
-            let returns_span = func_stmt.returns_span;
+            let returns_span = func_stmt.returns.expect("RETURNS is written").span;
             let returns_text = &src[returns_span.start as usize..returns_span.end as usize];
             assert!(
                 returns_text.to_uppercase().contains("TABLE"),
@@ -4854,7 +4940,7 @@ END;
     match &script.stmts[0] {
         AstStmt::CreateFunction(func_stmt) => {
             let name_span = func_stmt.name_span;
-            let returns_span = func_stmt.returns_span;
+            let returns_span = func_stmt.returns.expect("RETURNS is written").span;
             let name = &src[name_span.start as usize..name_span.end as usize];
             assert_eq!(name, "get_filtered_data");
 
@@ -4913,4 +4999,1345 @@ END;
         }
         _ => panic!("expected CreateProcedure statement"),
     }
+}
+
+/// The first FOR loop of `stmts`, inside blocks and `DO` bodies.
+fn first_for_loop(stmts: &[AstStmt]) -> Option<&lexega_syntax::ast::AstForStmt> {
+    stmts.iter().find_map(|s| {
+        if let AstStmt::For(f) = s {
+            Some(f.as_ref())
+        } else if let AstStmt::Block(b) = s {
+            first_for_loop(&b.body)
+        } else if let AstStmt::DoBlock(d) = s {
+            d.body_stmt
+                .as_deref()
+                .and_then(|body| first_for_loop(std::slice::from_ref(body)))
+        } else {
+            None
+        }
+    })
+}
+
+#[test]
+fn a_compound_statement_whose_header_does_not_parse_holds_it_as_an_error_and_reads_its_body() {
+    use lexega_syntax::ast::AstForIterable;
+    use lexega_syntax::dialect::{bigquery, postgres, snowflake};
+    // The statements of the first block a script holds (bare or a DO body).
+    fn block_body(stmts: &[AstStmt]) -> &[AstStmt] {
+        for s in stmts {
+            if let AstStmt::Block(b) = s {
+                return &b.body;
+            }
+            if let AstStmt::DoBlock(d) = s {
+                if let Some(AstStmt::Block(b)) = d.body_stmt.as_deref() {
+                    return &b.body;
+                }
+            }
+        }
+        panic!("no block: {stmts:?}")
+    }
+    // The text of an unparsed header, and the body after it.
+    fn unparsed<'a>(src: &str, e: &AstExpr, body: &'a [AstStmt]) -> (String, &'a [AstStmt]) {
+        let AstExpr::Error { span, .. } = e else {
+            panic!("expected the header as an error: {e:?}");
+        };
+        (
+            src[span.start as usize..span.end as usize].to_string(),
+            body,
+        )
+    }
+    let cases = [
+        (
+            "BEGIN IF (x = ) THEN DELETE FROM a; END IF; END;",
+            snowflake(),
+            "(x = )",
+        ),
+        (
+            "BEGIN IF (x = 1) THEN NULL; ELSEIF (x = ) THEN DELETE FROM a; END IF; END;",
+            snowflake(),
+            "(x = )",
+        ),
+        (
+            "BEGIN WHILE (x < ) DO DELETE FROM a; END WHILE; END;",
+            snowflake(),
+            "(x < )",
+        ),
+        (
+            "BEGIN FOR i IN 1 TO ) DO DELETE FROM a; END FOR; END;",
+            snowflake(),
+            "1 TO )",
+        ),
+        (
+            "BEGIN CASE WHEN x = THEN DELETE FROM a; END CASE; END;",
+            snowflake(),
+            "x =",
+        ),
+        (
+            "BEGIN IF x = THEN DELETE FROM a WHERE true; END IF; END;",
+            bigquery(),
+            "x =",
+        ),
+        (
+            "DO $$ BEGIN WHILE x < LOOP DELETE FROM a; END LOOP; END $$;",
+            postgres(),
+            "x <",
+        ),
+        (
+            "DO $$ BEGIN FOR r IN SELECT FROM WHERE LOOP DELETE FROM a; END LOOP; END $$;",
+            postgres(),
+            "SELECT FROM WHERE",
+        ),
+        (
+            "BEGIN REPEAT DELETE FROM a; UNTIL (x = ) END REPEAT; END;",
+            snowflake(),
+            "(x = )",
+        ),
+        (
+            "BEGIN REPEAT DELETE FROM a WHERE true; UNTIL x = END REPEAT; END;",
+            bigquery(),
+            "x =",
+        ),
+        (
+            "BEGIN CASE (x +) WHEN 1 THEN DELETE FROM a; END CASE; END;",
+            snowflake(),
+            "(x +)",
+        ),
+        (
+            "DO $$ BEGIN CASE x + WHEN 1 THEN DELETE FROM a; END CASE; END $$;",
+            postgres(),
+            "x +",
+        ),
+    ];
+    for (src, dialect, header) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let stmt = &block_body(&script.stmts)[0];
+        let (text, body) = if let AstStmt::If(i) = stmt {
+            let last = i.branches.last().expect("a branch");
+            assert!(last.lparen_token.is_none() && last.rparen_token.is_none());
+            unparsed(src, &last.condition, &last.body)
+        } else if let AstStmt::While(w) = stmt {
+            unparsed(src, &w.condition, &w.body)
+        } else if let AstStmt::CaseStmt(c) = stmt {
+            let header = c.operand.as_deref().unwrap_or(&c.branches[0].condition);
+            unparsed(src, header, &c.branches[0].body)
+        } else if let AstStmt::For(f) = stmt {
+            let AstForIterable::Expr(e) = &f.iterates else {
+                panic!("expected the header as an expression: {:?}", f.iterates);
+            };
+            unparsed(src, e, &f.body)
+        } else if let AstStmt::Repeat(r) = stmt {
+            unparsed(src, &r.until_condition, &r.body)
+        } else {
+            panic!("expected the compound statement: {stmt:?}");
+        };
+        assert_eq!(text, header, "{src}");
+        assert!(
+            matches!(body, [AstStmt::Delete(_)]),
+            "the body is read: {src}: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn a_compound_statement_missing_its_header_keyword_holds_the_header_as_an_error_and_reads_its_body()
+{
+    use lexega_syntax::ast::AstForIterable;
+    use lexega_syntax::dialect::{bigquery, mysql, snowflake};
+    // The statements of the first block or procedure body a script holds.
+    fn block_body(stmts: &[AstStmt]) -> &[AstStmt] {
+        for s in stmts {
+            if let AstStmt::Block(b) = s {
+                return &b.body;
+            }
+            if let AstStmt::CreateProcedure(c) = s {
+                if let Some(AstStmt::Block(b)) = c.body_stmt.as_deref() {
+                    return &b.body;
+                }
+            }
+        }
+        panic!("no block: {stmts:?}")
+    }
+    // The text of an unparsed header.
+    fn unparsed(src: &str, e: &AstExpr) -> String {
+        let AstExpr::Error { span, .. } = e else {
+            panic!("expected the header as an error: {e:?}");
+        };
+        src[span.start as usize..span.end as usize].to_string()
+    }
+    // (script, dialect, the header's text, whether the statement closes
+    // with its own END).
+    let cases = [
+        (
+            "BEGIN IF (x = 1) DELETE FROM a; END IF; DELETE FROM b; END;",
+            snowflake(),
+            "(x = 1)",
+            true,
+        ),
+        (
+            "BEGIN IF (x = 1) THEN NULL; ELSEIF (x = 2) DELETE FROM a; END IF; END;",
+            snowflake(),
+            "(x = 2)",
+            true,
+        ),
+        (
+            "BEGIN WHILE (x = 1) DELETE FROM a; END WHILE; END;",
+            snowflake(),
+            "(x = 1)",
+            true,
+        ),
+        (
+            "BEGIN FOR i IN 1 TO 3 DELETE FROM a; END FOR; END;",
+            snowflake(),
+            "1 TO 3",
+            true,
+        ),
+        (
+            "BEGIN CASE WHEN x = 1 DELETE FROM a; END CASE; END;",
+            snowflake(),
+            "x = 1",
+            true,
+        ),
+        (
+            "BEGIN IF x = 1 DELETE FROM a WHERE true; END IF; END;",
+            bigquery(),
+            "x = 1",
+            true,
+        ),
+        (
+            "CREATE PROCEDURE p() BEGIN WHILE x < 1 DELETE FROM a; END WHILE; END",
+            mysql(),
+            "x < 1",
+            true,
+        ),
+        // A call in the header is not a statement.
+        (
+            "BEGIN IF IF(x, 1, 0) = 1 DELETE FROM a WHERE true; END IF; END;",
+            bigquery(),
+            "IF(x, 1, 0) = 1",
+            true,
+        ),
+        // Never closed: the block keeps its END.
+        (
+            "BEGIN IF (x = 1) DELETE FROM a; END;",
+            snowflake(),
+            "(x = 1)",
+            false,
+        ),
+        (
+            "BEGIN WHILE (x = 1) DELETE FROM a; END;",
+            snowflake(),
+            "(x = 1)",
+            false,
+        ),
+        (
+            "BEGIN CASE WHEN x = 1 DELETE FROM a; END;",
+            snowflake(),
+            "x = 1",
+            false,
+        ),
+    ];
+    for (src, dialect, header, closed) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let block = block_body(&script.stmts);
+        let stmt = &block[0];
+        let (text, body, keyword, end) = if let AstStmt::If(i) = stmt {
+            let last = i.branches.last().expect("a branch");
+            (
+                unparsed(src, &last.condition),
+                &last.body,
+                last.then_token,
+                i.end_token,
+            )
+        } else if let AstStmt::While(w) = stmt {
+            (
+                unparsed(src, &w.condition),
+                &w.body,
+                w.body_keyword_token,
+                w.end_token,
+            )
+        } else if let AstStmt::CaseStmt(c) = stmt {
+            let b = &c.branches[0];
+            (
+                unparsed(src, &b.condition),
+                &b.body,
+                b.then_token,
+                c.end_token,
+            )
+        } else if let AstStmt::For(f) = stmt {
+            let AstForIterable::Expr(e) = &f.iterates else {
+                panic!("expected the header as an expression: {:?}", f.iterates);
+            };
+            (unparsed(src, e), &f.body, f.body_keyword_token, f.end_token)
+        } else {
+            panic!("expected the compound statement: {stmt:?}");
+        };
+        assert_eq!(text, header, "{src}");
+        assert!(keyword.is_none(), "no keyword is written: {src}");
+        assert!(
+            matches!(body.as_slice(), [AstStmt::Delete(_)]),
+            "the body is read: {src}: {body:?}"
+        );
+        assert_eq!(end.is_some(), closed, "{src}");
+        assert!(
+            !block.iter().any(|s| matches!(s, AstStmt::Error { .. })),
+            "nothing else is an error: {src}: {block:?}"
+        );
+    }
+}
+
+#[test]
+fn routines_whose_begin_never_closes_are_read_in_linear_time() {
+    use lexega_syntax::dialect::{mysql, snowflake};
+    // A body `BEGIN` with no `END` after it is read to its first `;`, and
+    // the routines after it are read on; one, four and sixteen times as
+    // many, each size read once its smaller one was.
+    type Form = (fn(usize) -> String, lexega_syntax::dialect::DialectRef);
+    let forms: [Form; 3] = [
+        (
+            |k| format!("CREATE PROCEDURE p{k}() BEGIN DELETE FROM orders;\n"),
+            mysql(),
+        ),
+        (
+            |k| format!("CREATE FUNCTION f{k}() RETURNS INT BEGIN DELETE FROM orders;\n"),
+            mysql(),
+        ),
+        (
+            |k| {
+                format!(
+                    "CREATE OR REPLACE PROCEDURE p{k}() RETURNS INT LANGUAGE SQL AS BEGIN \
+                     DELETE FROM orders;\n"
+                )
+            },
+            snowflake(),
+        ),
+    ];
+    for (routine, dialect) in forms {
+        let measure = |n: usize| {
+            let src: String = (0..n).map(routine).collect();
+            let started = std::time::Instant::now();
+            let script = parse_sql_with_dialect(&src, dialect.as_ref()).expect("parses");
+            (script.stmts.len(), started.elapsed())
+        };
+        let slack = std::time::Duration::from_millis(500);
+        let (one, x1) = measure(250);
+        let (four, x4) = measure(1_000);
+        assert!(
+            four == 4 * one && x4 < x1 * 8 + slack,
+            "{one} and {four} statements took {x1:?} and {x4:?}: {}",
+            routine(0)
+        );
+        let (sixteen, x16) = measure(4_000);
+        assert!(
+            sixteen == 16 * one && x16 < x4 * 8 + slack,
+            "{four} and {sixteen} statements took {x4:?} and {x16:?}: {}",
+            routine(0)
+        );
+    }
+}
+
+#[test]
+fn routines_whose_begin_never_closes_before_one_that_does_are_read_in_linear_time() {
+    use lexega_syntax::dialect::{mysql, snowflake};
+    // Each unclosed body is read on into the routines after it, up to the
+    // `END` of the last; every body is read to its failure once. One, four
+    // and sixteen times as many, each size read once its smaller one was.
+    type Form<'a> = (
+        fn(usize) -> String,
+        &'a str,
+        lexega_syntax::dialect::DialectRef,
+    );
+    let forms: [Form<'_>; 3] = [
+        (
+            |k| format!("CREATE PROCEDURE p{k}() BEGIN DELETE FROM orders;\n"),
+            "CREATE PROCEDURE q() BEGIN DELETE FROM archive; END;\n",
+            mysql(),
+        ),
+        (
+            |k| format!("CREATE FUNCTION f{k}() RETURNS INT BEGIN DELETE FROM orders;\n"),
+            "CREATE FUNCTION g() RETURNS INT BEGIN RETURN 1; END;\n",
+            mysql(),
+        ),
+        (
+            |k| {
+                format!(
+                    "CREATE OR REPLACE PROCEDURE p{k}() RETURNS INT LANGUAGE SQL AS BEGIN \
+                     DELETE FROM orders;\n"
+                )
+            },
+            "CREATE OR REPLACE PROCEDURE q() RETURNS INT LANGUAGE SQL AS BEGIN \
+             DELETE FROM archive; END;\n",
+            snowflake(),
+        ),
+    ];
+    for (routine, closed, dialect) in forms {
+        let measure = |n: usize| {
+            let src: String = (0..n).map(routine).chain([closed.to_string()]).collect();
+            let started = std::time::Instant::now();
+            let script = parse_sql_with_dialect(&src, dialect.as_ref()).expect("parses");
+            (script.stmts.len(), started.elapsed())
+        };
+        let slack = std::time::Duration::from_millis(500);
+        let (one, x1) = measure(250);
+        assert_eq!(one, 251, "{}{closed}", routine(0));
+        let (four, x4) = measure(1_000);
+        assert!(
+            four == 1_001 && x4 < x1 * 8 + slack,
+            "{one} and {four} statements took {x1:?} and {x4:?}: {}{closed}",
+            routine(0)
+        );
+        let (sixteen, x16) = measure(4_000);
+        assert!(
+            sixteen == 4_001 && x16 < x4 * 8 + slack,
+            "{four} and {sixteen} statements took {x4:?} and {x16:?}: {}{closed}",
+            routine(0)
+        );
+    }
+}
+
+#[test]
+fn reading_nested_headers_with_no_keyword_is_linear_in_the_source() {
+    use lexega_syntax::dialect::snowflake;
+    // Each header ends where its body's first statement starts, found from
+    // the header on, however deep the statements nest.
+    let measure = |depth: usize, copies: usize| {
+        let nested = format!(
+            "{}NULL; {}",
+            "IF (x = 1) ".repeat(depth),
+            "END IF; ".repeat(depth)
+        );
+        let src = format!("BEGIN {}END;", nested.repeat(copies));
+        let started = std::time::Instant::now();
+        let script = parse_sql_with_dialect(&src, snowflake().as_ref()).expect("parses");
+        assert_eq!(script.stmts.len(), 1);
+        started.elapsed()
+    };
+    let small = measure(60, 40);
+    let large = measure(240, 40);
+    assert!(
+        large < small * 8 + std::time::Duration::from_millis(500),
+        "four times the nesting took {large:?} against {small:?}"
+    );
+}
+
+#[test]
+fn a_repeat_loop_keeps_its_until_condition() {
+    use lexega_syntax::dialect::{bigquery, databricks, mysql, snowflake};
+    let cases = [
+        (
+            "BEGIN REPEAT NULL; UNTIL (x > (1 + 2)) END REPEAT; END;",
+            snowflake(),
+            "(x > (1 + 2))",
+        ),
+        (
+            "BEGIN REPEAT SELECT 1; UNTIL x > 10 END REPEAT; END;",
+            bigquery(),
+            "x > 10",
+        ),
+        (
+            "BEGIN DECLARE x INT; REPEAT SELECT 1; UNTIL x > 10 AND x < 20 END REPEAT; END;",
+            databricks(),
+            "x > 10 AND x < 20",
+        ),
+        (
+            "CREATE PROCEDURE p() BEGIN DECLARE x INT; \
+             REPEAT SET x = x + 1; UNTIL x > (SELECT 10) END REPEAT; END",
+            mysql(),
+            "x > (SELECT 10)",
+        ),
+    ];
+    // The first REPEAT at any depth of the statements.
+    fn first_repeat(stmts: &[AstStmt]) -> Option<&lexega_syntax::ast::AstRepeatStmt> {
+        stmts.iter().find_map(|s| {
+            if let AstStmt::Repeat(r) = s {
+                Some(r.as_ref())
+            } else if let AstStmt::Block(b) = s {
+                first_repeat(&b.decls).or_else(|| first_repeat(&b.body))
+            } else if let AstStmt::CreateProcedure(p) = s {
+                p.body_stmt
+                    .as_deref()
+                    .and_then(|body| first_repeat(std::slice::from_ref(body)))
+                    .or_else(|| first_repeat(&p.body_statements))
+            } else {
+                None
+            }
+        })
+    }
+    for (src, dialect, condition) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let r = first_repeat(&script.stmts).expect("a REPEAT loop");
+        assert!(
+            !matches!(*r.until_condition, AstExpr::Error { .. }),
+            "{src}: {:?}",
+            r.until_condition
+        );
+        let s = r.until_condition.span();
+        assert_eq!(&src[s.start as usize..s.end as usize], condition, "{src}");
+        assert_eq!(r.until_condition_span, s, "{src}");
+    }
+}
+
+#[test]
+fn a_simple_case_statement_keeps_its_operand() {
+    use lexega_syntax::dialect::{bigquery, databricks, mysql, postgres, snowflake};
+    // (script, dialect, the operand's text; None for a searched CASE).
+    let cases = [
+        (
+            "BEGIN CASE (x) WHEN 1 THEN NULL; END CASE; END;",
+            snowflake(),
+            Some("(x)"),
+        ),
+        (
+            "BEGIN CASE (CASE WHEN x = 1 THEN 1 END + 1) WHEN 2 THEN NULL; END CASE; END;",
+            snowflake(),
+            Some("(CASE WHEN x = 1 THEN 1 END + 1)"),
+        ),
+        (
+            "BEGIN CASE WHEN x = 1 THEN NULL; END CASE; END;",
+            snowflake(),
+            None,
+        ),
+        (
+            "DO $$ BEGIN CASE x + 1 WHEN 1 THEN NULL; END CASE; END $$;",
+            postgres(),
+            Some("x + 1"),
+        ),
+        (
+            "BEGIN CASE x WHEN 1 THEN SELECT 1; END CASE; END;",
+            bigquery(),
+            Some("x"),
+        ),
+        (
+            "BEGIN DECLARE x INT; CASE x WHEN 1 THEN SELECT 1; END CASE; END;",
+            databricks(),
+            Some("x"),
+        ),
+        (
+            "CREATE PROCEDURE p() BEGIN CASE (SELECT COUNT(*) FROM t) WHEN 0 THEN SELECT 1; \
+             END CASE; END",
+            mysql(),
+            Some("(SELECT COUNT(*) FROM t)"),
+        ),
+    ];
+    // The first CASE statement at any depth of the statements.
+    fn first_case(stmts: &[AstStmt]) -> Option<&lexega_syntax::ast::AstCaseStmt> {
+        stmts.iter().find_map(|s| {
+            if let AstStmt::CaseStmt(c) = s {
+                Some(c.as_ref())
+            } else if let AstStmt::Block(b) = s {
+                first_case(&b.decls).or_else(|| first_case(&b.body))
+            } else if let AstStmt::DoBlock(d) = s {
+                d.body_stmt
+                    .as_deref()
+                    .and_then(|body| first_case(std::slice::from_ref(body)))
+            } else if let AstStmt::CreateProcedure(p) = s {
+                p.body_stmt
+                    .as_deref()
+                    .and_then(|body| first_case(std::slice::from_ref(body)))
+                    .or_else(|| first_case(&p.body_statements))
+            } else {
+                None
+            }
+        })
+    }
+    for (src, dialect, operand) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let c = first_case(&script.stmts).expect("a CASE statement");
+        let text = c.operand.as_deref().map(|e| {
+            assert!(!matches!(e, AstExpr::Error { .. }), "{src}: {e:?}");
+            let s = e.span();
+            assert_eq!(c.operand_span, Some(s), "{src}");
+            &src[s.start as usize..s.end as usize]
+        });
+        assert_eq!(text, operand, "{src}");
+    }
+}
+
+#[test]
+fn a_simple_case_statement_keeps_every_value_of_a_when_list() {
+    use lexega_syntax::dialect::{postgres, snowflake};
+    // (script, dialect, each WHEN's values' texts; the first is `condition`).
+    let cases = [
+        (
+            "DO $$ BEGIN CASE x WHEN 1, 2 THEN DELETE FROM a; END CASE; END $$;",
+            postgres(),
+            vec![vec!["1", "2"]],
+        ),
+        (
+            "DO $$ BEGIN CASE x + 1 WHEN 0 THEN NULL; WHEN (1), CASE WHEN x > 0 THEN 2 END, \
+             abs(-3) THEN DELETE FROM a; END CASE; END $$;",
+            postgres(),
+            vec![
+                vec!["0"],
+                vec!["(1)", "CASE WHEN x > 0 THEN 2 END", "abs(-3)"],
+            ],
+        ),
+        (
+            "BEGIN CASE x WHEN 'a', 'b' THEN DELETE FROM a; WHEN 'c' THEN NULL; END CASE; END;",
+            snowflake(),
+            vec![vec!["'a'", "'b'"], vec!["'c'"]],
+        ),
+        (
+            "BEGIN CASE WHEN x = 1 THEN DELETE FROM a; END CASE; END;",
+            snowflake(),
+            vec![vec!["x = 1"]],
+        ),
+    ];
+    let text = |src: &str, e: &AstExpr| {
+        assert!(!matches!(e, AstExpr::Error { .. }), "{src}: {e:?}");
+        let s = e.span();
+        src[s.start as usize..s.end as usize].to_string()
+    };
+    for (src, dialect, whens) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let stmt = script
+            .stmts
+            .iter()
+            .find_map(|s| {
+                if let AstStmt::Block(b) = s {
+                    Some(&b.body[0])
+                } else if let AstStmt::DoBlock(d) = s {
+                    if let Some(AstStmt::Block(b)) = d.body_stmt.as_deref() {
+                        Some(&b.body[0])
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("a block");
+        let AstStmt::CaseStmt(c) = stmt else {
+            panic!("expected a CASE statement: {stmt:?}");
+        };
+        let read: Vec<Vec<String>> = c
+            .branches
+            .iter()
+            .map(|b| {
+                std::iter::once(b.condition.as_ref())
+                    .chain(&b.more_values)
+                    .map(|e| text(src, e))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(read, whens, "{src}");
+        for b in &c.branches {
+            let s = b.condition_span;
+            let last = b.more_values.last().unwrap_or(&b.condition).span();
+            assert_eq!(
+                (s.start, s.end),
+                (b.condition.span().start, last.end),
+                "{src}"
+            );
+        }
+        // The formatter prints every value.
+        let config = lexega_syntax::FormatterConfig {
+            dialect,
+            ..Default::default()
+        };
+        let formatted = lexega_syntax::format_sql_with_config(src, &config).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(
+            src,
+            &formatted,
+            config.dialect.as_ref(),
+        )
+        .unwrap_or_else(|e| panic!("{e}\nformatted:\n{formatted}\nSQL:\n{src}"));
+    }
+}
+
+#[test]
+fn a_when_list_with_a_value_that_does_not_parse_is_one_piece_not_parsed() {
+    use lexega_syntax::dialect::postgres;
+    let cases = [
+        (
+            "DO $$ BEGIN CASE x WHEN 1, (2 +) THEN DELETE FROM a; END CASE; END $$;",
+            "1, (2 +)",
+        ),
+        (
+            "DO $$ BEGIN CASE x WHEN 1, THEN DELETE FROM a; END CASE; END $$;",
+            "1,",
+        ),
+        (
+            "DO $$ BEGIN CASE WHEN x = 1, x = 2 THEN DELETE FROM a; END CASE; END $$;",
+            "x = 1, x = 2",
+        ),
+    ];
+    for (src, header) in cases {
+        let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+        let Some(AstStmt::DoBlock(d)) = script.stmts.first() else {
+            panic!("expected a DO block: {:?}", script.stmts);
+        };
+        let Some(AstStmt::Block(b)) = d.body_stmt.as_deref() else {
+            panic!("expected its block: {d:?}");
+        };
+        let AstStmt::CaseStmt(c) = &b.body[0] else {
+            panic!("expected a CASE statement: {:?}", b.body);
+        };
+        let branch = &c.branches[0];
+        let AstExpr::Error { span, .. } = branch.condition.as_ref() else {
+            panic!("expected the header as an error: {:?}", branch.condition);
+        };
+        assert_eq!(
+            &src[span.start as usize..span.end as usize],
+            header,
+            "{src}"
+        );
+        assert!(branch.more_values.is_empty(), "{src}");
+        assert!(
+            matches!(branch.body.as_slice(), [AstStmt::Delete(_)]),
+            "the body is read: {src}: {:?}",
+            branch.body
+        );
+    }
+}
+
+#[test]
+fn a_for_loop_keeps_what_it_iterates() {
+    use lexega_syntax::ast::AstForIterable;
+    use lexega_syntax::dialect::{bigquery, databricks, postgres, snowflake};
+    let text = |src: &str, e: &AstExpr| {
+        let s = e.span();
+        src[s.start as usize..s.end as usize].to_string()
+    };
+
+    // A range: its bounds, `REVERSE` and step; `1..10` reads 1 and 10.
+    let src = "DO $$ BEGIN FOR i IN REVERSE 10..1 BY 2 LOOP NULL; END LOOP; END $$;";
+    let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+    let f = first_for_loop(&script.stmts).expect("a FOR loop");
+    match &f.iterates {
+        AstForIterable::Range {
+            reverse,
+            low,
+            high,
+            step,
+        } => {
+            assert!(*reverse);
+            assert_eq!(text(src, low), "10");
+            assert_eq!(text(src, high), "1");
+            assert_eq!(step.as_deref().map(|s| text(src, s)), Some("2".to_string()));
+        }
+        other => panic!("expected a range: {other:?}"),
+    }
+    let src = "DO $$ BEGIN FOR i IN 1..10 LOOP NULL; END LOOP; END $$;";
+    let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+    match &first_for_loop(&script.stmts).expect("a FOR loop").iterates {
+        AstForIterable::Range { low, high, .. } => {
+            assert_eq!((text(src, low), text(src, high)), ("1".into(), "10".into()));
+        }
+        other => panic!("expected a range: {other:?}"),
+    }
+
+    // A bound read on the header's own tokens is the script's: its operator's
+    // token id and syntax node index the script's tokens and arena.
+    let src = "BEGIN FOR i IN 1 TO n + 1 DO x := i; END FOR; END;";
+    let script = parse_sql_with_dialect(src, snowflake().as_ref()).expect("parses");
+    let f = first_for_loop(&script.stmts).expect("a FOR loop");
+    let AstForIterable::Range { reverse, high, .. } = &f.iterates else {
+        panic!("expected a range: {:?}", f.iterates);
+    };
+    assert!(!*reverse);
+    let AstExpr::BinaryOp { syntax_id, .. } = high.as_ref() else {
+        panic!("expected n + 1: {high:?}");
+    };
+    let tokens = lexega_syntax::lexer::tokenize_with_dialect(src, snowflake().as_ref()).tokens;
+    let op = script.syntax_arena.binary_ops[syntax_id.0 as usize].op_token;
+    assert_eq!(tokens[op.0 as usize].lexeme(src), "+");
+
+    // A query, bare, in parentheses or after AS, and EXECUTE.
+    for (src, dialect, executes) in [
+        (
+            "DO $$ DECLARE r record; BEGIN FOR r IN SELECT id FROM users LOOP NULL; \
+             END LOOP; END $$;",
+            postgres(),
+            false,
+        ),
+        (
+            "DO $$ DECLARE r record; BEGIN FOR r IN EXECUTE 'SELECT id FROM users' LOOP \
+             NULL; END LOOP; END $$;",
+            postgres(),
+            true,
+        ),
+        (
+            "BEGIN FOR x IN (SELECT id FROM users) DO SELECT 1; END FOR; END;",
+            bigquery(),
+            false,
+        ),
+        (
+            "BEGIN FOR r AS SELECT id FROM users DO SELECT 1; END FOR; END;",
+            databricks(),
+            false,
+        ),
+    ] {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let f = first_for_loop(&script.stmts).expect("a FOR loop");
+        let AstForIterable::Query(query) = &f.iterates else {
+            panic!("expected a query: {src}: {:?}", f.iterates);
+        };
+        match query.as_ref() {
+            AstStmt::ExecuteImmediate { immediate_span, .. } if executes => {
+                assert!(immediate_span.is_none(), "{src}");
+            }
+            AstStmt::Select(_) if !executes => {}
+            other => panic!("{src}: {other:?}"),
+        }
+        // Node ids are the script's: none is shared with the loop or its body.
+        assert_ne!(query.node_id(), f.node_id, "{src}");
+        for s in &f.body {
+            assert_ne!(query.node_id(), s.node_id(), "{src}");
+        }
+    }
+
+    // A cursor.
+    let src = "DECLARE c1 CURSOR FOR SELECT id FROM t; BEGIN FOR rec IN c1 DO x := 1; \
+               END FOR; END;";
+    let script = parse_sql_with_dialect(src, snowflake().as_ref()).expect("parses");
+    match &first_for_loop(&script.stmts).expect("a FOR loop").iterates {
+        AstForIterable::Expr(e) => assert_eq!(text(src, e), "c1"),
+        other => panic!("expected a cursor: {other:?}"),
+    }
+}
+
+/// The `PERFORM` statements of a routine or `DO` body, at any depth of its
+/// blocks and `IF` branches.
+fn performs(stmts: &[AstStmt]) -> Vec<&lexega_syntax::ast::AstPerform> {
+    fn body(b: &Option<Box<AstStmt>>) -> &[AstStmt] {
+        b.as_deref().map(std::slice::from_ref).unwrap_or_default()
+    }
+    let mut found = Vec::new();
+    for stmt in stmts {
+        if let AstStmt::Perform(p) = stmt {
+            found.push(p.as_ref());
+        } else if let AstStmt::DoBlock(d) = stmt {
+            found.extend(performs(body(&d.body_stmt)));
+        } else if let AstStmt::CreateFunction(f) = stmt {
+            found.extend(performs(body(&f.body_stmt)));
+        } else if let AstStmt::CreateProcedure(p) = stmt {
+            found.extend(performs(body(&p.body_stmt)));
+        } else if let AstStmt::Block(b) = stmt {
+            found.extend(performs(&b.body));
+        } else if let AstStmt::If(i) = stmt {
+            for branch in &i.branches {
+                found.extend(performs(&branch.body));
+            }
+            found.extend(performs(&i.else_body));
+        }
+    }
+    found
+}
+
+#[test]
+fn perform_reads_its_query_as_a_select_and_formats_as_written() {
+    use lexega_syntax::dialect::{mssql, mysql, postgres, redshift, snowflake};
+    use lexega_syntax::{format_sql_with_config, verify_formatting_safe_with_dialect};
+
+    // (dialect, script, each PERFORM as written, whether its query reads a table)
+    let forms = [
+        (
+            postgres(),
+            "DO $$ BEGIN PERFORM zz_run('ALTER ROLE zz'); END $$;",
+            vec!["PERFORM zz_run('ALTER ROLE zz')"],
+            false,
+        ),
+        (
+            postgres(),
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n  \
+             PERFORM id, name FROM users u WHERE u.id > 1 ORDER BY id LIMIT 3;\nEND;\n$$;\n",
+            vec!["PERFORM id, name FROM users u WHERE u.id > 1 ORDER BY id LIMIT 3"],
+            true,
+        ),
+        (
+            postgres(),
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $b$\nBEGIN\n  IF true THEN\n    \
+             perform  pg_sleep(1) ;\n  END IF;\n  PERFORM 1;\nEND;\n$b$;\n",
+            vec!["perform  pg_sleep(1)", "PERFORM 1"],
+            false,
+        ),
+        (
+            postgres(),
+            "DO $$ BEGIN PERFORM id FROM users UNION ALL SELECT id FROM archive ORDER BY 1; \
+             DELETE FROM orders; END $$;",
+            vec!["PERFORM id FROM users UNION ALL SELECT id FROM archive ORDER BY 1"],
+            true,
+        ),
+        (
+            redshift(),
+            "CREATE PROCEDURE p() AS $$\nBEGIN\n  PERFORM id FROM users;\nEND;\n$$ LANGUAGE plpgsql;\n",
+            vec!["PERFORM id FROM users"],
+            true,
+        ),
+        (
+            postgres(),
+            "DO $$ BEGIN PERFORM (WITH c AS (SELECT 1) SELECT count(*) FROM c); \
+             DELETE FROM orders; END $$;",
+            vec!["PERFORM (WITH c AS (SELECT 1) SELECT count(*) FROM c)"],
+            false,
+        ),
+    ];
+    for (dialect, src, written, reads_table) in forms {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let found = performs(&script.stmts);
+        let texts: Vec<&str> = found
+            .iter()
+            .map(|p| &src[p.span.start as usize..p.span.end as usize])
+            .collect();
+        assert_eq!(texts, written, "{src}");
+        for p in &found {
+            assert_eq!(p.query.span(), p.span, "{src}");
+            let mut first = p.query.as_ref();
+            while let AstStmt::SetSelect(set) = first {
+                first = set.left.as_ref();
+            }
+            let AstStmt::Select(select) = first else {
+                panic!("expected a select: {first:?}");
+            };
+            assert_eq!(select.select_span.start, p.span.start, "{src}");
+            assert_eq!(select.from.len(), usize::from(reads_table), "{src}");
+        }
+        let config = lexega_syntax::FormatterConfig {
+            dialect,
+            ..Default::default()
+        };
+        let formatted = format_sql_with_config(src, &config).expect("formats");
+        verify_formatting_safe_with_dialect(src, &formatted, config.dialect.as_ref())
+            .unwrap_or_else(|e| panic!("{e}\n{formatted}"));
+        for text in written {
+            assert!(formatted.contains(text), "{text} not kept in:\n{formatted}");
+        }
+    }
+
+    // Outside a dollar-quoted routine or `DO` body the word leads no query,
+    // and a variable named `perform` is still assigned to.
+    for (dialect, src) in [
+        (
+            snowflake(),
+            "BEGIN PERFORM count(*) FROM orders; RETURN 1; END;",
+        ),
+        (
+            mssql(),
+            "CREATE PROCEDURE p AS BEGIN PERFORM 1; DELETE FROM orders; END;",
+        ),
+        (
+            mysql(),
+            "CREATE PROCEDURE p() BEGIN PERFORM 1; DELETE FROM orders; END;",
+        ),
+        (snowflake(), "BEGIN perform := 1; RETURN perform; END;"),
+        (
+            postgres(),
+            "DO $$ BEGIN perform := 1; RAISE NOTICE '%', perform; END $$;",
+        ),
+    ] {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        assert!(
+            performs(&script.stmts).is_empty(),
+            "{src}: {:?}",
+            script.stmts
+        );
+    }
+
+    // A query the select parser does not read up to its `;` leaves the
+    // statement kept as written, and the body read on after it.
+    let src = "DO $$ BEGIN PERFORM count(*) FROM c WINDOW; DELETE FROM orders; END $$;";
+    let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+    assert!(performs(&script.stmts).is_empty(), "{:?}", script.stmts);
+    let Some(AstStmt::DoBlock(d)) = script.stmts.first() else {
+        panic!("expected a DO block: {:?}", script.stmts);
+    };
+    let Some(AstStmt::Block(b)) = d.body_stmt.as_deref() else {
+        panic!("expected a block body: {:?}", d.body_stmt);
+    };
+    assert_eq!(b.body.len(), 2, "{:?}", b.body);
+    assert!(matches!(b.body[1], AstStmt::Delete(_)), "{:?}", b.body);
+}
+
+#[test]
+fn a_statement_gives_the_bodies_it_holds_in_the_order_written() {
+    use lexega_syntax::ast::BodyRole;
+    let held = |stmt: &AstStmt| -> Vec<(BodyRole, usize)> {
+        stmt.bodies()
+            .iter()
+            .map(|body| (body.role, body.stmts.len()))
+            .collect()
+    };
+    let one = |sql: &str, dialect: lexega_syntax::dialect::DialectRef| -> AstStmt {
+        let mut script = parse_sql_with_dialect(sql, dialect.as_ref()).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{sql}: {:?}", script.stmts);
+        script.stmts.remove(0)
+    };
+    let snowflake = lexega_syntax::dialect::snowflake;
+    let block = one(
+        "DECLARE x INT; BEGIN x := 1; IF (x = 1) THEN RETURN 1; ELSEIF (x = 2) THEN RETURN 2; \
+         RETURN 3; END IF; EXCEPTION WHEN OTHER THEN RETURN 0; END;",
+        snowflake(),
+    );
+    assert_eq!(
+        held(&block),
+        [
+            (BodyRole::Declarations, 1),
+            (BodyRole::Block, 2),
+            (BodyRole::ExceptionHandler, 1)
+        ]
+    );
+    let AstStmt::Block(b) = &block else {
+        panic!("a block: {block:?}");
+    };
+    assert_eq!(
+        held(&b.body[1]),
+        [
+            (BodyRole::Branch, 1),
+            (BodyRole::Branch, 2),
+            (BodyRole::Else, 0)
+        ]
+    );
+    let mssql = lexega_syntax::dialect::mssql;
+    let try_catch = one(
+        "BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; SELECT 3; END CATCH",
+        mssql(),
+    );
+    assert_eq!(
+        held(&try_catch),
+        [(BodyRole::Block, 1), (BodyRole::Catch, 2)]
+    );
+    let insert_exec = one("INSERT INTO t EXEC dbo.p", mssql());
+    assert_eq!(held(&insert_exec), [(BodyRole::InsertExec, 1)]);
+    let routine = one(
+        "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET @e = 1; \
+         DELETE FROM t; END",
+        lexega_syntax::dialect::mysql(),
+    );
+    assert_eq!(
+        held(&routine),
+        [(BodyRole::Routine, 1), (BodyRole::Routine, 0)]
+    );
+    let AstStmt::CreateProcedure(p) = &routine else {
+        panic!("a procedure: {routine:?}");
+    };
+    let body = p.body_stmt.as_deref().expect("a body");
+    let AstStmt::Block(b) = body else {
+        panic!("a block body: {body:?}");
+    };
+    assert_eq!(held(&b.body[0]), [(BodyRole::HandlerAction, 1)]);
+    let select = one("SELECT 1", snowflake());
+    assert!(held(&select).is_empty(), "a SELECT holds no body");
+}
+
+#[test]
+fn a_plpgsql_raise_reads_its_arguments_and_using_options_as_expressions() {
+    use lexega_syntax::dialect::{bigquery, postgres};
+    fn raise_in(src: &str, dialect: lexega_syntax::dialect::DialectRef) -> AstStmt {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let body = match &script.stmts[0] {
+            AstStmt::DoBlock(d) => match d.body_stmt.as_deref() {
+                Some(AstStmt::Block(b)) => b.body.clone(),
+                other => panic!("a block body: {other:?}"),
+            },
+            AstStmt::Block(b) => b.body.clone(),
+            other => panic!("a block: {other:?}"),
+        };
+        body.into_iter()
+            .find(|s| matches!(s, AstStmt::Raise { .. }))
+            .expect("a RAISE")
+    }
+    let text =
+        |src: &str, e: &AstExpr| src[e.span().start as usize..e.span().end as usize].to_string();
+    // (statement, its arguments, its USING options as `name=value`)
+    let cases: [(&str, &[&str], &[&str]); 7] = [
+        ("RAISE NOTICE '%', f('x');", &["f('x')"], &[]),
+        (
+            "RAISE NOTICE '% %', a + 1, g(b, 'c') USING DETAIL = h('d'), HINT := 'e';",
+            &["a + 1", "g(b, 'c')"],
+            &["DETAIL=h('d')", "HINT='e'"],
+        ),
+        ("RAISE 'plain';", &[], &[]),
+        (
+            "RAISE EXCEPTION USING MESSAGE = m(1), ERRCODE = '22012';",
+            &[],
+            &["MESSAGE=m(1)", "ERRCODE='22012'"],
+        ),
+        (
+            "RAISE division_by_zero USING TABLE = 't';",
+            &[],
+            &["TABLE='t'"],
+        ),
+        ("RAISE SQLSTATE '22012';", &[], &[]),
+        ("RAISE;", &[], &[]),
+    ];
+    for (statement, args, options) in cases {
+        let src = format!("DO $$ BEGIN {statement} END $$;");
+        let AstStmt::Raise {
+            message_args,
+            using_options,
+            message_expr,
+            ..
+        } = raise_in(&src, postgres())
+        else {
+            unreachable!()
+        };
+        let read: Vec<String> = message_args.iter().map(|e| text(&src, e)).collect();
+        assert_eq!(read, args, "{statement}");
+        let read: Vec<String> = using_options
+            .iter()
+            .map(|o| {
+                let name = &src[o.name_span.start as usize..o.name_span.end as usize];
+                format!("{name}={}", text(&src, &o.value))
+            })
+            .collect();
+        assert_eq!(read, options, "{statement}");
+        assert!(message_expr.is_none(), "{statement}");
+    }
+    // An argument that does not parse keeps the payload as written.
+    let src = "DO $$ BEGIN RAISE NOTICE '%', f(1 +; END $$;";
+    if let Ok(script) = parse_sql_with_dialect(src, postgres().as_ref()) {
+        for stmt in &script.stmts {
+            if let AstStmt::DoBlock(d) = stmt {
+                if let Some(AstStmt::Block(b)) = d.body_stmt.as_deref() {
+                    for s in &b.body {
+                        if let AstStmt::Raise { message_args, .. } = s {
+                            assert!(message_args.is_empty(), "{src}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // BigQuery's message is the message expression, as before.
+    let src = "BEGIN RAISE USING MESSAGE = CONCAT('a', f(1)); END;";
+    let AstStmt::Raise {
+        message_expr,
+        message_args,
+        using_options,
+        ..
+    } = raise_in(src, bigquery())
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        message_expr.map(|e| text(src, &e)).as_deref(),
+        Some("CONCAT('a', f(1))")
+    );
+    assert!(message_args.is_empty() && using_options.is_empty());
+}
+
+#[test]
+fn an_assert_reads_its_condition_message_and_description_in_every_dialect() {
+    use lexega_syntax::dialect::{bigquery, postgres, snowflake};
+    let text = |src: &str, span: lexega_syntax::lexer::Span| {
+        src[span.start as usize..span.end as usize].to_string()
+    };
+    // (dialect, script, condition, message, description)
+    let cases = [
+        (
+            postgres(),
+            "DO $$ BEGIN ASSERT x > 0, 'x must be positive'; END $$;",
+            "x > 0",
+            Some("'x must be positive'"),
+            None,
+        ),
+        (
+            postgres(),
+            "DO $$ BEGIN ASSERT (SELECT count(*) FROM t) > 0, f('m' || n); END $$;",
+            "(SELECT count(*) FROM t) > 0",
+            Some("f('m' || n)"),
+            None,
+        ),
+        (
+            postgres(),
+            "DO $$ BEGIN ASSERT 1 = 1; END $$;",
+            "1 = 1",
+            None,
+            None,
+        ),
+        (
+            bigquery(),
+            "ASSERT (SELECT COUNT(*) FROM d.t) > 0 AS 'nonempty';",
+            "(SELECT COUNT(*) FROM d.t) > 0",
+            None,
+            Some("AS 'nonempty'"),
+        ),
+        (
+            bigquery(),
+            "ASSERT 1 = 1, 'm' AS 'd';",
+            "1 = 1",
+            Some("'m'"),
+            Some("AS 'd'"),
+        ),
+        (snowflake(), "ASSERT 1 = 1;", "1 = 1", None, None),
+    ];
+    for (dialect, src, condition, message, description) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let assert = match &script.stmts[0] {
+            AstStmt::BqAssert(a) => a.clone(),
+            AstStmt::DoBlock(d) => match d.body_stmt.as_deref() {
+                Some(AstStmt::Block(b)) => match &b.body[0] {
+                    AstStmt::BqAssert(a) => a.clone(),
+                    other => panic!("an assertion: {other:?}"),
+                },
+                other => panic!("a block body: {other:?}"),
+            },
+            other => panic!("an assertion: {other:?}"),
+        };
+        assert_eq!(text(src, assert.expression.span()), condition, "{src}");
+        assert_eq!(
+            assert
+                .message
+                .as_ref()
+                .map(|m| text(src, m.span()))
+                .as_deref(),
+            message,
+            "{src}"
+        );
+        assert_eq!(
+            assert.description_span.map(|d| text(src, d)).as_deref(),
+            description,
+            "{src}"
+        );
+        let last = description.or(message).unwrap_or(condition);
+        assert!(
+            text(src, assert.span).starts_with("ASSERT") && text(src, assert.span).ends_with(last),
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_get_diagnostics_is_read_in_every_form_and_place() {
+    use lexega_syntax::dialect::{databricks, mysql, postgres};
+    fn diagnostics_in(stmt: &AstStmt, found: &mut Vec<lexega_syntax::lexer::Span>) {
+        if let AstStmt::GetDiagnostics {
+            diagnostics_span, ..
+        } = stmt
+        {
+            found.push(*diagnostics_span);
+        }
+        for body in stmt.bodies() {
+            for inner in body.stmts {
+                diagnostics_in(inner, found);
+            }
+        }
+    }
+    // (dialect, script, the statements read, in order)
+    let cases = [
+        (
+            postgres(),
+            "DO $$ DECLARE n int; BEGIN DELETE FROM t; GET DIAGNOSTICS n = ROW_COUNT; END $$;",
+            vec!["GET DIAGNOSTICS n = ROW_COUNT"],
+        ),
+        (
+            postgres(),
+            "DO $$ DECLARE a text; b text; BEGIN DELETE FROM t; EXCEPTION WHEN others THEN \
+             GET STACKED DIAGNOSTICS a = MESSAGE_TEXT, b = RETURNED_SQLSTATE; \
+             RAISE WARNING 'x'; END $$;",
+            vec!["GET STACKED DIAGNOSTICS a = MESSAGE_TEXT, b = RETURNED_SQLSTATE"],
+        ),
+        (
+            postgres(),
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ DECLARE n int; BEGIN \
+             GET CURRENT DIAGNOSTICS n := ROW_COUNT; END $$;",
+            vec!["GET CURRENT DIAGNOSTICS n := ROW_COUNT"],
+        ),
+        (
+            mysql(),
+            "CREATE PROCEDURE p() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN \
+             GET DIAGNOSTICS CONDITION 1 @m = MESSAGE_TEXT, @s = RETURNED_SQLSTATE; END; \
+             DELETE FROM t; END;",
+            vec!["GET DIAGNOSTICS CONDITION 1 @m = MESSAGE_TEXT, @s = RETURNED_SQLSTATE"],
+        ),
+        (
+            mysql(),
+            "CREATE PROCEDURE p() BEGIN GET STACKED DIAGNOSTICS CONDITION 1 @m = MESSAGE_TEXT; END;",
+            vec!["GET STACKED DIAGNOSTICS CONDITION 1 @m = MESSAGE_TEXT"],
+        ),
+        (
+            databricks(),
+            "BEGIN GET DIAGNOSTICS CONDITION 1 v = MESSAGE_TEXT; END;",
+            vec!["GET DIAGNOSTICS CONDITION 1 v = MESSAGE_TEXT"],
+        ),
+    ];
+    for (dialect, src, expected) in cases {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+        let mut found = Vec::new();
+        script
+            .stmts
+            .iter()
+            .for_each(|stmt| diagnostics_in(stmt, &mut found));
+        let read: Vec<&str> = found
+            .iter()
+            .map(|span| src[span.start as usize..span.end as usize].trim_end_matches(';'))
+            .collect();
+        assert_eq!(read, expected, "{src}");
+    }
+}
+
+/// Every statement of `script` at any depth, the outer before the inner.
+fn every_statement(stmts: &[AstStmt]) -> Vec<&AstStmt> {
+    fn walk<'a>(stmt: &'a AstStmt, out: &mut Vec<&'a AstStmt>) {
+        out.push(stmt);
+        for body in stmt.bodies() {
+            for s in body.stmts {
+                walk(s, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for stmt in stmts {
+        walk(stmt, &mut out);
+    }
+    out
+}
+
+#[test]
+fn a_plpgsql_exit_or_continue_when_reads_its_condition_and_label() {
+    let pg = lexega_syntax::dialect::postgres();
+    let text = |sql: &str, span: lexega_syntax::lexer::Span| {
+        sql[span.start as usize..span.end as usize].to_string()
+    };
+    let sql = "DO $$ DECLARE r record; v int; BEGIN <<outerloop>> FOR r IN SELECT id FROM o LOOP \
+               CONTINUE WHEN r.id < 0; EXIT outerloop WHEN r.id > 10; EXIT; END LOOP; \
+               SELECT id FROM u INTO v; END $$;";
+    let script = parse_sql_with_dialect(sql, &*pg).expect("parses");
+    let tokens = lexega_syntax::lexer::tokenize_with_dialect(sql, &*pg).tokens;
+    let all = every_statement(&script.stmts);
+    let exits: Vec<(Option<String>, bool, Option<String>)> = all
+        .iter()
+        .filter_map(|s| match s {
+            AstStmt::Break {
+                label_token,
+                condition,
+                when_span,
+                ..
+            } => Some((
+                label_token.map(|t| text(sql, tokens[t.0 as usize].span)),
+                when_span.is_some(),
+                condition.as_ref().map(|c| text(sql, c.span())),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        exits,
+        [
+            (
+                Some("outerloop".to_string()),
+                true,
+                Some("r.id > 10".to_string())
+            ),
+            (None, false, None)
+        ]
+    );
+    let continued = all.iter().find_map(|s| match s {
+        AstStmt::Continue { condition, .. } => condition.as_ref().map(|c| text(sql, c.span())),
+        _ => None,
+    });
+    assert_eq!(continued.as_deref(), Some("r.id < 0"));
+    // PL/pgSQL's INTO after FROM.
+    assert!(all.iter().any(|s| matches!(
+        s,
+        AstStmt::Select(select) if select.into_target.is_some()
+    )));
+    let config = lexega_syntax::FormatterConfig {
+        dialect: lexega_syntax::dialect::postgres(),
+        ..Default::default()
+    };
+    let formatted = lexega_syntax::format_sql_with_config(sql, &config).expect("formats");
+    lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*pg)
+        .unwrap_or_else(|e| panic!("{e}\n{formatted}"));
+    assert!(formatted.contains("outerloop WHEN"), "{formatted}");
 }

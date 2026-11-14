@@ -14,11 +14,12 @@ pub mod placeholder_classifier;
 pub mod sarif;
 
 pub use config::AnalysisConfig;
-pub use evidence_utils::LineIndex;
+pub use evidence_utils::{LineIndex, TextPosition};
 pub use gl_sast::{to_gl_sast, GlSastReport};
+pub(crate) use metrics::CatalogSubject;
 pub use metrics::MetricsCollector;
 pub use placeholder_classifier::{
-    classify_placeholder, compute_placeholder_stats, PlaceholderStats,
+    classify_placeholder, classify_placeholders, compute_placeholder_stats, PlaceholderStats,
 };
 pub use sarif::{to_sarif, SarifReport, ToolRun};
 
@@ -26,9 +27,9 @@ use chrono::Utc;
 
 use serde::{Deserialize, Serialize};
 
-/// Source of a policy signal
+/// Source of a policy finding
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SignalSource {
+pub enum FindingSource {
     /// Built-in analyzer (YAML rules in builtin_rules.yaml)
     BuiltIn,
     /// Custom user-defined rule
@@ -36,7 +37,7 @@ pub enum SignalSource {
 }
 
 /// Current schema version for risk artifacts
-pub const RISK_SCHEMA_VERSION: u32 = 1;
+pub const RISK_SCHEMA_VERSION: u32 = 2;
 
 /// Category of skipped statement
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,8 +46,53 @@ pub enum SkipReason {
     UnimplementedStatementType,
     /// OpaqueContent or other unparsed construct (rare edge case)
     UnparsedConstruct,
+    /// A sqlcmd command line that runs what the analysis did not read
+    SqlcmdCommand(SqlcmdUnread),
     /// Other/unknown reason
     Other(String),
+}
+
+/// What a sqlcmd command line runs that the analysis did not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SqlcmdUnread {
+    /// `:r file`: the file's statements, read into the batch
+    IncludedFile,
+    /// `:connect server`: the batch, run on another server
+    OtherServer,
+    /// `!! command`: an operating-system command
+    OsCommand,
+    /// `:ed`: the batch as the editor leaves it
+    EditedBatch,
+    /// `:exit(query)`: the query, sent with the batch
+    ExitQuery,
+}
+
+impl SqlcmdUnread {
+    /// The name an analysis limitation records it by.
+    pub fn as_snake_case(self) -> &'static str {
+        match self {
+            SqlcmdUnread::IncludedFile => "included_file",
+            SqlcmdUnread::OtherServer => "other_server",
+            SqlcmdUnread::OsCommand => "os_command",
+            SqlcmdUnread::EditedBatch => "edited_batch",
+            SqlcmdUnread::ExitQuery => "exit_query",
+        }
+    }
+
+    /// What the command does, as a report says it after the line it is on.
+    pub fn describe(self) -> &'static str {
+        match self {
+            SqlcmdUnread::IncludedFile => "includes a file the analysis did not read",
+            SqlcmdUnread::OtherServer => {
+                "sends the batch to another server, which the analysis did not see"
+            }
+            SqlcmdUnread::OsCommand => "runs an operating-system command",
+            SqlcmdUnread::EditedBatch => {
+                "sends the batch as an editor leaves it, which the analysis did not read"
+            }
+            SqlcmdUnread::ExitQuery => "sends a query the analysis did not read",
+        }
+    }
 }
 
 /// Details about a skipped statement
@@ -61,9 +107,6 @@ pub struct SkippedStatement {
     /// Best-guess impact category: control, security, ddl, dml, or unknown
     #[serde(skip_serializing_if = "Option::is_none")]
     pub impact_category: Option<String>,
-    /// Whether any signals were extracted from this statement
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signals_extracted: Option<bool>,
 }
 
 impl SkippedStatement {
@@ -253,16 +296,14 @@ impl std::fmt::Display for AnalysisDepth {
     }
 }
 
-/// Signals extracted from a single statement (for debugging custom rules)
+/// Findings extracted from a single statement (for debugging custom rules)
 /// Reason code for rule rejection (machine-readable)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReasonCode {
     Disabled,
     NodetypeMismatch,
-    MissingSignal,
     ConditionFailed,
-    SignalPresentButDifferentQualification,
     ResolutionLimitHit,
 }
 
@@ -273,14 +314,6 @@ pub enum RejectionDetails {
     NodetypeMismatch {
         expected: Vec<String>,
         actual: String,
-    },
-    MissingSignal {
-        missing_signals: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        present_signals_sample: Option<Vec<String>>,
-        /// Phase where the signal was missing: "trigger" or "condition"
-        #[serde(skip_serializing_if = "Option::is_none")]
-        phase: Option<String>,
     },
     ConditionFailed {
         block_type: String,
@@ -319,18 +352,13 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-/// Resolution warning for signal tracking limitations
+/// Resolution warning for column tracking limitations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolutionWarning {
     /// Kind of resolution issue
     pub kind: String,
-    /// Column or signal that couldn't be fully resolved
+    /// Column that couldn't be fully resolved
     pub column: String,
-    /// Signal that was actually observed
-    pub observed_signal: String,
-    /// Signal that was expected (if known from rule context)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_signal: Option<String>,
     /// Where resolution stopped (cte, derived_table, unknown)
     pub stopped_at: String,
     /// Detailed reason
@@ -370,11 +398,6 @@ pub struct AlmostMatchedRule {
     pub rule_id: String,
     /// Human-readable rule name
     pub rule_name: String,
-    /// Signals that were missing
-    pub missing_signals: Vec<String>,
-    /// Signals that were present (sample)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub present_signals: Vec<String>,
     /// Brief explanation
     pub reason: String,
 }
@@ -413,9 +436,9 @@ pub struct RejectedRuleExplanation {
     pub explanation: crate::rules::RuleExplanation,
 }
 
-/// Statement-level signal and rule matching information
+/// Statement-level finding and rule matching information
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatementSignals {
+pub struct StatementTrace {
     /// Line number where statement starts
     pub line_number: usize,
     /// First 80 chars of statement
@@ -428,13 +451,13 @@ pub struct StatementSignals {
     /// Rules that were evaluated but didn't match (for debugging)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evaluated_but_not_matched: Vec<EvaluatedRule>,
-    /// Rules that almost matched (verbose mode - missing signals only)
+    /// Rules that almost matched (verbose mode)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub almost_matched: Vec<AlmostMatchedRule>,
     /// Grouped summary of obvious mismatches (trace mode only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected_summary: Option<RejectedSummary>,
-    /// Resolution warnings (signal tracking limitations)
+    /// Resolution warnings (column tracking limitations)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolution_warnings: Vec<ResolutionWarning>,
     /// Per-statement IR-native facts (trace mode only). The public
@@ -605,11 +628,16 @@ pub struct AnalysisReport {
     /// High-level summary
     pub summary: AnalysisSummary,
 
-    /// Detailed signals (evidence stored directly in each signal)
-    pub signals: Vec<RuleMatch>,
+    /// Detailed findings (evidence stored directly in each finding)
+    #[serde(alias = "signals")]
+    pub findings: Vec<RuleMatch>,
 
-    /// Positive security/governance signals (non-blocking)
-    pub positive_signals: Vec<PositiveSignal>,
+    /// Entries of context-level rules: what the change does, with nothing to
+    /// act on. The same entry shape as `findings`; not counted as findings,
+    /// and not written as SARIF results, GitLab SAST vulnerabilities or
+    /// review comments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<RuleMatch>,
 
     /// Details about skipped statements (for transparency)
     pub skipped_details: Vec<SkippedStatement>,
@@ -618,17 +646,19 @@ pub struct AnalysisReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub analysis_limitations: Vec<AnalysisLimitation>,
 
-    /// Per-statement signal breakdown showing which rules matched.
-    /// Only includes RELEVANT signals (governance + used by active rules) to reduce noise.
+    /// Per-statement finding breakdown showing which rules matched.
+    /// Only includes RELEVANT findings (governance + used by active rules) to reduce noise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub statement_signals: Vec<StatementSignals>,
+    #[serde(alias = "statement_signals")]
+    pub statement_traces: Vec<StatementTrace>,
     /// Indicates which statements are included: "matched_only" (default) or "all" (trace)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub statement_signals_mode: Option<String>,
+    #[serde(alias = "statement_signals_mode")]
+    pub statement_traces_mode: Option<String>,
     /// V1 rule-engine diagnostic surface — populated when `trace_mode`
     /// is on. One entry per statement with matched-rule IDs and typed
     /// rejection explanations for each rule that didn't fire.
-    /// Distinct from `statement_signals`. See `StatementExplanation` doc.
+    /// Distinct from `statement_traces`. See `StatementExplanation` doc.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statement_explanations: Vec<StatementExplanation>,
     /// Whether trace mode was enabled (affects detail level)
@@ -647,6 +677,20 @@ pub struct AnalysisReport {
 }
 
 impl AnalysisReport {
+    /// The sqlcmd command lines skipped for running what the analysis did
+    /// not read, each with what it runs. They count among
+    /// `statements_skipped`.
+    pub fn unread_sqlcmd(&self) -> impl Iterator<Item = (&SkippedStatement, SqlcmdUnread)> {
+        self.skipped_details
+            .iter()
+            .filter_map(|skipped| match skipped.reason {
+                SkipReason::SqlcmdCommand(runs) => Some((skipped, runs)),
+                SkipReason::UnimplementedStatementType
+                | SkipReason::UnparsedConstruct
+                | SkipReason::Other(_) => None,
+            })
+    }
+
     pub fn new() -> Self {
         Self {
             schema_version: RISK_SCHEMA_VERSION,
@@ -657,12 +701,12 @@ impl AnalysisReport {
             run_id: None,
             source_file_path: None,
             summary: AnalysisSummary::default(),
-            signals: Vec::new(),
-            positive_signals: Vec::new(),
+            findings: Vec::new(),
+            context: Vec::new(),
             skipped_details: Vec::new(),
             analysis_limitations: Vec::new(),
-            statement_signals: Vec::new(),
-            statement_signals_mode: None,
+            statement_traces: Vec::new(),
+            statement_traces_mode: None,
             statement_explanations: Vec::new(),
             trace_mode: None,
             catalog_info: CatalogInfo::default(),
@@ -670,48 +714,75 @@ impl AnalysisReport {
         }
     }
 
-    /// Get maximum risk level across all signals
+    /// Get maximum risk level across all findings
     pub fn max_risk_level(&self) -> RiskLevel {
-        self.signals
+        self.findings
             .iter()
             .map(|f| f.risk_level())
             .max()
             .unwrap_or(RiskLevel::Low)
     }
 
-    /// Add a signal (evidence is already in the signal).
+    /// Add a finding (evidence is already in the finding).
     /// Also updates summary counts incrementally for performance.
-    pub fn add_signal(&mut self, signal: RuleMatch) {
+    pub fn add_finding(&mut self, finding: RuleMatch) {
         // Increment count by risk level as we add (avoid 4 iterations at the end)
-        match signal.risk_level() {
+        match finding.risk_level() {
             RiskLevel::Critical => self.summary.critical_count += 1,
             RiskLevel::High => self.summary.high_count += 1,
             RiskLevel::Medium => self.summary.medium_count += 1,
             RiskLevel::Low => self.summary.low_count += 1,
             RiskLevel::Info => self.summary.info_count += 1,
         }
-        self.summary.total_reported_signals += 1;
-        self.signals.push(signal);
+        self.summary.total_reported_findings += 1;
+        self.findings.push(finding);
     }
 
-    /// Add a positive signal (non-blocking governance improvement)
-    pub fn add_positive_signal(&mut self, signal: PositiveSignal) {
-        self.positive_signals.push(signal);
+    /// The report's findings, then its context entries.
+    pub fn entries(&self) -> impl Iterator<Item = &RuleMatch> {
+        self.findings.iter().chain(&self.context)
+    }
+
+    /// Move the entries of context-level rules from `findings` into
+    /// `context`, then recount the summary.
+    pub fn separate_context(&mut self) {
+        let (context, findings): (Vec<RuleMatch>, Vec<RuleMatch>) =
+            std::mem::take(&mut self.findings)
+                .into_iter()
+                .partition(|finding| finding.risk_level().is_context());
+        self.findings = findings;
+        self.context.extend(context);
+        self.recount();
+    }
+
+    /// Keep the findings and context entries at `threshold` or above, then
+    /// recount the summary.
+    pub fn retain_at_least(&mut self, threshold: RiskLevel) {
+        self.findings
+            .retain(|finding| finding.risk_level() >= threshold);
+        self.context.retain(|entry| entry.risk_level() >= threshold);
+        self.recount();
+    }
+
+    /// Recount the summary from `findings` and `context`.
+    pub fn recount(&mut self) {
+        self.summary.recalculate_from_findings(&self.findings);
+        self.summary.info_count = self.context.len();
     }
 
     /// Merge another report into this one
     pub fn merge(&mut self, other: AnalysisReport) {
-        // Simple: just extend everything (evidence is already in signals)
-        self.signals.extend(other.signals);
-        self.positive_signals.extend(other.positive_signals);
+        // Simple: just extend everything (evidence is already in findings)
+        self.findings.extend(other.findings);
+        self.context.extend(other.context);
         self.skipped_details.extend(other.skipped_details);
         self.analysis_limitations.extend(other.analysis_limitations);
-        self.statement_signals.extend(other.statement_signals);
+        self.statement_traces.extend(other.statement_traces);
         self.statement_explanations
             .extend(other.statement_explanations);
 
-        // Merge summary counts (since add_signal() updates them incrementally)
-        self.summary.total_reported_signals += other.summary.total_reported_signals;
+        // Merge summary counts (since add_finding() updates them incrementally)
+        self.summary.total_reported_findings += other.summary.total_reported_findings;
         self.summary.critical_count += other.summary.critical_count;
         self.summary.high_count += other.summary.high_count;
         self.summary.medium_count += other.summary.medium_count;
@@ -730,32 +801,32 @@ impl AnalysisReport {
         }
     }
 
-    /// Deduplicate policy signals by topic_key with custom > built-in precedence
+    /// Deduplicate policy findings by topic_key with custom > built-in precedence
     ///
-    /// Groups signals by topic_key (if present). When multiple signals share a topic:
-    /// - If any custom signal exists, suppress all built-in signals for that topic
-    /// - Keep the custom signal and add all rule IDs to contributors
-    /// - If only built-in signals exist, keep them as-is
+    /// Groups findings by topic_key (if present). When multiple findings share a topic:
+    /// - If any custom finding exists, suppress all built-in findings for that topic
+    /// - Keep the custom finding and add all rule IDs to contributors
+    /// - If only built-in findings exist, keep them as-is
     pub fn deduplicate_by_topic(&mut self) {
         use std::collections::{HashMap, HashSet};
 
         // Build index of statement lines covered by custom rules
         let mut custom_rule_lines: HashSet<usize> = HashSet::new();
-        for signal in &self.signals {
-            let RuleMatch::Analysis(pf) = signal;
-            if matches!(pf.source, Some(SignalSource::Custom)) {
+        for finding in &self.findings {
+            let RuleMatch::Analysis(pf) = finding;
+            if matches!(pf.source, Some(FindingSource::Custom)) {
                 if let Some(line) = pf.statement_line_number {
                     custom_rule_lines.insert(line);
                 }
             }
         }
 
-        // Separate policy signals with topic_key from others
+        // Separate policy findings with topic_key from others
         let mut topic_groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut keep_as_is = Vec::new();
 
-        for (idx, signal) in self.signals.iter().enumerate() {
-            match signal {
+        for (idx, finding) in self.findings.iter().enumerate() {
+            match finding {
                 RuleMatch::Analysis(pf) if pf.topic_key.is_some() => {
                     let topic = pf.topic_key.as_ref().unwrap().clone();
                     topic_groups.entry(topic).or_default().push(idx);
@@ -766,34 +837,36 @@ impl AnalysisReport {
             }
         }
 
-        let mut deduped_signals = Vec::new();
+        let mut deduped_findings = Vec::new();
 
-        // Keep non-topic signals as-is
+        // Keep non-topic findings as-is
         for idx in keep_as_is {
-            deduped_signals.push(self.signals[idx].clone());
+            deduped_findings.push(self.findings[idx].clone());
         }
 
         // Process each topic group
         for (_topic, indices) in topic_groups {
-            let signals_in_group: Vec<_> = indices.iter().map(|&idx| &self.signals[idx]).collect();
+            let findings_in_group: Vec<_> =
+                indices.iter().map(|&idx| &self.findings[idx]).collect();
 
-            // Check if any custom signals exist in this group
-            let has_custom = signals_in_group.iter().any(|f| {
+            // Check if any custom findings exist in this group
+            let has_custom = findings_in_group.iter().any(|f| {
                 let RuleMatch::Analysis(pf) = f;
-                matches!(pf.source, Some(SignalSource::Custom))
+                matches!(pf.source, Some(FindingSource::Custom))
             });
 
             if has_custom {
-                // Keep only custom signals, collect all rule IDs as contributors
+                // Keep only custom findings, collect all rule IDs as contributors
                 let mut contributors = Vec::new();
-                let mut representative: Option<AnalysisSignal> = None;
+                let mut representative: Option<AnalysisFinding> = None;
 
                 for &idx in &indices {
-                    let RuleMatch::Analysis(pf) = &self.signals[idx];
+                    let RuleMatch::Analysis(pf) = &self.findings[idx];
                     contributors.push(pf.matched_rule.clone());
 
-                    // Use first custom signal as representative
-                    if representative.is_none() && matches!(pf.source, Some(SignalSource::Custom)) {
+                    // Use first custom finding as representative
+                    if representative.is_none() && matches!(pf.source, Some(FindingSource::Custom))
+                    {
                         let mut merged = pf.clone();
                         merged.contributors = Some(contributors.clone());
                         representative = Some(merged);
@@ -803,23 +876,23 @@ impl AnalysisReport {
                 // Update contributors on representative
                 if let Some(mut rep) = representative {
                     rep.contributors = Some(contributors);
-                    deduped_signals.push(RuleMatch::Analysis(rep));
+                    deduped_findings.push(RuleMatch::Analysis(rep));
                 }
             } else {
-                // No custom signals - keep all built-in signals
+                // No custom findings - keep all built-in findings
                 for &idx in &indices {
-                    deduped_signals.push(self.signals[idx].clone());
+                    deduped_findings.push(self.findings[idx].clone());
                 }
             }
         }
 
-        self.signals = deduped_signals;
+        self.findings = deduped_findings;
     }
 
     /// Validate report invariants and evidence correctness
     ///
     /// Checks that:
-    /// - Summary counts match actual signals
+    /// - Summary counts match actual findings
     /// - Cross-database boolean matches database set size
     /// - Evidence is valid (line numbers > 0, etc.)
     ///
@@ -827,26 +900,41 @@ impl AnalysisReport {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Invariant 1: total_reported_signals == signals.len()
-        if self.summary.total_reported_signals != self.signals.len() {
+        // Invariant 1: total_reported_findings == findings.len()
+        if self.summary.total_reported_findings != self.findings.len() {
             errors.push(format!(
-                "total_reported_signals ({}) doesn't match signals.len() ({})",
-                self.summary.total_reported_signals,
-                self.signals.len()
+                "total_reported_findings ({}) doesn't match findings.len() ({})",
+                self.summary.total_reported_findings,
+                self.findings.len()
             ));
         }
 
-        // Invariant 2: sum of severity counts == total_reported_signals
+        // Invariant 2: sum of severity counts == total_reported_findings
         let severity_sum = self.summary.critical_count
             + self.summary.high_count
             + self.summary.medium_count
-            + self.summary.low_count
-            + self.summary.info_count;
-        if severity_sum != self.summary.total_reported_signals {
+            + self.summary.low_count;
+        if severity_sum != self.summary.total_reported_findings {
             errors.push(format!(
-                "Sum of severity counts ({}) doesn't match total_reported_signals ({})",
-                severity_sum, self.summary.total_reported_signals
+                "Sum of severity counts ({}) doesn't match total_reported_findings ({})",
+                severity_sum, self.summary.total_reported_findings
             ));
+        }
+
+        // Invariant 2b: info_count == context.len(), and no finding is context
+        if self.summary.info_count != self.context.len() {
+            errors.push(format!(
+                "info_count ({}) doesn't match context.len() ({})",
+                self.summary.info_count,
+                self.context.len()
+            ));
+        }
+        if self
+            .findings
+            .iter()
+            .any(|finding| finding.risk_level().is_context())
+        {
+            errors.push("A context-level entry is listed under findings".to_string());
         }
 
         // Invariant 3: cross_database boolean matches database set
@@ -863,9 +951,9 @@ impl AnalysisReport {
             ));
         }
 
-        // Invariant 4: Validate evidence in each signal
-        for (idx, signal) in self.signals.iter().enumerate() {
-            for (ev_idx, evidence) in signal.evidence().iter().enumerate() {
+        // Invariant 4: Validate evidence in each finding
+        for (idx, finding) in self.findings.iter().enumerate() {
+            for (ev_idx, evidence) in finding.evidence().iter().enumerate() {
                 if let RiskEvidence::RuleMatch {
                     line_number: Some(line),
                     statement_preview,
@@ -875,7 +963,7 @@ impl AnalysisReport {
                     // Line numbers should be >= 1 (1-indexed)
                     if *line == 0 {
                         errors.push(format!(
-                            "Signal #{} evidence #{}: Invalid line number 0",
+                            "Finding #{} evidence #{}: Invalid line number 0",
                             idx, ev_idx
                         ));
                     }
@@ -884,7 +972,7 @@ impl AnalysisReport {
                     if let Some(preview) = statement_preview {
                         if preview.trim().is_empty() {
                             errors.push(format!(
-                                "Signal #{} evidence #{}: Empty statement preview",
+                                "Finding #{} evidence #{}: Empty statement preview",
                                 idx, ev_idx
                             ));
                         }
@@ -908,7 +996,7 @@ impl AnalysisReport {
         }
     }
 
-    /// Deduplicate policy signals by aggregating identical rules, except
+    /// Deduplicate policy findings by aggregating identical rules, except
     /// those whose `id` appears in `per_statement_rules`. The set is sourced
     /// from the rule corpus's `per_statement: true` YAML flag — see
     /// [`crate::rules::engine::Rule::per_statement`]. An empty set
@@ -919,25 +1007,25 @@ impl AnalysisReport {
     ) {
         use std::collections::HashMap;
 
-        // Group policy signals by (matched_rule, signal_type, risk_level)
+        // Group policy findings by (matched_rule, finding_type, risk_level)
         let mut policy_groups: HashMap<(String, String, RiskLevel), Vec<usize>> = HashMap::new();
-        let mut other_signals = Vec::new();
+        let mut other_findings = Vec::new();
 
-        for (idx, signal) in self.signals.iter().enumerate() {
-            match signal {
+        for (idx, finding) in self.findings.iter().enumerate() {
+            match finding {
                 RuleMatch::Analysis(pf) => {
                     // Per-statement compliance/review rules emit one
-                    // signal per occurrence and bypass dedup
+                    // finding per occurrence and bypass dedup
                     // aggregation. Declared via `per_statement: true`
                     // in the rule's YAML; the set is built by the
                     // caller from the active rule corpus.
                     if per_statement_rules.contains(&pf.matched_rule) {
-                        other_signals.push(idx);
+                        other_findings.push(idx);
                         continue;
                     }
                     let key = (
                         pf.matched_rule.clone(),
-                        pf.signal_type.clone(),
+                        pf.finding_type.clone(),
                         pf.risk_level,
                     );
                     policy_groups.entry(key).or_default().push(idx);
@@ -945,46 +1033,50 @@ impl AnalysisReport {
             }
         }
 
-        // Build deduplicated signals list
-        let mut deduped_signals = Vec::new();
+        // Build deduplicated findings list
+        let mut deduped_findings = Vec::new();
 
-        // Add non-policy signals as-is
-        for idx in other_signals {
-            deduped_signals.push(self.signals[idx].clone());
+        // Add non-policy findings as-is
+        for idx in other_findings {
+            deduped_findings.push(self.findings[idx].clone());
         }
 
-        // Add aggregated policy signals
-        for ((_matched_rule, _signal_type, _risk_level), indices) in policy_groups {
+        // Add aggregated policy findings
+        for ((_matched_rule, _finding_type, _risk_level), indices) in policy_groups {
             if indices.is_empty() {
                 continue;
             }
 
-            // Get first signal as template
+            // Get first finding as template
             let first_idx = indices[0];
-            let RuleMatch::Analysis(first_signal) = &self.signals[first_idx];
+            let RuleMatch::Analysis(first_finding) = &self.findings[first_idx];
             // Collect all evidence from all occurrences, deduplicating
             let mut all_evidence = Vec::new();
             // Collect all affected_tables from all occurrences, deduplicating
             let mut all_affected_tables: Vec<String> = Vec::new();
+            // What is already collected, looked up in one step each.
+            let mut seen_evidence: std::collections::HashSet<EvidenceKey<'_>> =
+                std::collections::HashSet::new();
+            let mut seen_tables: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for &idx in &indices {
-                let RuleMatch::Analysis(pf) = &self.signals[idx];
+                let RuleMatch::Analysis(pf) = &self.findings[idx];
                 for ev in &pf.evidence {
-                    if !all_evidence.contains(ev) {
+                    if seen_evidence.insert(EvidenceKey(ev)) {
                         all_evidence.push(ev.clone());
                     }
                 }
                 // Merge affected_tables
                 if let Some(tables) = &pf.affected_tables {
                     for table in tables {
-                        if !all_affected_tables.contains(table) {
+                        if seen_tables.insert(table.as_str()) {
                             all_affected_tables.push(table.clone());
                         }
                     }
                 }
             }
 
-            // Create aggregated signal
-            let mut aggregated = first_signal.clone();
+            // Create aggregated finding
+            let mut aggregated = first_finding.clone();
             aggregated.evidence = all_evidence;
             // Set deduplicated affected_tables (sorted for deterministic
             // output — insertion order follows the nondeterministic group
@@ -995,25 +1087,25 @@ impl AnalysisReport {
             }
 
             // Always set both counts for clarity
-            let num_signals = indices.len();
+            let num_findings = indices.len();
             let num_evidence = aggregated.evidence.len();
-            aggregated.signals_merged = Some(num_signals);
+            aggregated.findings_merged = Some(num_findings);
             aggregated.evidence_count = Some(num_evidence);
 
-            // Update message if multiple signals were merged
-            if num_signals > 1 {
-                let base_message = &first_signal.message;
-                aggregated.message = format!("{} ({} occurrences)", base_message, num_signals);
+            // Update message if multiple findings were merged
+            if num_findings > 1 {
+                let base_message = &first_finding.message;
+                aggregated.message = format!("{} ({} occurrences)", base_message, num_findings);
             }
 
-            deduped_signals.push(RuleMatch::Analysis(aggregated));
+            deduped_findings.push(RuleMatch::Analysis(aggregated));
         }
 
-        // Replace signals with deduplicated list
-        self.signals = deduped_signals;
+        // Replace findings with deduplicated list
+        self.findings = deduped_findings;
 
         // Recalculate summary counts using centralized method
-        self.summary.recalculate_from_signals(&self.signals);
+        self.summary.recalculate_from_findings(&self.findings);
     }
 }
 
@@ -1028,11 +1120,14 @@ impl Default for AnalysisReport {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schema", schemars(rename = "AnalysisSummary"))]
 pub struct AnalysisSummary {
-    pub total_reported_signals: usize,
+    #[serde(alias = "total_reported_signals")]
+    pub total_reported_findings: usize,
     pub critical_count: usize,
     pub high_count: usize,
     pub medium_count: usize,
     pub low_count: usize,
+    /// Entries in the report's `context` list, which
+    /// `total_reported_findings` does not count.
     pub info_count: usize,
     pub tables_read: usize,
     pub tables_written: usize,
@@ -1123,45 +1218,45 @@ pub struct AnalysisSummary {
 }
 
 impl AnalysisSummary {
-    /// Recalculate signal counts from current signals list
+    /// Recalculate finding counts from current findings list
     ///
     /// This is the single source of truth for count calculation.
-    /// Should be called after any operation that modifies signals
-    /// (add_signal, merge, deduplicate).
-    pub fn recalculate_from_signals(&mut self, signals: &[RuleMatch]) {
-        self.total_reported_signals = signals.len();
-        self.critical_count = signals
+    /// Should be called after any operation that modifies findings
+    /// (add_finding, merge, deduplicate).
+    pub fn recalculate_from_findings(&mut self, findings: &[RuleMatch]) {
+        self.total_reported_findings = findings.len();
+        self.critical_count = findings
             .iter()
             .filter(|f| matches!(f.risk_level(), RiskLevel::Critical))
             .count();
-        self.high_count = signals
+        self.high_count = findings
             .iter()
             .filter(|f| matches!(f.risk_level(), RiskLevel::High))
             .count();
-        self.medium_count = signals
+        self.medium_count = findings
             .iter()
             .filter(|f| matches!(f.risk_level(), RiskLevel::Medium))
             .count();
-        self.low_count = signals
+        self.low_count = findings
             .iter()
             .filter(|f| matches!(f.risk_level(), RiskLevel::Low))
             .count();
-        self.info_count = signals
+        self.info_count = findings
             .iter()
             .filter(|f| matches!(f.risk_level(), RiskLevel::Info))
             .count();
     }
 }
 
-/// Risk signal types
+/// A finding in a report
 ///
-/// NOTE: Cost signals are now unified into AnalysisSignal with enrichment fields
+/// NOTE: Cost findings are now unified into AnalysisFinding with enrichment fields
 /// (scan_type, affected_tables). Cost/performance detection is handled by YAML rules
 /// with P0xx IDs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RuleMatch {
-    Analysis(AnalysisSignal),
+    Analysis(AnalysisFinding),
 }
 
 impl RuleMatch {
@@ -1171,8 +1266,8 @@ impl RuleMatch {
         }
     }
 
-    /// Get the rule ID that generated this signal.
-    /// All signals have a stable rule ID for policy matching.
+    /// Get the rule ID that generated this finding.
+    /// All findings have a stable rule ID for policy matching.
     pub fn rule_id(&self) -> Option<&str> {
         match self {
             RuleMatch::Analysis(f) => Some(&f.matched_rule),
@@ -1191,14 +1286,14 @@ impl RuleMatch {
         }
     }
 
-    /// Get the signal type as a string (for diff output)
-    pub fn signal_type(&self) -> &str {
+    /// Get the finding type as a string (for diff output)
+    pub fn finding_type(&self) -> &str {
         match self {
-            RuleMatch::Analysis(g) => &g.signal_type,
+            RuleMatch::Analysis(g) => &g.finding_type,
         }
     }
 
-    /// Get the assumed Snowflake role at the time this signal was generated.
+    /// Get the assumed Snowflake role at the time this finding was generated.
     /// Used for role-based exception matching.
     pub fn assumed_role(&self) -> Option<&str> {
         match self {
@@ -1206,19 +1301,19 @@ impl RuleMatch {
         }
     }
 
-    /// Get the affected tables for this signal.
+    /// Get the affected tables for this finding.
     pub fn affected_tables(&self) -> Vec<String> {
         match self {
             RuleMatch::Analysis(g) => g.affected_tables.clone().unwrap_or_default(),
         }
     }
 
-    /// Set the source file path on this signal.
+    /// Set the source file path on this finding.
     /// Called by CLI when processing files to attach file context.
     pub fn set_source_file(&mut self, path: String) {
         match self {
             RuleMatch::Analysis(f) => {
-                // For Analysis signals, source_file is stored in evidence
+                // For Analysis findings, source_file is stored in evidence
                 for ev in &mut f.evidence {
                     if let RiskEvidence::RuleMatch { source_file, .. } = ev {
                         *source_file = Some(path.clone());
@@ -1228,7 +1323,7 @@ impl RuleMatch {
         }
     }
 
-    /// Get the source file path for this signal.
+    /// Get the source file path for this finding.
     /// Returns the source_file from the first evidence item that has one.
     pub fn source_file(&self) -> Option<&str> {
         self.evidence().iter().find_map(|ev| ev.source_file())
@@ -1236,65 +1331,67 @@ impl RuleMatch {
 }
 
 // NOTE: Blast radius detection is handled by YAML rules DML-WRITE-UNBOUNDED, DML-WRITE-XSCHEMA, DML-WRITE-MULTITBL.
-// The AnalysisSignal enrichment fields (unbounded_write, statement_cross_schema, etc.) carry the data.
+// The AnalysisFinding enrichment fields (unbounded_write, statement_cross_schema, etc.) carry the data.
 
 // NOTE: Cost/performance detection is handled by YAML rules Q-SCAN-NOFILT, Q-JOIN-*, etc.
-// The AnalysisSignal enrichment fields (scan_type, affected_tables) carry the data.
+// The AnalysisFinding enrichment fields (scan_type, affected_tables) carry the data.
 
-/// Policy violation signal
+/// Policy violation finding
 ///
 /// ## Counting Fields
 ///
-/// - `signals_merged`: Number of raw signals that were grouped/aggregated into this one.
-///   For single occurrences this is 1. For aggregated signals (scope = "multi_statement"),
+/// - `findings_merged`: Number of raw findings that were grouped/aggregated into this one.
+///   For single occurrences this is 1. For aggregated findings (scope = "multi_statement"),
 ///   this is the count of statements that matched the same rule.
 ///
-/// - `evidence_count`: Number of evidence entries attached to this signal. This may differ
-///   from `signals_merged` because:
-///   - One signal may have multiple evidence entries (e.g., macro expansion generates multiple)
+/// - `evidence_count`: Number of evidence entries attached to this finding. This may differ
+///   from `findings_merged` because:
+///   - One finding may have multiple evidence entries (e.g., macro expansion generates multiple)
 ///   - Evidence entries may be deduplicated if they're identical
 ///
-/// **Important**: Subqueries and CTEs are counted as separate signals when they
+/// **Important**: Subqueries and CTEs are counted as separate findings when they
 /// generate their own semantic extraction warnings.
 ///
 /// ## Evidence
 ///
-/// Policy signals include structured evidence showing:
-/// - `RuleMatch`: Signal type, line number, preview, and the specific extraction warning(s) that triggered the rule
+/// Policy findings include structured evidence showing:
+/// - `RuleMatch`: Finding type, line number, preview, and the specific extraction warning(s) that triggered the rule
 /// - Additional context depending on the rule type
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalysisSignal {
+pub struct AnalysisFinding {
     pub message: String,
     pub risk_level: RiskLevel,
     pub matched_rule: String,
-    pub signal_type: String,
-    /// Number of raw signals merged into this aggregated signal (internal use only, not user-facing)
+    #[serde(alias = "signal_type")]
+    pub finding_type: String,
+    /// Number of raw findings merged into this aggregated finding (internal use only, not user-facing)
     #[serde(skip_serializing)]
-    pub signals_merged: Option<usize>,
+    #[serde(alias = "signals_merged")]
+    pub findings_merged: Option<usize>,
     /// Number of evidence entries
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_count: Option<usize>,
-    /// Scope of this signal: "statement" for single occurrence, "multi_statement" for aggregated
+    /// Scope of this finding: "statement" for single occurrence, "multi_statement" for aggregated
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    /// Line number for single-statement signals (used for deduplication and custom rule suppression)
+    /// Line number for single-statement findings (used for deduplication and custom rule suppression)
     /// Note: This field is actively used in deduplicate_by_topic() to track which lines
     /// have custom rules. Evidence line numbers serve a different purpose (display).
     #[serde(skip_serializing)]
     pub statement_line_number: Option<usize>,
-    /// Line numbers for multi-statement aggregated signals
+    /// Line numbers for multi-statement aggregated findings
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_lines: Option<Vec<usize>>,
     /// Topic key for deduplication (e.g., "governance.row_policy_removed")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
-    /// Source of this signal (BuiltIn or Custom)
+    /// Source of this finding (BuiltIn or Custom)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<SignalSource>,
-    /// Rule IDs that contributed to this signal (for merged signals)
+    pub source: Option<FindingSource>,
+    /// Rule IDs that contributed to this finding (for merged findings)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contributors: Option<Vec<String>>,
-    /// Parent context if this signal is from a nested statement (e.g., "PROCEDURE my_proc")
+    /// Parent context if this finding is from a nested statement (e.g., "PROCEDURE my_proc")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_context: Option<String>,
     pub evidence: Vec<RiskEvidence>,
@@ -1322,13 +1419,13 @@ pub struct AnalysisSignal {
     pub unbounded_write: Option<bool>,
 
     // === Role context ===
-    /// Snowflake role assumed when this signal was generated (from USE ROLE in SQL)
+    /// Snowflake role assumed when this finding was generated (from USE ROLE in SQL)
     /// Used for role-scoped exception matching
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assumed_role: Option<String>,
 }
 
-/// Supporting evidence for signals
+/// Supporting evidence for findings
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RiskEvidence {
@@ -1340,20 +1437,22 @@ pub enum RiskEvidence {
         has_where: bool,
         has_limit: bool,
     },
-    /// Signal that triggered a custom rule (shows which extraction warning matched)
+    /// Finding that triggered a custom rule (shows which extraction warning matched)
     RuleMatch {
-        /// Type of signal (table_touched, column_ref, governance)
-        signal_type: String,
-        /// Resolution status for column_ref signals: "base_table" (traced), "cte", "derived_table", "unknown" (unresolved)
-        /// For non-column signals, this is None
+        /// Type of finding (table_touched, column_ref, governance)
+        #[serde(alias = "signal_type")]
+        finding_type: String,
+        /// Resolution status for column_ref findings: "base_table" (traced), "cte", "derived_table", "unknown" (unresolved)
+        /// For non-column findings, this is None
         #[serde(skip_serializing_if = "Option::is_none")]
         resolution_status: Option<String>,
-        /// Full signal string (e.g., "column_ref:pii.users.ssn")
-        signal_value: String,
+        /// The id of the rule that raised the finding
+        #[serde(alias = "signal_value")]
+        rule_id: String,
         /// Line in rendered SQL (post-Jinja)
         #[serde(skip_serializing_if = "Option::is_none")]
         line_number: Option<usize>,
-        /// Column number within the line (1-based) for distinguishing same-line occurrences
+        /// Column within `line_number`'s line (1-based), in characters
         #[serde(skip_serializing_if = "Option::is_none")]
         column_number: Option<usize>,
         /// Line in template SQL (pre-Jinja) or call site for generated content
@@ -1371,13 +1470,62 @@ pub enum RiskEvidence {
         /// Source file path (for multi-file reports)
         #[serde(skip_serializing_if = "Option::is_none")]
         source_file: Option<String>,
-        /// Clickable location in path:line:column format
+        /// Clickable location in path:line:column format, in the file the
+        /// user wrote (the template of a rendered model, the file SQL is
+        /// embedded in), the column in characters
         #[serde(skip_serializing_if = "Option::is_none")]
         location: Option<String>,
+        /// Where `location` points, with its column in each unit a report
+        /// gives. Not written: JSON reads `location`.
+        #[serde(skip)]
+        position: Option<TextPosition>,
         /// Snowflake role active when this evidence was generated (for per-statement role tracking)
         #[serde(skip_serializing_if = "Option::is_none")]
         assumed_role: Option<String>,
     },
+}
+
+/// An evidence item as a set member: equal as [`RiskEvidence`] is equal,
+/// hashed by fields that equality compares.
+struct EvidenceKey<'e>(&'e RiskEvidence);
+
+impl PartialEq for EvidenceKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for EvidenceKey<'_> {}
+
+impl std::hash::Hash for EvidenceKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self.0).hash(state);
+        match self.0 {
+            RiskEvidence::TableReference { table, operation } => {
+                table.hash(state);
+                operation.hash(state);
+            }
+            RiskEvidence::PredicateInfo {
+                has_where,
+                has_limit,
+            } => {
+                has_where.hash(state);
+                has_limit.hash(state);
+            }
+            RiskEvidence::RuleMatch {
+                rule_id: finding_value,
+                line_number,
+                column_number,
+                source_file,
+                ..
+            } => {
+                finding_value.hash(state);
+                line_number.hash(state);
+                column_number.hash(state);
+                source_file.hash(state);
+            }
+        }
+    }
 }
 
 impl RiskEvidence {
@@ -1398,14 +1546,6 @@ impl RiskEvidence {
     }
 }
 
-/// Positive security/governance signals (non-blocking informational items)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PositiveSignal {
-    pub message: String,
-    pub signal_type: String,
-    pub details: Option<String>,
-}
-
 /// Risk severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1420,6 +1560,14 @@ pub enum RiskLevel {
 }
 
 impl RiskLevel {
+    /// Whether a rule at this level reports context rather than a finding.
+    pub(crate) fn is_context(self) -> bool {
+        match self {
+            RiskLevel::Info => true,
+            RiskLevel::Low | RiskLevel::Medium | RiskLevel::High | RiskLevel::Critical => false,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             RiskLevel::Info => "info",

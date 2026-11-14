@@ -16,9 +16,10 @@ use lexega_syntax::{
 };
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 fn roundtrip(sql: &str) {

@@ -627,7 +627,9 @@ fn find_property_value_span(
     None
 }
 
-/// Extract a comment string (quotes stripped, `''` escapes folded)
+/// Extract a comment string (quotes stripped, `''` escapes folded, and
+/// backslash escapes read as the dialect in force reads them, as
+/// [`crate::ir::span_extract::extract_string_literal_value`] does)
 /// from a [`PolicyCommentAction::Set`] value span. Public to the IR /
 /// facts modules; used by `derive_facts_from_policy_plan` to build the
 /// public `PolicyCommentChange::Set` payload.
@@ -854,6 +856,10 @@ fn absorb_network_property(
 #[derive(Debug, Clone, Default)]
 pub struct AuthenticationPolicyShape {
     pub mfa_required: bool,
+    /// The span of each method `AUTHENTICATION_METHODS` lists.
+    pub authentication_method_spans: Vec<Span>,
+    /// The value span of `MFA_ENROLLMENT = value`.
+    pub mfa_enrollment_value_span: Option<Span>,
     pub had_methods_change: bool,
     pub had_mfa_change: bool,
     pub had_client_types_change: bool,
@@ -885,6 +891,8 @@ pub fn lower_create_authentication_policy_to_policy_plan(
         .unwrap_or(false);
     let shape = AuthenticationPolicyShape {
         mfa_required: mfa_enrollment_required || mfa_policy_required,
+        authentication_method_spans: p.authentication_method_spans.clone(),
+        mfa_enrollment_value_span: p.mfa_enrollment_value_span,
         ..AuthenticationPolicyShape::default()
     };
     let comment = match p.comment_span {
@@ -1004,12 +1012,13 @@ pub fn lower_drop_authentication_policy_to_policy_plan(
 // ─────────────────────────────────────────────────────────────────────
 
 /// Aggregation-policy structured payload. Body analysis populates the
-/// three boolean shape signals plus the smallest `MIN_GROUP_SIZE`
+/// three boolean shape flags plus the smallest `MIN_GROUP_SIZE`
 /// literal observed; ALTER tracks `had_body_change` separately for
 /// the SNW-AGGPOL-NOCONST-CHG predicate.
 #[derive(Debug, Clone, Default)]
 pub struct AggregationPolicyShape {
     pub min_group_size: Option<u32>,
+    /// The body's default result is `NO_AGGREGATION_CONSTRAINT`.
     pub has_no_aggregation_constraint: bool,
     pub has_conditional_body: bool,
     pub had_body_change: bool,
@@ -1116,32 +1125,64 @@ pub fn lower_drop_aggregation_policy_to_policy_plan(p: &AstDropAggregationPolicy
     }
 }
 
+/// Populate an aggregation policy's shape from its body expression.
+fn analyze_aggregation_body(expr: &AstExpr, source: &str, shape: &mut AggregationPolicyShape) {
+    walk_aggregation_body(expr, source, shape);
+    shape.has_no_aggregation_constraint = returns_no_aggregation_constraint(expr, source);
+}
+
+/// Whether `leaf` holds for the default result of a policy body: the body
+/// itself when it is no `CASE`, otherwise its `ELSE`, which every role no
+/// `WHEN` names receives. A `CASE` without `ELSE` defaults to NULL: undecided,
+/// which holds.
+fn default_result(expr: &AstExpr, leaf: &impl Fn(&AstExpr) -> bool) -> bool {
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return false;
+    };
+    if let AstExpr::Case { else_expr, .. } = expr {
+        return else_expr.as_deref().is_none_or(|e| default_result(e, leaf));
+    }
+    leaf(expr)
+}
+
+/// Whether the default result of an aggregation-policy body is
+/// `NO_AGGREGATION_CONSTRAINT`.
+fn returns_no_aggregation_constraint(expr: &AstExpr, source: &str) -> bool {
+    default_result(expr, &|leaf| {
+        if let AstExpr::Ident { column_ref, .. } = leaf {
+            return crate::ir::utils::slice_span(source, column_ref.name.span)
+                .is_some_and(|text| text.eq_ignore_ascii_case("NO_AGGREGATION_CONSTRAINT"));
+        }
+        if let AstExpr::FunctionCall { func_name, .. } = leaf {
+            return crate::ir::utils::slice_span(source, func_name.span).is_some_and(|text| {
+                text.trim()
+                    .eq_ignore_ascii_case("NO_AGGREGATION_CONSTRAINT")
+            });
+        }
+        false
+    })
+}
+
 /// Walk an aggregation-policy body expression. Populates
-/// `has_no_aggregation_constraint` / `has_conditional_body` /
-/// `min_group_size` based on the expression shape.
+/// `has_conditional_body` / `min_group_size` based on the expression shape.
 ///
 /// Body forms:
-/// - bare `NO_AGGREGATION_CONSTRAINT` ident or `NO_AGGREGATION_CONSTRAINT()` function call
 /// - `AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => N)` function call
 /// - `MIN_GROUP_SIZE = N` binary op
 /// - `CASE WHEN … THEN … ELSE … END` — recursively analyzed into branches
-fn analyze_aggregation_body(expr: &AstExpr, source: &str, shape: &mut AggregationPolicyShape) {
+fn walk_aggregation_body(expr: &AstExpr, source: &str, shape: &mut AggregationPolicyShape) {
+    // A body nested deeper than the stack lets the analyzer walk is not
+    // read past that depth.
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return;
+    };
     match expr {
-        AstExpr::Ident { column_ref, .. } => {
-            if let Some(text) = crate::ir::utils::slice_span(source, column_ref.name.span) {
-                if text.eq_ignore_ascii_case("NO_AGGREGATION_CONSTRAINT") {
-                    shape.has_no_aggregation_constraint = true;
-                }
-            }
-        }
         AstExpr::FunctionCall {
             func_name, args, ..
         } => {
             if let Some(name_text) = crate::ir::utils::slice_span(source, func_name.span) {
                 let name_trim = name_text.trim();
-                if name_trim.eq_ignore_ascii_case("NO_AGGREGATION_CONSTRAINT") {
-                    shape.has_no_aggregation_constraint = true;
-                } else if name_trim.eq_ignore_ascii_case("AGGREGATION_CONSTRAINT") {
+                if name_trim.eq_ignore_ascii_case("AGGREGATION_CONSTRAINT") {
                     for arg in args {
                         if let AstFunctionArg::Named { name, value, .. } = &**arg {
                             let arg_name = crate::ir::utils::slice_span(source, name.span)
@@ -1175,10 +1216,10 @@ fn analyze_aggregation_body(expr: &AstExpr, source: &str, shape: &mut Aggregatio
         } => {
             shape.has_conditional_body = true;
             for when in whens {
-                analyze_aggregation_body(&when.result, source, shape);
+                walk_aggregation_body(&when.result, source, shape);
             }
             if let Some(else_expr) = else_expr {
-                analyze_aggregation_body(else_expr, source, shape);
+                walk_aggregation_body(else_expr, source, shape);
             }
         }
         _ => {}
@@ -1203,6 +1244,7 @@ fn literal_u32(expr: &AstExpr, source: &str) -> Option<u32> {
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionPolicyShape {
     pub has_allow_list: bool,
+    /// The body's default result allows projection or states no enforcement.
     pub has_enforcement_disabled: bool,
     pub has_enforcement_enabled: bool,
     pub has_conditional_body: bool,
@@ -1316,6 +1358,22 @@ pub fn lower_drop_projection_policy_to_policy_plan(p: &AstDropProjectionPolicy) 
 /// `PROJECTION_CONSTRAINT(ALLOW => true|false, ENFORCEMENT => 'NULLIFY'|…)`
 /// and `CASE WHEN … THEN … ELSE … END`.
 fn analyze_projection_body(expr: &AstExpr, source: &str, shape: &mut ProjectionPolicyShape) {
+    walk_projection_body(expr, source, shape);
+    shape.has_enforcement_disabled = default_result(expr, &|leaf| {
+        named_call_arg(leaf, source, "PROJECTION_CONSTRAINT", "ALLOW")
+            .is_some_and(|value| literal_bool(value, source) == Some(true))
+            || named_call_arg(leaf, source, "PROJECTION_CONSTRAINT", "ENFORCEMENT")
+                .and_then(|value| literal_string(value, source))
+                .is_some_and(|text| text.trim().eq_ignore_ascii_case("NONE"))
+    });
+}
+
+fn walk_projection_body(expr: &AstExpr, source: &str, shape: &mut ProjectionPolicyShape) {
+    // A body nested deeper than the stack lets the analyzer walk is not
+    // read past that depth.
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return;
+    };
     match expr {
         AstExpr::FunctionCall {
             func_name, args, ..
@@ -1336,16 +1394,7 @@ fn analyze_projection_body(expr: &AstExpr, source: &str, shape: &mut ProjectionP
                                 }
                             } else if arg_name.eq_ignore_ascii_case("ENFORCEMENT") {
                                 if let Some(text) = literal_string(value, source) {
-                                    // `NULLIFY` substitutes NULL; `NONE`
-                                    // performs no action — neither hard-blocks,
-                                    // so both classify as enforcement-disabled
-                                    // for SNW-PROJPOL-ENFORCE-OFF governance.
-                                    let t = text.trim();
-                                    if t.eq_ignore_ascii_case("NULLIFY")
-                                        || t.eq_ignore_ascii_case("NONE")
-                                    {
-                                        shape.has_enforcement_disabled = true;
-                                    } else {
+                                    if !text.trim().eq_ignore_ascii_case("NONE") {
                                         shape.has_enforcement_enabled = true;
                                     }
                                 }
@@ -1360,10 +1409,10 @@ fn analyze_projection_body(expr: &AstExpr, source: &str, shape: &mut ProjectionP
         } => {
             shape.has_conditional_body = true;
             for when in whens {
-                analyze_projection_body(&when.result, source, shape);
+                walk_projection_body(&when.result, source, shape);
             }
             if let Some(else_expr) = else_expr {
-                analyze_projection_body(else_expr, source, shape);
+                walk_projection_body(else_expr, source, shape);
             }
         }
         _ => {}
@@ -1404,7 +1453,7 @@ fn literal_string(expr: &AstExpr, source: &str) -> Option<String> {
 pub struct JoinPolicyShape {
     /// Body uses (or branches to) `JOIN_CONSTRAINT(JOIN_REQUIRED => TRUE)`.
     pub has_join_required: bool,
-    /// Body uses (or branches to) `JOIN_CONSTRAINT(JOIN_REQUIRED => FALSE)`
+    /// The body's default result is `JOIN_CONSTRAINT(JOIN_REQUIRED => FALSE)`
     /// — the policy permits unrestricted joins.
     pub has_join_not_required: bool,
     pub has_conditional_body: bool,
@@ -1464,8 +1513,10 @@ pub fn lower_alter_join_policy_to_policy_plan(p: &AstAlterJoinPolicy, source: &s
             };
         }
         A::UnsetComment => comment = PolicyCommentAction::Unset,
-        A::SetTag { assignments_span } => set_tag_action_spans.push(*assignments_span),
-        A::UnsetTag { tags_span } => unset_tag_action_spans.push(*tags_span),
+        A::SetTag {
+            assignments_span, ..
+        } => set_tag_action_spans.push(*assignments_span),
+        A::UnsetTag { tags_span, .. } => unset_tag_action_spans.push(*tags_span),
     }
 
     PolicyPlan {
@@ -1511,6 +1562,48 @@ pub fn lower_drop_join_policy_to_policy_plan(p: &AstDropJoinPolicy) -> PolicyPla
 /// `JOIN_CONSTRAINT(JOIN_REQUIRED => true|false)` and the CASE-branched
 /// conditional shape.
 fn analyze_join_body(expr: &AstExpr, source: &str, shape: &mut JoinPolicyShape) {
+    walk_join_body(expr, source, shape);
+    shape.has_join_not_required = default_result(expr, &|leaf| {
+        named_call_arg(leaf, source, "JOIN_CONSTRAINT", "JOIN_REQUIRED")
+            .is_some_and(|value| literal_bool(value, source) == Some(false))
+    });
+}
+
+/// The value of a named argument of a function call, `None` where the
+/// expression is no call of `function` or has no such argument.
+fn named_call_arg<'a>(
+    expr: &'a AstExpr,
+    source: &str,
+    function: &str,
+    argument: &str,
+) -> Option<&'a AstExpr> {
+    let AstExpr::FunctionCall {
+        func_name, args, ..
+    } = expr
+    else {
+        return None;
+    };
+    let is_call = crate::ir::utils::slice_span(source, func_name.span)
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case(function));
+    if !is_call {
+        return None;
+    }
+    args.iter().find_map(|arg| {
+        let AstFunctionArg::Named { name, value, .. } = &**arg else {
+            return None;
+        };
+        crate::ir::utils::slice_span(source, name.span)
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case(argument))
+            .then_some(&**value)
+    })
+}
+
+fn walk_join_body(expr: &AstExpr, source: &str, shape: &mut JoinPolicyShape) {
+    // A body nested deeper than the stack lets the analyzer walk is not
+    // read past that depth.
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return;
+    };
     match expr {
         AstExpr::FunctionCall {
             func_name, args, ..
@@ -1522,12 +1615,10 @@ fn analyze_join_body(expr: &AstExpr, source: &str, shape: &mut JoinPolicyShape) 
                             let arg_name = crate::ir::utils::slice_span(source, name.span)
                                 .map(|s| s.trim())
                                 .unwrap_or("");
-                            if arg_name.eq_ignore_ascii_case("JOIN_REQUIRED") {
-                                match literal_bool(value, source) {
-                                    Some(true) => shape.has_join_required = true,
-                                    Some(false) => shape.has_join_not_required = true,
-                                    None => {}
-                                }
+                            if arg_name.eq_ignore_ascii_case("JOIN_REQUIRED")
+                                && literal_bool(value, source) == Some(true)
+                            {
+                                shape.has_join_required = true;
                             }
                         }
                     }
@@ -1539,10 +1630,10 @@ fn analyze_join_body(expr: &AstExpr, source: &str, shape: &mut JoinPolicyShape) 
         } => {
             shape.has_conditional_body = true;
             for when in whens {
-                analyze_join_body(&when.result, source, shape);
+                walk_join_body(&when.result, source, shape);
             }
             if let Some(else_expr) = else_expr {
-                analyze_join_body(else_expr, source, shape);
+                walk_join_body(else_expr, source, shape);
             }
         }
         _ => {}
@@ -1752,6 +1843,9 @@ pub struct RowAccessPolicyShape {
     /// `analyze_ddl_facts` dispatch site via
     /// [`crate::facts::extract::PolicyDialectOrigin`].
     pub on_table_span: Option<Span>,
+    /// PG `TO role, …`: each role named, as written. Empty where the
+    /// statement names none.
+    pub roles: Vec<Span>,
 }
 
 /// IR-side mirror of [`crate::facts::PgPolicyPermissiveness`](crate::facts::policy::PgPolicyPermissiveness). Closed
@@ -1945,6 +2039,7 @@ pub fn lower_create_pg_policy_to_policy_plan(p: &AstCreatePgPolicy, _source: &st
         permissiveness,
         command,
         on_table_span: Some(p.table_name),
+        roles: p.roles.iter().map(|role| role.span).collect(),
     };
     PolicyPlan {
         action: PolicyAction::Create,
@@ -1979,12 +2074,14 @@ pub fn lower_alter_pg_policy_to_policy_plan(p: &AstAlterPgPolicy, _source: &str)
             renamed_to_span = Some(*new_name);
         }
         AlterPgPolicyAction::Modify {
+            roles,
             using_expr,
             check_expr,
             ..
         } => {
             shape.using = using_expr.clone();
             shape.check = check_expr.clone();
+            shape.roles = roles.iter().map(|role| role.span).collect();
         }
     }
     PolicyPlan {

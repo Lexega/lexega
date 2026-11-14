@@ -18,9 +18,16 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -89,7 +96,7 @@ fn test_roundtrip_databricks_create_function_return_form() {
 }
 
 #[test]
-fn test_create_function_return_plus_row_filter_still_emits_governance_signal() {
+fn test_create_function_return_plus_row_filter_still_emits_governance_finding() {
     let sql = r#"
         CREATE FUNCTION rf_fn(x INT) RETURNS BOOLEAN RETURN x > 0;
         ALTER TABLE t SET ROW FILTER rf_fn ON (c1);
@@ -97,10 +104,10 @@ fn test_create_function_return_plus_row_filter_still_emits_governance_signal() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "TBL-RAP-ADD"),
-        "Expected TBL-RAP-ADD for row filter attachment even with preceding CREATE FUNCTION RETURN syntax. Signals: {:?}",
+        has_context(&report, "TBL-RAP-ADD"),
+        "Expected TBL-RAP-ADD for row filter attachment even with preceding CREATE FUNCTION RETURN syntax. Findings: {:?}",
         report
-            .signals
+            .context
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -113,10 +120,10 @@ fn test_create_function_return_plus_row_filter_still_emits_governance_signal() {
 fn test_row_filter_set_emits_tbl_rap_add() {
     let report = dbx_analyze("ALTER TABLE t SET ROW FILTER rf_fn ON (c1);");
     assert!(
-        has_signal(&report, "TBL-RAP-ADD"),
-        "Expected TBL-RAP-ADD for row filter attachment. Signals: {:?}",
+        has_context(&report, "TBL-RAP-ADD"),
+        "Expected TBL-RAP-ADD for row filter attachment. Findings: {:?}",
         report
-            .signals
+            .context
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -129,10 +136,10 @@ fn test_row_filter_set_emits_tbl_rap_add() {
 fn test_row_filter_drop_emits_tbl_rap_rmv() {
     let report = dbx_analyze("ALTER TABLE t DROP ROW FILTER;");
     assert!(
-        has_signal(&report, "TBL-RAP-RMV"),
-        "Expected TBL-RAP-RMV for row filter removal. Signals: {:?}",
+        has_finding(&report, "TBL-RAP-RMV"),
+        "Expected TBL-RAP-RMV for row filter removal. Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -145,10 +152,10 @@ fn test_row_filter_drop_emits_tbl_rap_rmv() {
 fn test_column_mask_set_emits_tbl_mask_add() {
     let report = dbx_analyze("ALTER TABLE t ALTER COLUMN c1 SET MASK mask_fn;");
     assert!(
-        has_signal(&report, "TBL-MASK-ADD"),
-        "Expected TBL-MASK-ADD for column mask attachment. Signals: {:?}",
+        has_context(&report, "TBL-MASK-ADD"),
+        "Expected TBL-MASK-ADD for column mask attachment. Findings: {:?}",
         report
-            .signals
+            .context
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -161,10 +168,10 @@ fn test_column_mask_set_emits_tbl_mask_add() {
 fn test_column_mask_drop_emits_tbl_mask_rmv() {
     let report = dbx_analyze("ALTER TABLE t ALTER COLUMN c1 DROP MASK;");
     assert!(
-        has_signal(&report, "TBL-MASK-RMV"),
-        "Expected TBL-MASK-RMV for column mask removal. Signals: {:?}",
+        has_finding(&report, "TBL-MASK-RMV"),
+        "Expected TBL-MASK-RMV for column mask removal. Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -182,7 +189,7 @@ fn test_multi_statement_column_mask_drop_evidence_count() {
     let report = dbx_analyze(sql);
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "TBL-MASK-RMV"))
         .map(|s| {

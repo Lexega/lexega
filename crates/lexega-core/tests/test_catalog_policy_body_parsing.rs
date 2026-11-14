@@ -85,6 +85,7 @@ fn test_enrich_policy_dependencies() {
 
     let mut snapshot = CatalogSnapshot {
         schema_version: lexega_core::CATALOG_SCHEMA_VERSION,
+        listing: lexega_core::catalog::CatalogListing::Inventory,
         generated_at: None,
         source: Some("test".to_string()),
         databases: vec![],

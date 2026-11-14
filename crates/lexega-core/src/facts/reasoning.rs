@@ -14,17 +14,17 @@
 
 use std::collections::BTreeSet;
 
-use crate::ast::{AstCallArg, AstExpr, AstScript, AstStmt, AstUnloadSource, NodeId};
-use crate::ir::always_true::NonNullProof;
-use crate::ir::catalog_context::{CatalogContext, IndexedCatalogContext};
+use crate::ast::{AstCallArg, AstExpr, AstProcedureParam, AstScript, AstStmt, NodeId};
+use crate::context::node_metadata::IdentKey;
+use crate::ir::catalog_context::{IndexedCatalogContext, TagRef};
 use crate::ir::column::{BindingTable, ColumnId};
+use crate::ir::constraint_types::IrColumnConstraints;
 use crate::ir::dynamic_sql::{
     classify_execute_immediate_arg, classify_scalar_expr_argument, DynamicSqlArgIr,
     DynamicSqlCallIr, SpliceClass, SyntacticShapes,
 };
 use crate::ir::model_catalog::ModelCatalog;
-use crate::ir::plan::{CteBinding, RelPlan};
-use crate::ir::types::SessionContext;
+use crate::ir::plan::RelPlan;
 use crate::ir::FunctionCatalog;
 use crate::lexer::token::Span;
 
@@ -32,12 +32,12 @@ use super::catalog::{Nullability, TaintLabel, ValueExposure};
 use super::ddl::ExportedColumn;
 use super::privilege::{ObjectGrantImpactFacts, RoleGrantImpactFacts};
 use super::query::{
-    ColumnConstraintEvent, OrTautologyEvent, PredicateCrossScopeEffect, RepeatedSubqueryEvent,
-    TemporalJoinTable,
+    ColumnConstraintEvent, OrTautologyEvent, PredicateCrossScopeEffect, QueryFacts,
+    RepeatedSubqueryEvent, TemporalJoinTable,
 };
 use super::statement::StatementFacts;
 
-/// Everything a reasoning handle needs about one relational plan.
+/// Everything a reasoning handle needs about one statement's plan.
 pub struct QueryInputs<'a> {
     pub plan: &'a RelPlan,
     pub bindings: &'a BindingTable,
@@ -45,10 +45,6 @@ pub struct QueryInputs<'a> {
     pub catalog: Option<&'a IndexedCatalogContext>,
     pub function_catalog: &'a FunctionCatalog,
     pub source: &'a str,
-    /// CTE bindings visible from enclosing scopes; empty at a statement root.
-    pub outer_ctes: &'a [&'a CteBinding],
-    /// Volatile columns of every enclosing scope; empty at a statement root.
-    pub outer_volatile: &'a BTreeSet<ColumnId>,
 }
 
 /// Everything a reasoning handle needs about one script.
@@ -59,6 +55,124 @@ pub struct ScriptInputs<'a> {
     pub fold: &'a crate::ScriptContextFold,
     pub catalog: Option<&'a crate::catalog::CatalogIndex>,
     pub model_catalog: Option<&'a ModelCatalog>,
+    /// The SQL text the script runs, as the engine read it for the run:
+    /// the texts the script builds are parsed through it, each parse shared
+    /// by the readers that hold it ([`crate::DynamicBodies::built`]).
+    pub bodies: &'a crate::DynamicBodies,
+    /// The function catalog in force at each statement of the script, as
+    /// the engine lowers it.
+    pub functions: &'a crate::ir::ScriptFunctions,
+    /// What the scripts run before this one, in order, left dropped or
+    /// renamed away ([`EarlierRemovals`]); none for a script read on its
+    /// own.
+    pub earlier: &'a EarlierRemovals,
+    /// The spans of the script's statements that drop a temporary table,
+    /// on every path into them, which a table of its name may stand
+    /// behind: after one the name names what it named before the
+    /// temporary table was made.
+    pub temporary_drops: &'a [crate::lexer::Span],
+}
+
+/// A table's name as a script's schema changes name it: each part
+/// normalized, its database and schema where the statement or the session
+/// gave them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableIdentity {
+    pub database: Option<IdentKey>,
+    pub schema: Option<IdentKey>,
+    pub name: IdentKey,
+}
+
+impl TableIdentity {
+    /// The identity of the parts written, each normalized.
+    pub fn from_components(database: Option<&str>, schema: Option<&str>, name: &str) -> Self {
+        Self {
+            database: database.map(IdentKey::new),
+            schema: schema.map(IdentKey::new),
+            name: IdentKey::new(name),
+        }
+    }
+
+    /// Whether `other` may name the same table: the name is the same, and
+    /// the schema and the database each are where both give it and may be
+    /// where either omits it. `analytics.foo` and `staging.foo` are not.
+    pub fn partial_match(&self, other: &Self) -> bool {
+        fn compatible(a: &Option<IdentKey>, b: &Option<IdentKey>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                (Some(_), None) | (None, Some(_)) | (None, None) => true,
+            }
+        }
+        self.name == other.name
+            && compatible(&self.schema, &other.schema)
+            && compatible(&self.database, &other.database)
+    }
+}
+
+/// Where the tables a statement names are, as its session finds them
+/// ([`ScriptReasoning::attach_stale_references`]).
+pub trait TablePlaces {
+    /// The table `table`, a name as the statement writes it, names: a
+    /// name the session leaves to its search path is in the first schema
+    /// of the path that holds it, else in the path's first; any other as
+    /// written. Each part normalized.
+    fn place_of(&self, table: &super::identity::TableRef) -> TableIdentity;
+}
+
+/// What the scripts run before a script, in order, left removed, as their
+/// statements outside a routine's body did it: each table or view dropped
+/// or renamed away and not made again on every path after, and each column
+/// dropped from a table and not added again nor the table made again.
+/// Nothing a statement did to a temporary table, which its session holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EarlierRemovals {
+    pub tables: Vec<RemovedTable>,
+    pub columns: Vec<RemovedColumn>,
+}
+
+impl EarlierRemovals {
+    /// Nothing removed.
+    pub fn none() -> &'static Self {
+        static NONE: EarlierRemovals = EarlierRemovals {
+            tables: Vec::new(),
+            columns: Vec::new(),
+        };
+        &NONE
+    }
+}
+
+/// A table or view a script run before dropped or renamed away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedTable {
+    pub table: TableIdentity,
+    pub removal: TableRemoval,
+    pub at: EarlierStatement,
+}
+
+/// How a table was removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableRemoval {
+    Dropped(super::query::DroppedObjectKind),
+    /// Renamed to the name written.
+    RenamedTo(String),
+}
+
+/// A column a script run before dropped from a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedColumn {
+    pub table: TableIdentity,
+    pub column: IdentKey,
+    pub at: EarlierStatement,
+}
+
+/// Where in a script run before a statement is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlierStatement {
+    /// The 0-indexed position, among that script's top-level statements,
+    /// of the statement or of the one holding it.
+    pub index: u32,
+    /// That script's file, where it is named.
+    pub file: Option<String>,
 }
 
 /// Where a routine call site sits, for inter-procedural dispatch.
@@ -78,6 +192,40 @@ pub struct CallSite<'a> {
     pub args: &'a [AstCallArg],
     pub node_id: NodeId,
     pub kind: CallSiteKind,
+    /// The keys of the parameters of the procedure or function whose body
+    /// holds the call; none at the top level.
+    pub parameters: &'a [IdentKey],
+}
+
+/// A definition, in another script of the run, of a routine a call names
+/// ([`Reasoning::routines_elsewhere`]): each of its parameters in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutineRun {
+    pub parameters: Vec<ParameterRun>,
+    /// Whether what it runs is not established
+    /// ([`crate::definition_unread`]): it may run any argument it is called
+    /// with.
+    pub unread: bool,
+}
+
+/// A parameter of a routine another script of the run defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterRun {
+    /// Its name, as a variable of the routine's body is known; `None` for
+    /// one with no name.
+    pub name: Option<IdentKey>,
+    /// How the routine runs the text of the argument written to it; `None`
+    /// where it runs none of it.
+    pub run: Option<ArgumentRun>,
+}
+
+/// How a routine runs the text of an argument it is called with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgumentRun {
+    /// As the whole text of a statement it runs.
+    Whole,
+    /// Written into the text it builds and runs.
+    WrittenInto,
 }
 
 /// A column reference inside a filter predicate together with what the
@@ -90,10 +238,43 @@ pub struct PredicateNullWitness {
     pub nullability: Nullability,
     pub drops_null_row: bool,
     pub null_addressed: bool,
+    pub drops_padded_row: bool,
     pub aggregate_derived: bool,
     pub inequality_compared: bool,
     pub null_literal_compared: bool,
     pub inner_join_key_protected: bool,
+}
+
+/// A column of an earlier outer join's padded row that a join drops or
+/// is not shown to keep, with its nullability where the join reads it.
+pub struct DroppedPaddedColumn {
+    pub column: ColumnId,
+    /// Where the join's condition, or its lateral right operand, first
+    /// reads the column; `None` where the join names no reference to it
+    /// (a `USING` or `NATURAL` join).
+    pub column_ref_span: Option<Span>,
+    pub nullability: Nullability,
+}
+
+/// Where a column is read: a plan node and where in it.
+#[derive(Clone, Copy)]
+pub struct ReadSite<'a> {
+    pub node: &'a RelPlan,
+    pub at: ReadAt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAt {
+    /// What the node's inputs left.
+    Context,
+    /// A DML node's context after one definition group's predicate.
+    Selected(usize),
+    /// After the node's own definitions.
+    Defined,
+    /// The node's output.
+    Output,
+    /// A join's `ON` column, for the rule that asks about join keys.
+    JoinKey,
 }
 
 /// Reach of a privilege grant through the catalog's role hierarchy.
@@ -106,7 +287,8 @@ pub struct GrantImpacts {
 /// Findings produced by analysing the SQL inside dynamic-SQL string
 /// literals, remapped onto the enclosing script.
 pub struct DynamicBodyOutcome {
-    pub signals: Vec<crate::analyzer::RuleMatch>,
+    /// Each finding, with the span of the statement that runs the body.
+    pub findings: Vec<(crate::lexer::token::Span, crate::analyzer::RuleMatch)>,
     pub tables_read: std::collections::HashSet<String>,
     pub tables_written: std::collections::HashSet<String>,
 }
@@ -114,7 +296,7 @@ pub struct DynamicBodyOutcome {
 impl DynamicBodyOutcome {
     pub fn empty() -> Self {
         Self {
-            signals: Vec::new(),
+            findings: Vec::new(),
             tables_read: std::collections::HashSet::new(),
             tables_written: std::collections::HashSet::new(),
         }
@@ -133,6 +315,7 @@ pub const REASONING_FIELDS: &[(&str, &str)] = &[
     ("*", "nullability"),
     ("aggregates", "on_nullable_argument"),
     ("*", "null_effects"),
+    ("joins", "dropped_padded_columns"),
     ("*", "cross_scope_effects"),
     // Constraint propagation over predicates.
     ("*", "column_constraints"),
@@ -154,12 +337,21 @@ pub const REASONING_FIELDS: &[(&str, &str)] = &[
     // Temporal columns of the scans a statement joins.
     ("*", "temporal_gating_expressions"),
     ("*", "temporal_join_tables"),
+    // What analysis shows of each column of the relation a statement
+    // returns or makes.
+    ("output_columns", "nullable"),
+    ("output_columns", "sources"),
+    ("output_columns", "taint_tags"),
+    ("output_columns", "constraints"),
     // Taint.
     ("projections", "taint_labels"),
     ("projections", "value_exposure"),
+    ("written_columns", "value_taint_labels"),
+    ("written_columns", "value_exposure"),
     ("stage", "exported_columns"),
     // Dynamic-SQL argument resolution.
     ("dynamic_sql_calls", "argument"),
+    ("dynamic_sql_calls", "argument_parameter"),
     ("dynamic_sql_calls", "taint_splices"),
     // Cross-statement schema state.
     ("*", "stale_table_refs"),
@@ -179,6 +371,41 @@ pub fn is_reasoning_field(enclosing: &str, field: &str) -> bool {
         .any(|(parent, name)| *name == field && (*parent == "*" || *parent == enclosing))
 }
 
+/// A provider's hold on the dialect it adopted for a thread. Dropping it
+/// puts back whatever the thread had before the adoption.
+///
+/// The thread keeps the hold with the scope it was adopted for and drops
+/// it when that scope ends. A scope still open when its thread ends has
+/// its hold dropped as the thread's own state is torn down: a hold whose
+/// `Drop` reads a thread-local reads it with `try_with` and does nothing
+/// where it is gone.
+///
+/// When a scope ends, its hold is dropped after the thread's folding and
+/// `FORMAT` flag are put back: a name the hold's `Drop` folds is folded
+/// as the thread folded when the scope was opened. Where no scope is left
+/// open as the hold drops (its scope was the outermost, or a scope around
+/// it was dropped first and ended both), a debug build refuses that fold
+/// and a release build still folds as the thread folded when the scope was
+/// opened: as Snowflake does where that was outside every scope.
+///
+/// What a provider must not do, since each leaves its own state wrong:
+///
+/// - Leave open a dialect scope it opened while it adopted the dialect,
+///   or keep one in the hold it returns. That scope ends with the scope
+///   it was opened in, but the provider's state is then put back in the
+///   wrong order and stays at the inner dialect.
+/// - End a dialect scope from the hold's `Drop`. The thread's folding
+///   goes back to where the ended scope found it; what the provider's
+///   state goes back to is the provider's to get right.
+/// - Panic in the hold's `Drop`. The scopes still to be ended are ended
+///   and the panic goes on; a second hold that panics among them aborts
+///   the process, as does one dropped while the thread is unwinding or
+///   ending.
+pub trait DialectHold {}
+
+/// A provider that keeps no dialect state holds nothing.
+impl DialectHold for () {}
+
 /// Factory for the per-plan and per-script reasoning handles.
 pub trait Reasoning {
     /// Whether this provider performs semantic analysis. One that does
@@ -190,33 +417,17 @@ pub trait Reasoning {
 
     fn for_script<'a>(&'a self, inputs: ScriptInputs<'a>) -> Box<dyn ScriptReasoning + 'a>;
 
-    /// Proof of which of the plan's columns hold no NULLs, for judging
-    /// whether its row-selecting predicate keeps every row. `None` when
-    /// nothing can be proven.
-    fn non_null_proof<'a>(
-        &'a self,
-        plan: &'a RelPlan,
-        bindings: &'a BindingTable,
-        catalog: Option<&'a dyn CatalogContext>,
-    ) -> Option<Box<dyn NonNullProof + 'a>>;
-
-    /// Analyse the SQL carried inside dynamic-SQL string literals and
-    /// report its findings against the enclosing script.
-    fn dynamic_sql_literal_bodies(
-        &self,
-        source: &str,
-        script: &AstScript,
-        config: &crate::analyzer::AnalysisConfig,
-        source_file: Option<&str>,
-    ) -> DynamicBodyOutcome;
-
     /// Reach of a privilege grant through the attached catalog's role
     /// hierarchy.
     fn grant_impacts(&self, plan: &crate::ir::PrivilegePlan, source: &str) -> GrantImpacts;
 
     /// Adopt the analysis dialect for the current thread before lowering
-    /// begins; `None` is the Snowflake default.
-    fn configure_dialect(&self, dialect: Option<&dyn crate::dialect::Dialect>);
+    /// begins; `None` is the Snowflake default. The thread keeps it for as
+    /// long as the returned hold lives.
+    fn configure_dialect(
+        &self,
+        dialect: Option<&dyn crate::dialect::Dialect>,
+    ) -> Box<dyn DialectHold>;
 
     /// Render a Jinja / dbt template to the SQL to analyse, with the
     /// provenance the report needs. `file_path` locates the project the
@@ -227,51 +438,72 @@ pub trait Reasoning {
         source: &str,
         file_path: Option<&std::path::Path>,
     ) -> crate::template::RenderArtifacts;
+
+    /// Each definition another script of the run holds of the routine whose
+    /// name's parts are `name`, each part folded as the dialect folds an
+    /// identifier; none where the provider reads no other script. A report
+    /// masks what a call's argument holds as each definition runs it, and
+    /// every literal a call statement passes to a routine the run holds no
+    /// definition of.
+    fn routines_elsewhere(&self, name: &[IdentKey]) -> Vec<RoutineRun>;
+
+    /// What the rows of either of two relations meet in a column, the
+    /// rows of the one meeting `first` there and those of the other
+    /// `second`: no constraint where reasoning has no answer.
+    fn rows_of_either(
+        &self,
+        first: &IrColumnConstraints,
+        second: &IrColumnConstraints,
+    ) -> IrColumnConstraints;
 }
 
 /// Reasoning over one relational plan, consulted by the facts walk.
 pub trait QueryReasoning {
-    /// Whether the whole column can be NULL at the plan's output.
-    fn is_column_nullable(&self, col: ColumnId) -> bool;
+    /// The reasoning of the scope rooted at `root`, a plan nested in this
+    /// one's.
+    fn nested<'b>(&'b self, root: &'b RelPlan) -> Box<dyn QueryReasoning + 'b>;
+
+    /// Nullability of the column where `site` reads it. `Unknown` where
+    /// reasoning has no answer.
+    fn nullability(&self, site: ReadSite<'_>, col: ColumnId) -> Nullability;
 
     /// Base-source columns the column's value is drawn from, through
     /// every CTE / derived-table / set-op pass-through.
     fn lineage_roots(&self, col: ColumnId) -> Option<&BTreeSet<ColumnId>>;
 
-    /// Whether the column is provably unique at its binding site.
-    fn is_unique(&self, col: ColumnId) -> bool;
+    /// Whether the columns of `on` (those the join's `ON` equates) that
+    /// the input of `join` carrying `column` carries hold a key of that
+    /// input's rows. `None` where uniqueness is not analysed or neither
+    /// input carries the column.
+    fn key_backed(&self, join: &RelPlan, column: ColumnId, on: &[ColumnId]) -> Option<bool>;
 
-    /// Whether uniqueness was analysed at all, so that "not unique" is
-    /// a finding rather than an absence of information.
-    fn uniqueness_known(&self) -> bool;
+    /// The columns of an earlier outer join's padded row that `join`
+    /// drops or is not shown to keep. Empty where reasoning has no answer.
+    fn dropped_padded_columns(&self, join: &RelPlan) -> Vec<DroppedPaddedColumn>;
 
     /// Columns whose value reaches a volatile function along their lineage.
     fn volatile_columns(&self) -> &BTreeSet<ColumnId>;
 
-    /// Taint labels flowing into the output column with this display name.
-    fn output_taint_labels(&self, display_name: &str) -> Vec<TaintLabel>;
+    /// Taint labels flowing into the output column `column`.
+    fn output_taint_labels(&self, column: ColumnId) -> Vec<TaintLabel>;
 
-    /// How much of a tainted value the output column with this display
-    /// name exposes.
-    fn output_value_exposure(&self, display_name: &str) -> ValueExposure;
+    /// How much of a tainted value the output column `column` exposes.
+    fn output_value_exposure(&self, column: ColumnId) -> ValueExposure;
 
-    /// Whether an enclosing filter or null-safe wrapper guarantees the
-    /// projected column is non-null; `at` restricts the proof to filters
-    /// strictly upstream of that predicate site.
-    fn is_projected_col_null_guarded(
-        &self,
-        col: ColumnId,
-        ctes_in_scope: &[&CteBinding],
-        at: Option<Span>,
-    ) -> bool;
+    /// The catalog tags whose value reaches the output column `column`,
+    /// each once, as the catalog states it, whatever the exposure: what a
+    /// relation made from the plan carries in that column. Empty where
+    /// reasoning has no answer.
+    fn output_catalog_tags(&self, column: ColumnId) -> Vec<TagRef>;
 
-    /// Whether a column's defining expression makes its value non-null
-    /// by shape alone (literal, cast of a literal, null-safe wrapper, …).
-    fn is_column_provably_non_null_by_shape(
-        &self,
-        col: ColumnId,
-        ctes_in_scope: &[&CteBinding],
-    ) -> bool;
+    /// The constraints the rows of `relation`, a plan in this one, meet
+    /// in its output column `column`. Empty where reasoning has no answer.
+    fn output_constraints(&self, relation: &RelPlan, column: ColumnId) -> IrColumnConstraints;
+
+    /// Whether no two rows of `relation`, a plan in this one, hold the
+    /// same value in its output column `column`. `false` where reasoning
+    /// has no answer.
+    fn output_unique(&self, relation: &RelPlan, column: ColumnId) -> bool;
 
     /// Whether the column is high-cardinality (name pattern plus any
     /// catalog row-count evidence).
@@ -295,8 +527,9 @@ pub trait QueryReasoning {
     /// Scans that declare temporal columns.
     fn temporal_join_tables(&self) -> Vec<TemporalJoinTable>;
 
-    /// Whether a column reference is a temporal column of one of those
-    /// scans.
+    /// Whether a column reference holds a temporal column of one of those
+    /// scans: the column itself, or read through a CTE, a subquery or an
+    /// alias, or a column a filter computes from one before its predicate.
     fn is_temporal_gating_column(&self, col: ColumnId) -> bool;
 
     /// Structurally identical subqueries that occur more than once.
@@ -305,23 +538,39 @@ pub trait QueryReasoning {
 
 /// Reasoning over one script: state folded across its statements.
 pub trait ScriptReasoning {
-    /// Dynamic-SQL argument classifier seeded with the script's
-    /// top-level variable assignments.
+    /// Dynamic-SQL argument classifier of the script's top level: each
+    /// call reads its variables as the script has assigned them where it
+    /// runs.
     fn dynamic_sql(&self) -> &dyn DynamicSqlClassifier;
 
-    /// Classifier seeded with one routine body's own assignments.
+    /// Classifier of one routine body: each call reads its variables as the
+    /// body has assigned them where it runs, a parameter the caller's value
+    /// until the body assigns it.
     fn dynamic_sql_for_body<'b>(&'b self, body: &'b AstStmt) -> Box<dyn DynamicSqlClassifier + 'b>;
 
-    /// Dynamic-SQL sinks reached inside routines that `body` calls.
-    fn inter_procedural_calls(&self, body: &AstStmt) -> Vec<DynamicSqlCallIr>;
+    /// Analyse the SQL `script` (the script this reasoning reads) runs: the
+    /// text the engine's reading of its string literals and of the text it
+    /// builds gives each run, as the run's variables hold it there. Each
+    /// finding is placed at its line and column in the script's text.
+    fn dynamic_sql_literal_bodies(
+        &self,
+        script: &AstScript,
+        config: &crate::analyzer::AnalysisConfig,
+    ) -> DynamicBodyOutcome;
 
-    /// Dynamic-SQL sinks a call site reaches inside its callee, one per
-    /// argument that flows into the callee's sink.
-    fn call_site_calls(&self, site: &CallSite<'_>) -> Vec<DynamicSqlCallIr>;
+    /// Dynamic-SQL sinks reached inside routines that `body` calls, each
+    /// argument read as [`Self::dynamic_sql_for_body`] reads it.
+    fn inter_procedural_calls(
+        &self,
+        body: &AstStmt,
+        parameters: &[AstProcedureParam],
+    ) -> Vec<DynamicSqlCallIr>;
 
-    /// Attach references to tables and columns that earlier DDL in the
-    /// script dropped or renamed. `position` is the statement's index
-    /// among the top-level statements.
+    /// Attach references to tables and columns that DDL which may run
+    /// before the statement dropped or renamed. `position` is the
+    /// statement's index in the order [`crate::flatten_stmts_for_rules`]
+    /// gives the script's statements: every statement at every depth.
+    /// `places` says where each table the statement names is.
     fn attach_stale_references(
         &mut self,
         facts: &mut StatementFacts,
@@ -329,15 +578,12 @@ pub trait ScriptReasoning {
         plan: &RelPlan,
         bindings: &BindingTable,
         catalog: Option<&IndexedCatalogContext>,
+        places: &dyn TablePlaces,
     );
 
-    /// Columns an unload's source query exports, classified by the
-    /// taint reaching each one.
-    fn exported_columns(
-        &self,
-        source: &AstUnloadSource,
-        session: &SessionContext,
-    ) -> Vec<ExportedColumn>;
+    /// Columns an unload exports, from `query`, the facts of the query it
+    /// reads: each classified by the taint reaching it.
+    fn exported_columns(&self, query: &QueryFacts) -> Vec<ExportedColumn>;
 }
 
 /// Classifies the SQL-string argument of a dynamic-SQL call.
@@ -349,13 +595,27 @@ pub trait DynamicSqlClassifier {
     /// Positions at which runtime values splice into the argument.
     fn classify_arg_splices(&self, expr: &AstExpr, source: &str) -> Vec<SpliceClass>;
 
-    /// Shape and splices recorded for a bare variable, when an
-    /// assignment seeded it.
-    fn variable_shape(&self, name: &str) -> Option<(DynamicSqlArgIr, Vec<SpliceClass>)>;
-
     /// The argument's shape when it is a lowered expression (a
     /// dynamic-SQL function call inside a query).
     fn classify_scalar_arg(&self, expr: &crate::ir::scalar::ScalarExpr) -> DynamicSqlArgIr;
+
+    /// Dynamic-SQL sinks a call site reaches inside its callee, one per
+    /// argument that flows into the callee's sink, each argument read as
+    /// the classifier reads variables.
+    fn call_site_calls(&self, site: &CallSite<'_>) -> Vec<DynamicSqlCallIr>;
+
+    /// The parameter of `parameters`, those of the routine whose body
+    /// runs the argument, that the argument is: written alone, or, read as
+    /// the classifier reads variables, a variable holding the caller's
+    /// text of it.
+    fn argument_parameter(
+        &self,
+        expr: &AstExpr,
+        source: &str,
+        parameters: &[IdentKey],
+    ) -> Option<String> {
+        crate::ir::dynamic_sql::expr_parameter(expr, source, parameters)
+    }
 }
 
 /// Argument classification from the expression's own shape, with
@@ -371,12 +631,12 @@ impl DynamicSqlClassifier for SyntacticClassifier {
         Vec::new()
     }
 
-    fn variable_shape(&self, _name: &str) -> Option<(DynamicSqlArgIr, Vec<SpliceClass>)> {
-        None
-    }
-
     fn classify_scalar_arg(&self, expr: &crate::ir::scalar::ScalarExpr) -> DynamicSqlArgIr {
         classify_scalar_expr_argument(expr, &SyntacticShapes)
+    }
+
+    fn call_site_calls(&self, _site: &CallSite<'_>) -> Vec<DynamicSqlCallIr> {
+        Vec::new()
     }
 }
 
@@ -398,30 +658,16 @@ impl Reasoning for RecognitionOnly {
         Box::new(NoScriptReasoning)
     }
 
-    fn non_null_proof<'a>(
-        &'a self,
-        _plan: &'a RelPlan,
-        _bindings: &'a BindingTable,
-        _catalog: Option<&'a dyn CatalogContext>,
-    ) -> Option<Box<dyn NonNullProof + 'a>> {
-        None
-    }
-
-    fn dynamic_sql_literal_bodies(
-        &self,
-        _source: &str,
-        _script: &AstScript,
-        _config: &crate::analyzer::AnalysisConfig,
-        _source_file: Option<&str>,
-    ) -> DynamicBodyOutcome {
-        DynamicBodyOutcome::empty()
-    }
-
     fn grant_impacts(&self, _plan: &crate::ir::PrivilegePlan, _source: &str) -> GrantImpacts {
         GrantImpacts::default()
     }
 
-    fn configure_dialect(&self, _dialect: Option<&dyn crate::dialect::Dialect>) {}
+    fn configure_dialect(
+        &self,
+        _dialect: Option<&dyn crate::dialect::Dialect>,
+    ) -> Box<dyn DialectHold> {
+        Box::new(())
+    }
 
     fn render_template(
         &self,
@@ -433,6 +679,18 @@ impl Reasoning for RecognitionOnly {
             "template rendering is not available in this build".to_string(),
         )
     }
+
+    fn routines_elsewhere(&self, _name: &[IdentKey]) -> Vec<RoutineRun> {
+        Vec::new()
+    }
+
+    fn rows_of_either(
+        &self,
+        _first: &IrColumnConstraints,
+        _second: &IrColumnConstraints,
+    ) -> IrColumnConstraints {
+        IrColumnConstraints::default()
+    }
 }
 
 struct NoQueryReasoning {
@@ -440,48 +698,49 @@ struct NoQueryReasoning {
 }
 
 impl QueryReasoning for NoQueryReasoning {
-    fn is_column_nullable(&self, _col: ColumnId) -> bool {
-        false
+    fn nested<'b>(&'b self, _root: &'b RelPlan) -> Box<dyn QueryReasoning + 'b> {
+        Box::new(NoQueryReasoning {
+            empty: BTreeSet::new(),
+        })
+    }
+
+    fn nullability(&self, _site: ReadSite<'_>, _col: ColumnId) -> Nullability {
+        Nullability::Unknown
     }
 
     fn lineage_roots(&self, _col: ColumnId) -> Option<&BTreeSet<ColumnId>> {
         None
     }
 
-    fn is_unique(&self, _col: ColumnId) -> bool {
-        false
+    fn key_backed(&self, _join: &RelPlan, _column: ColumnId, _on: &[ColumnId]) -> Option<bool> {
+        None
     }
 
-    fn uniqueness_known(&self) -> bool {
-        false
+    fn dropped_padded_columns(&self, _join: &RelPlan) -> Vec<DroppedPaddedColumn> {
+        Vec::new()
     }
 
     fn volatile_columns(&self) -> &BTreeSet<ColumnId> {
         &self.empty
     }
 
-    fn output_taint_labels(&self, _display_name: &str) -> Vec<TaintLabel> {
+    fn output_taint_labels(&self, _column: ColumnId) -> Vec<TaintLabel> {
         Vec::new()
     }
 
-    fn output_value_exposure(&self, _display_name: &str) -> ValueExposure {
+    fn output_value_exposure(&self, _column: ColumnId) -> ValueExposure {
         ValueExposure::Value
     }
 
-    fn is_projected_col_null_guarded(
-        &self,
-        _col: ColumnId,
-        _ctes_in_scope: &[&CteBinding],
-        _at: Option<Span>,
-    ) -> bool {
-        false
+    fn output_catalog_tags(&self, _column: ColumnId) -> Vec<TagRef> {
+        Vec::new()
     }
 
-    fn is_column_provably_non_null_by_shape(
-        &self,
-        _col: ColumnId,
-        _ctes_in_scope: &[&CteBinding],
-    ) -> bool {
+    fn output_constraints(&self, _relation: &RelPlan, _column: ColumnId) -> IrColumnConstraints {
+        IrColumnConstraints::default()
+    }
+
+    fn output_unique(&self, _relation: &RelPlan, _column: ColumnId) -> bool {
         false
     }
 
@@ -532,12 +791,20 @@ impl ScriptReasoning for NoScriptReasoning {
         Box::new(SyntacticClassifier)
     }
 
-    fn inter_procedural_calls(&self, _body: &AstStmt) -> Vec<DynamicSqlCallIr> {
+    fn inter_procedural_calls(
+        &self,
+        _body: &AstStmt,
+        _parameters: &[AstProcedureParam],
+    ) -> Vec<DynamicSqlCallIr> {
         Vec::new()
     }
 
-    fn call_site_calls(&self, _site: &CallSite<'_>) -> Vec<DynamicSqlCallIr> {
-        Vec::new()
+    fn dynamic_sql_literal_bodies(
+        &self,
+        _script: &AstScript,
+        _config: &crate::analyzer::AnalysisConfig,
+    ) -> DynamicBodyOutcome {
+        DynamicBodyOutcome::empty()
     }
 
     fn attach_stale_references(
@@ -547,14 +814,43 @@ impl ScriptReasoning for NoScriptReasoning {
         _plan: &RelPlan,
         _bindings: &BindingTable,
         _catalog: Option<&IndexedCatalogContext>,
+        _places: &dyn TablePlaces,
     ) {
     }
 
-    fn exported_columns(
-        &self,
-        _source: &AstUnloadSource,
-        _session: &SessionContext,
-    ) -> Vec<ExportedColumn> {
+    fn exported_columns(&self, _query: &QueryFacts) -> Vec<ExportedColumn> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognition_answers_unknown_at_every_site() {
+        let node = RelPlan::Opaque {
+            stmt_node_id: NodeId::new(0),
+            reason: crate::ir::strict::OpaqueReason::NonSelectTopLevel,
+            hints: Vec::new(),
+            span: Span { start: 0, end: 1 },
+        };
+        let reasoning = NoQueryReasoning {
+            empty: BTreeSet::new(),
+        };
+        for at in [
+            ReadAt::Context,
+            ReadAt::Selected(0),
+            ReadAt::Defined,
+            ReadAt::Output,
+            ReadAt::JoinKey,
+        ] {
+            let site = ReadSite { node: &node, at };
+            assert_eq!(
+                reasoning.nullability(site, ColumnId::new(0)),
+                Nullability::Unknown,
+                "{at:?}"
+            );
+        }
     }
 }

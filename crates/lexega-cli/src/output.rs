@@ -1,11 +1,13 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Report rendering: Markdown summaries and the fact / signal / rule
+//! Report rendering: Markdown summaries and the fact / finding / rule
 //! explanation views.
 
 use lexega_core::analyzer;
 use lexega_core::analyzer::PlaceholderStats;
+
+use super::color::Palette;
 
 /// Truncate message for table display
 pub fn truncate_for_table(s: &str, max_len: usize) -> String {
@@ -16,11 +18,78 @@ pub fn truncate_for_table(s: &str, max_len: usize) -> String {
     }
 }
 
+/// The Markdown marker of a level.
+pub fn risk_icon(level: analyzer::RiskLevel) -> &'static str {
+    match level {
+        analyzer::RiskLevel::Critical => "🔴",
+        analyzer::RiskLevel::High => "🟠",
+        analyzer::RiskLevel::Medium => "🟡",
+        analyzer::RiskLevel::Low => "🟢",
+        analyzer::RiskLevel::Info => "ℹ️",
+    }
+}
+
+/// Text lines for entries: each one's level and message, then up to
+/// `evidence_shown` evidence lines, previews on one line each.
+pub fn write_text_entries(
+    out: &mut String,
+    entries: &[analyzer::RuleMatch],
+    evidence_shown: usize,
+    palette: &Palette,
+) {
+    for entry in entries {
+        let level = entry.risk_level();
+        let tag = palette.severity(level, &format!("[{}]", level.as_str().to_uppercase()));
+        out.push_str(&format!("  {} {}\n", tag, entry.message()));
+        let evidence = entry.evidence();
+        for ev in evidence.iter().take(evidence_shown) {
+            let analyzer::RiskEvidence::RuleMatch {
+                statement_preview,
+                rule_id,
+                location,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            let mut parts = Vec::new();
+            if let Some(line) = source_line(ev) {
+                parts.push(palette.dim(&format!("Line {}", line)));
+            }
+            if !rule_id.is_empty() {
+                parts.push(palette.rule_id(&format!("`{}`", rule_id)));
+            }
+            if let Some(preview) = statement_preview.as_deref().filter(|p| !p.is_empty()) {
+                // One physical line per occurrence, so previews do not bury
+                // the headlines below them.
+                let one_line = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+                parts.push(palette.dim(&format!("\"{}\"", one_line)));
+            }
+            if let Some(loc) = location {
+                parts.push(palette.dim(loc));
+            }
+            if !parts.is_empty() {
+                out.push_str(&format!("    {} {}\n", palette.dim("↳"), parts.join(" • ")));
+            }
+        }
+        if evidence.len() > evidence_shown {
+            out.push_str(&format!(
+                "    {}\n",
+                palette.dim(&format!(
+                    "↳ (+{} more occurrences)",
+                    evidence.len() - evidence_shown
+                ))
+            ));
+        }
+    }
+}
+
 pub fn print_analyze_markdown(
     report: &lexega_core::analyzer::AnalysisReport,
     input_path: &str,
     placeholder_stats: &PlaceholderStats,
     depth_note: Option<&str>,
+    run_notes: &[String],
 ) {
     use lexega_core::analyzer::RiskLevel;
 
@@ -33,21 +102,24 @@ pub fn print_analyze_markdown(
         "🟠"
     } else if summary.medium_count > 0 {
         "🟡"
+    } else if !run_notes.is_empty() {
+        // Not all clear: the notes say what was not checked.
+        "⚠️"
     } else {
         "🟢"
     };
 
-    // Extract file/directory name for display
-    let input_name = std::path::Path::new(input_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(input_path);
-
-    println!("## {} Semantic Analysis: `{}`", risk_emoji, input_name);
+    // A run at reduced depth is not titled for the analysis it lacks.
+    let title = if depth_note.is_some() {
+        "Analysis"
+    } else {
+        "Semantic Analysis"
+    };
+    println!("## {} {}: `{}`", risk_emoji, title, input_path);
     println!();
     println!(
-        "**{} statements analyzed** | **{} signals**",
-        summary.statements_analyzed, summary.total_reported_signals
+        "**{} statements analyzed** | **{} findings**",
+        summary.statements_analyzed, summary.total_reported_findings
     );
     println!();
 
@@ -79,85 +151,89 @@ pub fn print_analyze_markdown(
         println!("**Note**: {}", note);
         println!();
     }
+    for note in run_notes {
+        println!("**Note**: {}", note);
+        println!();
+    }
 
-    // Collect and sort signals by severity (RiskLevel derives Ord,
+    // Collect and sort findings by severity (RiskLevel derives Ord,
     // Info < … < Critical); stable sort keeps report order within a level.
-    let mut signals_by_level: Vec<_> = report.signals.iter().collect();
-    signals_by_level.sort_by_key(|signal| std::cmp::Reverse(signal.risk_level()));
+    let mut findings_by_level: Vec<_> = report.findings.iter().collect();
+    findings_by_level.sort_by_key(|finding| std::cmp::Reverse(finding.risk_level()));
 
-    // Critical signals
-    let critical_signals: Vec<_> = signals_by_level
+    // Critical findings
+    let critical_findings: Vec<_> = findings_by_level
         .iter()
         .filter(|s| matches!(s.risk_level(), RiskLevel::Critical))
         .collect();
 
-    if !critical_signals.is_empty() {
+    if !critical_findings.is_empty() {
         println!(
             "### 🔴 Critical ({})
 ",
             summary.critical_count
         );
-        println!("| Signal | Location |");
+        println!("| Finding | Location |");
         println!("|--------|----------|");
-        for signal in &critical_signals {
-            let location = get_signal_location(signal);
-            let message = truncate_for_table(signal.message(), 60);
+        for finding in &critical_findings {
+            let location = get_finding_location(finding);
+            let message = truncate_for_table(finding.message(), 60);
             println!("| {} | {} |", message, location);
         }
         println!();
     }
 
-    // High signals
-    let high_signals: Vec<_> = signals_by_level
+    // High findings
+    let high_findings: Vec<_> = findings_by_level
         .iter()
         .filter(|s| matches!(s.risk_level(), RiskLevel::High))
         .collect();
 
-    if !high_signals.is_empty() {
+    if !high_findings.is_empty() {
         println!(
             "### 🟠 High Risk ({})
 ",
             summary.high_count
         );
-        println!("| Signal | Location |");
+        println!("| Finding | Location |");
         println!("|--------|----------|");
-        for signal in &high_signals {
-            let location = get_signal_location(signal);
-            let message = truncate_for_table(signal.message(), 60);
+        for finding in &high_findings {
+            let location = get_finding_location(finding);
+            let message = truncate_for_table(finding.message(), 60);
             println!("| {} | {} |", message, location);
         }
         println!();
     }
 
-    // Medium signals
-    let medium_signals: Vec<_> = signals_by_level
+    // Medium findings
+    let medium_findings: Vec<_> = findings_by_level
         .iter()
         .filter(|s| matches!(s.risk_level(), RiskLevel::Medium))
         .collect();
 
-    if !medium_signals.is_empty() {
+    if !medium_findings.is_empty() {
         println!(
             "### 🟡 Medium ({})
 ",
             summary.medium_count
         );
-        println!("| Signal | Location |");
+        println!("| Finding | Location |");
         println!("|--------|----------|");
-        for signal in &medium_signals {
-            let location = get_signal_location(signal);
-            let message = truncate_for_table(signal.message(), 60);
+        for finding in &medium_findings {
+            let location = get_finding_location(finding);
+            let message = truncate_for_table(finding.message(), 60);
             println!("| {} | {} |", message, location);
         }
         println!();
     }
 
-    // Low signals (only show if no higher severity signals exist)
-    let low_signals: Vec<_> = signals_by_level
+    // Low findings (only show if no higher severity findings exist)
+    let low_findings: Vec<_> = findings_by_level
         .iter()
         .filter(|s| matches!(s.risk_level(), RiskLevel::Low))
         .collect();
 
-    if !low_signals.is_empty()
+    if !low_findings.is_empty()
         && summary.critical_count == 0
         && summary.high_count == 0
         && summary.medium_count == 0
@@ -167,88 +243,36 @@ pub fn print_analyze_markdown(
 ",
             summary.low_count
         );
-        println!("| Signal | Location |");
+        println!("| Finding | Location |");
         println!("|--------|----------|");
-        for signal in &low_signals {
-            let location = get_signal_location(signal);
-            let message = truncate_for_table(signal.message(), 60);
+        for finding in &low_findings {
+            let location = get_finding_location(finding);
+            let message = truncate_for_table(finding.message(), 60);
             println!("| {} | {} |", message, location);
         }
         println!();
     }
 
-    // Positive signals
-    if !report.positive_signals.is_empty() {
+    // Context entries (kept only with --min-severity info)
+    if !report.context.is_empty() {
         println!(
-            "### ✅ Positive Signals ({})
+            "### ℹ️ Context ({})
 ",
-            report.positive_signals.len()
+            report.context.len()
         );
-        for signal in &report.positive_signals {
-            println!("- ✓ {}", signal.message);
-            if let Some(details) = &signal.details {
-                println!("  - {}", details);
-            }
+        for entry in &report.context {
+            print_entry_details(entry);
         }
-        println!();
     }
 
-    // Details section (collapsible) - expanded signal info
-    if !report.signals.is_empty() {
+    // Details section (collapsible) - expanded finding info
+    if !report.findings.is_empty() {
         println!("<details>");
-        println!("<summary>📋 Signal Details</summary>");
+        println!("<summary>📋 Finding Details</summary>");
         println!();
 
-        for signal in &signals_by_level {
-            let icon = match signal.risk_level() {
-                RiskLevel::Critical => "🔴",
-                RiskLevel::High => "🟠",
-                RiskLevel::Medium => "🟡",
-                RiskLevel::Low => "🟢",
-                RiskLevel::Info => "ℹ️",
-            };
-
-            println!("#### {} {}", icon, signal.message());
-
-            // Show evidence
-            let evidence = signal.evidence();
-            if !evidence.is_empty() {
-                println!();
-                for ev in evidence.iter().take(5) {
-                    if let lexega_core::analyzer::RiskEvidence::RuleMatch {
-                        line_number,
-                        statement_preview,
-                        signal_value,
-                        location,
-                        ..
-                    } = ev
-                    {
-                        let mut parts = Vec::new();
-                        if let Some(line) = line_number {
-                            parts.push(format!("Line {}", line));
-                        }
-                        if !signal_value.is_empty() {
-                            parts.push(format!("`{}`", signal_value));
-                        }
-                        if let Some(preview) = statement_preview {
-                            if !preview.is_empty() {
-                                parts.push(format!("`{}`", preview));
-                            }
-                        }
-                        // Add clickable location link
-                        if let Some(loc) = location {
-                            parts.push(loc.clone());
-                        }
-                        if !parts.is_empty() {
-                            println!("- {}", parts.join(" • "));
-                        }
-                    }
-                }
-                if evidence.len() > 5 {
-                    println!("- *(+{} more occurrences)*", evidence.len() - 5);
-                }
-                println!();
-            }
+        for finding in &findings_by_level {
+            print_entry_details(finding);
         }
 
         println!("</details>");
@@ -265,14 +289,27 @@ pub fn print_analyze_markdown(
         "| SQL Statements Analyzed | {} |",
         summary.statements_analyzed
     );
-    if summary.statements_skipped > 0 {
+    // The sqlcmd commands that run what was not read count among the
+    // skipped, apart from what did not parse.
+    let not_read = report.unread_sqlcmd().count();
+    let unrecognized = summary.statements_skipped.saturating_sub(not_read);
+    if unrecognized > 0 {
         println!(
             "| Unrecognized (could not parse, no analysis) | {} |",
-            summary.statements_skipped
+            unrecognized
+        );
+    }
+    if not_read > 0 {
+        println!(
+            "| Not read (sqlcmd commands that run SQL or commands the analysis did not read) | {} |",
+            not_read
         );
     }
     if summary.jinja_blocks > 0 {
-        println!("| Jinja Blocks | {} |", summary.jinja_blocks);
+        println!(
+            "| Template blocks, not SQL statements | {} |",
+            summary.jinja_blocks
+        );
     }
     if placeholder_stats.total > 0 {
         println!(
@@ -298,20 +335,86 @@ pub fn print_analyze_markdown(
     println!("</details>");
 }
 
-/// Extract location string from signal evidence
-pub fn get_signal_location(signal: &lexega_core::analyzer::RuleMatch) -> String {
-    let evidence = signal.evidence();
+/// One entry of a Markdown report's details: its message and up to five
+/// evidence lines.
+fn print_entry_details(finding: &lexega_core::analyzer::RuleMatch) {
+    println!(
+        "#### {} {}",
+        risk_icon(finding.risk_level()),
+        finding.message()
+    );
+
+    // Show evidence
+    let evidence = finding.evidence();
+    if !evidence.is_empty() {
+        println!();
+        for ev in evidence.iter().take(5) {
+            if let lexega_core::analyzer::RiskEvidence::RuleMatch {
+                statement_preview,
+                rule_id: finding_value,
+                location,
+                ..
+            } = ev
+            {
+                let mut parts = Vec::new();
+                if let Some(line) = source_line(ev) {
+                    parts.push(format!("Line {}", line));
+                }
+                if !finding_value.is_empty() {
+                    parts.push(format!("`{}`", finding_value));
+                }
+                if let Some(preview) = statement_preview {
+                    if !preview.is_empty() {
+                        parts.push(format!("`{}`", preview));
+                    }
+                }
+                // Add clickable location link
+                if let Some(loc) = location {
+                    parts.push(loc.clone());
+                }
+                if !parts.is_empty() {
+                    println!("- {}", parts.join(" • "));
+                }
+            }
+        }
+        if evidence.len() > 5 {
+            println!("- *(+{} more occurrences)*", evidence.len() - 5);
+        }
+        println!();
+    }
+}
+
+/// The line an evidence item is shown at: its line in the file the user
+/// wrote where it is placed there, else the template line where the render
+/// carries one, else the line of the analyzed text.
+pub(crate) fn source_line(evidence: &analyzer::RiskEvidence) -> Option<usize> {
+    match evidence {
+        analyzer::RiskEvidence::RuleMatch {
+            position: Some(at), ..
+        } => Some(at.line),
+        analyzer::RiskEvidence::RuleMatch {
+            line_number,
+            template_line_number,
+            ..
+        } => template_line_number.or(*line_number),
+        analyzer::RiskEvidence::TableReference { .. }
+        | analyzer::RiskEvidence::PredicateInfo { .. } => None,
+    }
+}
+
+/// Extract location string from finding evidence
+pub fn get_finding_location(finding: &lexega_core::analyzer::RuleMatch) -> String {
+    let evidence = finding.evidence();
     if evidence.is_empty() {
         return "—".to_string();
     }
 
     // Get first evidence with line number
     for ev in evidence {
-        if let lexega_core::analyzer::RiskEvidence::RuleMatch {
-            line_number: Some(line),
-            ..
-        } = ev
-        {
+        if let lexega_core::analyzer::RiskEvidence::RuleMatch { .. } = ev {
+            let Some(line) = source_line(ev) else {
+                continue;
+            };
             if evidence.len() > 1 {
                 return format!("Line {} (+{} more)", line, evidence.len() - 1);
             } else {
@@ -323,7 +426,7 @@ pub fn get_signal_location(signal: &lexega_core::analyzer::RuleMatch) -> String 
     "—".to_string()
 }
 
-pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str, format: &str) {
+pub fn print_finding_explanation(report: &analyzer::AnalysisReport, source: &str, format: &str) {
     // Build the line index once. Used to map source spans on
     // `StatementExplanation` entries to 1-indexed line numbers for
     // display.
@@ -401,7 +504,7 @@ pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str,
                 }
             }
         } else {
-            println!("Signal Explanation (by Statement)");
+            println!("Finding Explanation (by Statement)");
             println!("==================================");
             println!();
             for ((start, end), (preview, rules)) in &by_span {
@@ -425,7 +528,7 @@ pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str,
         // to render outside trace mode.
         if format == "json" {
             let output = serde_json::json!({
-                "mode": "global_signals",
+                "mode": "global_findings",
                 "note": "Run with --trace for per-statement breakdown",
             });
             println!(
@@ -436,10 +539,10 @@ pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str,
                 })
             );
         } else if format == "yaml" {
-            println!("mode: global_signals");
+            println!("mode: global_findings");
             println!("note: Run with --trace for per-statement breakdown");
         } else {
-            println!("Signal Explanation (Global View)");
+            println!("Finding Explanation (Global View)");
             println!("=================================");
             println!();
             println!("Note: For per-statement breakdown, run with --trace");
@@ -447,7 +550,7 @@ pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str,
     }
 }
 
-/// Render `report.statement_signals[].facts` — the per-statement
+/// Render `report.statement_traces[].facts` — the per-statement
 /// [`lexega_core::facts::StatementFacts`] tree the rules were evaluated
 /// against. Populated only in trace mode. JSON output serializes
 /// `StatementFacts` directly.
@@ -458,7 +561,7 @@ pub fn print_signal_explanation(report: &analyzer::AnalysisReport, source: &str,
 pub fn print_fact_explanation(report: &analyzer::AnalysisReport, _source: &str, format: &str) {
     use lexega_core::facts::query::{ScopeKind, TableAccessKind};
 
-    if report.statement_signals.is_empty() {
+    if report.statement_traces.is_empty() {
         eprintln!("Error: --explain-facts requires --trace mode to populate semantic info");
         eprintln!("Try: analyze query.sql --explain-facts (trace is auto-enabled)");
         return;
@@ -468,7 +571,7 @@ pub fn print_fact_explanation(report: &analyzer::AnalysisReport, _source: &str, 
         // Public-schema JSON: serialize each `StatementFacts` carrier
         // verbatim. The schemars-derived shape is the customer contract.
         let mut facts_json = Vec::new();
-        for sig in &report.statement_signals {
+        for sig in &report.statement_traces {
             if let Some(ref facts) = sig.facts {
                 facts_json.push(serde_json::json!({
                     "line": sig.line_number,
@@ -497,7 +600,7 @@ pub fn print_fact_explanation(report: &analyzer::AnalysisReport, _source: &str, 
     println!();
 
     let mut found_any = false;
-    for sig in &report.statement_signals {
+    for sig in &report.statement_traces {
         let Some(ref facts) = sig.facts else { continue };
         found_any = true;
         println!("Line {}:", sig.line_number);

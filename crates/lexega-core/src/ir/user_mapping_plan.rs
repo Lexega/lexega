@@ -47,6 +47,8 @@ pub struct UserMappingPlan {
 #[derive(Debug, Clone)]
 pub struct UserMappingOptionIr {
     pub key: String,
+    /// Where the source writes the key.
+    pub key_span: Span,
     pub value_literal: Option<String>,
 }
 
@@ -66,6 +68,7 @@ fn lower_options(
         .iter()
         .map(|o| UserMappingOptionIr {
             key: span_text(source, o.key_span),
+            key_span: o.key_span,
             value_literal: o.value_literal_span.and_then(|v| {
                 source
                     .get(v.start as usize..v.end as usize)

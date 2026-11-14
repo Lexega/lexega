@@ -36,10 +36,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
@@ -125,15 +124,14 @@ fn test_cluster_by_none_idempotent() {
 // ============================================================================
 
 #[test]
-fn test_cluster_by_none_risk_signal() {
+fn test_cluster_by_none_risk_finding() {
     let report = dbx_analyze("ALTER TABLE t CLUSTER BY NONE;");
 
     assert!(
-        has_signal(&report, "DBX-TBL-CLUSTER-OFF"),
-        "CLUSTER BY NONE should generate DBX-TBL-CLUSTER-OFF (clustering removed). Signals: {:?}",
+        has_finding(&report, "DBX-TBL-CLUSTER-OFF"),
+        "CLUSTER BY NONE should generate DBX-TBL-CLUSTER-OFF (clustering removed). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
@@ -146,22 +144,21 @@ fn test_cluster_by_none_risk_level() {
     let report = dbx_analyze("ALTER TABLE t CLUSTER BY NONE;");
 
     assert!(
-        report.summary.high_count >= 1,
-        "CLUSTER BY NONE should produce at least one High signal. Got: high={}",
-        report.summary.high_count
+        report.summary.low_count >= 1,
+        "CLUSTER BY NONE should produce at least one Low finding. Got: low={}",
+        report.summary.low_count
     );
 }
 
 #[test]
-fn test_cluster_by_columns_info_signal() {
+fn test_cluster_by_columns_info_finding() {
     let report = dbx_analyze("ALTER TABLE t CLUSTER BY (a, b);");
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-CLUSTER-CFG"),
-        "CLUSTER BY (cols) should generate INFO-DBX-TBL-CLUSTER-CFG (clustering configured). Signals: {:?}",
+        has_finding(&report, "INFO-DBX-TBL-CLUSTER-CFG"),
+        "CLUSTER BY (cols) should generate INFO-DBX-TBL-CLUSTER-CFG (clustering configured). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
@@ -170,16 +167,15 @@ fn test_cluster_by_columns_info_signal() {
 }
 
 #[test]
-fn test_cluster_by_auto_info_signal() {
+fn test_cluster_by_auto_info_finding() {
     let report = dbx_analyze("ALTER TABLE t CLUSTER BY AUTO;");
 
     // AUTO is not NONE, so it should emit "configured", not "disabled"
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-CLUSTER-CFG"),
-        "CLUSTER BY AUTO should generate INFO-DBX-TBL-CLUSTER-CFG (clustering configured). Signals: {:?}",
+        has_finding(&report, "INFO-DBX-TBL-CLUSTER-CFG"),
+        "CLUSTER BY AUTO should generate INFO-DBX-TBL-CLUSTER-CFG (clustering configured). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
             })
@@ -188,7 +184,7 @@ fn test_cluster_by_auto_info_signal() {
 
     // AUTO should NOT trigger the "disabled" rule
     assert!(
-        !has_signal(&report, "DBX-TBL-CLUSTER-OFF"),
+        !has_finding(&report, "DBX-TBL-CLUSTER-OFF"),
         "CLUSTER BY AUTO should NOT generate DBX-TBL-CLUSTER-OFF (that's for NONE only)"
     );
 }
@@ -199,7 +195,7 @@ fn test_cluster_by_none_not_on_columns() {
 
     // Setting columns should NOT trigger the "disabled" rule
     assert!(
-        !has_signal(&report, "DBX-TBL-CLUSTER-OFF"),
+        !has_finding(&report, "DBX-TBL-CLUSTER-OFF"),
         "CLUSTER BY (cols) should NOT generate DBX-TBL-CLUSTER-OFF (that's for NONE only)"
     );
 }
@@ -215,8 +211,7 @@ fn test_cluster_by_multi_statement() {
 
     // t1 should trigger clustering disabled
     let disabled_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-CLUSTER-OFF"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -230,8 +225,7 @@ fn test_cluster_by_multi_statement() {
 
     // t2 and t3 should trigger clustering configured
     let configured_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(
             |s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-DBX-TBL-CLUSTER-CFG"),
         )

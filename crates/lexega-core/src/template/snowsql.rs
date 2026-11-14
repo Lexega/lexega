@@ -646,7 +646,7 @@ mod tests {
         assert!(out.contains("SELECT PROD"), "{out}");
     }
 
-    // --- placeholder records for undefined vars (confidence signal) ---
+    // --- placeholder records for undefined vars (confidence indicator) ---
 
     #[test]
     fn undefined_var_records_a_placeholder() {

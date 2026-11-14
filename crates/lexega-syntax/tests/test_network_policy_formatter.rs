@@ -118,3 +118,31 @@ fn test_network_policy_formatter_all_actions() {
 
     println!("✅ All network policy operations formatted correctly");
 }
+
+#[test]
+fn a_network_rule_written_alone_is_a_list_of_one() {
+    use lexega_syntax::ast::{
+        AstAlterNetworkPolicyActionKind, AstNetworkPolicyPropertyKind, AstStmt,
+    };
+    let sql = "ALTER NETWORK POLICY np ADD ALLOWED_NETWORK_RULE_LIST = 'corp_rule'";
+    let script = lexega_syntax::parse_sql(sql).expect("parses");
+    let [AstStmt::AlterNetworkPolicy(alter)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let AstAlterNetworkPolicyActionKind::Add { property, .. } = &alter.action.kind else {
+        panic!("{:?}", alter.action.kind);
+    };
+    let AstNetworkPolicyPropertyKind::AllowedNetworkRuleList {
+        rules,
+        lparen_token,
+        ..
+    } = &property.kind
+    else {
+        panic!("{:?}", property.kind);
+    };
+    assert_eq!(rules.len(), 1);
+    assert!(lparen_token.is_none());
+    let formatted = format_sql_with_config(sql, &FormatterConfig::default()).expect("formats");
+    lexega_syntax::verify_formatting_safe(sql, &formatted)
+        .unwrap_or_else(|e| panic!("{e}\n{formatted}"));
+}

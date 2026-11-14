@@ -143,7 +143,7 @@ fn classify_alter_action(kind: &AlterCatalogActionKind) -> IrCatalogAlterAction 
     use AlterCatalogActionKind as K;
     use IrCatalogAlterAction as A;
     match kind {
-        K::OwnerTo => A::OwnerTo,
+        K::OwnerTo { .. } => A::OwnerTo,
         K::SetTags => A::SetTags,
         K::UnsetTags => A::UnsetTags,
         K::EnablePredictiveOptimization => A::EnablePredictiveOptimization,

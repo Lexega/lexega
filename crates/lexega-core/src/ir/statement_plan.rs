@@ -69,15 +69,6 @@ impl StatementPlan {
         }
     }
 
-    /// True iff the relational arm has any filter (`WHERE` or
-    /// `QUALIFY`). False for DDL.
-    pub fn has_any_filter(&self) -> bool {
-        match self {
-            StatementPlan::Rel(p) => p.has_any_filter(),
-            StatementPlan::Ddl(_) => false,
-        }
-    }
-
     /// True iff the relational arm has a `LIMIT`. False for DDL.
     pub fn has_limit(&self) -> bool {
         match self {

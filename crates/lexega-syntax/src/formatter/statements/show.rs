@@ -56,14 +56,10 @@ pub fn format_show(printer: &mut Printer, show: &AstShow) -> Result<(), Formatte
         }
     }
 
-    // STARTS WITH clause - use push_span for trivia preservation
+    // STARTS WITH clause, as written: its span holds the keywords too.
     if let Some(starts_span) = show.starts_with_span {
         printer.space();
-        printer.push_keyword("STARTS");
-        printer.space();
-        printer.push_keyword("WITH");
-        printer.space();
-        printer.push_span(starts_span); // String literal - preserve original case
+        printer.push_span(starts_span);
     }
 
     // LIMIT clause - use push_span for trivia preservation

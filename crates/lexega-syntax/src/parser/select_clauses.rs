@@ -26,6 +26,8 @@ pub(crate) struct LimitOffsetParsed {
     pub offset_expr: Option<AstExpr>,
     pub limit_keyword_span: Option<Span>,
     pub fetch_clause_span: Option<Span>,
+    /// `WITH TIES` ending the FETCH clause.
+    pub fetch_with_ties_span: Option<Span>,
     pub offset_keyword_span: Option<Span>,
     /// Span of the comma in the MySQL `LIMIT offset, count` form.
     /// When `Some`, `offset_expr` precedes `limit_expr` in source and the
@@ -89,7 +91,7 @@ impl<'a> Parser<'a> {
                 TokenKind::JinjaEndIf | TokenKind::JinjaEndFor => {
                     depth -= 1;
                     if depth == 0 {
-                        // Reached end of block without signal statement fragment keywords
+                        // Reached end of block without finding statement fragment keywords
                         break;
                     }
                 }
@@ -151,33 +153,64 @@ impl<'a> Parser<'a> {
         }
 
         let mut from = Vec::new();
-        while let Some(tok) = self.peek() {
-            // Stop the FROM list when we hit another clause keyword or closing paren (for subqueries)
-            match &tok.kind {
-                TokenKind::Keyword(Keyword::Where)
-                | TokenKind::Keyword(Keyword::Group)
-                | TokenKind::Keyword(Keyword::Order)
-                | TokenKind::Keyword(Keyword::Qualify)
-                | TokenKind::Keyword(Keyword::Limit)
-                | TokenKind::Keyword(Keyword::Offset)
-                | TokenKind::Keyword(Keyword::Fetch)
-                | TokenKind::Keyword(Keyword::Having)
-                | TokenKind::Keyword(Keyword::For)  // Stop at FOR UPDATE clause
-                | TokenKind::Operator(crate::lexer::Operator::Pipe)
-                // Stop on ) for scalar subqueries: SELECT func((SELECT x FROM tbl))
-                | TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => break,
-                _ if self.dialect.supports_named_window_clause()
-                    && tok.lexeme(self.source).eq_ignore_ascii_case("WINDOW") =>
-                {
-                    break
+        loop {
+            // A table is due here, after FROM or after a comma of its list:
+            // another clause's keyword, a closing paren (the end of a
+            // subquery) or the statement's end leaves the list without one,
+            // unless a template that rendered nothing stands there.
+            let next = self.peek();
+            let clause_boundary = next.is_none_or(|tok| {
+                matches!(
+                    tok.kind,
+                    TokenKind::Keyword(Keyword::Where)
+                        | TokenKind::Keyword(Keyword::Group)
+                        | TokenKind::Keyword(Keyword::Order)
+                        | TokenKind::Keyword(Keyword::Qualify)
+                        | TokenKind::Keyword(Keyword::Limit)
+                        | TokenKind::Keyword(Keyword::Offset)
+                        | TokenKind::Keyword(Keyword::Fetch)
+                        | TokenKind::Keyword(Keyword::Having)
+                        | TokenKind::Keyword(Keyword::For)
+                        | TokenKind::Operator(crate::lexer::Operator::Pipe)
+                        | TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+                        | TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
+                ) || (self.dialect.supports_named_window_clause()
+                    && tok.lexeme(self.source).eq_ignore_ascii_case("WINDOW"))
+                    // Dialect-gated clause boundaries (e.g., RETURNING in PostgreSQL)
+                    || (self.can_be_identifier_token(tok)
+                        && self.dialect.is_clause_boundary_keyword(tok.lexeme(self.source)))
+            });
+            if clause_boundary {
+                let due_from = self
+                    .idx
+                    .checked_sub(1)
+                    .and_then(|i| self.tokens.get(i))
+                    .map_or(0, |t| t.span.end);
+                let due_to = match next {
+                    Some(tok) => tok.span.start,
+                    None => self
+                        .tokens
+                        .get(self.idx)
+                        .map_or(self.source.len() as u32, |t| t.span.start),
+                };
+                match self.rendered_nothing_between(due_from, due_to) {
+                    Some(span) => {
+                        let table = self.rendered_nothing_table(span);
+                        from.push(crate::ast::FromItem {
+                            node_id: self.id_gen.next(),
+                            kind: crate::ast::FromItemKind::TableRef(Box::new(table)),
+                        });
+                        break;
+                    }
+                    None => {
+                        return Err(ParseError::new(
+                            next.map_or_else(|| self.current_span(), |tok| tok.span),
+                            ParseErrorKind::InvalidSyntax {
+                                message: "Expected table reference in FROM clause".to_string(),
+                            },
+                        ));
+                    }
                 }
-                // Dialect-gated clause boundaries (e.g., RETURNING in PostgreSQL)
-                _ if self.can_be_identifier_token(tok)
-                    && self.dialect.is_clause_boundary_keyword(tok.lexeme(self.source)) =>
-                {
-                    break
-                }
-                _ => {}
             }
 
             // Parse base table factor FIRST
@@ -415,6 +448,7 @@ impl<'a> Parser<'a> {
                 // Use parse_join_chain on a dummy table to extract joins
                 // Create minimal valid table ref
                 let dummy_name = crate::ast::AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
                     node_id: self.id_gen.next(),
                     span: tok.span,
                     // Synthetic placeholder used only to feed
@@ -438,13 +472,18 @@ impl<'a> Parser<'a> {
                     values: None,
                     lateral_keyword_span: None,
                     only_span: None,
+                    stream_span: None,
                     time_travel: None,
                     syntax_id: None,
                     sample: None,
                     changes: None,
                     stage_options: None,
+                    stage: None,
                     table_function: None,
                     tvf_schema_span: None,
+                    table_function_columns: None,
+                    column_definitions_span: None,
+                    with_ordinality_span: None,
                     with_offset: None,
                     pivot: None,
                     unpivot: None,
@@ -1286,9 +1325,10 @@ impl<'a> Parser<'a> {
                 .into_iter()
                 .filter_map(|e| match e.kind {
                     crate::ast::AstGroupElementKind::Expr(item) => Some(item),
-                    crate::ast::AstGroupElementKind::Cube(_)
-                    | crate::ast::AstGroupElementKind::Rollup(_)
-                    | crate::ast::AstGroupElementKind::GroupingSets(_) => None,
+                    crate::ast::AstGroupElementKind::Cube { .. }
+                    | crate::ast::AstGroupElementKind::Rollup { .. }
+                    | crate::ast::AstGroupElementKind::GroupingSets { .. }
+                    | crate::ast::AstGroupElementKind::EmptySet => None,
                 })
                 .collect();
             crate::ast::AstGroupByVariant::Standard(items)
@@ -1317,6 +1357,33 @@ impl<'a> Parser<'a> {
 
         let start = self.current_span().start;
 
+        // `()`, the empty grouping set.
+        let empty_set = self.peek().is_some_and(|tok| {
+            matches!(
+                tok.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+            )
+        }) && self.peek_ahead(1).is_some_and(|tok| {
+            matches!(
+                tok.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+            )
+        });
+        if empty_set {
+            self.advance(); // Consume `(`
+            let rparen = self
+                .advance()
+                .expect_invariant("`)` consumed after peek_ahead match");
+            return Ok(AstGroupElement {
+                node_id: self.id_gen.next(),
+                kind: AstGroupElementKind::EmptySet,
+                span: Span {
+                    start,
+                    end: rparen.span.end,
+                },
+            });
+        }
+
         // CUBE(...) / ROLLUP(...)
         let cube_or_rollup = self.peek().and_then(|tok| {
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Cube)) {
@@ -1329,6 +1396,7 @@ impl<'a> Parser<'a> {
         });
         if let Some(is_cube) = cube_or_rollup {
             self.advance(); // Consume CUBE / ROLLUP
+            let open = self.peek().map_or(start, |t| t.span.start);
             let items = self.parse_group_by_items_in_parens()?;
             let end_paren = self.idx.saturating_sub(1);
             let end = self
@@ -1336,10 +1404,11 @@ impl<'a> Parser<'a> {
                 .get(end_paren)
                 .map(|t| t.span.end)
                 .unwrap_or(start);
+            let parens = Span { start: open, end };
             let kind = if is_cube {
-                AstGroupElementKind::Cube(items)
+                AstGroupElementKind::Cube { items, parens }
             } else {
-                AstGroupElementKind::Rollup(items)
+                AstGroupElementKind::Rollup { items, parens }
             };
             return Ok(AstGroupElement {
                 node_id: self.id_gen.next(),
@@ -1397,7 +1466,7 @@ impl<'a> Parser<'a> {
                         tok.kind,
                         TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                     ) {
-                        self.advance(); // Consume opening paren
+                        let lparen = self.advance().expect_invariant("( after peek");
                         let items = self.parse_group_by_items_until_rparen()?;
                         let rparen_tok = self
                             .advance()
@@ -1416,11 +1485,20 @@ impl<'a> Parser<'a> {
                                 },
                             ));
                         }
-                        sets.push(items);
+                        sets.push(crate::ast::AstGroupingSet {
+                            items,
+                            parens: Some(Span {
+                                start: lparen.span.start,
+                                end: rparen_tok.span.end,
+                            }),
+                        });
                     } else {
                         // Single item without parentheses
                         let item = self.parse_single_group_item()?;
-                        sets.push(vec![item]);
+                        sets.push(crate::ast::AstGroupingSet {
+                            items: vec![item],
+                            parens: None,
+                        });
                     }
                 } else {
                     return Err(ParseError::new(
@@ -1463,7 +1541,13 @@ impl<'a> Parser<'a> {
                 .unwrap_or(start);
             return Ok(AstGroupElement {
                 node_id: self.id_gen.next(),
-                kind: AstGroupElementKind::GroupingSets(sets),
+                kind: AstGroupElementKind::GroupingSets {
+                    sets,
+                    parens: Span {
+                        start: lparen_tok.span.start,
+                        end,
+                    },
+                },
                 span: Span { start, end },
             });
         }
@@ -1528,13 +1612,24 @@ impl<'a> Parser<'a> {
                     index_span: full_span,
                 }
             }
-            // Handle expressions: CASE, parens, identifiers, and keywords that can be identifiers
-            // Many keywords like ID, TYPE, KEY, etc. are valid column names
+            // Expressions: parens, identifiers, literals, an ODBC escape
+            // (`{fn …}`), and every keyword, which the expression reader takes
+            // where one starts an operand (`CASE`, `CAST(…)`, a keyword used
+            // as a column name). A string is a constant key (`GROUP BY 'x'`).
             kind if matches!(kind,
                 TokenKind::JinjaComment
                 | TokenKind::JinjaStmtOpen
-                | TokenKind::Keyword(Keyword::Case)
-                | TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                | TokenKind::Keyword(_)
+                | TokenKind::Literal(
+                    crate::lexer::LiteralKind::Parameter
+                        | crate::lexer::LiteralKind::Money
+                        | crate::lexer::LiteralKind::String
+                        | crate::lexer::LiteralKind::Boolean
+                        | crate::lexer::LiteralKind::Null
+                )
+                | TokenKind::Punctuation(
+                    crate::lexer::Punctuation::LParen | crate::lexer::Punctuation::LCurly
+                )
             ) || self.can_be_identifier_token(expr_tok) => {
                 // Parse as full expression to handle function calls, qualified names, Jinja, etc.
                 self.parse_expr()?
@@ -1637,6 +1732,49 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
+    /// Consume `NOCYCLE` after `CONNECT BY` and return its span. The word
+    /// is a column instead when the token after it continues an expression
+    /// (`CONNECT BY nocycle = PRIOR id`).
+    fn parse_connect_by_nocycle(&mut self) -> Option<Span> {
+        let word = self.peek()?;
+        if !matches!(
+            word.kind,
+            TokenKind::Identifier {
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
+            }
+        ) || !word.lexeme(self.source).eq_ignore_ascii_case("NOCYCLE")
+        {
+            return None;
+        }
+        let continues_expression = self.peek_ahead(1).is_none_or(|next| {
+            matches!(
+                next.kind,
+                TokenKind::Eof
+                    | TokenKind::Operator(_)
+                    | TokenKind::Keyword(
+                        Keyword::Is
+                            | Keyword::In
+                            | Keyword::Between
+                            | Keyword::Like
+                            | Keyword::Ilike
+                            | Keyword::Rlike
+                            | Keyword::Regexp
+                            | Keyword::And
+                            | Keyword::Or
+                    )
+            ) || matches!(
+                next.kind,
+                TokenKind::Punctuation(punctuation)
+                    if punctuation != crate::lexer::Punctuation::LParen
+            )
+        });
+        if continues_expression {
+            return None;
+        }
+        self.advance().map(|tok| tok.span)
+    }
+
     /// Parse CONNECT BY clause (hierarchical queries)
     pub(crate) fn parse_connect_by(&mut self) -> ParseResult<Option<AstConnectBy>> {
         // Parse optional START WITH clause
@@ -1709,6 +1847,8 @@ impl<'a> Parser<'a> {
                 Parser::token_description(by_tok, self.source),
             ));
         }
+
+        let nocycle = self.parse_connect_by_nocycle();
 
         // Parse CONNECT BY conditions (can include PRIOR)
         let mut conditions = Vec::new();
@@ -1831,6 +1971,7 @@ impl<'a> Parser<'a> {
             start_with_span,
             start_with_condition,
             connect_by_span,
+            nocycle,
             conditions,
             order_siblings_by,
             span: Span {
@@ -2101,6 +2242,8 @@ impl<'a> Parser<'a> {
                         alias: AstIdentifier {
                             node_id: self.id_gen.next(),
                             span: alias_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
                         },
                         span: measure_span,
                     });
@@ -2776,11 +2919,13 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Stop at semicolon
+            // Stop at semicolon, and at the batch separator after a
+            // statement written without one
             if matches!(
                 tok.kind,
                 TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
-            ) {
+            ) || self.is_batch_separator(tok)
+            {
                 break;
             }
 
@@ -2838,6 +2983,10 @@ impl<'a> Parser<'a> {
                     TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
                 ) {
                     self.advance();
+                } else if self.should_stop_scan_at_statement_start(next) {
+                    // No comma: a word that leads a statement starts the
+                    // next one, where statements need no terminator.
+                    break;
                 }
             }
             // Continue loop - stop conditions checked at start of next iteration
@@ -2876,6 +3025,7 @@ impl<'a> Parser<'a> {
         let mut offset: Option<AstExpr> = None;
         let mut limit_keyword_span: Option<Span> = None;
         let mut fetch_clause_span: Option<Span> = None;
+        let mut fetch_with_ties_span: Option<Span> = None;
         let mut offset_keyword_span: Option<Span> = None;
         let mut limit_comma_span: Option<Span> = None;
 
@@ -3018,118 +3168,17 @@ impl<'a> Parser<'a> {
                     end: offset_end,
                 });
 
-                // FETCH [FIRST|NEXT] <count> [ROW|ROWS] [ONLY]
-                if let Some(fetch_tok) = self.peek() {
-                    if matches!(fetch_tok.kind, TokenKind::Keyword(Keyword::Fetch)) {
-                        let fetch_kw = self
-                            .advance()
-                            .expect_invariant("FETCH keyword consumed after peek match");
-                        let fetch_start = fetch_kw.span.start;
-                        let mut fetch_end = fetch_kw.span.end;
-
-                        // Optional FIRST or NEXT
-                        if let Some(first_next) = self.peek() {
-                            if matches!(
-                                first_next.kind,
-                                TokenKind::Keyword(Keyword::First)
-                                    | TokenKind::Keyword(Keyword::Next)
-                            ) {
-                                let kw = self.advance().expect_invariant(
-                                    "FIRST/NEXT keyword consumed after peek match",
-                                );
-                                fetch_end = kw.span.end;
-                            }
-                        }
-
-                        limit = self.parse_expr().ok();
-                        if let Some(ref e) = limit {
-                            fetch_end = e.span().end;
-                        }
-
-                        // Optional ROW or ROWS
-                        if let Some(row_tok) = self.peek() {
-                            if matches!(
-                                row_tok.kind,
-                                TokenKind::Keyword(Keyword::Row)
-                                    | TokenKind::Keyword(Keyword::Rows)
-                            ) {
-                                let row = self
-                                    .advance()
-                                    .expect_invariant("ROW/ROWS keyword consumed after peek match");
-                                fetch_end = row.span.end;
-                            }
-                        }
-
-                        // Optional ONLY
-                        if let Some(only_tok) = self.peek() {
-                            if matches!(only_tok.kind, TokenKind::Keyword(Keyword::Only)) {
-                                let only = self
-                                    .advance()
-                                    .expect_invariant("ONLY keyword consumed after peek match");
-                                fetch_end = only.span.end;
-                            }
-                        }
-
-                        fetch_clause_span = Some(Span {
-                            start: fetch_start,
-                            end: fetch_end,
-                        });
-                    }
+                if let Some((count, span, ties)) = self.read_row_limiting_fetch() {
+                    limit = count;
+                    fetch_clause_span = Some(span);
+                    fetch_with_ties_span = ties;
                 }
             }
             // Standalone FETCH without OFFSET
-            else if matches!(tok.kind, TokenKind::Keyword(Keyword::Fetch)) {
-                let fetch_kw = self
-                    .advance()
-                    .expect_invariant("FETCH keyword consumed after peek match");
-                let fetch_start = fetch_kw.span.start;
-                let mut fetch_end = fetch_kw.span.end;
-
-                // Optional FIRST or NEXT
-                if let Some(first_next) = self.peek() {
-                    if matches!(
-                        first_next.kind,
-                        TokenKind::Keyword(Keyword::First) | TokenKind::Keyword(Keyword::Next)
-                    ) {
-                        let kw = self
-                            .advance()
-                            .expect_invariant("FIRST/NEXT keyword consumed after peek match");
-                        fetch_end = kw.span.end;
-                    }
-                }
-
-                limit = self.parse_expr().ok();
-                if let Some(ref e) = limit {
-                    fetch_end = e.span().end;
-                }
-
-                // Optional ROW or ROWS
-                if let Some(row_tok) = self.peek() {
-                    if matches!(
-                        row_tok.kind,
-                        TokenKind::Keyword(Keyword::Row) | TokenKind::Keyword(Keyword::Rows)
-                    ) {
-                        let row = self
-                            .advance()
-                            .expect_invariant("ROW/ROWS keyword consumed after peek match");
-                        fetch_end = row.span.end;
-                    }
-                }
-
-                // Optional ONLY
-                if let Some(only_tok) = self.peek() {
-                    if matches!(only_tok.kind, TokenKind::Keyword(Keyword::Only)) {
-                        let only = self
-                            .advance()
-                            .expect_invariant("ONLY keyword consumed after peek match");
-                        fetch_end = only.span.end;
-                    }
-                }
-
-                fetch_clause_span = Some(Span {
-                    start: fetch_start,
-                    end: fetch_end,
-                });
+            else if let Some((count, span, ties)) = self.read_row_limiting_fetch() {
+                limit = count;
+                fetch_clause_span = Some(span);
+                fetch_with_ties_span = ties;
             }
         }
 
@@ -3138,8 +3187,84 @@ impl<'a> Parser<'a> {
             offset_expr: offset,
             limit_keyword_span,
             fetch_clause_span,
+            fetch_with_ties_span,
             offset_keyword_span,
             limit_comma_span,
         })
+    }
+
+    /// A `FETCH` at the current token that limits the query's rows, `FETCH
+    /// [FIRST | NEXT] [<count>] [ROW | ROWS] [ONLY | WITH TIES]`: its count,
+    /// the clause's span and the span of its `WITH TIES`. With `FIRST` /
+    /// `NEXT` the count may be omitted before `ROW` / `ROWS`. The count is
+    /// an expression of any shape (a literal, a bind or session variable, a
+    /// call, a cast, a parenthesised expression), read once. `None` for a
+    /// cursor's `FETCH` ([`crate::parser::scripting::fetch_reads_cursor_at`]
+    /// decides), for no `FETCH`, and, with the tokens given back and the
+    /// count's recovery errors dropped, where no count can be read.
+    fn read_row_limiting_fetch(&mut self) -> Option<(Option<AstExpr>, Span, Option<Span>)> {
+        let fetch_kw = self
+            .peek()
+            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Fetch)))?;
+        if crate::parser::scripting::fetch_reads_cursor_at(self, self.idx) {
+            return None;
+        }
+        let (from, errors) = (self.idx, self.recovery_errors.len());
+        self.advance();
+        let mut end = fetch_kw.span.end;
+        let is_kw = |parser: &Self, kws: &[Keyword]| {
+            parser
+                .peek()
+                .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(kw) if kws.contains(&kw)))
+        };
+        let oriented = is_kw(self, &[Keyword::First, Keyword::Next]);
+        if oriented {
+            end = self
+                .advance()
+                .expect_invariant("FIRST/NEXT keyword consumed after peek match")
+                .span
+                .end;
+        }
+        let count_omitted = is_kw(self, &[Keyword::Row, Keyword::Rows]);
+        let count = if count_omitted && !oriented {
+            None
+        } else {
+            self.parse_expr().ok()
+        };
+        if count.is_none() && !(count_omitted && oriented) {
+            self.idx = from;
+            self.recovery_errors.truncate(errors);
+            return None;
+        }
+        if let Some(count) = &count {
+            end = count.span().end;
+        }
+        for kws in [&[Keyword::Row, Keyword::Rows][..], &[Keyword::Only]] {
+            if is_kw(self, kws) {
+                end = self
+                    .advance()
+                    .expect_invariant("ROW/ROWS/ONLY keyword consumed after peek match")
+                    .span
+                    .end;
+            }
+        }
+        let mut with_ties = None;
+        if is_kw(self, &[Keyword::With]) && self.is_word(self.peek_ahead(1), "TIES") {
+            let with = self.advance().expect_invariant("WITH after peek");
+            let ties = self.advance().expect_invariant("TIES after peek");
+            end = ties.span.end;
+            with_ties = Some(Span {
+                start: with.span.start,
+                end,
+            });
+        }
+        Some((
+            count,
+            Span {
+                start: fetch_kw.span.start,
+                end,
+            },
+            with_ties,
+        ))
     }
 }

@@ -88,3 +88,6 @@ ALTER ASSEMBLY util_clr WITH PERMISSION_SET = EXTERNAL_ACCESS;
 -- Module signing --------------------------------------------------------------
 ADD SIGNATURE TO dbo.escalate_proc BY CERTIFICATE signing_cert;
 ADD COUNTER SIGNATURE TO dbo.escalate_proc BY CERTIFICATE counter_cert WITH PASSWORD = 'p';
+
+-- Savepoints ------------------------------------------------------------------
+SAVE TRANSACTION before_purge;

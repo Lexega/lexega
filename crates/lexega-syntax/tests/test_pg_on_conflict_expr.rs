@@ -203,3 +203,30 @@ fn test_on_conflict_expr_with_default_values() {
 fn test_on_conflict_expr_with_select_source() {
     roundtrip("INSERT INTO users (id, email) SELECT id, email FROM staging ON CONFLICT (LOWER(email)) DO UPDATE SET email = EXCLUDED.email;");
 }
+
+#[test]
+fn a_conflict_update_reads_a_row_assignment_as_an_update_does() {
+    use lexega_syntax::ast::{AstConflictAction, AstStmt};
+    let sql = "INSERT INTO a (id, name) VALUES (1, 'x') ON CONFLICT (id) \
+               DO UPDATE SET (id, name) = (SELECT id, email FROM u LIMIT 1), note = 'n' WHERE a.id > 0";
+    let pg = lexega_syntax::dialect::postgres();
+    let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+    let [AstStmt::Insert(insert)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let Some(AstConflictAction::DoUpdate {
+        set_items,
+        where_clause,
+        ..
+    }) = insert.on_conflict.as_ref().map(|c| &c.action)
+    else {
+        panic!("{:?}", insert.on_conflict);
+    };
+    let columns: Vec<&str> = set_items
+        .iter()
+        .map(|a| &sql[a.column.span().start as usize..a.column.span().end as usize])
+        .collect();
+    assert_eq!(columns, ["(id, name)", "note"]);
+    assert!(where_clause.is_some());
+    roundtrip(sql);
+}

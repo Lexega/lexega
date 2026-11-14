@@ -4,7 +4,9 @@
 // This file contains the parser implementation for RETURNING clause
 // (Common in PostgreSQL, also supported by some other databases)
 
-use crate::ast::{AstReturning, AstReturningItem};
+use crate::ast::{
+    AstIdentifier, AstIdentifierKind, AstReturning, AstReturningAliases, AstReturningItem,
+};
 use crate::error::{ExpectInvariant, ParseResult};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
@@ -32,6 +34,7 @@ impl<'a> Parser<'a> {
             .expect_invariant("RETURNING keyword after peek");
         let returning_token_id = self.last_token_id();
         let returning_span = returning_tok.span;
+        let with_aliases = self.parse_returning_aliases();
 
         // Parse expression list (at least one expression required)
         // Each item can have an optional AS alias: expr [AS alias]
@@ -92,9 +95,72 @@ impl<'a> Parser<'a> {
         Ok(Some(AstReturning {
             syntax_id: Some(syntax_id),
             returning_span,
+            with_aliases,
             items,
             span,
             node_id: self.id_gen.next(),
         }))
+    }
+
+    /// `WITH ( { OLD | NEW } AS name [, …] )` after `RETURNING`: the names
+    /// the list reads the row's versions under. `None`, consuming nothing,
+    /// where that is not written.
+    fn parse_returning_aliases(&mut self) -> Option<AstReturningAliases> {
+        let from = self.idx;
+        let read = self.read_returning_aliases();
+        if read.is_none() {
+            self.idx = from;
+        }
+        read
+    }
+
+    fn read_returning_aliases(&mut self) -> Option<AstReturningAliases> {
+        let with = self
+            .peek()
+            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::With)))?;
+        self.advance();
+        self.peek()
+            .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))?;
+        self.advance();
+        let (mut old, mut new) = (None, None);
+        loop {
+            let is_old = self.is_word(self.peek(), "OLD");
+            if !is_old && !self.is_word(self.peek(), "NEW") {
+                return None;
+            }
+            self.advance();
+            self.peek()
+                .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::As)))?;
+            self.advance();
+            let name = self
+                .peek()
+                .filter(|t| matches!(t.kind, TokenKind::Identifier { .. }))?;
+            self.advance();
+            let ident = AstIdentifier {
+                node_id: self.id_gen.next(),
+                span: name.span,
+                kind: AstIdentifierKind::of(&name.kind),
+                templated: None,
+            };
+            match is_old {
+                true => old = Some(ident),
+                false => new = Some(ident),
+            }
+            let next = self.advance()?;
+            match next.kind {
+                TokenKind::Punctuation(Punctuation::Comma) => {}
+                TokenKind::Punctuation(Punctuation::RParen) => {
+                    return Some(AstReturningAliases {
+                        span: Span {
+                            start: with.span.start,
+                            end: next.span.end,
+                        },
+                        old,
+                        new,
+                    });
+                }
+                _ => return None,
+            }
+        }
     }
 }

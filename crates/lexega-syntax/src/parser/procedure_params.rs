@@ -65,6 +65,42 @@ pub fn parse_procedure_params(
     out
 }
 
+/// The arguments a `DROP` of a routine lists at `params_span`, parentheses
+/// included. Every dialect that lists them writes `[mode] [name] type`, the
+/// shape of a PostgreSQL parameter; a list of types alone is that shape
+/// with neither.
+pub(crate) fn parse_dropped_routine_args(
+    params_span: Span,
+    source: &str,
+    id_gen: &crate::ast::NodeIdGenerator,
+) -> Vec<AstProcedureParam> {
+    parse_procedure_params(
+        params_span,
+        source,
+        ProcedureParamGrammar::LeadingModeOptionalName,
+        id_gen,
+    )
+}
+
+impl crate::parser::core::Parser<'_> {
+    /// The parameters written at `params_span` ([`parse_procedure_params`]),
+    /// each initializer read as the expression it is where it is one.
+    pub(crate) fn read_procedure_params(&mut self, params_span: Span) -> Vec<AstProcedureParam> {
+        let mut params = parse_procedure_params(
+            params_span,
+            self.source,
+            self.dialect.procedure_param_grammar(),
+            &self.id_gen,
+        );
+        for param in &mut params {
+            if let Some(span) = param.default_span {
+                param.default_expr = self.expr_written_at(span).map(Box::new);
+            }
+        }
+        params
+    }
+}
+
 /// One pre-split parameter section: the substring covering one
 /// parameter declaration, with absolute-source span coordinates.
 #[derive(Debug, Clone)]
@@ -236,6 +272,57 @@ fn tokenize_param(sec: &ParamSection) -> Vec<(String, Span)> {
     out
 }
 
+/// Whether `lex` starts a parameter's initializer.
+fn starts_initializer(lex: &str) -> bool {
+    lex.eq_ignore_ascii_case("DEFAULT") || lex == "=" || lex == ":="
+}
+
+/// The words of `toks` before an initializer.
+fn before_initializer(toks: &[(String, Span)]) -> &[(String, Span)] {
+    let end = toks
+        .iter()
+        .position(|(lex, _)| starts_initializer(lex))
+        .unwrap_or(toks.len());
+    &toks[..end]
+}
+
+/// The span from the first of `words` to the last: a type of several
+/// words whole.
+fn words_span(words: &[(String, Span)]) -> Option<Span> {
+    Some(Span {
+        start: words.first()?.1.start,
+        end: words.last()?.1.end,
+    })
+}
+
+/// The text of a parameter's initializer, written after `DEFAULT`, `=` or
+/// `:=` to the section's end, a trailing T-SQL mode (`OUTPUT`, `OUT`,
+/// `READONLY`) left out.
+fn default_span(toks: &[(String, Span)], sec: &ParamSection) -> Option<Span> {
+    let at =
+        toks.iter().skip(1).position(|(lex, _)| {
+            lex.eq_ignore_ascii_case("DEFAULT") || lex == "=" || lex == ":="
+        })? + 1;
+    let first = toks.get(at + 1)?;
+    let mut last = toks.len().checked_sub(1)?;
+    while last > at + 1
+        && ["OUTPUT", "OUT", "READONLY"]
+            .iter()
+            .any(|mode| toks[last].0.eq_ignore_ascii_case(mode))
+    {
+        last -= 1;
+    }
+    let end = if last + 1 == toks.len() {
+        sec.span.end
+    } else {
+        toks.get(last)?.1.end
+    };
+    Some(Span {
+        start: first.1.start,
+        end,
+    })
+}
+
 /// T-SQL: `@name TYPE [= default] [OUTPUT | OUT | READONLY]`
 fn parse_tsql_param(
     sec: &ParamSection,
@@ -277,6 +364,7 @@ fn parse_tsql_param(
         type_span: typ.map(|t| t.1),
         mode,
         default_expr: None,
+        default_span: default_span(&toks, sec),
     })
 }
 
@@ -314,15 +402,20 @@ fn parse_pg_param(
             _ => {}
         }
     }
-    // After the mode keyword: either `name type` or `type` (unnamed OUT).
+    // After the mode keyword: either `name type` or `type` (unnamed OUT),
+    // the type of as many words as are written before an initializer. A
+    // first word that starts a type is the name only where a second does.
     let remaining = &toks[idx..];
     if remaining.is_empty() {
         return None;
     }
-    let (name_span, type_span) = if remaining.len() >= 2 && !is_pg_builtin_type(&remaining[0].0) {
-        (Some(remaining[0].1), Some(remaining[1].1))
+    let words = before_initializer(remaining);
+    let named =
+        words.len() >= 2 && (!is_pg_builtin_type(&words[0].0) || is_pg_builtin_type(&words[1].0));
+    let (name_span, type_span) = if named {
+        (Some(words[0].1), words_span(&words[1..]))
     } else {
-        (None, Some(remaining[0].1))
+        (None, words_span(words))
     };
     Some(AstProcedureParam {
         node_id: id_gen.next(),
@@ -331,11 +424,15 @@ fn parse_pg_param(
         type_span,
         mode,
         default_expr: None,
+        default_span: default_span(&toks, sec),
     })
 }
 
+/// Whether `lex`, a length or array suffix left out, is a word a PostgreSQL
+/// type starts with that a parameter is not named.
 fn is_pg_builtin_type(lex: &str) -> bool {
-    let up = lex.to_ascii_uppercase();
+    let word = lex.find(['(', '[']).map_or(lex, |at| &lex[..at]);
+    let up = word.to_ascii_uppercase();
     matches!(
         up.as_str(),
         "INTEGER"
@@ -348,6 +445,8 @@ fn is_pg_builtin_type(lex: &str) -> bool {
             | "TEXT"
             | "VARCHAR"
             | "CHAR"
+            | "CHARACTER"
+            | "BIT"
             | "BOOLEAN"
             | "BOOL"
             | "REAL"
@@ -355,6 +454,8 @@ fn is_pg_builtin_type(lex: &str) -> bool {
             | "NUMERIC"
             | "DECIMAL"
             | "DATE"
+            | "TIME"
+            | "INTERVAL"
             | "TIMESTAMP"
             | "TIMESTAMPTZ"
             | "JSON"
@@ -376,7 +477,7 @@ fn parse_snowflake_param(
         return None;
     }
     let name_span = Some(toks[0].1);
-    let type_span = toks.get(1).map(|t| t.1);
+    let type_span = words_span(before_initializer(&toks[1..]));
     Some(AstProcedureParam {
         node_id: id_gen.next(),
         span: sec.span,
@@ -384,6 +485,7 @@ fn parse_snowflake_param(
         type_span,
         mode: ProcedureParamMode::In,
         default_expr: None,
+        default_span: default_span(&toks, sec),
     })
 }
 
@@ -426,6 +528,7 @@ fn parse_mysql_param(
         type_span: remaining.get(1).map(|t| t.1),
         mode,
         default_expr: None,
+        default_span: default_span(&toks, sec),
     })
 }
 
@@ -451,6 +554,7 @@ fn parse_bq_param(
         type_span,
         mode: ProcedureParamMode::In,
         default_expr: None,
+        default_span: default_span(&toks, sec),
     })
 }
 

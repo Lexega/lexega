@@ -73,15 +73,6 @@ pub(crate) fn is_user_mapping_at(tokens: &[Token], idx: usize, source: &str) -> 
     p < sig.len() && matches!(tokens[sig[p]].kind, TokenKind::Keyword(Keyword::For))
 }
 
-/// Option keys whose string-literal value is a secret and must be masked from
-/// output surfaces. Matched on a lowercased `contains` so `sslpassword`,
-/// `secret_access_key`, etc. are covered. Over-masking is safe: masking
-/// only affects what is displayed, never what is parsed.
-pub fn is_secret_option_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k.contains("password") || k.contains("secret")
-}
-
 impl<'a> Parser<'a> {
     /// Consume the leading `{ CREATE | ALTER | DROP } USER MAPPING` keywords,
     /// returning the statement start offset.
@@ -151,6 +142,7 @@ impl<'a> Parser<'a> {
         }
         self.advance()
             .ok_or_eof(self.current_span(), vec!["OPTIONS".to_string()])?;
+        self.record_option_list_secrets(self.idx);
         let lparen = self
             .advance()
             .ok_or_eof(self.current_span(), vec!["(".to_string()])?;
@@ -189,20 +181,14 @@ impl<'a> Parser<'a> {
                 *end = key_tok.span.end;
             }
             let key_span = key_tok.span;
-            let key_lex = key_tok.lexeme(self.source);
             let value_literal_span = match self.peek_non_trivia() {
                 Some(v) if matches!(v.kind, TokenKind::Literal(LiteralKind::String)) => {
-                    Some(inner_literal_span(v.span, self.source))
+                    Some(inner_literal_span(v.span, self.source, self.dialect))
                 }
                 _ => None,
             };
-            if let Some(inner) = value_literal_span {
-                if is_secret_option_key(key_lex) {
-                    self.redaction_spans.push(inner);
-                }
-            }
             // A rendered placeholder is not a statically-known value — drop
-            // the capture (redaction above still applies).
+            // the capture (its secret is masked as the list's).
             let value_literal_span =
                 value_literal_span.filter(|s| !self.span_overlaps_placeholder(*s));
             options.push(AstUserMappingOption {

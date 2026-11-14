@@ -15,18 +15,18 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(report.entries())
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -105,7 +105,7 @@ fn test_rule_create_fires() {
 fn test_rule_replace_fires() {
     let rules = analyze_and_get_rules("CREATE OR REPLACE FILE FORMAT j TYPE = JSON;");
     assert!(rules.contains("SNW-FILEFORMAT-REPLACE"));
-    // Creation info still fires alongside the replace signal.
+    // Creation info still fires alongside the replace finding.
     assert!(rules.contains("INFO-SNW-FILEFORMAT-CREATE"));
 }
 
@@ -131,7 +131,7 @@ fn test_plain_create_does_not_fire_replace() {
 
 #[test]
 fn test_alter_set_does_not_fire_rename() {
-    // SET without RENAME must not surface the rename signal.
+    // SET without RENAME must not surface the rename finding.
     let rules = analyze_and_get_rules("ALTER FILE FORMAT my_csv SET COMPRESSION = GZIP;");
     assert!(!rules.contains("SNW-FILEFORMAT-RENAME"));
 }

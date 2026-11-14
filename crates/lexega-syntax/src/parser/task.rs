@@ -69,12 +69,13 @@
 //! | $$...$$| Dollar quote tokens | For CONFIG JSON |
 
 use crate::ast::{
-    AstAlterTask, AstAlterTaskAction, AstAlterTaskActionKind, AstCreateTask, AstDropTask, AstStmt,
-    AstUnknownClause, UnknownKind,
+    AstAlterTask, AstAlterTaskAction, AstAlterTaskActionKind, AstCreateTask, AstDropTask,
+    AstObjectRef, AstStmt, AstTagRef, AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{parse_property_clause, NamePosition, Parser, PropertyValue};
+use crate::parser::tag::TagListShape;
 
 /// Known task property names (all are Identifiers in lexer).
 /// Used for recognizing properties vs session parameters.
@@ -198,6 +199,7 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
 
     // Initialize all optional spans
     let mut warehouse_span: Option<Span> = None;
+    let mut warehouse: Option<Span> = None;
     let mut schedule_span: Option<Span> = None;
     let mut config_span: Option<Span> = None;
     let mut allow_overlapping_execution_span: Option<Span> = None;
@@ -216,11 +218,15 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
     let mut user_task_managed_initial_warehouse_size_span: Option<Span> = None;
     let mut comment_span: Option<Span> = None;
     let mut with_tag_span: Option<Span> = None;
+    let mut tags: Vec<AstTagRef> = Vec::new();
     let mut after_span: Option<Span> = None;
+    let mut after: Vec<AstObjectRef> = Vec::new();
     let mut when_span: Option<Span> = None;
     let mut execute_as_span: Option<Span> = None;
+    let mut execute_as_user: Option<Span> = None;
     let mut as_span: Option<Span> = None;
     let mut clone_span: Option<Span> = None;
+    let mut clone_source: Option<AstObjectRef> = None;
     let mut session_parameters_spans: Vec<Span> = Vec::new();
     let mut extras: Vec<AstUnknownClause> = Vec::new();
 
@@ -240,8 +246,10 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
 
         // Check for CLONE first (identifier, not keyword)
         if lexeme.eq_ignore_ascii_case("CLONE") {
-            clone_span = Some(parse_clone_clause(p)?);
-            span.end = clone_span.as_ref().unwrap().end;
+            let (clause, source) = parse_clone_clause(p)?;
+            clone_span = Some(clause);
+            clone_source = source;
+            span.end = clause.end;
             // After CLONE, no body - break out
             break;
         }
@@ -255,29 +263,37 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
 
         // AFTER keyword - task dependencies
         if matches!(tok.kind, TokenKind::Keyword(Keyword::After)) {
-            after_span = Some(parse_after_clause(p)?);
-            span.end = after_span.as_ref().unwrap().end;
+            let (clause, names) = parse_after_clause(p)?;
+            after_span = Some(clause);
+            after = names;
+            span.end = clause.end;
             continue;
         }
 
         // WITH keyword - could be WITH TAG
         if matches!(tok.kind, TokenKind::Keyword(Keyword::With)) {
-            with_tag_span = Some(parse_with_tag_clause(p)?);
-            span.end = with_tag_span.as_ref().unwrap().end;
+            let (clause, read) = parse_with_tag_clause(p)?;
+            with_tag_span = Some(clause);
+            tags = read;
+            span.end = clause.end;
             continue;
         }
 
         // TAG keyword (without WITH)
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Tag)) {
-            with_tag_span = Some(parse_tag_only_clause(p)?);
-            span.end = with_tag_span.as_ref().unwrap().end;
+            let (clause, read) = parse_tag_only_clause(p)?;
+            with_tag_span = Some(clause);
+            tags = read;
+            span.end = clause.end;
             continue;
         }
 
         // EXECUTE keyword - EXECUTE AS clause
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Execute)) {
-            execute_as_span = Some(parse_execute_as_clause(p)?);
-            span.end = execute_as_span.as_ref().unwrap().end;
+            let (clause, user) = parse_execute_as_clause(p)?;
+            execute_as_span = Some(clause);
+            execute_as_user = user;
+            span.end = clause.end;
             continue;
         }
 
@@ -290,8 +306,10 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
 
         // All task properties are Identifiers - check by lexeme
         if lexeme.eq_ignore_ascii_case("WAREHOUSE") {
-            warehouse_span = Some(parse_property_clause(p)?);
-            span.end = warehouse_span.as_ref().unwrap().end;
+            let clause = p.parse_property(PropertyValue::Name)?;
+            warehouse_span = Some(clause.span);
+            warehouse = clause.name;
+            span.end = clause.span.end;
         } else if lexeme.eq_ignore_ascii_case("SCHEDULE") {
             schedule_span = Some(parse_property_clause(p)?);
             span.end = schedule_span.as_ref().unwrap().end;
@@ -417,6 +435,7 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
         if_not_exists_span,
         name_span,
         warehouse_span,
+        warehouse,
         schedule_span,
         config_span,
         allow_overlapping_execution_span,
@@ -436,12 +455,16 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
         comment_span,
         session_parameters_spans,
         with_tag_span,
+        tags,
         after_span,
+        after,
         when_span,
         execute_as_span,
+        execute_as_user,
         as_span,
         body,
         clone_span,
+        clone_source,
         extras,
     };
 
@@ -449,7 +472,67 @@ pub(crate) fn try_parse_create_task(p: &mut Parser<'_>) -> ParseResult<AstStmt> 
 }
 
 /// Skip to statement end (semicolon or EOF), return end position
+/// Whether `EXECUTE TASK name` starts at the current token: the name, or a
+/// template writing some of it, after TASK.
+pub(crate) fn execute_task_at(p: &Parser<'_>) -> bool {
+    p.is_word(p.peek(), "EXECUTE")
+        && p.is_word(p.peek_ahead(1), "TASK")
+        && p.peek_ahead(2).is_some_and(|name| {
+            matches!(
+                name.kind,
+                TokenKind::Identifier {
+                    kind: crate::lexer::IdentifierKind::Unquoted
+                        | crate::lexer::IdentifierKind::Quoted,
+                    ..
+                } | TokenKind::JinjaExprOpen
+            )
+        })
+}
+
+/// `EXECUTE TASK name [RETRY LAST]` at the current token
+/// ([`execute_task_at`]).
+pub(crate) fn try_parse_execute_task_stmt(p: &mut Parser<'_>) -> ParseResult<AstStmt> {
+    let execute = p
+        .advance()
+        .ok_or_eof(p.current_span(), vec!["EXECUTE".to_string()])?;
+    let task = p
+        .advance()
+        .ok_or_eof(p.current_span(), vec!["TASK".to_string()])?;
+    let name = p.parse_object_name_span()?;
+    let mut end = name.end;
+    let retry_last_span = match p.is_word(p.peek(), "RETRY") && p.is_word(p.peek_ahead(1), "LAST") {
+        true => {
+            let retry = p
+                .advance()
+                .ok_or_eof(p.current_span(), vec!["RETRY".to_string()])?;
+            let last = p
+                .advance()
+                .ok_or_eof(p.current_span(), vec!["LAST".to_string()])?;
+            end = last.span.end;
+            Some(Span {
+                start: retry.span.start,
+                end,
+            })
+        }
+        false => None,
+    };
+    Ok(AstStmt::ExecuteTask(Box::new(crate::ast::AstExecuteTask {
+        node_id: p.id_gen.next(),
+        span: Span {
+            start: execute.span.start,
+            end,
+        },
+        keyword_span: Span {
+            start: execute.span.start,
+            end: task.span.end,
+        },
+        name,
+        retry_last_span,
+    })))
+}
+
 fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = p.current_span().end;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -460,11 +543,14 @@ fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
             .expect_invariant("token consumed during skip_to_statement_end");
         end = t.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }
 
 /// Skip to matching closing paren, return end position
 fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
+    let from = p.idx;
     let mut depth = 1;
     while let Some(tok) = p.advance() {
         match tok.kind {
@@ -472,7 +558,11 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             TokenKind::Punctuation(Punctuation::RParen) => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(tok.span.end);
+                    let end = tok.span.end;
+                    // The text is not read: its secrets are recorded as
+                    // unparsed text's are.
+                    p.record_unparsed_secrets(from, p.idx);
+                    return Ok(end);
                 }
             }
             _ => {}
@@ -484,40 +574,6 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             message: "Unmatched parenthesis".to_string(),
         },
     ))
-}
-
-/// Parse KEY = VALUE clause, return span covering entire clause
-fn parse_property_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let key_tok = p
-        .advance()
-        .ok_or_eof(p.current_span(), vec!["property".to_string()])?;
-    let start = key_tok.span.start;
-    let mut end = key_tok.span.end;
-
-    // Expect =
-    if let Some(tok) = p.peek_non_trivia() {
-        if matches!(tok.kind, TokenKind::Operator(crate::lexer::Operator::Eq)) {
-            let eq = p
-                .advance()
-                .expect_invariant("= operator consumed after match in parse_property_clause");
-            end = eq.span.end;
-
-            // Value (could be string, identifier, number, boolean, or parenthesized)
-            if let Some(val) = p.peek_non_trivia() {
-                if matches!(val.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance();
-                    end = skip_to_matching_paren(p)?;
-                } else {
-                    let v = p.advance().expect_invariant(
-                        "property value consumed after peek in parse_property_clause",
-                    );
-                    end = v.span.end;
-                }
-            }
-        }
-    }
-
-    Ok(Span { start, end })
 }
 
 /// Parse CONFIG = $$...$$  clause (handles dollar-quoted JSON)
@@ -556,24 +612,37 @@ fn parse_config_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
     Ok(Span { start, end })
 }
 
+/// The task name at the current token and its span: the name as an object
+/// reference, or (a string literal standing for it) the span alone.
+fn task_name_at(p: &mut Parser<'_>) -> ParseResult<(Span, Option<AstObjectRef>)> {
+    p.skip_trivia();
+    match p.parse_object_ref() {
+        Ok(name) => Ok((name.span, Some(name))),
+        Err(_) => Ok((p.parse_qualified_name_span()?, None)),
+    }
+}
+
 /// Parse CLONE <source_task_name> clause
-fn parse_clone_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_clone_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Option<AstObjectRef>)> {
     let clone_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["CLONE".to_string()])?;
     let start = clone_tok.span.start;
 
     // Parse source task name (qualified identifier)
-    let name_span = p.parse_qualified_name_span()?;
+    let (name_span, source) = task_name_at(p)?;
 
-    Ok(Span {
-        start,
-        end: name_span.end,
-    })
+    Ok((
+        Span {
+            start,
+            end: name_span.end,
+        },
+        source,
+    ))
 }
 
 /// Parse AFTER task1 [, task2, ...] clause
-fn parse_after_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_after_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Vec<AstObjectRef>)> {
     let after_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["AFTER".to_string()])?;
@@ -581,8 +650,9 @@ fn parse_after_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
     let mut end;
 
     // Parse first task name
-    let name_span = p.parse_qualified_name_span()?;
+    let (name_span, first) = task_name_at(p)?;
     end = name_span.end;
+    let mut names: Vec<AstObjectRef> = first.into_iter().collect();
 
     // Parse additional comma-separated task names
     while let Some(tok) = p.peek_non_trivia() {
@@ -590,14 +660,15 @@ fn parse_after_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
             let _ = p
                 .advance()
                 .expect_invariant("comma consumed after match in parse_after_clause");
-            let next_name = p.parse_qualified_name_span()?;
+            let (next_name, next) = task_name_at(p)?;
             end = next_name.end;
+            names.extend(next);
         } else {
             break;
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, names))
 }
 
 /// Parse WHEN <condition> clause
@@ -633,12 +704,13 @@ fn parse_when_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
 }
 
 /// Parse [WITH] TAG (...) clause
-fn parse_with_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_with_tag_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Vec<AstTagRef>)> {
     let with_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["WITH".to_string()])?;
     let start = with_tok.span.start;
     let mut end = with_tok.span.end;
+    let mut tags = Vec::new();
 
     // Expect TAG
     if let Some(tok) = p.peek_non_trivia() {
@@ -651,42 +723,42 @@ fn parse_with_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
             // Expect (...)
             if let Some(lparen) = p.peek_non_trivia() {
                 if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance();
-                    end = skip_to_matching_paren(p)?;
+                    (end, tags) = p.parse_tag_assignments_in_parens()?;
                 }
             }
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, tags))
 }
 
 /// Parse TAG (...) clause (without WITH prefix)
-fn parse_tag_only_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_tag_only_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Vec<AstTagRef>)> {
     let tag_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["TAG".to_string()])?;
     let start = tag_tok.span.start;
     let mut end = tag_tok.span.end;
+    let mut tags = Vec::new();
 
     // Expect (...)
     if let Some(lparen) = p.peek_non_trivia() {
         if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-            p.advance();
-            end = skip_to_matching_paren(p)?;
+            (end, tags) = p.parse_tag_assignments_in_parens()?;
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, tags))
 }
 
 /// Parse EXECUTE AS { OWNER | CALLER | USER <username> } clause
-fn parse_execute_as_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_execute_as_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Option<Span>)> {
     let execute_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["EXECUTE".to_string()])?;
     let start = execute_tok.span.start;
     let mut end = execute_tok.span.end;
+    let mut user = None;
 
     // Expect AS
     if let Some(tok) = p.peek_non_trivia() {
@@ -712,14 +784,18 @@ fn parse_execute_as_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
                         .expect_invariant("USER identifier consumed after lexeme check");
                     let _user_end = user_tok.span.end;
                     // Expect user name
-                    let name_span = p.parse_qualified_name_span()?;
+                    user = p.take_name_span(NamePosition::Object);
+                    let name_span = match user {
+                        Some(read) => read,
+                        None => p.parse_qualified_name_span()?,
+                    };
                     end = name_span.end;
                 }
             }
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, user))
 }
 
 /// Check if identifier is a known Snowflake session parameter
@@ -1177,13 +1253,13 @@ fn parse_set_action(
             .expect_invariant("TAG keyword consumed after match in parse_set_action");
         let tag_span = tag_tok.span;
 
-        // Parse tag assignments
-        let assignments_span = parse_tag_assignments(p)?;
+        let (assignments_span, tags) = p.parse_tag_list(TagListShape::Assignments)?;
 
         return Ok(AstAlterTaskActionKind::SetTag {
             set_span,
             tag_span,
             assignments_span,
+            tags,
         });
     }
 
@@ -1260,30 +1336,13 @@ fn parse_unset_action(p: &mut Parser<'_>) -> ParseResult<AstAlterTaskActionKind>
             .expect_invariant("TAG keyword consumed after match in parse_unset_action");
         let tag_span = tag_tok.span;
 
-        // Parse tag names (comma-separated identifiers)
-        let tags_start = p.current_span().start;
-        let mut tags_end;
-
-        loop {
-            let tag_name_span = p.parse_qualified_name_span()?;
-            tags_end = tag_name_span.end;
-
-            if let Some(tok) = p.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                    p.advance();
-                    continue;
-                }
-            }
-            break;
-        }
+        let (tags_span, tags) = p.parse_tag_list(TagListShape::Names)?;
 
         return Ok(AstAlterTaskActionKind::UnsetTag {
             unset_span,
             tag_span,
-            tags_span: Span {
-                start: tags_start,
-                end: tags_end,
-            },
+            tags_span,
+            tags,
         });
     }
 
@@ -1403,47 +1462,6 @@ fn parse_modify_action(p: &mut Parser<'_>) -> ParseResult<AstAlterTaskActionKind
     }
 }
 
-/// Parse tag assignments: tag_name = 'value' [, ...]
-fn parse_tag_assignments(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let start = p.current_span().start;
-    let mut end;
-
-    loop {
-        // Tag name (possibly qualified: db.schema.tag_name)
-        let _tag_name_span = p.parse_qualified_name_span()?;
-
-        // =
-        let eq_tok = p
-            .advance()
-            .ok_or_eof(p.current_span(), vec!["=".to_string()])?;
-        if !matches!(eq_tok.kind, TokenKind::Operator(crate::lexer::Operator::Eq)) {
-            return Err(ParseError::new(
-                eq_tok.span,
-                ParseErrorKind::InvalidStatement {
-                    message: "Expected '=' in tag assignment".to_string(),
-                },
-            ));
-        }
-
-        // Value
-        let value_tok = p
-            .advance()
-            .ok_or_eof(p.current_span(), vec!["tag value".to_string()])?;
-        end = value_tok.span.end;
-
-        // Check for comma
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                p.advance();
-                continue;
-            }
-        }
-        break;
-    }
-
-    Ok(Span { start, end })
-}
-
 /// Parse a single property assignment for ALTER TASK SET
 fn parse_alter_task_property(
     p: &mut Parser<'_>,
@@ -1488,6 +1506,7 @@ fn skip_to_statement_end_span(p: &mut Parser<'_>) -> Span {
 
 /// Skip to statement end (semicolon or EOF), return end position
 fn skip_to_statement_end_pos(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = p.current_span().end;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -1498,5 +1517,7 @@ fn skip_to_statement_end_pos(p: &mut Parser<'_>) -> u32 {
             .expect_invariant("token consumed during skip_to_statement_end_pos");
         end = t.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }

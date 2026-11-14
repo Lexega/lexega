@@ -23,9 +23,10 @@ use lexega_core::{
 // ============================================================================
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn token_kinds(sql: &str, dialect: &dyn Dialect) -> Vec<TokenKind> {
@@ -57,7 +58,7 @@ fn format_and_verify(sql: &str, config: &FormatterConfig) {
     let formatted = format_sql_with_config(sql, config)
         .unwrap_or_else(|e| panic!("Format failed for {}: {}", config.dialect.name(), e));
 
-    lexega_core::verify_formatting_safe_with_dialect(&sql, &formatted, config.dialect.as_ref())
+    lexega_core::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
         .unwrap_or_else(|e| panic!("BigQuery formatting verification failed: {}", e));
 }
 
@@ -800,8 +801,10 @@ fn test_bq_format_double_quoted_string_concat() {
 fn test_bq_risk_analysis_basic() {
     // Simple SELECT should be analyzable with BigQuery dialect
     let sql = "SELECT * FROM users WHERE id = 1";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis should succeed");
     assert!(
@@ -813,11 +816,85 @@ fn test_bq_risk_analysis_basic() {
 #[test]
 fn test_bq_risk_analysis_cross_join() {
     let sql = "SELECT a.*, b.* FROM table_a a CROSS JOIN table_b b";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis should succeed");
     assert!(report.summary.statements_parsed > 0);
+}
+
+#[test]
+fn test_bq_unbounded_delete_on_a_dashed_project_name() {
+    let sql = "DELETE FROM my-project.ds.t WHERE TRUE";
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
+    let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
+        .expect("BQ risk analysis should succeed");
+    assert!(
+        report.findings.iter().any(|s| matches!(
+            s,
+            lexega_core::analyzer::RuleMatch::Analysis(a) if a.matched_rule == "DML-WRITE-UNBOUNDED"
+        )),
+        "the whole statement is analysed: {:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.statements_skipped, 0);
+    assert_eq!(report.summary.statements_partial, 0);
+    assert!(report.summary.databases_accessed.contains("MY-PROJECT"));
+}
+
+#[test]
+fn test_bq_unbounded_delete_on_a_project_name_ending_in_digits() {
+    let sql = "DELETE FROM proj-123.ds.t WHERE TRUE";
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
+    let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
+        .expect("BQ risk analysis should succeed");
+    assert!(
+        report.findings.iter().any(|s| matches!(
+            s,
+            lexega_core::analyzer::RuleMatch::Analysis(a) if a.matched_rule == "DML-WRITE-UNBOUNDED"
+        )),
+        "the whole statement is analysed: {:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.statements_skipped, 0);
+    assert_eq!(report.summary.statements_partial, 0);
+    assert_eq!(
+        report.summary.tables_written_names,
+        ["proj-123.ds.t".to_string()].into_iter().collect()
+    );
+}
+
+#[test]
+fn test_bq_unbounded_delete_on_a_project_segment_of_digits_then_letters() {
+    let sql = "DELETE FROM proj-1a.ds.t WHERE TRUE";
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
+    let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
+        .expect("BQ risk analysis should succeed");
+    assert!(
+        report.findings.iter().any(|s| matches!(
+            s,
+            lexega_core::analyzer::RuleMatch::Analysis(a) if a.matched_rule == "DML-WRITE-UNBOUNDED"
+        )),
+        "the whole statement is analysed: {:?}",
+        report.findings
+    );
+    assert_eq!(report.summary.statements_skipped, 0);
+    assert_eq!(report.summary.statements_partial, 0);
+    assert_eq!(
+        report.summary.tables_written_names,
+        ["proj-1a.ds.t".to_string()].into_iter().collect()
+    );
 }
 
 // ============================================================================
@@ -1219,8 +1296,10 @@ fn test_bq_except_then_join() {
 #[test]
 fn test_bq_risk_safe_cast() {
     let sql = "SELECT SAFE_CAST(col AS INT64) FROM users";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis with SAFE_CAST should succeed");
     assert!(report.summary.statements_parsed > 0);
@@ -1229,8 +1308,10 @@ fn test_bq_risk_safe_cast() {
 #[test]
 fn test_bq_risk_unnest() {
     let sql = "SELECT * FROM UNNEST([1, 2, 3]) AS x";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis with UNNEST should succeed");
     assert!(report.summary.statements_parsed > 0);
@@ -1342,8 +1423,10 @@ fn test_bq_typed_literal_in_expression() {
 #[test]
 fn test_bq_risk_typed_literal() {
     let sql = "SELECT * FROM events WHERE ts > TIMESTAMP '2024-01-01 00:00:00'";
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
         .expect("BQ risk analysis with typed literal should succeed");
     assert!(report.summary.statements_parsed > 0);

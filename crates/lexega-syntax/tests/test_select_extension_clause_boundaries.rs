@@ -44,34 +44,28 @@ fn assert_no_opaque_mssql(sql: &str) {
 }
 
 fn assert_rejected_or_opaque_snowflake(sql: &str) {
-    match parse_sql_with_dialect(sql, &SnowflakeDialect) {
-        Ok(script) => {
-            assert!(
-                script
-                    .stmts
-                    .iter()
-                    .any(|stmt| matches!(stmt, AstStmt::OpaqueContent { .. })),
-                "Snowflake SQL should be rejected or opaque, but parsed cleanly:\n{}",
-                sql
-            );
-        }
-        Err(_) => {}
+    if let Ok(script) = parse_sql_with_dialect(sql, &SnowflakeDialect) {
+        assert!(
+            script
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, AstStmt::OpaqueContent { .. })),
+            "Snowflake SQL should be rejected or opaque, but parsed cleanly:\n{}",
+            sql
+        );
     }
 }
 
 fn assert_rejected_or_opaque_dbx(sql: &str) {
-    match parse_sql_with_dialect(sql, &DatabricksDialect) {
-        Ok(script) => {
-            assert!(
-                script
-                    .stmts
-                    .iter()
-                    .any(|stmt| matches!(stmt, AstStmt::OpaqueContent { .. })),
-                "Databricks SQL should be rejected or opaque, but parsed cleanly:\n{}",
-                sql
-            );
-        }
-        Err(_) => {}
+    if let Ok(script) = parse_sql_with_dialect(sql, &DatabricksDialect) {
+        assert!(
+            script
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, AstStmt::OpaqueContent { .. })),
+            "Databricks SQL should be rejected or opaque, but parsed cleanly:\n{}",
+            sql
+        );
     }
 }
 
@@ -187,7 +181,8 @@ fn window_alias_is_dialect_sensitive() {
 fn keyword_identifier_matrix_smoke_test() {
     // WINDOW: reserved in Snowflake; Databricks allows it as identifier but has alias restrictions for specific words.
     assert!(!SnowflakeDialect.keyword_can_be_unquoted_identifier("WINDOW"));
-    assert!(PostgresDialect.keyword_can_be_unquoted_identifier("WINDOW"));
+    // PostgreSQL 17 reserves WINDOW.
+    assert!(!PostgresDialect.keyword_can_be_unquoted_identifier("WINDOW"));
     assert!(DatabricksDialect.keyword_can_be_unquoted_identifier("WINDOW"));
 
     // RETURNING differs between Snowflake (unreserved) and PostgreSQL (reserved).

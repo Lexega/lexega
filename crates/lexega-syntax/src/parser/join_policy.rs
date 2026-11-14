@@ -21,6 +21,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 impl<'a> Parser<'a> {
     /// Parse `CREATE [OR REPLACE] JOIN POLICY [IF NOT EXISTS] <name>
@@ -161,8 +162,12 @@ impl<'a> Parser<'a> {
                     }
                     TokenKind::Keyword(Keyword::Tag) => {
                         self.advance().expect_invariant("TAG after peek");
-                        let assignments_span = self.parse_tag_assignment_list()?;
-                        AstAlterJoinPolicyActionKind::SetTag { assignments_span }
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
+                        AstAlterJoinPolicyActionKind::SetTag {
+                            assignments_span,
+                            tags,
+                        }
                     }
                     TokenKind::Keyword(Keyword::Comment) => {
                         self.advance().expect_invariant("COMMENT after peek");
@@ -192,8 +197,8 @@ impl<'a> Parser<'a> {
                 match &next.kind {
                     TokenKind::Keyword(Keyword::Tag) => {
                         self.advance().expect_invariant("TAG after peek");
-                        let tags_span = self.parse_tag_name_list()?;
-                        AstAlterJoinPolicyActionKind::UnsetTag { tags_span }
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                        AstAlterJoinPolicyActionKind::UnsetTag { tags_span, tags }
                     }
                     TokenKind::Keyword(Keyword::Comment) => {
                         self.advance().expect_invariant("COMMENT after peek");
@@ -285,7 +290,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::Policy)
     }
 
-    fn expect_punct(&mut self, punct: Punctuation, label: &str) -> ParseResult<Span> {
+    pub(crate) fn expect_punct(&mut self, punct: Punctuation, label: &str) -> ParseResult<Span> {
         let tok = self
             .advance()
             .ok_or_eof(self.current_span(), vec![label.to_string()])?;
@@ -374,45 +379,5 @@ impl<'a> Parser<'a> {
             .advance()
             .ok_or_eof(self.current_span(), vec!["comment_string".to_string()])?;
         Ok((Some(value_tok.span), value_tok.span.end))
-    }
-
-    /// `<name> = '<value>' [, ...]` — returns the span covering the list.
-    fn parse_tag_assignment_list(&mut self) -> ParseResult<Span> {
-        let start = self.current_span().start;
-        let mut end;
-        loop {
-            let _name = self.parse_qualified_name_span()?;
-            self.expect_eq()?;
-            let value_tok = self
-                .advance()
-                .ok_or_eof(self.current_span(), vec!["tag_value".to_string()])?;
-            end = value_tok.span.end;
-            if let Some(tok) = self.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                    self.advance();
-                    continue;
-                }
-            }
-            break;
-        }
-        Ok(Span { start, end })
-    }
-
-    /// `<name> [, ...]` — returns the span covering the list.
-    fn parse_tag_name_list(&mut self) -> ParseResult<Span> {
-        let start = self.current_span().start;
-        let mut end;
-        loop {
-            let name = self.parse_qualified_name_span()?;
-            end = name.end;
-            if let Some(tok) = self.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                    self.advance();
-                    continue;
-                }
-            }
-            break;
-        }
-        Ok(Span { start, end })
     }
 }

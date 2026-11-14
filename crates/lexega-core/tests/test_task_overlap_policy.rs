@@ -5,17 +5,16 @@ use lexega_core::api::analyze_risk;
 use lexega_core::{format_sql_with_config, verify_formatting_safe, FormatterConfig};
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(
+    report.entries().any(
         |s| matches!(s, lexega_core::analyzer::RuleMatch::Analysis(g) if g.matched_rule == rule_id),
     )
 }
 
 fn rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> Vec<String> {
     report
-        .signals
-        .iter()
-        .filter_map(|s| match s {
-            lexega_core::analyzer::RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .entries()
+        .map(|s| match s {
+            lexega_core::analyzer::RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -65,11 +64,11 @@ fn test_format_overlap_policy_with_or_replace() {
 }
 
 // ============================================================
-// Risk analysis signal tests
+// Risk analysis finding tests
 // ============================================================
 
 #[test]
-fn test_overlap_policy_allow_all_overlap_signal() {
+fn test_overlap_policy_allow_all_overlap_finding() {
     let sql = "CREATE TASK t1 WAREHOUSE = mywh OVERLAP_POLICY = ALLOW_ALL_OVERLAP SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
@@ -81,7 +80,7 @@ fn test_overlap_policy_allow_all_overlap_signal() {
 }
 
 #[test]
-fn test_overlap_policy_allow_child_overlap_signal() {
+fn test_overlap_policy_allow_child_overlap_finding() {
     let sql = "CREATE TASK t1 WAREHOUSE = mywh OVERLAP_POLICY = ALLOW_CHILD_OVERLAP SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
@@ -93,7 +92,7 @@ fn test_overlap_policy_allow_child_overlap_signal() {
 }
 
 #[test]
-fn test_overlap_policy_no_overlap_no_signal() {
+fn test_overlap_policy_no_overlap_no_finding() {
     let sql = "CREATE TASK t1 WAREHOUSE = mywh OVERLAP_POLICY = NO_OVERLAP SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
@@ -109,7 +108,7 @@ fn test_overlap_policy_no_overlap_no_signal() {
 }
 
 #[test]
-fn test_legacy_allow_overlapping_execution_true_signal() {
+fn test_legacy_allow_overlapping_execution_true_finding() {
     let sql = "CREATE TASK t1 WAREHOUSE = mywh ALLOW_OVERLAPPING_EXECUTION = TRUE SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
@@ -122,7 +121,7 @@ fn test_legacy_allow_overlapping_execution_true_signal() {
 }
 
 #[test]
-fn test_legacy_allow_overlapping_execution_false_no_signal() {
+fn test_legacy_allow_overlapping_execution_false_no_finding() {
     let sql = "CREATE TASK t1 WAREHOUSE = mywh ALLOW_OVERLAPPING_EXECUTION = FALSE SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
@@ -138,7 +137,7 @@ fn test_legacy_allow_overlapping_execution_false_no_signal() {
 }
 
 #[test]
-fn test_no_overlap_policy_no_signal() {
+fn test_no_overlap_policy_no_finding() {
     // Task without any overlap policy — should not trigger overlap warnings
     let sql = "CREATE TASK t1 WAREHOUSE = mywh SCHEDULE = '5 MINUTES' AS SELECT 1;";
     let report = analyze_risk(sql).expect("analysis should succeed");
@@ -172,4 +171,46 @@ fn test_multi_task_overlap_evidence() {
         "Expected SNW-TASK-OVERLAP-CHILD for t2. Got: {:?}",
         rule_ids(&report)
     );
+}
+
+#[test]
+fn execute_task_is_a_statement_of_its_own_kind() {
+    use lexega_core::analyzer::{AnalysisConfig, RuleMatch};
+    use lexega_core::rules::{build_v1_rule_corpus, load_v1_rules};
+    let custom = load_v1_rules(
+        r#"
+rules:
+  - id: TEST-EXECUTE-TASK
+    risk_level: info
+    message: "task run"
+    triggers:
+      all_of:
+        - kind: execute_task
+"#,
+    )
+    .expect("rules parse");
+    let config = AnalysisConfig {
+        custom_rules: Some(build_v1_rule_corpus(custom, true).expect("corpus").into()),
+        ..Default::default()
+    };
+    for sql in [
+        "EXECUTE TASK analytics.etl.t_load;",
+        "EXECUTE TASK t_load RETRY LAST;",
+        "BEGIN EXECUTE TASK t_load; END;",
+    ] {
+        let report =
+            lexega_core::api::analyze_risk_with_policy_config(sql, &config).expect("analyzes");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+        let ids: Vec<String> = report
+            .entries()
+            .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
+            .collect();
+        assert!(
+            ids.iter().any(|id| id == "TEST-EXECUTE-TASK"),
+            "{sql}: {ids:?}"
+        );
+        let formatted = format_sql_with_config(sql, &FormatterConfig::default()).expect("formats");
+        verify_formatting_safe(sql, &formatted)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+    }
 }

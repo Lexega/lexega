@@ -17,7 +17,7 @@ use std::process::{self, Command};
 
 use lexega_core::catalog;
 
-use super::io::resolve_uri;
+use super::io::load_catalog_index_from_uri;
 use super::usage::print_catalog_usage;
 
 fn resolve_default_catalog_sidecar(provider_name: Option<&str>) -> String {
@@ -221,23 +221,24 @@ pub fn handle_catalog_command(args: &[String]) {
         process::exit(1);
     }
 
-    /// Load a catalog snapshot from a URI (local path or cloud storage).
-    fn load_catalog_from_uri(uri: &str) -> Result<catalog::CatalogSnapshot, String> {
-        let content = resolve_uri(uri).map_err(|e| e.to_string())?;
+    /// Load a catalog snapshot as `analyze --catalog` loads it, refusing what
+    /// it refuses in its words.
+    fn load_catalog_or_exit(uri: &str) -> catalog::CatalogIndex {
+        load_catalog_index_from_uri(uri, None, &None).unwrap_or_else(|e| {
+            eprintln!("Failed to load catalog: {e}");
+            process::exit(1);
+        })
+    }
 
-        // Detect format by extension or content
-        let is_yaml = uri.ends_with(".yaml")
-            || uri.ends_with(".yml")
-            || content.trim_start().starts_with("schema_version:");
-
-        let snapshot: catalog::CatalogSnapshot = if is_yaml {
-            serde_yaml_ng::from_str(&content).map_err(|e| format!("YAML parse error: {e}"))?
-        } else {
-            serde_json::from_str(&content).map_err(|e| format!("JSON parse error: {e}"))?
-        };
-
-        snapshot.validate_version().map_err(|e| e.to_string())?;
-        Ok(snapshot)
+    // Help for a subcommand never runs it. A pull passes everything after
+    // `--` to the extractor, so only what precedes `--` is read.
+    let asks_for_help = args[3..]
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "-h" || a == "--help");
+    if asks_for_help && matches!(args[2].as_str(), "inspect" | "diff" | "pull") {
+        print_catalog_usage(&args[0]);
+        return;
     }
 
     match args[2].as_str() {
@@ -252,23 +253,12 @@ pub fn handle_catalog_command(args: &[String]) {
             }
 
             let uri = &args[3];
-            let snapshot = match load_catalog_from_uri(uri) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error: failed to load snapshot: {e}");
-                    process::exit(1);
-                }
-            };
+            let index = load_catalog_or_exit(uri);
+            let snapshot = index.snapshot();
 
             // Same content identity recorded in reports (catalog_sha256),
             // so auditors can verify a catalog file against a decision.
-            let sha256 = match snapshot.sha256_hex() {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("Error: failed to hash snapshot: {e}");
-                    process::exit(1);
-                }
-            };
+            let sha256 = index.snapshot_sha256();
 
             let mut schema_count: usize = 0;
             let mut table_count: usize = 0;
@@ -301,7 +291,7 @@ pub fn handle_catalog_command(args: &[String]) {
             if let Some(ts) = snapshot.generated_at {
                 println!("  Generated at: {}", ts.to_rfc3339());
             }
-            if let Some(src) = snapshot.source {
+            if let Some(src) = &snapshot.source {
                 println!("  Source: {}", src);
             }
             println!("  Databases: {}", snapshot.databases.len());
@@ -321,20 +311,9 @@ pub fn handle_catalog_command(args: &[String]) {
             let old_uri = &args[3];
             let new_uri = &args[4];
 
-            let old = match load_catalog_from_uri(old_uri) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error: failed to load old snapshot: {e}");
-                    process::exit(1);
-                }
-            };
-            let new = match load_catalog_from_uri(new_uri) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error: failed to load new snapshot: {e}");
-                    process::exit(1);
-                }
-            };
+            let old_index = load_catalog_or_exit(old_uri);
+            let new_index = load_catalog_or_exit(new_uri);
+            let (old, new) = (old_index.snapshot(), new_index.snapshot());
 
             use std::collections::BTreeSet;
 
@@ -411,12 +390,12 @@ pub fn handle_catalog_command(args: &[String]) {
                 out
             }
 
-            let old_tables = collect_tables(&old);
-            let new_tables = collect_tables(&new);
-            let old_cols = collect_columns(&old);
-            let new_cols = collect_columns(&new);
-            let old_constraints = collect_constraints(&old);
-            let new_constraints = collect_constraints(&new);
+            let old_tables = collect_tables(old);
+            let new_tables = collect_tables(new);
+            let old_cols = collect_columns(old);
+            let new_cols = collect_columns(new);
+            let old_constraints = collect_constraints(old);
+            let new_constraints = collect_constraints(new);
 
             let tables_added = new_tables.difference(&old_tables).count();
             let tables_removed = old_tables.difference(&new_tables).count();
@@ -512,16 +491,25 @@ pub fn handle_catalog_command(args: &[String]) {
                     let resolved = resolve_default_catalog_sidecar(provider_name.as_deref());
                     if !catalog_sidecar_is_runnable(&resolved) {
                         let provider = provider_name.as_deref().unwrap_or("snowflake");
-                        eprintln!(
-                            "Error: no catalog extractor is available to pull a '{provider}' snapshot."
-                        );
-                        eprintln!(
-                            "  Lexega bundles 'catalog pull' extractors for: {}.",
-                            BUNDLED_PULL_PROVIDERS.join(", ")
-                        );
-                        eprintln!(
-                            "  To pull anyway, provide your own extractor: catalog pull --sidecar <path> ..."
-                        );
+                        if BUNDLED_PULL_PROVIDERS.contains(&provider) {
+                            eprintln!(
+                                "Error: the '{provider}' catalog extractor `{resolved}` was not found beside this binary or on PATH."
+                            );
+                            eprintln!(
+                                "  It is published with each release (https://github.com/Lexega/lexega/releases/latest): put it beside the binary or on PATH, or name it with: catalog pull --sidecar <path> ..."
+                            );
+                        } else {
+                            eprintln!(
+                                "Error: no catalog extractor is available to pull a '{provider}' snapshot."
+                            );
+                            eprintln!(
+                                "  Lexega publishes 'catalog pull' extractors for: {}.",
+                                BUNDLED_PULL_PROVIDERS.join(", ")
+                            );
+                            eprintln!(
+                                "  To pull anyway, provide your own extractor: catalog pull --sidecar <path> ..."
+                            );
+                        }
                         eprintln!(
                             "  If you already have a snapshot, attach it directly: analyze --catalog <file> ..."
                         );
@@ -721,25 +709,14 @@ pub fn handle_catalog_command(args: &[String]) {
                     }
                 }
 
-                // Sanity check the produced snapshot. If it's older than our current version,
-                // it's usually because an older sidecar binary was used.
-                match catalog::CatalogSnapshot::load_from_path(&out_path) {
-                    Ok(snapshot) => {
-                        if snapshot.schema_version != catalog::CATALOG_SCHEMA_VERSION {
-                            eprintln!(
-                                "Error: catalog snapshot schema_version={} (expected {}).\n  This usually means an older sidecar was used.\n  Using sidecar: {}\n  Tip: override with: catalog pull --sidecar <path> ...",
-                                snapshot.schema_version,
-                                catalog::CATALOG_SCHEMA_VERSION,
-                                sidecar
-                            );
-                            process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: wrote catalog snapshot but failed to re-load it for validation: {e}"
-                        );
-                    }
+                // The snapshot must load as `analyze --catalog` loads it. An
+                // older schema version usually means an older sidecar ran.
+                if let Err(e) = load_catalog_index_from_uri(&out, provider_name.as_deref(), &None) {
+                    eprintln!("Error: the extractor wrote a catalog snapshot that cannot be used.");
+                    eprintln!("  Failed to load catalog: {e}");
+                    eprintln!("  Using sidecar: {sidecar}");
+                    eprintln!("  Tip: override with: catalog pull --sidecar <path> ...");
+                    process::exit(1);
                 }
             }
         }

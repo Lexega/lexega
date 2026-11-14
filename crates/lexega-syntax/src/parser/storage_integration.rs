@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterStorageIntegration, SyntaxAlterStorageIntegrationAction,
     SyntaxCreateStorageIntegration, SyntaxDropStorageIntegration,
@@ -672,25 +673,11 @@ impl<'a> Parser<'a> {
                         .expect_invariant("TAG keyword consumed after match");
                     let tag_span = tag_tok.span;
 
-                    // Consume tag assignments until we hit semicolon or EOF
-                    let tags_start = self.current_span().start;
-                    let mut tags_end = tags_start;
-                    while let Some(tok) = self.peek_non_trivia() {
-                        if matches!(
-                            tok.kind,
-                            TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
-                        ) {
-                            break;
-                        }
-                        let consumed_tok = self
-                            .advance()
-                            .expect_invariant("tag assignment token consumed after peek in loop");
-                        tags_end = consumed_tok.span.end;
-                    }
+                    let (tags_value_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
 
                     let action_span = Span {
                         start: set_span.start,
-                        end: tags_end,
+                        end: tags_value_span.end,
                     };
 
                     let action = AstAlterStorageIntegrationAction {
@@ -700,10 +687,8 @@ impl<'a> Parser<'a> {
                         kind: AstAlterStorageIntegrationActionKind::SetTag {
                             set_span: Some(set_span),
                             tag_span,
-                            tags_value_span: Span {
-                                start: tags_start,
-                                end: tags_end,
-                            },
+                            tags_value_span,
+                            tags,
                         },
                     };
                     actions.push(action);
@@ -904,25 +889,11 @@ impl<'a> Parser<'a> {
                         .expect_invariant("TAG keyword consumed after match");
                     let tag_span = tag_tok.span;
 
-                    // Consume tag names until we hit semicolon or EOF
-                    let tags_start = self.current_span().start;
-                    let mut tags_end = tags_start;
-                    while let Some(tok) = self.peek_non_trivia() {
-                        if matches!(
-                            tok.kind,
-                            TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
-                        ) {
-                            break;
-                        }
-                        let consumed_tok = self
-                            .advance()
-                            .expect_invariant("tag name token consumed after peek in loop");
-                        tags_end = consumed_tok.span.end;
-                    }
+                    let (tag_names_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                     let action_span = Span {
                         start: unset_span.start,
-                        end: tags_end,
+                        end: tag_names_span.end,
                     };
 
                     let action = AstAlterStorageIntegrationAction {
@@ -932,10 +903,8 @@ impl<'a> Parser<'a> {
                         kind: AstAlterStorageIntegrationActionKind::UnsetTag {
                             unset_span: Some(unset_span),
                             tag_span,
-                            tag_names_span: Span {
-                                start: tags_start,
-                                end: tags_end,
-                            },
+                            tag_names_span,
+                            tags,
                         },
                     };
                     actions.push(action);

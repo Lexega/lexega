@@ -163,8 +163,9 @@ pub fn lower_drop_network_rule_to_network_rule_plan(s: &AstDrop, source: &str) -
     NetworkRulePlan {
         action: NetworkRuleAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: NetworkRuleOptions {
             or_replace: false,
             if_not_exists: false,
@@ -194,8 +195,8 @@ fn fold_other_properties(plan: &mut NetworkRulePlan, properties: &[AstObjectProp
     }
 }
 
-/// Split a parenthesized literal list (`('a', 'b')`) into unquoted
-/// trimmed entries.
+/// Split a parenthesized literal list (`('a', 'b')`) into the values of
+/// its entries.
 fn split_value_list(source: &str, span: Span) -> Vec<String> {
     slice_span(source, span)
         .unwrap_or("")
@@ -203,9 +204,8 @@ fn split_value_list(source: &str, span: Span) -> Vec<String> {
         .trim_start_matches('(')
         .trim_end_matches(')')
         .split(',')
-        .map(|s| s.trim().trim_matches('\''))
+        .map(crate::ir::span_extract::literal_value_or_text)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect()
 }
 

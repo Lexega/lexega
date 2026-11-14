@@ -20,6 +20,7 @@
 
 use crate::ast::NodeId;
 use crate::context::node_metadata::IdentKey;
+use crate::ir::plan::JoinKind;
 use crate::lexer::Span;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -209,7 +210,10 @@ impl BindingTable {
         let Some(binding) = self.entries.get_mut(&id) else {
             return;
         };
-        if !matches!(binding.origin, ColumnOrigin::Computed { .. }) {
+        if !matches!(
+            binding.origin,
+            ColumnOrigin::Computed { .. } | ColumnOrigin::Merged { .. }
+        ) {
             return;
         }
         if binding.explicit_alias.is_some() {
@@ -240,6 +244,55 @@ pub struct ColumnBinding {
     pub explicit_alias: Option<IdentKey>,
 }
 
+/// What a merged column holds on each row of its join, in terms of the
+/// column of each side it merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergedValue {
+    /// Both columns' value: on every row they are equal, so it is not
+    /// NULL where either is known not to be. That the join's match
+    /// rejects NULL is not stated: over two columns that may be NULL it
+    /// may be NULL to a reader, as either column of the same join
+    /// written with `ON` may.
+    Both { left: ColumnId, right: ColumnId },
+    /// `kept`'s value. The join keeps every row of that side unpadded;
+    /// `other` is equal to it on the rows its side matched.
+    Side { kept: ColumnId, other: ColumnId },
+    /// The first of the two that is not NULL.
+    Either { left: ColumnId, right: ColumnId },
+}
+
+impl MergedValue {
+    /// What a join of `kind` makes of the `left` and `right` columns it
+    /// merges.
+    pub fn of(kind: JoinKind, left: ColumnId, right: ColumnId) -> Self {
+        match kind {
+            JoinKind::Inner | JoinKind::Cross => MergedValue::Both { left, right },
+            JoinKind::LeftOuter | JoinKind::Asof | JoinKind::LeftSemi | JoinKind::LeftAnti => {
+                MergedValue::Side {
+                    kept: left,
+                    other: right,
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => MergedValue::Side {
+                kept: right,
+                other: left,
+            },
+            JoinKind::FullOuter => MergedValue::Either { left, right },
+        }
+    }
+
+    /// The two columns. On every row the merged column holds the value
+    /// of one of them.
+    pub fn sides(self) -> [ColumnId; 2] {
+        match self {
+            MergedValue::Both { left, right } | MergedValue::Either { left, right } => {
+                [left, right]
+            }
+            MergedValue::Side { kept, other } => [kept, other],
+        }
+    }
+}
+
 /// Where a column's value originates.
 ///
 /// Correlated outer references get their own variant so subquery
@@ -261,6 +314,15 @@ pub enum ColumnOrigin {
         producing_node: NodeId,
         expr_span: Span,
     },
+    /// The column a `USING` / `NATURAL` join exposes for a name it merges.
+    ///
+    /// `producing_node` is the join; `expr_span` is the name in `USING`,
+    /// or the join's span when it is `NATURAL`.
+    Merged {
+        producing_node: NodeId,
+        expr_span: Span,
+        value: MergedValue,
+    },
     /// Produced by a set-op (UNION / INTERSECT / EXCEPT) that unified inputs.
     ///
     /// Each entry is a column from one input, in input order.
@@ -273,4 +335,15 @@ pub enum ColumnOrigin {
     /// Recursive CTE self-reference. `binding_index` is the column position
     /// within the recursive CTE's output schema.
     RecursiveRef { binding_index: u32 },
+    /// A column whose source lowering cannot choose: an unqualified name
+    /// several sources of its block could have, or none; a qualifier
+    /// that names no source in scope. No source lists it.
+    ///
+    /// `qualifier` and `name` are the raw text of the first reference's
+    /// qualifier and identifier, and `span` is that identifier's.
+    Unattributed {
+        qualifier: Option<String>,
+        name: String,
+        span: Span,
+    },
 }

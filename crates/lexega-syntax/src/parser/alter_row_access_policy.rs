@@ -14,8 +14,9 @@ use crate::ast::{
     AstStmt,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
+use crate::lexer::{Keyword, Operator, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{SyntaxAlterRowAccessPolicyAction, SyntaxAlterRowAccessPolicyStmt};
 
 impl<'a> Parser<'a> {
@@ -89,7 +90,7 @@ impl<'a> Parser<'a> {
             self.parse_if_exists_clause_for_policy()?;
 
         // Policy name (qualified identifier)
-        let name_span = self.parse_policy_name()?;
+        let name_span = self.parse_object_name_span()?;
 
         // Parse action
         let action_start = self.current_span().start;
@@ -187,36 +188,6 @@ impl<'a> Parser<'a> {
         Ok((None, None, None))
     }
 
-    /// Parse policy name (qualified identifier)
-    fn parse_policy_name(&mut self) -> ParseResult<Span> {
-        let start_span = self.current_span();
-        let first_tok = self
-            .advance()
-            .ok_or_eof(start_span, vec!["identifier".to_string()])?;
-
-        let mut name_end = first_tok.span.end;
-
-        // Handle qualified names (db.schema.policy)
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                let _dot = self
-                    .advance()
-                    .expect_invariant("dot punctuation available after peek in policy name");
-                let part_tok = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                name_end = part_tok.span.end;
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span {
-            start: first_tok.span.start,
-            end: name_end,
-        })
-    }
-
     /// Parse ALTER ROW ACCESS POLICY action
     fn parse_alter_row_access_policy_action(
         &mut self,
@@ -244,7 +215,7 @@ impl<'a> Parser<'a> {
                 };
 
                 // New name
-                let new_name_span = self.parse_policy_name()?;
+                let new_name_span = self.parse_object_name_span()?;
 
                 AstAlterRowAccessPolicyActionKind::RenameTo {
                     rename_span,
@@ -309,19 +280,14 @@ impl<'a> Parser<'a> {
                             .expect_invariant("TAG keyword available after peek in SET TAG");
                         let tag_span = Some(tag_tok.span);
 
-                        // Parse tag assignments (tag_name = 'value', ...)
-                        let assignments_start = self.current_span().start;
-                        let _ = self.consume_until_statement_end_or_semicolon();
-                        let assignments_end = self.current_span().end;
-                        let assignments_span = Span {
-                            start: assignments_start,
-                            end: assignments_end,
-                        };
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
 
                         AstAlterRowAccessPolicyActionKind::SetTag {
                             set_span,
                             tag_span,
                             assignments_span,
+                            tags,
                         }
                     }
 
@@ -388,19 +354,13 @@ impl<'a> Parser<'a> {
                             .expect_invariant("TAG keyword available after peek in UNSET TAG");
                         let tag_span = Some(tag_tok.span);
 
-                        // Parse tag names (tag_name, tag_name, ...)
-                        let tags_start = self.current_span().start;
-                        let _ = self.consume_until_statement_end_or_semicolon();
-                        let tags_end = self.current_span().end;
-                        let tags_span = Span {
-                            start: tags_start,
-                            end: tags_end,
-                        };
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                         AstAlterRowAccessPolicyActionKind::UnsetTag {
                             unset_span,
                             tag_span,
                             tags_span,
+                            tags,
                         }
                     }
 
@@ -448,34 +408,5 @@ impl<'a> Parser<'a> {
             syntax_id: None,
             kind,
         })
-    }
-
-    /// Consume tokens until statement end or semicolon
-    fn consume_until_statement_end_or_semicolon(&mut self) -> ParseResult<()> {
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                break;
-            }
-            // Check for potential next statement keywords
-            if matches!(
-                tok.kind,
-                TokenKind::Keyword(
-                    Keyword::Select
-                        | Keyword::Insert
-                        | Keyword::Update
-                        | Keyword::Delete
-                        | Keyword::Create
-                        | Keyword::Alter
-                        | Keyword::Drop
-                        | Keyword::Grant
-                        | Keyword::Revoke
-                        | Keyword::Deny
-                )
-            ) {
-                break;
-            }
-            self.advance();
-        }
-        Ok(())
     }
 }

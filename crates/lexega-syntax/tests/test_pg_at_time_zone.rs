@@ -20,9 +20,10 @@ use lexega_syntax::{
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) -> String {

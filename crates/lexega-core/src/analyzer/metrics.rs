@@ -10,7 +10,7 @@ use crate::ast::NodeId;
 use crate::context::node_metadata::TableRef;
 use crate::facts::statement::{StatementFacts, StatementKind};
 use crate::lexer::Span;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// Statement classification (exactly one per statement)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +120,7 @@ pub fn classify_statement_kind(kind: StatementKind) -> StatementClassification {
         | K::DropRole
         | K::CreateUser
         | K::AlterUser
+        | K::RenameUser
         | K::DropUser
         | K::AlterAccount
         | K::CreateShare
@@ -359,6 +360,7 @@ pub fn classify_statement_kind(kind: StatementKind) -> StatementClassification {
         | K::MssqlDropExternalModel
         | K::MssqlCreateVectorIndex
         | K::MssqlDropTrigger
+        | K::MssqlTriggerState
         | K::BqCreateModel
         | K::BqAlterModel
         | K::BqDropModel
@@ -420,11 +422,22 @@ pub fn classify_statement_kind(kind: StatementKind) -> StatementClassification {
         | K::DoBlock
         | K::AnalyzeStmt
         | K::Call
+        | K::ExecuteTask
         | K::MssqlExec
         | K::MssqlSetOption
         | K::Reconfigure
+        | K::MssqlServerCommand
+        | K::OptimizeTable
+        | K::CheckTable
+        | K::ChecksumTable
+        | K::RepairTable
+        | K::Flush
+        | K::Kill
+        | K::AlterInstance
+        | K::XaTransaction
         | K::AlterSession
         | K::BqAssert
+        | K::Assert
         | K::BqExportModel
         | K::DbxOptimize
         | K::DbxVacuum
@@ -467,9 +480,51 @@ pub struct StatementSemantics {
     /// Empty for non-DML-WRITE statements.
     pub tables_written: Vec<TableRef>,
 
-    /// Tables modified by DDL (only populated when classification == Ddl).
-    /// Empty for non-DDL statements.
+    /// Tables modified by DDL: the statement's DDL target where that is a
+    /// table, a view, a materialized view, a dynamic table or an external
+    /// table. Empty for a statement with no such target.
     pub tables_modified_ddl: Vec<TableRef>,
+
+    /// The object a DDL statement targets, of whatever kind.
+    pub(crate) ddl_target: Option<TableRef>,
+
+    /// The tables of the three lists that an attached catalog is asked
+    /// for, from every fact of the statement.
+    pub(crate) catalog_subjects: Vec<CatalogSubject>,
+}
+
+/// A table a statement names, for the question whether an attached
+/// catalog has it.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogSubject {
+    /// Source offset the statement names the table at.
+    pub(crate) at: u32,
+    pub(crate) table: TableRef,
+    /// The catalog's answer where lowering asked it for this table; `None`
+    /// where it did not.
+    pub(crate) in_catalog: Option<bool>,
+    /// Whether a query of the statement reads or writes the table. Lowering
+    /// asks the catalog for every such table but a session's own and a
+    /// stage, so where it has no answer the catalog is not asked again.
+    pub(crate) queried: bool,
+    /// Whether the statement creates the table.
+    pub(crate) created: bool,
+    /// The statement naming it.
+    pub(crate) statement: Span,
+}
+
+impl CatalogSubject {
+    /// Its place in script order. A statement reads before it creates: a
+    /// created table falls where its statement ends, after everything that
+    /// statement names and before the statement that follows.
+    pub(crate) fn script_order(&self) -> (u32, u32, bool) {
+        let place = if self.created {
+            self.statement.end
+        } else {
+            self.at
+        };
+        (place, self.statement.start, self.created)
+    }
 }
 
 impl StatementSemantics {
@@ -495,6 +550,16 @@ impl StatementSemantics {
             &[]
         }
     }
+
+    /// The object a DDL statement targets, of whatever kind (only if
+    /// classification == Ddl).
+    fn ddl_object(&self) -> Option<&TableRef> {
+        if self.classification == StatementClassification::Ddl {
+            self.ddl_target.as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// Single source of truth: StatementId → StatementSemantics
@@ -505,14 +570,25 @@ impl StatementSemantics {
 /// Note: statements_parsed is derived from entries.len() to guarantee the invariant.
 #[derive(Debug, Clone, Default)]
 pub struct StatementLedger {
-    pub(crate) entries: HashMap<NodeId, StatementSemantics>,
+    // Keyed by the offset a statement starts at, so iteration is in script order.
+    pub(crate) entries: BTreeMap<NodeId, StatementSemantics>,
     /// Tracks span starts that have been added (for dedup)
     span_starts: std::collections::HashSet<u32>,
     /// Whether ledger has been finalized (invariant check)
     finalized: bool,
+    /// Span starts of the statements whose DDL target the parser read as a
+    /// session's own table or a stage: no catalog holds it.
+    uncatalogued_ddl_targets: std::collections::BTreeSet<u32>,
 }
 
 impl StatementLedger {
+    /// Record that the DDL target of the statement starting at
+    /// `statement_start` is a session's own table or a stage, so an
+    /// attached catalog is not asked for it.
+    pub(crate) fn record_uncatalogued_ddl_target(&mut self, statement_start: u32) {
+        self.uncatalogued_ddl_targets.insert(statement_start);
+    }
+
     /// Create empty ledger
     pub fn new() -> Self {
         Self::default()
@@ -597,7 +673,9 @@ impl StatementLedger {
         Ok(())
     }
 
-    /// Add statement to ledger. Only adds if span_start is new (no duplicates).
+    /// Add statement to ledger. Only adds if span_start is new (no duplicates);
+    /// a later statement at a recorded start adds its catalog subjects to
+    /// the entry already there.
     pub fn add_statement(&mut self, node_id: NodeId, semantics: StatementSemantics) {
         let span_start = semantics.span.start;
 
@@ -605,6 +683,8 @@ impl StatementLedger {
         // (prevents triple-counting from blast_radius, cost_risk, policy analyzers)
         if self.span_starts.insert(span_start) {
             self.entries.insert(node_id, semantics);
+        } else if let Some(first) = self.entries.get_mut(&node_id) {
+            first.catalog_subjects.extend(semantics.catalog_subjects);
         }
     }
 
@@ -669,11 +749,26 @@ impl StatementLedger {
         // View, MaterializedView, DynamicTable, ExternalTable). Other
         // ObjectKinds (Stage, Pipe, Procedure, etc.) are not tracked
         // as table modifications.
-        let tables_modified_ddl: Vec<TableRef> =
-            match fact.ddl.as_ref().and_then(|d| d.target.as_ref()) {
-                Some(obj) => vec![facts_tableref_to_metadata(&obj.name)],
-                None => Vec::new(),
-            };
+        let ddl_object = fact.ddl.as_ref().and_then(|d| d.target.as_ref());
+        let ddl_target: Option<TableRef> =
+            ddl_object.map(|obj| facts_tableref_to_metadata(&obj.name));
+        let table_shaped = ddl_object.is_some_and(|obj| {
+            matches!(
+                obj.kind,
+                crate::facts::ObjectKind::Table
+                    | crate::facts::ObjectKind::View
+                    | crate::facts::ObjectKind::MaterializedView
+                    | crate::facts::ObjectKind::DynamicTable
+                    | crate::facts::ObjectKind::ExternalTable
+            )
+        });
+        let tables_modified_ddl: Vec<TableRef> = ddl_target
+            .iter()
+            .filter(|_| table_shaped)
+            .cloned()
+            .collect();
+        // Whether one of the three lists holds the DDL target.
+        let mut target_listed = table_shaped;
 
         // Statements classified as DmlWrite that carry their target
         // table on `ddl.target` rather than `query.{reads,writes}_table[]`
@@ -688,16 +783,17 @@ impl StatementLedger {
         if classification == StatementClassification::DmlWrite
             && tables_written.is_empty()
             && tables_read.is_empty()
-            && !tables_modified_ddl.is_empty()
         {
-            let direction = fact.pg_copy.as_ref().map(|p| p.direction);
-            match direction {
-                Some(crate::facts::PgCopyDirection::To) => {
-                    tables_read.extend(tables_modified_ddl.iter().cloned());
+            if let Some(target) = &ddl_target {
+                if matches!(
+                    fact.pg_copy.as_ref().map(|p| p.direction),
+                    Some(crate::facts::PgCopyDirection::To)
+                ) {
+                    tables_read.push(target.clone());
+                } else {
+                    tables_written.push(target.clone());
                 }
-                _ => {
-                    tables_written.extend(tables_modified_ddl.iter().cloned());
-                }
+                target_listed = true;
             }
         }
 
@@ -713,13 +809,72 @@ impl StatementLedger {
             Some(crate::facts::DdlAction::Maintenance)
         ) && tables_read.is_empty()
             && tables_written.is_empty()
-            && !tables_modified_ddl.is_empty()
         {
-            if matches!(fact.kind, crate::facts::StatementKind::DbxRestore) {
-                tables_written.extend(tables_modified_ddl.iter().cloned());
-            } else {
-                tables_read.extend(tables_modified_ddl.iter().cloned());
+            if let Some(target) = &ddl_target {
+                if matches!(fact.kind, crate::facts::StatementKind::DbxRestore) {
+                    tables_written.push(target.clone());
+                } else {
+                    tables_read.push(target.clone());
+                }
+                target_listed = true;
             }
+        }
+
+        // The tables an attached catalog is asked for are the ones the
+        // three lists hold: a table read where lowering asked the catalog
+        // for it (a CTE or a derived table is never asked for), a table
+        // written, and the DDL target where a list holds it and it is no
+        // session's own table or a stage.
+        let mut catalog_subjects: Vec<CatalogSubject> = Vec::new();
+        if let Some(q) = fact.query.as_ref() {
+            // The statement's read and write lists name each table once
+            // and carry no place; its scans do. A table read only inside
+            // an expression's subquery has no scan here: it is placed
+            // after the tables that have one.
+            let mut first_scan: BTreeMap<&str, u32> = BTreeMap::new();
+            for scan in q.scopes.iter().flat_map(|scope| &scope.tables) {
+                if let Some(scanned) = scan.source_span {
+                    let at = first_scan
+                        .entry(scan.table.canonical.as_str())
+                        .or_insert(scanned.start);
+                    *at = (*at).min(scanned.start);
+                }
+            }
+            let subject = |te: &crate::facts::query::TableEvent, unplaced: u32| CatalogSubject {
+                at: first_scan
+                    .get(te.table.canonical.as_str())
+                    .copied()
+                    .or(te.source_span.map(|s| s.start))
+                    .unwrap_or(unplaced),
+                table: facts_tableref_to_metadata(&te.table),
+                in_catalog: te.in_catalog,
+                queried: true,
+                created: false,
+                statement: span,
+            };
+            catalog_subjects.extend(
+                q.reads_table
+                    .iter()
+                    .filter(|te| te.in_catalog.is_some())
+                    .map(|te| subject(te, span.end)),
+            );
+            catalog_subjects.extend(q.writes_table.iter().map(|te| subject(te, span.start)));
+        }
+        if let Some(target) = ddl_target
+            .as_ref()
+            .filter(|_| target_listed && !self.uncatalogued_ddl_targets.contains(&span.start))
+        {
+            catalog_subjects.push(CatalogSubject {
+                at: span.start,
+                table: target.clone(),
+                in_catalog: None,
+                queried: false,
+                created: matches!(
+                    fact.ddl.as_ref().map(|d| d.action),
+                    Some(crate::facts::DdlAction::Create)
+                ),
+                statement: span,
+            });
         }
 
         let semantics = StatementSemantics {
@@ -730,38 +885,54 @@ impl StatementLedger {
             tables_read,
             tables_written,
             tables_modified_ddl,
+            ddl_target,
+            catalog_subjects,
         };
 
         // Synthesize a stable NodeId from the span start. The ledger
         // uses NodeId for keying.
         //
-        // First-wins on collision: the four rule evaluators fold into
-        // the same per-statement fact stream in the order
-        // privilege → ddl → query → policy_attachment. When two
-        // evaluators produce facts for the same span (e.g. the DDL
-        // evaluator producing a `PgCopy` fact with a populated
-        // `ddl.target` and the query evaluator producing a
-        // Terminal-plan Select stub for the same statement),
-        // the first/earlier evaluator's fact wins. This preserves
-        // the more specific surface — the later stub would
-        // otherwise overwrite the typed `ddl.target` and silently
-        // drop the read-set / write-set on the floor.
-        // Route through add_statement (first-wins by span_start). NodeId is
-        // derived from span.start, so this preserves the prior
-        // or_insert/first-wins keying.
+        // Each statement is one fact record, so one entry. Where two
+        // statements start at the same offset the first entry is kept
+        // and a later one adds only the tables it names for the catalog
+        // question (add_statement, first-wins by span start).
         let nid = NodeId::new(span.start);
         self.add_statement(nid, semantics);
     }
 
     /// Derive all metrics from ledger (never store derived values)
     pub fn derive_metrics(&self) -> DerivedMetrics {
+        self.derive_metrics_masking(&|_| false)
+    }
+
+    /// [`Self::derive_metrics`], each table whose text `masked` says a
+    /// report masks named masked whole: the source writes a string literal
+    /// the report does not show in it (`IDENTIFIER('…')`, template code).
+    pub fn derive_metrics_masking(&self, masked: &dyn Fn(Span) -> bool) -> DerivedMetrics {
+        let shown = |t: &TableRef| -> TableRef {
+            match t.span.is_some_and(masked) {
+                true => {
+                    let part = |p: &Option<String>| {
+                        p.as_ref().map(|_| crate::facts::MASKED_VALUE.to_string())
+                    };
+                    TableRef {
+                        server: part(&t.server),
+                        db: part(&t.db),
+                        schema: part(&t.schema),
+                        name: crate::facts::MASKED_VALUE.to_string(),
+                        span: t.span,
+                    }
+                }
+                false => t.clone(),
+            }
+        };
         // Tables Written (DML) = unique set of DmlWrite targets
         let tables_written: HashSet<String> = self
             .entries
             .values()
             .filter(|s| s.classification == StatementClassification::DmlWrite)
             .flat_map(|s| s.tables_written_dml())
-            .map(|t| t.canonical())
+            .map(|t| shown(t).canonical())
             .collect();
 
         // Tables Read = tables from:
@@ -769,6 +940,7 @@ impl StatementLedger {
         // - DmlWrite (read-side of MERGE, INSERT...SELECT)
         // - Security (policies with subqueries)
         // - Control (cursor queries like DECLARE CURSOR FOR SELECT...)
+        // - Ddl (the query of a CREATE TABLE … AS or of a view)
         let tables_read: HashSet<String> = self
             .entries
             .values()
@@ -779,10 +951,11 @@ impl StatementLedger {
                         | StatementClassification::DmlWrite
                         | StatementClassification::Security
                         | StatementClassification::Control
+                        | StatementClassification::Ddl
                 )
             })
             .flat_map(|s| s.tables_read())
-            .map(|t| t.canonical())
+            .map(|t| shown(t).canonical())
             .collect();
 
         // DDL Operations = count of statements with classification == Ddl
@@ -814,8 +987,9 @@ impl StatementLedger {
                 s.tables_read()
                     .iter()
                     .chain(s.tables_written_dml().iter())
-                    .chain(s.tables_modified_ddl().iter())
-                    .filter_map(|t| t.db.as_ref())
+                    .chain(s.ddl_object())
+                    .map(shown)
+                    .filter_map(|t| t.db)
                     .map(|db| db.to_uppercase())
             })
             .collect();
@@ -828,7 +1002,8 @@ impl StatementLedger {
                 s.tables_read()
                     .iter()
                     .chain(s.tables_written_dml().iter())
-                    .chain(s.tables_modified_ddl().iter())
+                    .chain(s.ddl_object())
+                    .map(shown)
                     .filter_map(|t| {
                         t.schema.as_ref().map(|schema| {
                             if let Some(db) = &t.db {
@@ -862,7 +1037,7 @@ impl StatementLedger {
             .values()
             .filter(|s| s.classification == StatementClassification::DmlWrite)
             .flat_map(|s| s.tables_written_dml())
-            .map(|t| t.canonical())
+            .map(|t| shown(t).canonical())
             .collect();
 
         DerivedMetrics {
@@ -923,6 +1098,45 @@ impl MetricsCollector {
 
 #[cfg(test)]
 mod tests {
+    use super::CatalogSubject;
+    use crate::context::node_metadata::TableRef;
+    use crate::lexer::Span;
+
+    fn subject(at: u32, created: bool, statement: Span) -> CatalogSubject {
+        CatalogSubject {
+            at,
+            table: TableRef {
+                server: None,
+                db: None,
+                schema: None,
+                name: "t".to_string(),
+                span: None,
+            },
+            in_catalog: None,
+            queried: false,
+            created,
+            statement,
+        }
+    }
+
+    #[test]
+    fn a_created_table_follows_what_its_statement_names_and_precedes_the_next_statement() {
+        let creating = Span { start: 0, end: 20 };
+        let following = Span { start: 20, end: 30 };
+        let read_inside = subject(12, false, creating);
+        // A read with no place of its own is put at its statement's end.
+        let read_at_the_end = subject(20, false, creating);
+        let created = subject(0, true, creating);
+        let next_target = subject(20, false, following);
+
+        let mut order = [&next_target, &created, &read_at_the_end, &read_inside];
+        order.sort_by_key(|s| s.script_order());
+        let expected = [&read_inside, &read_at_the_end, &created, &next_target];
+        assert!(order
+            .iter()
+            .zip(expected)
+            .all(|(got, want)| std::ptr::eq(*got, want)));
+    }
 
     #[test]
     fn test_metrics_collector_single_db() {

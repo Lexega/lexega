@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "lexega-cli"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "dunce",
  "glob",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "lexega-core"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "lexega-syntax"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "criterion",
  "phf",

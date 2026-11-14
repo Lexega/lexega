@@ -12,45 +12,47 @@ use lexega_core::api::analyze_risk_with_policy_config;
 use lexega_core::dialect::mssql;
 
 fn analyze(sql: &str) -> Vec<(String, RiskLevel)> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("analyze");
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some((g.matched_rule.clone(), g.risk_level)),
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => (g.matched_rule.clone(), g.risk_level),
         })
         .collect()
 }
 
-fn fires(signals: &[(String, RiskLevel)], rule_id: &str) -> bool {
-    signals.iter().any(|(id, _)| id == rule_id)
+fn fires(findings: &[(String, RiskLevel)], rule_id: &str) -> bool {
+    findings.iter().any(|(id, _)| id == rule_id)
 }
 
-fn fires_with_level(signals: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
-    signals.iter().any(|(id, l)| id == rule_id && *l == level)
+fn fires_with_level(findings: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
+    findings.iter().any(|(id, l)| id == rule_id && *l == level)
 }
 
 #[test]
-fn four_part_read_fires_medium() {
+fn four_part_read_fires_low() {
     let sql = "SELECT * FROM PAYROLL_LINK.payroll.dbo.EmployeeCompensation;";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LINKEDSRV-READ", RiskLevel::Medium),
-        "MSSQL-LINKEDSRV-READ should fire at Medium on a four-part read. Got: {:?}",
-        signals
+        fires_with_level(&findings, "MSSQL-LINKEDSRV-READ", RiskLevel::Low),
+        "MSSQL-LINKEDSRV-READ should fire at Low on a four-part read. Got: {:?}",
+        findings
     );
 }
 
 #[test]
 fn four_part_write_fires() {
     let sql = "UPDATE PAYROLL_LINK.payroll.dbo.t SET x = 1;";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires(&signals, "MSSQL-LINKEDSRV-READ"),
+        fires(&findings, "MSSQL-LINKEDSRV-READ"),
         "MSSQL-LINKEDSRV-READ should fire on a four-part write target. Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -58,21 +60,21 @@ fn four_part_write_fires() {
 fn three_part_read_does_not_fire() {
     // An ordinary three-part name has no linked-server component.
     let sql = "SELECT * FROM payroll.dbo.EmployeeCompensation;";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-LINKEDSRV-READ"),
+        !fires(&findings, "MSSQL-LINKEDSRV-READ"),
         "MSSQL-LINKEDSRV-READ must not fire on a three-part name. Got: {:?}",
-        signals
+        findings
     );
 }
 
 #[test]
 fn bracket_quoted_four_part_fires() {
     let sql = "SELECT * FROM [PAYROLL_LINK].[payroll].[dbo].[EmployeeCompensation];";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires(&signals, "MSSQL-LINKEDSRV-READ"),
+        fires(&findings, "MSSQL-LINKEDSRV-READ"),
         "MSSQL-LINKEDSRV-READ should fire on a bracket-quoted four-part name. Got: {:?}",
-        signals
+        findings
     );
 }

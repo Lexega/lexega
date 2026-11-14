@@ -8,11 +8,13 @@
 
 use crate::ast::{
     AstAlterSchema, AstAlterSchemaAction, AstAlterSchemaActionKind, AstCreateSchema,
-    AstCreateSchemaVariant, AstDropSchema, AstStmt, AstUndropSchema, AstUnknownClause, UnknownKind,
+    AstCreateSchemaVariant, AstDropSchema, AstStmt, AstTagRef, AstUndropSchema, AstUnknownClause,
+    UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{NamePosition, Parser};
+use crate::parser::tag::TagListShape;
 
 impl<'a> Parser<'a> {
     /// Parse CREATE SCHEMA statement.
@@ -77,17 +79,19 @@ impl<'a> Parser<'a> {
         let mut with_managed_access_span: Option<Span> = None;
         let mut comment_span: Option<Span> = None;
         let mut tag_span: Option<Span> = None;
+        let mut tags: Vec<AstTagRef> = Vec::new();
         let mut managed_location_span: Option<Span> = None;
         let mut location_span: Option<Span> = None;
         let mut default_collation_span: Option<Span> = None;
         let mut dbproperties_span: Option<Span> = None;
+        let mut authorization: Option<Span> = None;
 
         let variant = self.parse_create_schema_variant(&mut extras)?;
 
         // Parse properties AFTER variant (CLONE allows trailing properties)
         let properties_span = match &variant {
             AstCreateSchemaVariant::Standard | AstCreateSchemaVariant::Clone { .. } => {
-                self.parse_schema_properties(&mut extras)?
+                self.parse_schema_properties(&mut extras, &mut authorization)?
             }
         };
 
@@ -215,6 +219,7 @@ impl<'a> Parser<'a> {
                     // WITH DBPROPERTIES (key=val, ...) (Databricks)
                     if next_lex.eq_ignore_ascii_case("DBPROPERTIES") {
                         self.advance(); // DBPROPERTIES
+                        self.record_option_list_secrets(self.idx);
                         let paren_span = self.consume_balanced_parens()?;
                         dbproperties_span = Some(Span {
                             start: with_start,
@@ -249,7 +254,12 @@ impl<'a> Parser<'a> {
         }
 
         // Parse trailing COMMENT and TAG (Snowflake-specific handling)
-        self.parse_schema_trailing_clauses(&mut comment_span, &mut tag_span, &mut extras)?;
+        self.parse_schema_trailing_clauses(
+            &mut comment_span,
+            &mut tag_span,
+            &mut tags,
+            &mut extras,
+        )?;
 
         // Calculate final span
         let mut span_end = name_span.end;
@@ -327,6 +337,8 @@ impl<'a> Parser<'a> {
             dbproperties_span,
             comment_span,
             tag_span,
+            tags,
+            authorization,
             extras,
         })))
     }
@@ -558,7 +570,9 @@ impl<'a> Parser<'a> {
         // Schema name
         let name_span = self.parse_qualified_name_span()?;
 
-        // Parse the action
+        // Parse the action; each parameter's value is recorded as every
+        // statement setting one records it.
+        self.record_setting_secrets(self.idx);
         let mut extras: Vec<AstUnknownClause> = Vec::new();
         let action = self.parse_alter_schema_action(&mut extras)?;
 
@@ -684,22 +698,20 @@ impl<'a> Parser<'a> {
                         .expect_invariant("TAG: consumed after Keyword::Tag match in SET TAG");
                     let tag_span = tag_tok.span;
 
-                    let assignments_start = self.current_span().start;
-                    let end = self.consume_until_semi_or_eof_schema()?;
+                    let (assignments_span, tags) =
+                        self.parse_tag_list(TagListShape::Assignments)?;
 
                     return Ok(AstAlterSchemaAction {
                         node_id: self.id_gen.next(),
                         span: Span {
                             start: action_start,
-                            end,
+                            end: assignments_span.end,
                         },
                         kind: AstAlterSchemaActionKind::SetTag {
                             set_span,
                             tag_span,
-                            assignments_span: Span {
-                                start: assignments_start,
-                                end,
-                            },
+                            assignments_span,
+                            tags,
                         },
                     });
                 }
@@ -738,6 +750,7 @@ impl<'a> Parser<'a> {
                         .eq_ignore_ascii_case("DBPROPERTIES")
                 {
                     self.advance(); // DBPROPERTIES
+                    self.record_option_list_secrets(self.idx);
                     let end = self.consume_balanced_parens()?.end;
 
                     return Ok(AstAlterSchemaAction {
@@ -820,7 +833,7 @@ impl<'a> Parser<'a> {
             }
 
             // Not a special SET action, parse properties (Snowflake SET property = value)
-            let props_span = self.parse_schema_properties(extras)?;
+            let props_span = self.parse_schema_properties(extras, &mut None)?;
             let mut properties_span = props_span.unwrap_or(Span {
                 start: set_span.end,
                 end: set_span.end,
@@ -870,22 +883,19 @@ impl<'a> Parser<'a> {
                         .expect_invariant("TAG: consumed after Keyword::Tag match in UNSET TAG");
                     let tag_span = tag_tok.span;
 
-                    let tags_start = self.current_span().start;
-                    let end = self.consume_until_semi_or_eof_schema()?;
+                    let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                     return Ok(AstAlterSchemaAction {
                         node_id: self.id_gen.next(),
                         span: Span {
                             start: action_start,
-                            end,
+                            end: tags_span.end,
                         },
                         kind: AstAlterSchemaActionKind::UnsetTag {
                             unset_span,
                             tag_span,
-                            tags_span: Span {
-                                start: tags_start,
-                                end,
-                            },
+                            tags_span,
+                            tags,
                         },
                     });
                 }
@@ -1195,8 +1205,29 @@ impl<'a> Parser<'a> {
             });
         }
 
-        // Unknown action - consume rest as extra
-        let end = self.consume_until_semi_or_eof()?;
+        // Unknown action - consume rest as extra. T-SQL `TRANSFER [{ OBJECT |
+        // TYPE | XML SCHEMA COLLECTION } ::] name` ends with the name where
+        // the dialect needs no terminator.
+        let bound = tok
+            .lexeme(self.source)
+            .eq_ignore_ascii_case("TRANSFER")
+            .then(|| {
+                let class_end = self
+                    .any_words_end(
+                        self.idx + 1,
+                        &[&["OBJECT"], &["TYPE"], &["XML", "SCHEMA", "COLLECTION"]],
+                    )
+                    .filter(|&k| {
+                        self.tokens.get(k).is_some_and(|t| {
+                            matches!(t.kind, TokenKind::Operator(Operator::ColonColon))
+                        })
+                    })
+                    .map_or(self.idx + 1, |k| k + 1);
+                self.object_name_end(class_end)
+            })
+            .flatten()
+            .map_or(usize::MAX, |end| self.clauses_bound(end));
+        let end = self.consume_until_semi_or_eof_before(bound)?;
         let unknown_clause = AstUnknownClause {
             introducer: Some(tok.span),
             span: Span {
@@ -1222,6 +1253,7 @@ impl<'a> Parser<'a> {
     fn parse_schema_properties(
         &mut self,
         extras: &mut Vec<AstUnknownClause>,
+        authorization: &mut Option<Span>,
     ) -> ParseResult<Option<Span>> {
         let mut props_start: Option<u32> = None;
         let mut props_end: u32 = 0;
@@ -1229,6 +1261,11 @@ impl<'a> Parser<'a> {
         while let Some(tok) = self.peek_non_trivia() {
             // Stop conditions
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
+                break;
+            }
+            // Where statements need no terminator, the next one (or a `GO`
+            // batch separator) ends the schema's properties.
+            if self.should_stop_scan_at_statement_start(tok) {
                 break;
             }
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Comment))
@@ -1292,8 +1329,26 @@ impl<'a> Parser<'a> {
                         let unknown_tok = self.advance().expect_invariant(
                             "unknown property: consumed after Identifier match in outer if",
                         );
+                        // BigQuery's `OPTIONS (…)`.
+                        if lex_up == "OPTIONS" {
+                            self.record_option_list_secrets(self.idx);
+                        }
+                        // `AUTHORIZATION owner` ends with the owner's name
+                        // where the dialect needs no terminator; the schema
+                        // elements after it are statements of their own.
+                        let bound = if lex_up == "AUTHORIZATION" {
+                            self.skip_trivia();
+                            if let Some((_, owner)) =
+                                self.name_span_at(self.idx, NamePosition::Object)
+                            {
+                                *authorization = Some(owner);
+                            }
+                            self.clauses_bound(self.object_name_end(self.idx).unwrap_or(self.idx))
+                        } else {
+                            usize::MAX
+                        };
                         // Consume until next known property or stop condition
-                        while let Some(next) = self.peek_non_trivia() {
+                        while let Some(next) = self.peek_non_trivia().filter(|_| self.idx < bound) {
                             if matches!(next.kind, TokenKind::Punctuation(Punctuation::Semi)) {
                                 break;
                             }
@@ -1333,6 +1388,9 @@ impl<'a> Parser<'a> {
                             kind: UnknownKind::Property,
                             node_id: self.id_gen.next(),
                         });
+                        if self.idx >= bound {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -1356,6 +1414,7 @@ impl<'a> Parser<'a> {
         &mut self,
         comment_span: &mut Option<Span>,
         tag_span: &mut Option<Span>,
+        tags: &mut Vec<AstTagRef>,
         _extras: &mut Vec<AstUnknownClause>,
     ) -> ParseResult<()> {
         while let Some(tok) = self.peek_non_trivia() {
@@ -1401,26 +1460,21 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                // Consume until closing paren or statement end
+                // The parenthesised list, or what follows up to the statement end
                 let mut end = self.current_span().end;
-                let mut paren_depth = 0;
-                while let Some(t) = self.peek_non_trivia() {
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        paren_depth += 1;
-                    }
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)) {
-                        paren_depth -= 1;
-                        if paren_depth <= 0 {
-                            end = t.span.end;
-                            self.advance();
+                if self
+                    .peek_non_trivia()
+                    .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))
+                {
+                    (end, *tags) = self.parse_tag_assignments_in_parens()?;
+                } else {
+                    while let Some(t) = self.peek_non_trivia() {
+                        if matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)) {
                             break;
                         }
+                        end = t.span.end;
+                        self.advance();
                     }
-                    if matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                        break;
-                    }
-                    end = t.span.end;
-                    self.advance();
                 }
 
                 *tag_span = Some(Span { start, end });
@@ -1435,6 +1489,7 @@ impl<'a> Parser<'a> {
 
     /// Consume tokens until semicolon or EOF for schema, return end position
     fn consume_until_semi_or_eof_schema(&mut self) -> ParseResult<u32> {
+        let from = self.idx;
         let mut end = self.current_span().end;
         while let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -1443,6 +1498,8 @@ impl<'a> Parser<'a> {
             end = tok.span.end;
             self.advance();
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(end)
     }
 }

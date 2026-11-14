@@ -91,24 +91,7 @@ impl<'a> Parser<'a> {
             // `'user'@'host'` / bare user — reuse the shared principal-name
             // reader so the `@host` split matches CREATE USER / GRANT.
             match self.consume_principal_name() {
-                Ok((user_span, mut host_span)) => {
-                    // An unquoted `user@host` lexes the host as a single
-                    // `@host` AtVariable token, which `consume_principal_name`
-                    // (Operator::At only) leaves behind. Pick it up here, the
-                    // host being the part after the leading `@`.
-                    if host_span.is_none() {
-                        if let Some(t) = self.peek_non_trivia() {
-                            if matches!(t.kind, TokenKind::Identifier { .. })
-                                && t.lexeme(self.source).starts_with('@')
-                            {
-                                host_span = Some(Span {
-                                    start: t.span.start + 1,
-                                    end: t.span.end,
-                                });
-                                self.advance();
-                            }
-                        }
-                    }
+                Ok((user_span, host_span)) => {
                     // Clause end = end of the last consumed significant token.
                     // `host_span` is the *dequoted inner* span (excludes the
                     // closing quote of a `'host'`), so it can't bound the
@@ -384,7 +367,7 @@ impl<'a> Parser<'a> {
 
         let scan = self.scan_event_header(&mut end);
 
-        let body_stmt = if self
+        let (do_span, body_stmt) = if self
             .peek_non_trivia()
             .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Do)))
             .unwrap_or(false)
@@ -392,10 +375,11 @@ impl<'a> Parser<'a> {
             let do_tok = self
                 .advance()
                 .ok_or_eof(self.current_span(), vec!["DO".to_string()])?;
-            end = do_tok.span.end;
-            self.parse_routine_body(&mut end)
+            let do_span = do_tok.span;
+            end = do_span.end;
+            (Some(do_span), self.parse_routine_body(&mut end))
         } else {
-            None
+            (None, None)
         };
 
         let span = Span { start, end };
@@ -407,6 +391,7 @@ impl<'a> Parser<'a> {
             schedule_present: scan.schedule_present,
             rename_present: scan.rename_present,
             enable_state: scan.enable_state,
+            do_span,
             body_stmt,
         };
         Ok(AstStmt::AlterEvent(Box::new(node)))

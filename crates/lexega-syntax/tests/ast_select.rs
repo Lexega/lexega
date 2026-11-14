@@ -272,12 +272,7 @@ fn ast_select_projection_with_parenthesized_expression() {
             // Expression should be a binary op (outer "*"), with a nested
             // binary op for "a + 1" on the left.
             match &as_select_item(item).expr {
-                AstExpr::BinaryOp {
-                    left,
-                    right,
-                    span: _,
-                    ..
-                } => {
+                AstExpr::BinaryOp { left, right, .. } => {
                     // Operator text check removed - use syntax arena if needed
                     // Operator assertion removed
 
@@ -291,7 +286,6 @@ fn ast_select_projection_with_parenthesized_expression() {
                         AstExpr::BinaryOp {
                             left: inner_l,
                             right: inner_r,
-                            span: _,
                             ..
                         } => {
                             // Operator text check removed - inner op no longer accessible
@@ -356,12 +350,7 @@ fn ast_select_projection_with_case_plus_literal() {
             assert_eq!(items.len(), 1);
             let item = &items[0];
             match &as_select_item(item).expr {
-                AstExpr::BinaryOp {
-                    left,
-                    right,
-                    span: _,
-                    ..
-                } => {
+                AstExpr::BinaryOp { left, right, .. } => {
                     // Operator text check removed - use syntax arena if needed
                     // Operator assertion removed
                     if let AstExpr::Case {
@@ -1018,12 +1007,7 @@ fn ast_select_simple_scalar_expressions_in_projection() {
 
             // col + 1 AS c1
             match &as_select_item(&items[0]).expr {
-                AstExpr::BinaryOp {
-                    left,
-                    right,
-                    span: _,
-                    ..
-                } => {
+                AstExpr::BinaryOp { left, right, .. } => {
                     // Operator text check removed - use syntax arena if needed
                     // Operator assertion removed
                     match &**left {
@@ -1099,12 +1083,7 @@ fn ast_select_simple_scalar_expressions_in_projection() {
 
             // 5 % 2 AS m
             match &as_select_item(&items[3]).expr {
-                AstExpr::BinaryOp {
-                    left,
-                    right,
-                    span: _,
-                    ..
-                } => {
+                AstExpr::BinaryOp { left, right, .. } => {
                     // Operator text check removed - use syntax arena if needed
                     // Operator assertion removed
                     match &**left {
@@ -2047,12 +2026,7 @@ fn ast_select_inner_join_with_on_condition() {
         lexega_syntax::ast::AstJoinConstraint::On(boxed_expr) => {
             // Expect a binary comparison t1.id = t2.id
             match &**boxed_expr {
-                AstExpr::BinaryOp {
-                    left,
-                    right,
-                    span: _,
-                    ..
-                } => {
+                AstExpr::BinaryOp { left, right, .. } => {
                     // Operator text check removed - use syntax arena if needed
                     // Operator assertion removed
                     // Left: t1.id
@@ -2567,5 +2541,810 @@ fn ast_set_select_parenthesized_simple() {
             }
         }
         _ => panic!("expected AstStmt::SetSelect"),
+    }
+}
+
+#[test]
+fn a_stage_reference_keeps_its_alias() {
+    for (src, name, alias) in [
+        (
+            "SELECT src.$1 FROM @stage/path/ src",
+            "@stage/path/",
+            Some("src"),
+        ),
+        ("SELECT s.$1 FROM @stage s", "@stage", Some("s")),
+        (
+            "SELECT s.$1 FROM @stage/path AS s",
+            "@stage/path",
+            Some("s"),
+        ),
+        (
+            "SELECT s.$1 FROM @db.sch.stage/dir/file.csv s WHERE s.$1 > 0",
+            "@db.sch.stage/dir/file.csv",
+            Some("s"),
+        ),
+        (
+            "SELECT $1 FROM @stage/path/file.csv",
+            "@stage/path/file.csv",
+            None,
+        ),
+    ] {
+        let tokens = tokenize(src).tokens;
+        let ast = parse_select_from_tokens(src, &tokens).expect("ast");
+        assert_eq!(ast.from.len(), 1, "{src}");
+        let table = &ast.from[0];
+        let text = |span: lexega_syntax::lexer::Span| &src[span.start as usize..span.end as usize];
+        assert_eq!(text(table.name.span), name, "{src}");
+        assert_eq!(table.alias.as_ref().map(|a| text(a.span)), alias, "{src}");
+    }
+}
+
+#[test]
+fn a_stage_reference_spans_its_options_and_alias() {
+    for (src, whole) in [
+        ("SELECT 1 FROM @stage/path s WHERE 1 = 1", "@stage/path s"),
+        ("SELECT 1 FROM @stage AS s", "@stage AS s"),
+        (
+            "SELECT 1 FROM @stage/path (FILE_FORMAT => 'ff') s",
+            "@stage/path (FILE_FORMAT => 'ff') s",
+        ),
+        (
+            "SELECT 1 FROM @stage/path (FILE_FORMAT => 'ff') WHERE 1 = 1",
+            "@stage/path (FILE_FORMAT => 'ff')",
+        ),
+    ] {
+        let tokens = tokenize(src).tokens;
+        let ast = parse_select_from_tokens(src, &tokens).expect("ast");
+        let span = ast.from[0].span;
+        assert_eq!(&src[span.start as usize..span.end as usize], whole, "{src}");
+    }
+    // A MERGE that reads a stage under an alias formats, with or without
+    // options and `AS`.
+    for using in [
+        "@stage s",
+        "@stage/path s",
+        "@stage/path AS s",
+        "@stage/path (FILE_FORMAT => 'ff') s",
+    ] {
+        let src = format!(
+            "MERGE INTO t USING {using} ON t.id = s.$1 WHEN MATCHED THEN UPDATE SET a = s.$2;"
+        );
+        let config = lexega_syntax::FormatterConfig::default();
+        let formatted = lexega_syntax::format_sql_with_config(&src, &config)
+            .unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        lexega_syntax::verify_formatting_safe(&src, &formatted)
+            .unwrap_or_else(|e| panic!("{src}: {e}\n{formatted}"));
+        assert!(formatted.contains(using), "{src}\n{formatted}");
+    }
+}
+
+#[test]
+fn a_clause_after_a_stage_is_the_table_references() {
+    enum Clause {
+        Sample,
+        Pivot,
+        MatchRecognize,
+        TimeTravel,
+        Changes,
+    }
+    for (src, clause) in [
+        ("SELECT $1 FROM @stage/path SAMPLE (10)", Clause::Sample),
+        (
+            "SELECT $1 FROM @stage/path TABLESAMPLE (10)",
+            Clause::Sample,
+        ),
+        (
+            "SELECT * FROM @stage/path PIVOT (SUM(amount) FOR kind IN ('a', 'b')) AS p",
+            Clause::Pivot,
+        ),
+        (
+            "SELECT * FROM @stage/path MATCH_RECOGNIZE \
+             (PARTITION BY a ORDER BY b PATTERN (X+) DEFINE X AS c > 0)",
+            Clause::MatchRecognize,
+        ),
+        (
+            "SELECT $1 FROM @stage/path AT (TIMESTAMP => '2024-01-01'::timestamp)",
+            Clause::TimeTravel,
+        ),
+        (
+            "SELECT $1 FROM @stage/path CHANGES (INFORMATION => DEFAULT) AT (OFFSET => -60)",
+            Clause::Changes,
+        ),
+        ("SELECT s.$1 FROM @stage/path s SAMPLE (10)", Clause::Sample),
+        (
+            "SELECT s.$1 FROM @stage/path (FILE_FORMAT => 'ff') SAMPLE (10) s",
+            Clause::Sample,
+        ),
+    ] {
+        let script = parse_sql(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+            panic!("{src}: expected one SELECT, got {:?}", script.stmts);
+        };
+        let table = &select.from[0];
+        let name = table.name.span;
+        assert_eq!(
+            &src[name.start as usize..name.end as usize],
+            "@stage/path",
+            "{src}"
+        );
+        let named = match clause {
+            Clause::Sample => table.sample.is_some(),
+            Clause::Pivot => table.pivot.is_some(),
+            Clause::MatchRecognize => table.match_recognize.is_some(),
+            Clause::TimeTravel => table.time_travel.is_some(),
+            Clause::Changes => table.changes.is_some(),
+        };
+        assert!(named, "{src}: {table:#?}");
+    }
+}
+
+fn set_operator_text(set: &lexega_syntax::ast::AstSetSelect) -> &'static str {
+    let all = matches!(set.modifier, AstSetModifier::All);
+    match (&set.op, all) {
+        (AstSetOpKind::Union, false) => "UNION",
+        (AstSetOpKind::Union, true) => "UNION ALL",
+        (AstSetOpKind::Intersect, false) => "INTERSECT",
+        (AstSetOpKind::Intersect, true) => "INTERSECT ALL",
+        (AstSetOpKind::Except, false) => "EXCEPT",
+        (AstSetOpKind::Except, true) => "EXCEPT ALL",
+        (AstSetOpKind::Minus, false) => "MINUS",
+        (AstSetOpKind::Minus, true) => "MINUS ALL",
+    }
+}
+
+/// A set operation written out with each operation in parentheses and each
+/// operand as its source text.
+fn set_shape(src: &str, stmt: &AstStmt) -> String {
+    if let AstStmt::SetSelect(set) = stmt {
+        return format!(
+            "({} {} {})",
+            set_shape(src, &set.left),
+            set_operator_text(set),
+            set_shape(src, &set.right)
+        );
+    }
+    if let AstStmt::ValuesQuery(values) = stmt {
+        let span = values.values.span;
+        return src[span.start as usize..span.end as usize].to_string();
+    }
+    let AstStmt::Select(select) = stmt else {
+        panic!("{src}: a set operand is a SELECT or VALUES: {stmt:?}");
+    };
+    src[select.span.start as usize..select.span.end as usize].to_string()
+}
+
+fn set_shape_in_every_dialect(src: &str) -> String {
+    use lexega_syntax::dialect::{bigquery, databricks, mssql, mysql, postgres, snowflake};
+
+    set_shape_in(
+        src,
+        vec![
+            snowflake(),
+            postgres(),
+            mysql(),
+            bigquery(),
+            databricks(),
+            mssql(),
+        ],
+    )
+}
+
+/// The shape `src` parses to in each of `dialects`, which must agree.
+fn set_shape_in(src: &str, dialects: Vec<lexega_syntax::dialect::DialectRef>) -> String {
+    use lexega_syntax::parse_sql_with_dialect;
+
+    let mut shapes = Vec::new();
+    for dialect in dialects {
+        let script = parse_sql_with_dialect(src, dialect.as_ref()).expect("should parse");
+        let [stmt] = script.stmts.as_slice() else {
+            panic!("{src}: expected one statement, got {:?}", script.stmts);
+        };
+        shapes.push(set_shape(src, stmt));
+    }
+    assert!(
+        shapes.windows(2).all(|pair| pair[0] == pair[1]),
+        "{src}: {shapes:?}"
+    );
+    shapes.swap_remove(0)
+}
+
+#[test]
+fn ast_set_select_intersect_binds_tighter_than_the_operator_before_it() {
+    let cases = [
+        (
+            "SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3",
+            "(SELECT 1 UNION ALL (SELECT 2 INTERSECT SELECT 3))",
+        ),
+        (
+            "SELECT 1 EXCEPT SELECT 2 INTERSECT SELECT 3",
+            "(SELECT 1 EXCEPT (SELECT 2 INTERSECT SELECT 3))",
+        ),
+        (
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 INTERSECT ALL SELECT 4",
+            "(SELECT 1 UNION ((SELECT 2 INTERSECT SELECT 3) INTERSECT ALL SELECT 4))",
+        ),
+    ];
+    for (src, shape) in cases {
+        assert_eq!(set_shape_in_every_dialect(src), shape, "{src}");
+    }
+}
+
+// MINUS is a set operator where the dialect reserves it.
+#[test]
+fn ast_set_select_intersect_binds_tighter_than_minus() {
+    let src = "SELECT 1 MINUS SELECT 2 INTERSECT SELECT 3";
+    assert_eq!(
+        set_shape_in(src, vec![lexega_syntax::dialect::snowflake()]),
+        "(SELECT 1 MINUS (SELECT 2 INTERSECT SELECT 3))",
+        "{src}"
+    );
+}
+
+#[test]
+fn ast_set_select_intersect_first_is_unchanged() {
+    let cases = [
+        (
+            "SELECT 1 INTERSECT SELECT 2 UNION SELECT 3",
+            "((SELECT 1 INTERSECT SELECT 2) UNION SELECT 3)",
+        ),
+        (
+            "SELECT 1 INTERSECT SELECT 2 UNION SELECT 3 INTERSECT SELECT 4",
+            "((SELECT 1 INTERSECT SELECT 2) UNION (SELECT 3 INTERSECT SELECT 4))",
+        ),
+    ];
+    for (src, shape) in cases {
+        assert_eq!(set_shape_in_every_dialect(src), shape, "{src}");
+    }
+}
+
+#[test]
+fn ast_set_select_equal_precedence_groups_left_to_right() {
+    let cases = [
+        (
+            "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3",
+            "((SELECT 1 UNION SELECT 2) UNION ALL SELECT 3)",
+        ),
+        (
+            "SELECT 1 UNION SELECT 2 EXCEPT SELECT 3 UNION SELECT 4",
+            "(((SELECT 1 UNION SELECT 2) EXCEPT SELECT 3) UNION SELECT 4)",
+        ),
+        (
+            "SELECT 1 INTERSECT SELECT 2 INTERSECT SELECT 3",
+            "((SELECT 1 INTERSECT SELECT 2) INTERSECT SELECT 3)",
+        ),
+        (
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 EXCEPT SELECT 4",
+            "((SELECT 1 UNION (SELECT 2 INTERSECT SELECT 3)) EXCEPT SELECT 4)",
+        ),
+    ];
+    for (src, shape) in cases {
+        assert_eq!(set_shape_in_every_dialect(src), shape, "{src}");
+    }
+}
+
+#[test]
+fn ast_set_select_parentheses_override_intersect_precedence() {
+    let cases = [
+        (
+            "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3",
+            "((SELECT 1 UNION SELECT 2) INTERSECT SELECT 3)",
+        ),
+        (
+            "SELECT 1 INTERSECT (SELECT 2 UNION SELECT 3)",
+            "(SELECT 1 INTERSECT (SELECT 2 UNION SELECT 3))",
+        ),
+        (
+            "SELECT 1 UNION (SELECT 2 UNION SELECT 3) INTERSECT SELECT 4",
+            "(SELECT 1 UNION ((SELECT 2 UNION SELECT 3) INTERSECT SELECT 4))",
+        ),
+    ];
+    for (src, shape) in cases {
+        assert_eq!(set_shape_in_every_dialect(src), shape, "{src}");
+    }
+}
+
+#[test]
+fn ast_set_select_intersect_precedence_after_values() {
+    let src = "VALUES (1) UNION SELECT 2 INTERSECT SELECT 3";
+    assert_eq!(
+        set_shape_in_every_dialect(src),
+        "(VALUES (1) UNION (SELECT 2 INTERSECT SELECT 3))",
+        "{src}"
+    );
+}
+
+#[test]
+fn ast_set_select_trailing_clauses_belong_to_the_whole_chain() {
+    let src = "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 ORDER BY 1 LIMIT 2";
+    let tokens = tokenize(src).tokens;
+    let AstStmt::SetSelect(set) = parse_stmt(src, &tokens).expect("stmt") else {
+        panic!("expected a set operation");
+    };
+    assert!(set.order_by.is_some() && set.limit.is_some());
+    assert!(matches!(set.op, AstSetOpKind::Union));
+    let AstStmt::SetSelect(inner) = &*set.right else {
+        panic!("expected the INTERSECT on the right");
+    };
+    let AstStmt::Select(last) = &*inner.right else {
+        panic!("expected a SELECT operand");
+    };
+    assert!(last.order_by.is_none() && last.limit.is_none());
+}
+
+#[test]
+fn ast_set_select_intersect_chain_is_written_as_it_was() {
+    let sources = [
+        "SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3",
+        "SELECT 1 EXCEPT SELECT 2 INTERSECT ALL SELECT 3 UNION SELECT 4",
+        "VALUES (1) UNION SELECT 2 INTERSECT SELECT 3",
+    ];
+    for src in sources {
+        let formatted = lexega_syntax::format_sql(src).expect("should format");
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(words(&formatted), words(src), "{src}");
+        lexega_syntax::verify_formatting_safe(src, &formatted).expect("should round-trip");
+    }
+}
+
+/// The one statement `src` parses to in `dialect`.
+fn only_statement(src: &str, dialect: &str) -> AstStmt {
+    let dialect = lexega_syntax::dialect_from_name(dialect).expect("dialect");
+    let script = lexega_syntax::parse_sql_with_dialect(src, dialect.as_ref()).expect("parses");
+    let [stmt] = script.stmts.as_slice() else {
+        panic!("{src}: {:#?}", script.stmts);
+    };
+    stmt.clone()
+}
+
+/// The expressions of the select list of `src`, read in `dialect`.
+fn select_items(src: &str, dialect: &str) -> Vec<AstExpr> {
+    let AstStmt::Select(select) = only_statement(src, dialect) else {
+        panic!("not a SELECT: {src}");
+    };
+    let AstProjectionKind::Columns(items) = &select.projection.kind else {
+        panic!("no select list: {src}");
+    };
+    items
+        .iter()
+        .map(|item| as_select_item(item).expr.clone())
+        .collect()
+}
+
+#[test]
+fn a_query_in_parentheses_is_a_subquery_wherever_one_starts() {
+    let where_of = |src: &str| {
+        let AstStmt::Select(select) = only_statement(src, "postgresql") else {
+            panic!("not a SELECT: {src}");
+        };
+        select.where_clause.expect("a WHERE").expr
+    };
+    for src in [
+        "SELECT id FROM a WHERE id IN (TABLE u)",
+        "SELECT id FROM a WHERE (id, email) IN (TABLE u)",
+        "SELECT id FROM o WHERE id NOT IN ((SELECT id FROM a UNION SELECT id FROM a) INTERSECT SELECT id FROM k)",
+    ] {
+        assert!(
+            matches!(where_of(src), AstExpr::InSubquery { .. }),
+            "{src}: {:?}",
+            where_of(src)
+        );
+    }
+    let expr = where_of("SELECT id FROM a WHERE id = (TABLE u)");
+    let AstExpr::BinaryOp { right, .. } = &expr else {
+        panic!("{expr:?}");
+    };
+    assert!(
+        matches!(**right, AstExpr::ScalarSubquery { .. }),
+        "{right:?}"
+    );
+    let items = select_items(
+        "SELECT (TABLE u), ((SELECT 1) INTERSECT SELECT 2)",
+        "postgresql",
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| matches!(item, AstExpr::ScalarSubquery { .. })),
+        "{items:?}"
+    );
+}
+
+#[test]
+fn parentheses_holding_more_than_a_query_are_an_expression() {
+    let items = select_items(
+        "SELECT ((SELECT 1) + 2), x IN ((SELECT 1), 2) FROM t",
+        "snowflake",
+    );
+    assert!(
+        !matches!(items[0], AstExpr::ScalarSubquery { .. }),
+        "{:?}",
+        items[0]
+    );
+    assert!(matches!(items[1], AstExpr::InList { .. }), "{:?}", items[1]);
+    // MySQL's `VALUES(c)` of ON DUPLICATE KEY UPDATE is a call, not rows.
+    let AstStmt::Insert(_) = only_statement(
+        "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = (VALUES(a) + 1)",
+        "mysql",
+    ) else {
+        panic!("not an INSERT");
+    };
+}
+
+#[test]
+fn an_insert_source_is_any_query() {
+    use lexega_syntax::ast::AstInsertSourceKind;
+    for (dialect, src, columns) in [
+        (
+            "postgresql",
+            "INSERT INTO a (id) VALUES (1) UNION SELECT id FROM u INTERSECT SELECT id FROM o",
+            true,
+        ),
+        ("postgresql", "INSERT INTO a (id, email) TABLE u", true),
+        ("mysql", "INSERT INTO a (SELECT id FROM u)", false),
+    ] {
+        let AstStmt::Insert(insert) = only_statement(src, dialect) else {
+            panic!("not an INSERT: {src}");
+        };
+        assert!(
+            matches!(insert.source_kind, AstInsertSourceKind::Query),
+            "{src}"
+        );
+        assert!(
+            insert.query.is_some() && insert.values_rows.is_empty(),
+            "{src}"
+        );
+        assert_eq!(insert.columns_span.is_some(), columns, "{src}");
+    }
+    // Rows no set operation follows stay rows.
+    let AstStmt::Insert(insert) =
+        only_statement("INSERT INTO a (id) VALUES (1), (2)", "postgresql")
+    else {
+        panic!("not an INSERT");
+    };
+    assert!(matches!(insert.source_kind, AstInsertSourceKind::Values));
+    assert_eq!(insert.values_rows.len(), 2);
+}
+
+#[test]
+fn a_query_wherever_one_starts_is_written_as_it_was() {
+    use lexega_syntax::{format_sql_with_config, FormatterConfig};
+    let config = FormatterConfig {
+        dialect: lexega_syntax::dialect_from_name("postgresql").expect("dialect"),
+        ..FormatterConfig::default()
+    };
+    for src in [
+        "TABLE users",
+        "SELECT id FROM a WHERE EXISTS (TABLE u)",
+        "SELECT id FROM a WHERE id IN (TABLE u)",
+        "SELECT id FROM o WHERE id NOT IN ((SELECT id FROM a UNION SELECT id FROM a) INTERSECT SELECT id FROM k)",
+        "SELECT id, name FROM a UNION ALL TABLE u",
+        "SELECT d.p FROM (TABLE u) d(p)",
+        "SELECT d.p FROM (VALUES (1) UNION ALL SELECT id FROM a) d(p)",
+        "INSERT INTO a (id) VALUES (1) UNION SELECT id FROM u",
+        "INSERT INTO a (id, email) TABLE u",
+        "INSERT INTO a (SELECT id FROM u)",
+        "UPDATE a SET (id, email) = (TABLE u)",
+    ] {
+        let formatted = format_sql_with_config(src, &config).expect("should format");
+        let text = |text: &str| text.split_whitespace().collect::<String>();
+        assert_eq!(text(&formatted), text(src), "{src}");
+        lexega_syntax::verify_formatting_safe_with_dialect(src, &formatted, config.dialect.as_ref())
+            .expect("should round-trip");
+    }
+}
+
+#[test]
+fn a_tail_after_a_parenthesised_query_is_the_whole_querys() {
+    // (source, the query's own LIMIT inside, the tail's text)
+    for (src, inner_limit) in [
+        (
+            "(SELECT id FROM a UNION ALL SELECT id FROM u) ORDER BY 1 LIMIT 5",
+            false,
+        ),
+        ("(SELECT id FROM a LIMIT 10) ORDER BY 1 LIMIT 5", true),
+        (
+            "WITH x AS (SELECT 1 AS a) (SELECT a FROM x LIMIT 3) ORDER BY 1",
+            true,
+        ),
+        ("(VALUES (1), (2)) LIMIT 1", false),
+    ] {
+        let stmt = only_statement(src, "postgresql");
+        assert_eq!(
+            stmt.span().start,
+            0,
+            "{src}: the query's span starts where it is written"
+        );
+        assert_eq!(
+            stmt.span().end as usize,
+            src.len(),
+            "{src}: and ends after the tail"
+        );
+        let tail = match &stmt {
+            AstStmt::Select(s) => {
+                assert_eq!(s.limit.is_some(), inner_limit, "{src}");
+                s.outer_tail.as_deref()
+            }
+            AstStmt::SetSelect(s) => {
+                assert!(s.order_by.is_none() && s.limit.is_none(), "{src}");
+                s.outer_tail.as_deref()
+            }
+            AstStmt::ValuesQuery(v) => v.outer_tail.as_deref(),
+            other => panic!("{src}: {other:?}"),
+        };
+        assert!(tail.is_some(), "{src}");
+    }
+    // Without parentheses the clauses are the query's own.
+    let AstStmt::Select(s) = only_statement("SELECT id FROM a ORDER BY 1", "postgresql") else {
+        panic!("a SELECT");
+    };
+    assert!(s.outer_tail.is_none() && s.order_by.is_some());
+}
+
+#[test]
+fn a_tail_after_a_parenthesised_query_is_written_as_it_was() {
+    use lexega_syntax::{format_sql_with_config, FormatterConfig};
+    let config = FormatterConfig {
+        dialect: lexega_syntax::dialect_from_name("postgresql").expect("dialect"),
+        ..FormatterConfig::default()
+    };
+    for src in [
+        "(SELECT id FROM a UNION ALL SELECT id FROM u) ORDER BY 1 LIMIT 5",
+        "(SELECT id FROM a LIMIT 10) ORDER BY 1 LIMIT 5",
+        "(VALUES (1), (2)) LIMIT 1",
+        "INSERT INTO a (id) (SELECT id FROM a UNION ALL SELECT id FROM u) ORDER BY 1 LIMIT 5",
+    ] {
+        let formatted = format_sql_with_config(src, &config).expect("should format");
+        let text = |text: &str| text.split_whitespace().collect::<String>();
+        assert_eq!(text(&formatted), text(src), "{src}");
+        lexega_syntax::verify_formatting_safe_with_dialect(
+            src,
+            &formatted,
+            config.dialect.as_ref(),
+        )
+        .expect("should round-trip");
+    }
+}
+
+#[test]
+fn a_column_definition_list_ordinality_and_a_merge_using_list_are_read() {
+    use lexega_syntax::ast::{AstStmt, AstTableFunctionColumnKind};
+    let pg = lexega_syntax::dialect::postgres();
+    let text = |sql: &str, span: lexega_syntax::lexer::Span| {
+        sql[span.start as usize..span.end as usize].to_string()
+    };
+    let first_from = |sql: &str| {
+        let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+        let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+            panic!("{sql}: {:?}", script.stmts);
+        };
+        select.from[0].clone()
+    };
+
+    let defined = "SELECT * FROM dblink('h', 'q') AS t(a int, \"b\" varchar(10))";
+    let table = first_from(defined);
+    let columns = table
+        .table_function_columns
+        .as_deref()
+        .expect("declared columns");
+    let names: Vec<String> = columns.iter().map(|c| text(defined, c.name.span)).collect();
+    assert_eq!(names, ["a", "\"b\""]);
+    assert!(columns
+        .iter()
+        .all(|c| matches!(c.kind, AstTableFunctionColumnKind::Value { path: None, .. })));
+    assert_eq!(
+        table
+            .column_definitions_span
+            .map(|s| text(defined, s))
+            .as_deref(),
+        Some("(a int, \"b\" varchar(10))")
+    );
+    assert!(table.alias_columns.is_none());
+
+    let numbered = "SELECT * FROM unnest(ARRAY[1, 2]) WITH ORDINALITY AS u(v, n)";
+    let table = first_from(numbered);
+    assert_eq!(
+        table
+            .with_ordinality_span
+            .map(|s| text(numbered, s))
+            .as_deref(),
+        Some("WITH ORDINALITY")
+    );
+    assert_eq!(table.alias_columns.as_ref().map(|c| c.len()), Some(2));
+
+    let merge = "MERGE INTO a USING (SELECT email FROM u) s(p) ON a.id = 1 \
+                 WHEN MATCHED THEN UPDATE SET email = s.p";
+    let script = lexega_syntax::parse_sql_with_dialect(merge, &*pg).expect("parses");
+    let [AstStmt::Merge(m)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let listed: Vec<String> = m
+        .using_alias_columns
+        .iter()
+        .map(|c| text(merge, c.span))
+        .collect();
+    assert_eq!(listed, ["p"]);
+    assert_eq!(
+        m.using_alias_span.map(|s| text(merge, s)).as_deref(),
+        Some("s")
+    );
+
+    let config = lexega_syntax::FormatterConfig {
+        dialect: lexega_syntax::dialect::postgres(),
+        ..Default::default()
+    };
+    for sql in [
+        defined,
+        numbered,
+        merge,
+        "SELECT * FROM jsonb_each(x) WITH ORDINALITY",
+    ] {
+        let formatted = lexega_syntax::format_sql_with_config(sql, &config).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*pg)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+    }
+}
+
+#[test]
+fn fetch_with_ties_is_read_wherever_fetch_is() {
+    use lexega_syntax::ast::AstStmt;
+    let pg = lexega_syntax::dialect::postgres();
+    let text = |sql: &str, span: lexega_syntax::lexer::Span| {
+        sql[span.start as usize..span.end as usize].to_string()
+    };
+    let sql = "SELECT id FROM u ORDER BY id FETCH FIRST 5 ROWS WITH TIES";
+    let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+    let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    assert_eq!(
+        select.fetch_with_ties_span.map(|s| text(sql, s)).as_deref(),
+        Some("WITH TIES")
+    );
+    assert_eq!(
+        select.fetch_clause_span.map(|s| text(sql, s)).as_deref(),
+        Some("FETCH FIRST 5 ROWS WITH TIES")
+    );
+    let only = "SELECT id FROM u ORDER BY id OFFSET 1 ROWS FETCH NEXT 5 ROWS ONLY";
+    let script = lexega_syntax::parse_sql_with_dialect(only, &*pg).expect("parses");
+    let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    assert!(select.fetch_with_ties_span.is_none());
+    let config = lexega_syntax::FormatterConfig {
+        dialect: lexega_syntax::dialect::postgres(),
+        ..Default::default()
+    };
+    for sql in [
+        sql,
+        "SELECT id FROM u UNION ALL SELECT id FROM v ORDER BY id FETCH FIRST 1 ROW WITH TIES",
+    ] {
+        let formatted = lexega_syntax::format_sql_with_config(sql, &config).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*pg)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+    }
+}
+
+#[test]
+fn a_non_reserved_keyword_qualifies_a_name_where_postgresql_writes_it_as_one() {
+    use lexega_syntax::ast::AstStmt;
+    let pg = lexega_syntax::dialect::postgres();
+    for sql in [
+        "SELECT insert.id FROM u insert WHERE insert.id = 1",
+        "SELECT r.id FROM u replace JOIN v r ON replace.id = r.id",
+    ] {
+        let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+        let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+            panic!("{sql}: {:?}", script.stmts);
+        };
+        assert!(
+            select.where_clause.is_some() || !select.from[0].joins.is_empty(),
+            "{sql}"
+        );
+    }
+    // A call stays a call.
+    let script = lexega_syntax::parse_sql_with_dialect("SELECT replace(a, 'x', 'y') FROM t", &*pg)
+        .expect("parses");
+    assert!(matches!(script.stmts.as_slice(), [AstStmt::Select(_)]));
+}
+
+#[test]
+fn a_string_a_template_writes_into_is_one_literal() {
+    for literal in [
+        "'a{{ x }}b'",
+        "'a{{ x }}'",
+        "'a{{ x }}{{ y }}b'",
+        // A doubled quote before a template does not close the string.
+        "'a{{ x }}b''{{ y }}c'",
+        "'a{{ x }}b'''",
+    ] {
+        let src = format!("SELECT {literal} AS c FROM t");
+        let tokens = tokenize(&src).tokens;
+        let ast =
+            parse_select_from_tokens(&src, &tokens).unwrap_or_else(|| panic!("{src}: no select"));
+        let AstProjectionKind::Columns(items) = &ast.projection.kind else {
+            panic!("{src}: expected columns projection");
+        };
+        let [item] = items.as_slice() else {
+            panic!("{src}: expected one item, got {items:?}");
+        };
+        let select_item = as_select_item(item);
+        let AstExpr::Literal {
+            literal: AstLiteral::StringWithJinja { span },
+            ..
+        } = &select_item.expr
+        else {
+            panic!(
+                "{src}: expected a templated string, got {:?}",
+                select_item.expr
+            );
+        };
+        assert_eq!(
+            &src[span.start as usize..span.end as usize],
+            literal,
+            "{src}"
+        );
+        let alias = select_item.alias.as_ref().expect("alias");
+        assert_eq!(
+            &src[alias.ident.span.start as usize..alias.ident.span.end as usize],
+            "c",
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_mysql_set_password_a_template_writes_into_stays_a_templated_string() {
+    use lexega_syntax::ast::AstMysqlSetKind;
+    let mysql = lexega_syntax::dialect::mysql();
+    let src = "SET PASSWORD = 'a{{ x }}b'";
+    let script = lexega_syntax::parse_sql_with_dialect(src, &*mysql).expect("parses");
+    let [AstStmt::MysqlSet(set)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    let AstMysqlSetKind::Password(password) = &set.kind else {
+        panic!("{:?}", set.kind);
+    };
+    assert!(
+        matches!(
+            *password.value,
+            AstExpr::Literal {
+                literal: AstLiteral::StringWithJinja { .. },
+                ..
+            }
+        ),
+        "{:?}",
+        password.value
+    );
+}
+
+#[test]
+fn a_mysql_set_password_joined_to_a_templated_string_is_one_templated_string() {
+    use lexega_syntax::ast::AstMysqlSetKind;
+    let mysql = lexega_syntax::dialect::mysql();
+    for (value, templated) in [
+        ("'a' '{{ x }}b'", true),
+        ("'a{{ x }}' 'b'", true),
+        ("N'a{{ x }}b'", true),
+        ("'a' 'b'", false),
+        ("N'a' 'b'", false),
+    ] {
+        let src = format!("SET PASSWORD = {value}");
+        let script = lexega_syntax::parse_sql_with_dialect(&src, &*mysql).expect("parses");
+        let [AstStmt::MysqlSet(set)] = script.stmts.as_slice() else {
+            panic!("{src}: {:?}", script.stmts);
+        };
+        let AstMysqlSetKind::Password(password) = &set.kind else {
+            panic!("{src}: {:?}", set.kind);
+        };
+        let AstExpr::Literal { literal, .. } = &*password.value else {
+            panic!("{src}: {:?}", password.value);
+        };
+        let span = match (literal, templated) {
+            (AstLiteral::StringWithJinja { span }, true) | (AstLiteral::String { span }, false) => {
+                span
+            }
+            (other, _) => panic!("{src}: {other:?}"),
+        };
+        assert_eq!(&src[span.start as usize..span.end as usize], value, "{src}");
     }
 }

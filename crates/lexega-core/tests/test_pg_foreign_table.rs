@@ -4,7 +4,7 @@
 //! SQL/MED `CREATE FOREIGN TABLE` (PostgreSQL FDW).
 //!
 //! Covers recognition (parse + byte-exact round-trip, not skipped) across the
-//! column-list and `PARTITION OF` forms, governance (the federated-data signal
+//! column-list and `PARTITION OF` forms, governance (the federated-data finding
 //! fires), and the non-regression of the Databricks `CREATE FOREIGN CATALOG`
 //! form (which this parser must not intercept — it gates on the `TABLE`
 //! keyword).
@@ -25,15 +25,16 @@ fn pg_cfg() -> AnalysisConfig {
 fn rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &pg_cfg()).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::postgres();
+    let config = FormatterConfig {
+        dialect: dialect::postgres(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -81,7 +82,7 @@ fn test_multi_statement_roundtrip() {
 // ── Governance ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_foreign_table_fires_signal() {
+fn test_foreign_table_fires_finding() {
     for sql in [
         "CREATE FOREIGN TABLE ft (a int) SERVER s;",
         "CREATE FOREIGN TABLE pt PARTITION OF parent FOR VALUES IN (1) SERVER s;",
@@ -89,7 +90,7 @@ fn test_foreign_table_fires_signal() {
         let ids = rule_ids(sql);
         assert!(
             ids.contains(&"INFO-PG-FDW-FOREIGN-TABLE".to_string()),
-            "a foreign table should fire the federated-data signal for {sql}. Got: {ids:?}"
+            "a foreign table should fire the federated-data finding for {sql}. Got: {ids:?}"
         );
     }
 }
@@ -100,7 +101,7 @@ fn test_foreign_table_fires_signal() {
 fn test_foreign_catalog_not_hijacked() {
     // `CREATE FOREIGN CATALOG` (Databricks) shares the FOREIGN keyword but is
     // not a foreign TABLE — the branch gates on the TABLE keyword, so the
-    // catalog parser still handles it and no foreign-table signal fires.
+    // catalog parser still handles it and no foreign-table finding fires.
     let cfg = AnalysisConfig {
         dialect: Some(dialect::databricks()),
         ..Default::default()
@@ -112,12 +113,11 @@ fn test_foreign_catalog_not_hijacked() {
         "CREATE FOREIGN CATALOG must still be analyzed: {sql}"
     );
     let ids: Vec<String> = report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect();
     assert!(
         !ids.contains(&"INFO-PG-FDW-FOREIGN-TABLE".to_string()),
-        "CREATE FOREIGN CATALOG must not fire a foreign-table signal: {ids:?}"
+        "CREATE FOREIGN CATALOG must not fire a foreign-table finding: {ids:?}"
     );
 }

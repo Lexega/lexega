@@ -8,7 +8,7 @@
 //! - COMMENT ON VOLUME / CONNECTION / SHARE / RECIPIENT / PROVIDER
 //! - COMMENT ON ... IS NULL (comment removal)
 //! - Qualified names (catalog.schema.table.column)
-//! - Signal emission with object-kind-specific surfaces
+//! - Finding emission with object-kind-specific surfaces
 //! - YAML rule matching: INFO-COMMENT-CHG (generic), INFO-DBX-CAT-COMMENT-CHG..INFO-DBX-CONN-COMMENT-CHG
 
 use lexega_core::analyzer::RuleMatch;
@@ -47,17 +47,15 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
-fn signal_evidence_count(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> usize {
+fn finding_evidence_count(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> usize {
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| match s {
             RuleMatch::Analysis(g) if g.matched_rule == rule_id => {
                 Some(g.evidence_count.unwrap_or(1))
@@ -150,35 +148,35 @@ fn test_comment_on_volume_qualified_format() {
     dbx_format_and_verify("COMMENT ON VOLUME catalog.schema.my_volume IS 'A volume';");
 }
 
-// ─── RISK ANALYSIS: Generic Signal (INFO-COMMENT-CHG) ───────────────────────────────
+// ─── RISK ANALYSIS: Generic Finding (INFO-COMMENT-CHG) ───────────────────────────────
 
 #[test]
-fn test_comment_on_generic_signal() {
+fn test_comment_on_generic_finding() {
     let sql = "COMMENT ON TABLE my_table IS 'desc';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
-        "INFO-COMMENT-CHG (generic COMMENT ON) should fire for TABLE. Signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-COMMENT-CHG"),
+        "INFO-COMMENT-CHG (generic COMMENT ON) should fire for TABLE. Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn test_comment_on_column_generic_signal() {
+fn test_comment_on_column_generic_finding() {
     let sql = "COMMENT ON COLUMN my_table.c1 IS 'col desc';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should fire for COLUMN"
     );
 }
 
 #[test]
-fn test_comment_on_schema_generic_signal() {
+fn test_comment_on_schema_generic_finding() {
     let sql = "COMMENT ON SCHEMA my_schema IS 'schema desc';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should fire for SCHEMA"
     );
 }
@@ -186,47 +184,47 @@ fn test_comment_on_schema_generic_signal() {
 // ─── RISK ANALYSIS: Databricks-Specific Rules ──────────────────────────────
 
 #[test]
-fn test_comment_on_catalog_dbx_signal() {
+fn test_comment_on_catalog_dbx_finding() {
     let sql = "COMMENT ON CATALOG my_catalog IS 'This is my catalog';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-DBX-CAT-COMMENT-CHG"),
-        "INFO-DBX-CAT-COMMENT-CHG (Catalog Comment Changed) should fire. Signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-DBX-CAT-COMMENT-CHG"),
+        "INFO-DBX-CAT-COMMENT-CHG (Catalog Comment Changed) should fire. Findings: {:?}",
+        report.findings
     );
     // Generic INFO-COMMENT-CHG should also fire
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should also fire for CATALOG"
     );
 }
 
 #[test]
-fn test_comment_on_volume_dbx_signal() {
+fn test_comment_on_volume_dbx_finding() {
     let sql = "COMMENT ON VOLUME my_volume IS 'Huge volume';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-DBX-VOL-COMMENT-CHG"),
-        "INFO-DBX-VOL-COMMENT-CHG (Volume Comment Changed) should fire. Signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-DBX-VOL-COMMENT-CHG"),
+        "INFO-DBX-VOL-COMMENT-CHG (Volume Comment Changed) should fire. Findings: {:?}",
+        report.findings
     );
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should also fire for VOLUME"
     );
 }
 
 #[test]
-fn test_comment_on_connection_dbx_signal() {
+fn test_comment_on_connection_dbx_finding() {
     let sql = "COMMENT ON CONNECTION mysql_connection IS 'mysql conn';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-DBX-CONN-COMMENT-CHG"),
-        "INFO-DBX-CONN-COMMENT-CHG (Connection Comment Changed) should fire. Signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-DBX-CONN-COMMENT-CHG"),
+        "INFO-DBX-CONN-COMMENT-CHG (Connection Comment Changed) should fire. Findings: {:?}",
+        report.findings
     );
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should also fire for CONNECTION"
     );
 }
@@ -238,20 +236,20 @@ fn test_comment_on_share_only_generic() {
     let sql = "COMMENT ON SHARE my_share IS 'A good share';";
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "INFO-COMMENT-CHG"),
+        has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should fire for SHARE"
     );
     // SHARE/RECIPIENT/PROVIDER use Metadata surface — no specific DBX rule
     assert!(
-        !has_signal(&report, "INFO-DBX-CAT-COMMENT-CHG"),
+        !has_finding(&report, "INFO-DBX-CAT-COMMENT-CHG"),
         "INFO-DBX-CAT-COMMENT-CHG should not fire for SHARE"
     );
     assert!(
-        !has_signal(&report, "INFO-DBX-VOL-COMMENT-CHG"),
+        !has_finding(&report, "INFO-DBX-VOL-COMMENT-CHG"),
         "INFO-DBX-VOL-COMMENT-CHG should not fire for SHARE"
     );
     assert!(
-        !has_signal(&report, "INFO-DBX-CONN-COMMENT-CHG"),
+        !has_finding(&report, "INFO-DBX-CONN-COMMENT-CHG"),
         "INFO-DBX-CONN-COMMENT-CHG should not fire for SHARE"
     );
 }
@@ -259,10 +257,10 @@ fn test_comment_on_share_only_generic() {
 // ─── RISK ANALYSIS: IS NULL (Comment Removal) ──────────────────────────────
 
 #[test]
-fn test_comment_on_is_null_still_signals() {
+fn test_comment_on_is_null_still_findings() {
     let sql = "COMMENT ON TABLE my_table IS NULL;";
     let report = dbx_analyze(sql);
-    assert!(has_signal(&report, "INFO-COMMENT-CHG"),
+    assert!(has_finding(&report, "INFO-COMMENT-CHG"),
         "INFO-COMMENT-CHG should fire even for IS NULL (comment removal is still a metadata change)");
 }
 
@@ -278,7 +276,7 @@ fn test_comment_on_multi_statement_evidence() {
     let report = dbx_analyze(sql);
 
     // INFO-COMMENT-CHG should have evidence for all 3
-    let generic_evidence = signal_evidence_count(&report, "INFO-COMMENT-CHG");
+    let generic_evidence = finding_evidence_count(&report, "INFO-COMMENT-CHG");
     assert!(
         generic_evidence >= 3,
         "INFO-COMMENT-CHG should have at least 3 evidence entries, got {}",
@@ -286,7 +284,7 @@ fn test_comment_on_multi_statement_evidence() {
     );
 
     // INFO-DBX-CAT-COMMENT-CHG should also have evidence for all 3 (they're all CATALOG)
-    let catalog_evidence = signal_evidence_count(&report, "INFO-DBX-CAT-COMMENT-CHG");
+    let catalog_evidence = finding_evidence_count(&report, "INFO-DBX-CAT-COMMENT-CHG");
     assert!(
         catalog_evidence >= 3,
         "INFO-DBX-CAT-COMMENT-CHG should have at least 3 evidence entries, got {}",
@@ -305,7 +303,7 @@ fn test_comment_on_mixed_objects_evidence() {
     let report = dbx_analyze(sql);
 
     // INFO-COMMENT-CHG matches all 4
-    let generic_evidence = signal_evidence_count(&report, "INFO-COMMENT-CHG");
+    let generic_evidence = finding_evidence_count(&report, "INFO-COMMENT-CHG");
     assert!(
         generic_evidence >= 4,
         "INFO-COMMENT-CHG should have at least 4 evidence entries, got {}",
@@ -314,15 +312,15 @@ fn test_comment_on_mixed_objects_evidence() {
 
     // Each DBX rule should have exactly 1
     assert!(
-        has_signal(&report, "INFO-DBX-CAT-COMMENT-CHG"),
-        "Should have CATALOG signal"
+        has_finding(&report, "INFO-DBX-CAT-COMMENT-CHG"),
+        "Should have CATALOG finding"
     );
     assert!(
-        has_signal(&report, "INFO-DBX-VOL-COMMENT-CHG"),
-        "Should have VOLUME signal"
+        has_finding(&report, "INFO-DBX-VOL-COMMENT-CHG"),
+        "Should have VOLUME finding"
     );
     assert!(
-        has_signal(&report, "INFO-DBX-CONN-COMMENT-CHG"),
-        "Should have CONNECTION signal"
+        has_finding(&report, "INFO-DBX-CONN-COMMENT-CHG"),
+        "Should have CONNECTION finding"
     );
 }

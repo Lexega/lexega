@@ -3,7 +3,10 @@
 
 use phf::phf_map;
 
-use crate::dialect::{Dialect, SnowflakeDialect};
+use crate::dialect::{
+    CaretOperator, Dialect, DollarNumber, DoubleAmpersand, NumberLiteralGrammar, RadixPrefix,
+    SnowflakeDialect,
+};
 use crate::error::ExpectInvariant;
 use crate::lexer::token::{
     IdentifierKind, Keyword, LiteralKind, Operator, Punctuation, Span, Token, TokenKind, Trivia,
@@ -267,6 +270,12 @@ pub struct Lexer<'src> {
     /// Tracks nesting depth of braces { } and brackets [ ] in Jinja mode.
     /// Used to prevent `}}` from being treated as JinjaExprClose when one `}` belongs to a dict.
     jinja_brace_depth: i32,
+    /// Whether a `}` of the current `{{ }}` expression closed nothing: the
+    /// expression is not balanced, and its next `}}` closes it.
+    jinja_expr_unbalanced: bool,
+    /// Whether the next token of the current `{% %}` tag is its first: a
+    /// block's word (`filter`, `call`) is a keyword there only.
+    jinja_tag_first: bool,
     /// Stack of enclosing dollar-quoted bodies (innermost last). Each entry is
     /// `(body_end, close_tag_span)`: the byte offset where the body content ends
     /// and the matching close tag (`$tag$`) begins, plus that close tag's span
@@ -283,6 +292,50 @@ pub struct Lexer<'src> {
     /// an `Unknown` token (instead of swallowing the rest of the file as a
     /// comment) so the parser surfaces it as unparsed content.
     unterminated_comment: Option<Span>,
+    /// Where the dialect writes a `$$…$$` string as words: the offset of the
+    /// `$$` that closes the string an opening `$$` began, which no word,
+    /// quote or comment inside the string reads past.
+    dollar_words_close: Option<usize>,
+    /// Each dollar-quoted string read, in the order its opener is read.
+    dollar_quotes: Vec<crate::lexer::DollarQuote>,
+    /// The statement terminator the last client `DELIMITER` command set, its
+    /// byte range in the source; `None` while it is `;`.
+    client_delimiter: Option<(usize, usize)>,
+    /// What the statement being read is so far, as a `COPY` whose rows
+    /// follow its terminator ([`CopyRows`]).
+    copy_rows: CopyRows,
+    /// Whether a psql `\copy` command is being read: its line ends it.
+    psql_copy_line: bool,
+}
+
+/// What the statement being read is so far, as a `COPY … FROM STDIN`, whose
+/// rows follow its terminator ([`TriviaKind::CopyData`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyRows {
+    /// No token of the statement is read.
+    Start,
+    /// A `COPY`, inside `depth` parentheses.
+    Copy { depth: u32 },
+    /// A `COPY` whose last token is a `FROM` outside parentheses.
+    From,
+    /// A `COPY … FROM STDIN`.
+    Stdin,
+    /// Another statement.
+    Other,
+}
+
+/// What a token is to [`CopyRows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyToken {
+    /// A `;`, or the end of the source.
+    End,
+    Copy,
+    From,
+    Open,
+    Close,
+    /// `STDIN`, in any case.
+    Stdin,
+    Other,
 }
 
 impl<'src> Lexer<'src> {
@@ -304,8 +357,15 @@ impl<'src> Lexer<'src> {
             mode: LexMode::Sql,
             in_interrupted_string: false,
             jinja_brace_depth: 0,
+            jinja_expr_unbalanced: false,
+            jinja_tag_first: false,
             dollar_bodies: Vec::new(),
             unterminated_comment: None,
+            dollar_words_close: None,
+            dollar_quotes: Vec::new(),
+            client_delimiter: None,
+            copy_rows: CopyRows::Start,
+            psql_copy_line: false,
         }
     }
 
@@ -374,8 +434,14 @@ impl<'src> Lexer<'src> {
             };
 
         let nesting = self.dialect.supports_nested_block_comments();
+        let start = self.current_pos();
         let mut depth: u32 = 1;
         while let Some(c) = self.peek_char() {
+            // Inside a `$$` string written as words, the text ends at its
+            // closer, which ends the comment's text too.
+            if self.at_dollar_words_close(start) {
+                return (trivia_kind, true);
+            }
             if c == '/' && nesting {
                 self.bump();
                 if let Some('*') = self.peek_char() {
@@ -437,6 +503,224 @@ impl<'src> Lexer<'src> {
         self.pos as u32
     }
 
+    /// The width of the client delimiter written at the current position
+    /// ([`TriviaKind::ClientDelimiter`]).
+    fn client_delimiter_at(&self) -> Option<usize> {
+        let (start, end) = self.client_delimiter?;
+        self.source
+            .get(self.pos..self.effective_end())?
+            .starts_with(&self.source[start..end])
+            .then_some(end - start)
+    }
+
+    /// Whether the client's `DELIMITER` command starts at the current
+    /// position: the word first on its line, then a space or tab.
+    fn client_delimiter_command_at(&self) -> bool {
+        const WORD: &str = "DELIMITER";
+        if !self.dialect.client_delimiter_command()
+            || self.mode != LexMode::Sql
+            || !self.dollar_bodies.is_empty()
+        {
+            return false;
+        }
+        let line_start = self.source[..self.pos].rfind('\n').map_or(0, |n| n + 1);
+        let first_on_line = self.source[line_start..self.pos]
+            .chars()
+            .all(|c| c == ' ' || c == '\t');
+        let rest = &self.source[self.pos..];
+        first_on_line
+            && rest
+                .get(..WORD.len())
+                .is_some_and(|word| word.eq_ignore_ascii_case(WORD))
+            && rest[WORD.len()..].starts_with([' ', '\t'])
+    }
+
+    /// The client's `DELIMITER x` command at the current position, to the end
+    /// of its line; `x`, its first word, is the terminator from here on.
+    fn lex_client_delimiter_command(&mut self) -> Trivia {
+        let start = self.pos;
+        while let Some(c) = self.peek_char() {
+            if c == '\n' || c == '\r' {
+                break;
+            }
+            self.bump();
+        }
+        let end = self.pos;
+        let after_word = start + "DELIMITER".len();
+        let text = &self.source[after_word..end];
+        let from = after_word + (text.len() - text.trim_start().len());
+        let to = self.source[from..end]
+            .find(char::is_whitespace)
+            .map_or(end, |n| from + n);
+        self.client_delimiter = (to > from && &self.source[from..to] != ";").then_some((from, to));
+        Trivia {
+            kind: TriviaKind::ClientDelimiter,
+            span: Span {
+                start: start as u32,
+                end: end as u32,
+            },
+        }
+    }
+
+    /// The psql command that sends the query written at the `\\` at the
+    /// current position: `\g` or `\gexec`, a whole word. `None` for any
+    /// other command.
+    fn psql_meta_command_at(&self) -> Option<crate::lexer::token::PsqlMetaCommand> {
+        use crate::lexer::token::PsqlMetaCommand;
+        let rest = self.source.get(self.pos + 1..self.effective_end())?;
+        let word_end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
+        match &rest[..word_end] {
+            "g" => Some(PsqlMetaCommand::Go),
+            "gexec" => Some(PsqlMetaCommand::Gexec),
+            _ => None,
+        }
+    }
+
+    /// Whether psql's `\copy` command starts at the current position: first
+    /// on its line, a whole word.
+    fn psql_copy_at(&self) -> bool {
+        if self.mode != LexMode::Sql || !self.dollar_bodies.is_empty() {
+            return false;
+        }
+        let line_start = self.source[..self.pos].rfind('\n').map_or(0, |n| n + 1);
+        let first_on_line = self.source[line_start..self.pos]
+            .chars()
+            .all(|c| c == ' ' || c == '\t');
+        let rest = &self.source[self.pos..];
+        first_on_line
+            && rest.starts_with(PSQL_COPY)
+            && !rest[PSQL_COPY.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| self.is_ident_continue(c))
+    }
+
+    /// Read `token`, a token of a statement at the top level, into what the
+    /// statement is so far ([`CopyRows`]); at the `;` that ends a `COPY …
+    /// FROM STDIN`, read the rows written after it, from the next line to
+    /// the end of the line `\.` that ends them or of the source, as its
+    /// trailing trivia ([`TriviaKind::CopyData`]).
+    fn read_copy_rows(&mut self, token: &mut Token) {
+        if !self.dollar_bodies.is_empty() {
+            return;
+        }
+        let read = if matches!(
+            token.kind,
+            TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+        ) {
+            CopyToken::End
+        } else if matches!(token.kind, TokenKind::Keyword(Keyword::Copy)) {
+            CopyToken::Copy
+        } else if matches!(token.kind, TokenKind::Keyword(Keyword::From)) {
+            CopyToken::From
+        } else if matches!(token.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+            CopyToken::Open
+        } else if matches!(token.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+            CopyToken::Close
+        } else if matches!(token.kind, TokenKind::Identifier { .. })
+            && token.lexeme(self.source).eq_ignore_ascii_case("STDIN")
+        {
+            CopyToken::Stdin
+        } else {
+            CopyToken::Other
+        };
+        self.copy_rows = match (self.copy_rows, read) {
+            (CopyRows::Stdin, CopyToken::End) => {
+                if let Some(rows) = self.copy_data() {
+                    token.trailing_trivia.extend(rows);
+                }
+                CopyRows::Start
+            }
+            (_, CopyToken::End) => CopyRows::Start,
+            (CopyRows::Start, CopyToken::Copy) => CopyRows::Copy { depth: 0 },
+            // psql's `\copy` runs a `COPY` wherever it is written.
+            (_, CopyToken::Copy) if self.psql_copy_line => CopyRows::Copy { depth: 0 },
+            (CopyRows::Start, _) => CopyRows::Other,
+            (CopyRows::Copy { depth }, CopyToken::Open) => CopyRows::Copy { depth: depth + 1 },
+            (CopyRows::Copy { depth }, CopyToken::Close) => CopyRows::Copy {
+                depth: depth.saturating_sub(1),
+            },
+            (CopyRows::Copy { depth: 0 }, CopyToken::From) => CopyRows::From,
+            (CopyRows::From, CopyToken::Stdin) => CopyRows::Stdin,
+            (CopyRows::From, _) => CopyRows::Copy { depth: 0 },
+            (state @ (CopyRows::Copy { .. } | CopyRows::Stdin | CopyRows::Other), _) => state,
+        };
+    }
+
+    /// The rows a `COPY … FROM STDIN` reads, at the end of the line of its
+    /// `;`: the line break, then the rows to the end of the line `\.`
+    /// that ends them, or of the source. `None` where the line holds more
+    /// than trivia after the `;`, or no line follows.
+    fn copy_data(&mut self) -> Option<[Trivia; 2]> {
+        let break_start = self.pos;
+        let rest = self.source.get(break_start..)?;
+        let width = if rest.starts_with("\r\n") {
+            2
+        } else if rest.starts_with(['\n', '\r']) {
+            1
+        } else {
+            return None;
+        };
+        let start = break_start + width;
+        if start >= self.source.len() {
+            return None;
+        }
+        let mut end = self.source.len();
+        let mut at = start;
+        for line in self.source[start..].split_inclusive('\n') {
+            let content = line.trim_end_matches(['\n', '\r']);
+            if content.trim() == "\\." {
+                end = at + content.len();
+                break;
+            }
+            at += line.len();
+        }
+        self.pos = end;
+        let span = |from: usize, to: usize| Span {
+            start: from as u32,
+            end: to as u32,
+        };
+        Some([
+            Trivia {
+                kind: TriviaKind::Newline,
+                span: span(break_start, start),
+            },
+            Trivia {
+                kind: TriviaKind::CopyData,
+                span: span(start, end),
+            },
+        ])
+    }
+
+    /// The psql `command` at the current position, to the end of its line, as
+    /// trivia of the `;` of no width after it, which ends the statement.
+    fn lex_psql_meta_command(
+        &mut self,
+        mut leading_trivia: Vec<Trivia>,
+        command: crate::lexer::token::PsqlMetaCommand,
+    ) -> Token {
+        let start = self.current_pos();
+        while let Some(c) = self.peek_char() {
+            if c == '\n' || c == '\r' {
+                break;
+            }
+            self.bump();
+        }
+        let end = self.current_pos();
+        leading_trivia.push(Trivia {
+            kind: TriviaKind::PsqlMetaCommand(command),
+            span: Span { start, end },
+        });
+        Token {
+            kind: TokenKind::Punctuation(crate::lexer::Punctuation::Semi),
+            span: Span { start: end, end },
+            leading_trivia,
+            trailing_trivia: Vec::new(),
+        }
+    }
+
     /// Collect leading trivia (whitespace, newlines, comments) starting at current position.
     fn collect_leading_trivia(&mut self) -> Vec<Trivia> {
         let mut trivia = Vec::new();
@@ -451,6 +735,16 @@ impl<'src> Lexer<'src> {
                 Some(c) => c,
                 None => break,
             };
+
+            // The client's terminator is a token, not a comment's start.
+            if self.client_delimiter_at().is_some() {
+                break;
+            }
+            if matches!(ch, 'D' | 'd') && self.client_delimiter_command_at() {
+                let command = self.lex_client_delimiter_command();
+                trivia.push(command);
+                continue;
+            }
 
             // BOM (Byte Order Mark) - treat as whitespace trivia
             if ch == '\u{feff}' {
@@ -508,14 +802,13 @@ impl<'src> Lexer<'src> {
             // Line comment "-- ..."
             if ch == '-' {
                 if let Some('-') = self.peek_next_char() {
-                    // MySQL requires a space/whitespace after '--' for it to be a comment.
-                    // Without the space, '--' is two minus operators (e.g., x--y = x - (-y)).
+                    // MySQL requires whitespace or a control character (a line
+                    // end included) after '--' for it to be a comment. Without
+                    // it, '--' is two minus operators (e.g., x--y = x - (-y)).
                     if self.dialect.requires_space_after_double_dash() {
-                        let third = self.peek_ahead_n(2);
-                        let is_comment = match third {
-                            Some(' ') | Some('\t') | None => true, // space, tab, or EOF
-                            _ => false,
-                        };
+                        let is_comment = self
+                            .peek_ahead_n(2)
+                            .is_none_or(|c| c.is_whitespace() || c.is_control());
                         if !is_comment {
                             break; // Not a comment — fall through to operator lexing
                         }
@@ -523,7 +816,7 @@ impl<'src> Lexer<'src> {
                     self.bump();
                     self.bump();
                     while let Some(c) = self.peek_char() {
-                        if c == '\n' || c == '\r' {
+                        if c == '\n' || c == '\r' || self.at_dollar_words_close(start) {
                             break;
                         }
                         self.bump();
@@ -562,7 +855,7 @@ impl<'src> Lexer<'src> {
                         self.bump();
                         self.bump();
                         while let Some(c) = self.peek_char() {
-                            if c == '\n' || c == '\r' {
+                            if c == '\n' || c == '\r' || self.at_dollar_words_close(start) {
                                 break;
                             }
                             self.bump();
@@ -639,7 +932,11 @@ impl<'src> Lexer<'src> {
     pub fn next_token(&mut self) -> Token {
         // Dispatch based on current lexing mode
         match self.mode {
-            LexMode::Sql => self.next_sql_token(),
+            LexMode::Sql => {
+                let mut token = self.next_sql_token();
+                self.read_copy_rows(&mut token);
+                token
+            }
             LexMode::DollarBody => self.next_dollar_body_token(),
             LexMode::JinjaExpr | LexMode::JinjaStmt => self.next_jinja_token(),
         }
@@ -678,7 +975,8 @@ impl<'src> Lexer<'src> {
             }
             return Token {
                 kind: TokenKind::Identifier {
-                    kind: IdentifierKind::Unquoted,
+                    kind: IdentifierKind::DollarQuoteDelimiter,
+                    word_operator: None,
                 },
                 span: close_span,
                 leading_trivia: trivia,
@@ -731,7 +1029,11 @@ impl<'src> Lexer<'src> {
             // Check if we're at another Jinja block
             if let Some('{') = self.peek_char() {
                 if let Some(next) = self.peek_next_char() {
-                    if next == '{' || next == '%' || next == '#' {
+                    if next == '#' {
+                        // A comment inside the string is a token of it, not
+                        // trivia; the string continues after it.
+                        return self.lex_jinja_comment(Vec::new());
+                    } else if next == '{' || next == '%' {
                         // Let normal dispatch handle the Jinja token
                         // (in_interrupted_string stays true so we continue after)
                     } else {
@@ -743,6 +1045,18 @@ impl<'src> Lexer<'src> {
             } else {
                 return self.lex_string_continuation(Vec::new());
             }
+        }
+
+        // A psql `\copy` command ends at its line's end: a `;` of no width.
+        if self.psql_copy_line && matches!(self.peek_char(), None | Some('\n' | '\r')) {
+            self.psql_copy_line = false;
+            let at = self.current_pos();
+            return Token {
+                kind: TokenKind::Punctuation(Punctuation::Semi),
+                span: Span { start: at, end: at },
+                leading_trivia: Vec::new(),
+                trailing_trivia: Vec::new(),
+            };
         }
 
         let leading_trivia = self.collect_leading_trivia();
@@ -778,6 +1092,41 @@ impl<'src> Lexer<'src> {
         let ch = self
             .peek_char()
             .expect_invariant("Character should be available in lex_token");
+        // The terminator a client `DELIMITER` command set: a `;` of its width.
+        if let Some(width) = self.client_delimiter_at() {
+            self.pos += width;
+            return Token {
+                kind: TokenKind::Punctuation(crate::lexer::Punctuation::Semi),
+                span: Span {
+                    start,
+                    end: self.current_pos(),
+                },
+                leading_trivia,
+                trailing_trivia: Vec::new(),
+            };
+        }
+        // psql's `\copy`, in any dialect: the `COPY` it runs, to its line's end.
+        if ch == '\\' && self.psql_copy_at() {
+            self.pos += PSQL_COPY.len();
+            self.psql_copy_line = true;
+            let mut token = Token {
+                kind: TokenKind::Keyword(Keyword::Copy),
+                span: Span {
+                    start,
+                    end: self.current_pos(),
+                },
+                leading_trivia,
+                trailing_trivia: Vec::new(),
+            };
+            token.trailing_trivia = self.collect_trailing_trivia();
+            return token;
+        }
+        // A psql command that sends the query: kept as written, a `;` after.
+        if ch == '\\' && self.mode == LexMode::Sql && self.dialect.psql_meta_commands() {
+            if let Some(command) = self.psql_meta_command_at() {
+                return self.lex_psql_meta_command(leading_trivia, command);
+            }
+        }
 
         let mut token = if ch == '{' {
             // Check for Jinja syntax: {{ }}, {% %}, {# #}
@@ -821,8 +1170,11 @@ impl<'src> Lexer<'src> {
             // but a bare '.' (not followed by a digit) should be punctuation.
             if ch == '.' {
                 // Look ahead: if next char is not a digit, treat as '.' punctuation.
+                // The second dot of `..` (a range, an omitted schema) is never a
+                // decimal point: `1..10` is `1`, `.`, `.`, `10`.
+                let after_dot = self.source[..self.pos].ends_with('.');
                 if let Some(next) = self.peek_next_char() {
-                    if !next.is_ascii_digit() {
+                    if after_dot || !next.is_ascii_digit() {
                         // Consume '.' and return it as a Dot punctuation token.
                         let start = self.current_pos();
                         self.bump();
@@ -867,6 +1219,7 @@ impl<'src> Lexer<'src> {
 
     fn next_jinja_token(&mut self) -> Token {
         let leading_trivia = self.collect_leading_trivia();
+        let tag_first = std::mem::take(&mut self.jinja_tag_first);
 
         if self.is_eof() {
             return Token {
@@ -889,7 +1242,9 @@ impl<'src> Lexer<'src> {
         // BUT: only treat }} as JinjaExprClose if we're at brace depth 0
         if ch == '}' {
             if let Some(next_ch) = self.peek_next_char() {
-                if next_ch == '}' && self.mode == LexMode::JinjaExpr && self.jinja_brace_depth == 0
+                if next_ch == '}'
+                    && self.mode == LexMode::JinjaExpr
+                    && (self.jinja_brace_depth == 0 || self.jinja_expr_unbalanced)
                 {
                     // Exit Jinja expression mode - we're closing the {{ }}
                     self.mode = self.mode_after_jinja();
@@ -910,6 +1265,8 @@ impl<'src> Lexer<'src> {
             // Decrement brace depth when closing a dict/set
             if self.mode != LexMode::Sql && self.jinja_brace_depth > 0 {
                 self.jinja_brace_depth -= 1;
+            } else if self.mode == LexMode::JinjaExpr {
+                self.jinja_expr_unbalanced = true;
             }
             self.bump();
             return Token {
@@ -1197,7 +1554,7 @@ impl<'src> Lexer<'src> {
                     }
                 } else if next_ch == '}'
                     && self.mode == LexMode::JinjaExpr
-                    && self.jinja_brace_depth == 0
+                    && (self.jinja_brace_depth == 0 || self.jinja_expr_unbalanced)
                 {
                     // This is -}} - check if the next char is also }
                     if let Some(after_brace) = self.peek_ahead_n(2) {
@@ -1362,7 +1719,7 @@ impl<'src> Lexer<'src> {
 
         // Identifiers and keywords (lowercase in Jinja)
         if is_identifier_start(ch) {
-            return self.lex_jinja_identifier_or_keyword(leading_trivia);
+            return self.lex_jinja_identifier_or_keyword(leading_trivia, tag_first);
         }
 
         // Unknown/unsupported character
@@ -1378,7 +1735,13 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn lex_jinja_identifier_or_keyword(&mut self, leading_trivia: Vec<Trivia>) -> Token {
+    /// A Jinja word: a keyword, or, as the first word of a `{% %}` tag
+    /// (`tag_first`), a block's word too.
+    fn lex_jinja_identifier_or_keyword(
+        &mut self,
+        leading_trivia: Vec<Trivia>,
+        tag_first: bool,
+    ) -> Token {
         let start = self.current_pos();
         self.bump();
         while let Some(c) = self.peek_char() {
@@ -1412,8 +1775,13 @@ impl<'src> Lexer<'src> {
             "endset" => TokenKind::JinjaEndSet,
             "docs" => TokenKind::JinjaDocs,
             "enddocs" => TokenKind::JinjaEndDocs,
+            "filter" if tag_first => TokenKind::JinjaFilter,
+            "endfilter" if tag_first => TokenKind::JinjaEndFilter,
+            "call" if tag_first => TokenKind::JinjaCall,
+            "endcall" if tag_first => TokenKind::JinjaEndCall,
             _ => TokenKind::Identifier {
                 kind: IdentifierKind::Unquoted,
+                word_operator: None,
             },
         };
 
@@ -1515,6 +1883,10 @@ impl<'src> Lexer<'src> {
         let start = self.current_pos();
         self.bump();
         while let Some(c) = self.peek_char() {
+            // Inside a `$$` string written as words, a word ends at its closer.
+            if self.at_dollar_words_close(start) {
+                break;
+            }
             if self.is_ident_continue(c) {
                 self.bump();
             } else {
@@ -1556,8 +1928,11 @@ impl<'src> Lexer<'src> {
             Some(Keyword::False) => TokenKind::Literal(LiteralKind::Boolean),
             Some(Keyword::Null) => TokenKind::Literal(LiteralKind::Null),
             Some(kw) => TokenKind::Keyword(kw),
+            // Still a name, and marked where the dialect also writes an
+            // operator with the word.
             None => TokenKind::Identifier {
                 kind: IdentifierKind::Unquoted,
+                word_operator: self.dialect.word_operator(text),
             },
         };
 
@@ -1571,10 +1946,16 @@ impl<'src> Lexer<'src> {
 
     fn lex_quoted_identifier(&mut self, leading_trivia: Vec<Trivia>) -> Token {
         let start = self.current_pos();
+        let mut stopped_at_close = false;
         // opening quote
         self.bump();
 
         while let Some(c) = self.peek_char() {
+            // Inside a `$$` string written as words, the quote ends at its closer.
+            if self.at_dollar_words_close(start) {
+                stopped_at_close = true;
+                break;
+            }
             self.bump();
             if c == '"' {
                 // doubled quote inside identifier
@@ -1589,8 +1970,14 @@ impl<'src> Lexer<'src> {
         let end = self.current_pos();
 
         Token {
-            kind: TokenKind::Identifier {
-                kind: IdentifierKind::Quoted,
+            kind: if stopped_at_close {
+                // Part of the text of a `$$` string written as words.
+                TokenKind::Literal(LiteralKind::StringFragment)
+            } else {
+                TokenKind::Identifier {
+                    kind: IdentifierKind::Quoted,
+                    word_operator: None,
+                }
             },
             span: Span { start, end },
             leading_trivia,
@@ -1654,6 +2041,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::Quoted,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -1684,6 +2072,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::Quoted,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -1734,6 +2123,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::AtVariable,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -1766,6 +2156,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::TempTable,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -1904,6 +2295,16 @@ impl<'src> Lexer<'src> {
 
         match close_at {
             Some(cs) => {
+                self.dollar_quotes.push(crate::lexer::DollarQuote {
+                    span: Span {
+                        start,
+                        end: (cs + tag_len) as u32,
+                    },
+                    content: Span {
+                        start: open_end as u32,
+                        end: cs as u32,
+                    },
+                });
                 // Push a bounded dollar-body. `pos` is already at `open_end`
                 // (body start); inner lexing runs until `cs`, then the close tag
                 // `[cs, cs + tag_len)` is emitted as the closing delimiter. The
@@ -1920,7 +2321,8 @@ impl<'src> Lexer<'src> {
                 // Emit the opening delimiter token (exactly `$tag$`).
                 Token {
                     kind: TokenKind::Identifier {
-                        kind: IdentifierKind::Unquoted,
+                        kind: IdentifierKind::DollarQuoteDelimiter,
+                        word_operator: None,
                     },
                     span: Span {
                         start,
@@ -1954,6 +2356,36 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Whether a scanner that started at `start` has reached the closing `$$`
+    /// of the `$$…$$` string, written as words, that it started inside.
+    fn at_dollar_words_close(&self, start: u32) -> bool {
+        self.dollar_words_close
+            .is_some_and(|close| close > start as usize && self.pos >= close)
+    }
+
+    /// Tracks the `$$…$$` string, written as words, that the `$$` at `start`
+    /// opens or closes: the `$$` at the open string's closer closes it, any
+    /// other opens one that runs to the next `$$`.
+    fn note_dollar_quote(&mut self, start: usize) {
+        if self.dollar_words_close == Some(start) {
+            self.dollar_words_close = None;
+            return;
+        }
+        self.dollar_words_close = self.source[start + 2..].find("$$").map(|at| start + 2 + at);
+        // A string no `$$` closes runs to the end of the source.
+        let close = self.dollar_words_close.unwrap_or(self.source.len());
+        self.dollar_quotes.push(crate::lexer::DollarQuote {
+            span: Span {
+                start: start as u32,
+                end: (close + 2).min(self.source.len()) as u32,
+            },
+            content: Span {
+                start: (start + 2) as u32,
+                end: close as u32,
+            },
+        });
+    }
+
     /// Helper: finish lexing a dollar-prefixed token as an identifier (fallback).
     fn finish_dollar_identifier(&mut self, start: u32, leading_trivia: Vec<Trivia>) -> Token {
         while let Some(c) = self.peek_char() {
@@ -1967,6 +2399,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::Unquoted,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -1976,25 +2409,22 @@ impl<'src> Lexer<'src> {
 
     fn lex_number(&mut self, leading_trivia: Vec<Trivia>) -> Token {
         let start = self.current_pos();
+        let grammar = self.dialect.number_literal_grammar();
+        let separators = grammar.digit_separators;
 
-        if let Some(c) = self.peek_char() {
-            if c.is_ascii_digit() {
-                self.bump();
-                while let Some(c2) = self.peek_char() {
-                    if c2.is_ascii_digit() {
-                        self.bump();
-                    } else {
-                        break;
-                    }
+        if !self.lex_radix_digits(grammar) {
+            let mut integer = true;
+            if let Some(c) = self.peek_char() {
+                if c.is_ascii_digit() {
+                    self.bump_digit_run(|d| d.is_ascii_digit(), separators);
+                } else if c == '.' {
+                    // Leading '.' case: .123
+                    self.bump();
+                    integer = false;
                 }
-            } else if c == '.' {
-                // Leading '.' case: .123
-                self.bump();
             }
-        }
 
-        // Optional fractional part for forms like 123.45 or 123.
-        if let Some('.') = self.peek_char() {
+            // Optional fractional part for forms like 123.45 or 123.
             if let Some('.') = self.peek_char() {
                 // Lookahead for ".." (range, not part of the number)
                 let mut iter = self.source[self.pos..].chars();
@@ -2003,54 +2433,42 @@ impl<'src> Lexer<'src> {
                 if matches!(first, Some('.')) && !matches!(second, Some('.')) {
                     // Single '.' as decimal point
                     self.bump();
-                    while let Some(c2) = self.peek_char() {
-                        if c2.is_ascii_digit() {
-                            self.bump();
-                        } else {
-                            break;
-                        }
-                    }
+                    integer = false;
+                    self.bump_digit_run(|d| d.is_ascii_digit(), separators);
                 }
+            } else {
+                // We started with '.', consume trailing digits for .123 or .0
+                self.bump_digit_run(|d| d.is_ascii_digit(), separators);
             }
-        } else {
-            // We started with '.', consume trailing digits for .123 or .0
-            while let Some(c2) = self.peek_char() {
-                if c2.is_ascii_digit() {
-                    self.bump();
-                } else {
-                    break;
-                }
-            }
-        }
 
-        // Optional exponent part: e[+/-]?digits
-        if let Some(c) = self.peek_char() {
-            if c == 'e' || c == 'E' {
-                // Look ahead to ensure this looks like an exponent (has digit after optional sign).
-                let mut iter = self.source[self.pos + c.len_utf8()..].chars();
-                let maybe_sign = iter.next();
-                let mut next_after_sign = maybe_sign;
-                if matches!(maybe_sign, Some('+') | Some('-')) {
-                    next_after_sign = iter.next();
-                }
-                if matches!(next_after_sign, Some(d) if d.is_ascii_digit()) {
-                    // Consume 'e' / 'E'
-                    self.bump();
-                    // Optional sign
-                    if let Some(sign) = self.peek_char() {
-                        if sign == '+' || sign == '-' {
-                            self.bump();
-                        }
+            // Optional exponent part: e[+/-]?digits
+            if let Some(c) = self.peek_char() {
+                if c == 'e' || c == 'E' {
+                    // Look ahead to ensure this looks like an exponent (has digit after optional sign).
+                    let mut iter = self.source[self.pos + c.len_utf8()..].chars();
+                    let maybe_sign = iter.next();
+                    let mut next_after_sign = maybe_sign;
+                    if matches!(maybe_sign, Some('+') | Some('-')) {
+                        next_after_sign = iter.next();
                     }
-                    // At least one digit (we know it's there from lookahead)
-                    while let Some(d) = self.peek_char() {
-                        if d.is_ascii_digit() {
-                            self.bump();
-                        } else {
-                            break;
+                    if matches!(next_after_sign, Some(d) if d.is_ascii_digit()) {
+                        // Consume 'e' / 'E'
+                        self.bump();
+                        integer = false;
+                        // Optional sign
+                        if let Some(sign) = self.peek_char() {
+                            if sign == '+' || sign == '-' {
+                                self.bump();
+                            }
                         }
+                        // At least one digit (we know it's there from lookahead)
+                        self.bump_digit_run(|d| d.is_ascii_digit(), separators);
                     }
                 }
+            }
+
+            if grammar.type_suffixes {
+                self.bump_type_suffix(integer);
             }
         }
 
@@ -2064,13 +2482,103 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Consumes `0x…`, `0b…` or `0o…` where `grammar` reads that prefix in
+    /// the case written and a digit of its radix follows (an `_` before it
+    /// where the grammar has digit separators). Returns whether it did.
+    fn lex_radix_digits(&mut self, grammar: NumberLiteralGrammar) -> bool {
+        let mut chars = self.source[self.pos..self.effective_end()].chars();
+        if chars.next() != Some('0') {
+            return false;
+        }
+        let Some(letter) = chars.next() else {
+            return false;
+        };
+        let (prefix, is_digit): (RadixPrefix, fn(char) -> bool) = match letter.to_ascii_lowercase()
+        {
+            'x' => (grammar.hexadecimal, |d| d.is_ascii_hexdigit()),
+            'b' => (grammar.binary, |d| matches!(d, '0' | '1')),
+            'o' => (grammar.octal, |d| matches!(d, '0'..='7')),
+            _ => return false,
+        };
+        let case_read = match prefix {
+            RadixPrefix::Absent => false,
+            RadixPrefix::LowerCase => letter.is_ascii_lowercase(),
+            RadixPrefix::AnyCase => true,
+        };
+        let first = match chars.next() {
+            Some('_') if grammar.digit_separators => chars.next(),
+            other => other,
+        };
+        if !case_read || !first.is_some_and(is_digit) {
+            return false;
+        }
+        self.bump();
+        self.bump();
+        if self.peek_char() == Some('_') {
+            self.bump();
+        }
+        self.bump_digit_run(is_digit, grammar.digit_separators);
+        true
+    }
+
+    /// Consumes the digits `is_digit` accepts from here, and, where
+    /// `separators`, each `_` written between two of them.
+    fn bump_digit_run(&mut self, is_digit: impl Fn(char) -> bool, separators: bool) {
+        let mut after_digit = false;
+        while let Some(c) = self.peek_char() {
+            if is_digit(c) {
+                self.bump();
+                after_digit = true;
+            } else if separators
+                && c == '_'
+                && after_digit
+                && self.peek_next_char().is_some_and(&is_digit)
+            {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Consumes a type suffix written against a number (`BD`, `D`, `F`, and on
+    /// an `integer` also `L`, `S`, `Y`), in either case, when no name
+    /// character follows it.
+    fn bump_type_suffix(&mut self, integer: bool) {
+        let rest = &self.source[self.pos..self.effective_end()];
+        let len = if rest.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("BD")) {
+            2
+        } else {
+            match rest.chars().next().map(|c| c.to_ascii_uppercase()) {
+                Some('D' | 'F') => 1,
+                Some('L' | 'S' | 'Y') if integer => 1,
+                Some(_) | None => 0,
+            }
+        };
+        let ends_word = rest[len..]
+            .chars()
+            .next()
+            .is_none_or(|c| !self.is_ident_continue(c));
+        if len > 0 && ends_word {
+            for _ in 0..len {
+                self.bump();
+            }
+        }
+    }
+
     fn lex_string(&mut self, leading_trivia: Vec<Trivia>) -> Token {
         let start = self.current_pos();
         let backslash_escapes = self.dialect.backslash_escapes_in_single_quoted_strings();
+        // Inside a `$$` string written as words, the quote ends at its closer.
+        let mut stopped_at_close = false;
         // opening quote
         self.bump();
 
         while let Some(c) = self.peek_char() {
+            if self.at_dollar_words_close(start) {
+                stopped_at_close = true;
+                break;
+            }
             // Jinja-first: Check for {{ before consuming the character.
             // If we see {{, stop the string here so the Jinja expression
             // is lexed as its own token.
@@ -2126,7 +2634,10 @@ impl<'src> Lexer<'src> {
         // Determine the token kind based on whether the string is complete
         // A complete string ends with a closing quote (and is not a doubled quote escape)
         let is_complete = text.ends_with('\'') && !self.in_interrupted_string;
-        let kind = if is_complete {
+        let kind = if stopped_at_close {
+            // Part of the text of a `$$` string written as words.
+            TokenKind::Literal(LiteralKind::StringFragment)
+        } else if is_complete {
             TokenKind::Literal(LiteralKind::String)
         } else if self.in_interrupted_string || !self.dollar_bodies.is_empty() {
             // Interrupted by a Jinja block (continuation follows), or bounded
@@ -2216,6 +2727,7 @@ impl<'src> Lexer<'src> {
         // Enter Jinja expression mode and reset brace depth
         self.mode = LexMode::JinjaExpr;
         self.jinja_brace_depth = 0;
+        self.jinja_expr_unbalanced = false;
 
         // Consume opening delimiters: {{ or {{-
         self.bump(); // {
@@ -2244,6 +2756,7 @@ impl<'src> Lexer<'src> {
         // Enter Jinja statement mode and reset brace depth
         self.mode = LexMode::JinjaStmt;
         self.jinja_brace_depth = 0;
+        self.jinja_tag_first = true;
 
         // Consume opening delimiters: {% or {%-
         self.bump(); // {
@@ -2349,7 +2862,8 @@ impl<'src> Lexer<'src> {
         let dollar_start = start;
         self.bump();
 
-        // If followed by digits, treat as positional literal $<n>
+        // `$<n>`: a bind parameter, a column by position or a money literal,
+        // as the dialect reads it
         let mut tmp_pos = self.pos;
         let mut had_digit = false;
         while tmp_pos < self.source.len() {
@@ -2370,13 +2884,28 @@ impl<'src> Lexer<'src> {
             while self.pos < tmp_pos {
                 self.bump();
             }
-            let index_end = self.current_pos();
+            let kind = match self.dialect.dollar_number() {
+                DollarNumber::PositionalColumn => LiteralKind::Position,
+                DollarNumber::Parameter => LiteralKind::Parameter,
+                DollarNumber::Money => {
+                    // The fraction is part of the literal: `$1.50`.
+                    let fraction = self.peek_char() == Some('.')
+                        && self.peek_next_char().is_some_and(|c| c.is_ascii_digit());
+                    if fraction {
+                        self.bump();
+                        while self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+                            self.bump();
+                        }
+                    }
+                    LiteralKind::Money
+                }
+            };
             let span = Span {
                 start: dollar_start,
-                end: index_end,
+                end: self.current_pos(),
             };
             return Token {
-                kind: TokenKind::Literal(LiteralKind::Position),
+                kind: TokenKind::Literal(kind),
                 span,
                 leading_trivia,
                 trailing_trivia: Vec::new(),
@@ -2404,8 +2933,30 @@ impl<'src> Lexer<'src> {
             }
         }
 
+        // Where the dialect writes a `$$…$$` string as words, its opening and
+        // closing `$$` are delimiters of their own.
+        if self.dialect.dollar_strings_written_as_words() && self.peek_char() == Some('$') {
+            self.bump();
+            self.note_dollar_quote(start as usize);
+            return Token {
+                kind: TokenKind::Identifier {
+                    kind: IdentifierKind::DollarQuoteDelimiter,
+                    word_operator: None,
+                },
+                span: Span {
+                    start,
+                    end: self.current_pos(),
+                },
+                leading_trivia,
+                trailing_trivia: Vec::new(),
+            };
+        }
+
         // Otherwise, treat the whole thing as an identifier starting with '$'
         while let Some(c) = self.peek_char() {
+            if self.at_dollar_words_close(start) {
+                break;
+            }
             if self.is_ident_continue(c) || c == '$' {
                 self.bump();
             } else {
@@ -2417,6 +2968,7 @@ impl<'src> Lexer<'src> {
         Token {
             kind: TokenKind::Identifier {
                 kind: IdentifierKind::Unquoted,
+                word_operator: None,
             },
             span: Span { start, end },
             leading_trivia,
@@ -2544,9 +3096,21 @@ impl<'src> Lexer<'src> {
                     }
                 }
             } else {
+                // T-SQL's `!<` and `!>`; a bare `!` is MySQL's prefix NOT.
                 self.bump();
+                let op = match self.peek_char() {
+                    Some('<') => {
+                        self.bump();
+                        Operator::BangLt
+                    }
+                    Some('>') => {
+                        self.bump();
+                        Operator::BangGt
+                    }
+                    _ => Operator::Bang,
+                };
                 Token {
-                    kind: TokenKind::Unknown,
+                    kind: TokenKind::Operator(op),
                     span: Span {
                         start,
                         end: self.current_pos(),
@@ -2730,10 +3294,26 @@ impl<'src> Lexer<'src> {
                     leading_trivia,
                     trailing_trivia: Vec::new(),
                 }
+            } else if self.dialect.supports_postgres_operator_symbols()
+                && self.source[self.pos..].starts_with("|/")
+                && !self.source[self.pos..].starts_with("|/*")
+            {
+                // Square root `|/`; a `/*` after `|` opens a comment.
+                self.bump();
+                self.bump();
+                Token {
+                    kind: TokenKind::Operator(Operator::BarSlash),
+                    span: Span {
+                        start,
+                        end: self.current_pos(),
+                    },
+                    leading_trivia,
+                    trailing_trivia: Vec::new(),
+                }
             } else {
                 self.bump();
                 Token {
-                    kind: TokenKind::Unknown,
+                    kind: TokenKind::Operator(Operator::Bar),
                     span: Span {
                         start,
                         end: self.current_pos(),
@@ -2866,6 +3446,29 @@ impl<'src> Lexer<'src> {
                     leading_trivia,
                     trailing_trivia: Vec::new(),
                 }
+            } else if self.dialect.supports_postgres_operator_symbols() {
+                // `@@` match, `@?` path exists, a bare `@` absolute value
+                self.bump();
+                let op = match self.peek_char() {
+                    Some('@') => {
+                        self.bump();
+                        Operator::AtAt
+                    }
+                    Some('?') => {
+                        self.bump();
+                        Operator::AtQuestion
+                    }
+                    _ => Operator::At,
+                };
+                Token {
+                    kind: TokenKind::Operator(op),
+                    span: Span {
+                        start,
+                        end: self.current_pos(),
+                    },
+                    leading_trivia,
+                    trailing_trivia: Vec::new(),
+                }
             } else if self.dialect.at_is_operator() {
                 // Databricks: @ is a time travel separator (events@v123)
                 self.bump();
@@ -2891,12 +3494,16 @@ impl<'src> Lexer<'src> {
                 }
             }
         } else if ch == '&' {
-            // PostgreSQL array overlap: &&
+            // `&&`: array overlap, or the dialect's logical AND.
             if let Some('&') = self.peek_next_char() {
                 self.bump();
                 self.bump();
+                let op = match self.dialect.double_ampersand() {
+                    DoubleAmpersand::ArrayOverlap => Operator::AmpAmp,
+                    DoubleAmpersand::LogicalAnd => Operator::AmpAmpAnd,
+                };
                 Token {
-                    kind: TokenKind::Operator(Operator::AmpAmp),
+                    kind: TokenKind::Operator(op),
                     span: Span {
                         start,
                         end: self.current_pos(),
@@ -2905,9 +3512,16 @@ impl<'src> Lexer<'src> {
                     trailing_trivia: Vec::new(),
                 }
             } else {
+                // `&=` is T-SQL's compound assignment, as `|=`.
                 self.bump();
+                let op = if let Some('=') = self.peek_char() {
+                    self.bump();
+                    Operator::AmpEq
+                } else {
+                    Operator::Amp
+                };
                 Token {
-                    kind: TokenKind::Unknown,
+                    kind: TokenKind::Operator(op),
                     span: Span {
                         start,
                         end: self.current_pos(),
@@ -2917,10 +3531,22 @@ impl<'src> Lexer<'src> {
                 }
             }
         } else if ch == '^' {
-            // PostgreSQL exponentiation / bitwise XOR
+            // Exponentiation or bitwise XOR, as the dialect reads it;
+            // PostgreSQL's `^@` is starts-with.
             self.bump();
+            let op = if self.dialect.supports_postgres_operator_symbols()
+                && self.peek_char() == Some('@')
+            {
+                self.bump();
+                Operator::CaretAt
+            } else {
+                match self.dialect.caret() {
+                    CaretOperator::BitwiseXor => Operator::Caret,
+                    CaretOperator::Exponent => Operator::Power,
+                }
+            };
             Token {
-                kind: TokenKind::Operator(Operator::Caret),
+                kind: TokenKind::Operator(op),
                 span: Span {
                     start,
                     end: self.current_pos(),
@@ -3020,6 +3646,27 @@ impl<'src> Lexer<'src> {
                     leading_trivia,
                     trailing_trivia: Vec::new(),
                 }
+            }
+        } else if ch == '?'
+            && self.dialect.supports_postgres_operator_symbols()
+            && matches!(self.peek_next_char(), Some('|' | '&'))
+        {
+            // Any or all of the keys exist: `?|`, `?&`
+            self.bump();
+            let op = if self.peek_char() == Some('|') {
+                Operator::QuestionBar
+            } else {
+                Operator::QuestionAmp
+            };
+            self.bump();
+            Token {
+                kind: TokenKind::Operator(op),
+                span: Span {
+                    start,
+                    end: self.current_pos(),
+                },
+                leading_trivia,
+                trailing_trivia: Vec::new(),
             }
         } else {
             // Punctuation or unknown
@@ -3125,11 +3772,14 @@ impl<'src> Lexer<'src> {
             // The comment extends to end of line but the newline itself stays out
             if ch == '-' {
                 if let Some('-') = self.peek_next_char() {
-                    // MySQL requires a space after `--` for it to be a comment.
-                    // `--y` is two minus operators followed by identifier in MySQL.
+                    // MySQL requires whitespace or a control character (a line
+                    // end included) after `--` for it to be a comment. `--y` is
+                    // two minus operators followed by identifier in MySQL.
                     if self.dialect.requires_space_after_double_dash() {
-                        let third = self.peek_ahead_n(2);
-                        if third != Some(' ') && third != Some('\t') && third.is_some() {
+                        let is_comment = self
+                            .peek_ahead_n(2)
+                            .is_none_or(|c| c.is_whitespace() || c.is_control());
+                        if !is_comment {
                             break; // not a comment in MySQL — leave for operator lexing
                         }
                     }
@@ -3137,7 +3787,7 @@ impl<'src> Lexer<'src> {
                     self.bump(); // consume '-'
                     self.bump(); // consume '-'
                     while let Some(c) = self.peek_char() {
-                        if c == '\n' || c == '\r' {
+                        if c == '\n' || c == '\r' || self.at_dollar_words_close(start) {
                             break; // stop before newline
                         }
                         self.bump();
@@ -3169,9 +3819,15 @@ impl<'src> Lexer<'src> {
                 break;
             }
         }
-        crate::lexer::LexResult { tokens }
+        crate::lexer::LexResult {
+            tokens,
+            dollar_quotes: self.dollar_quotes,
+        }
     }
 }
+
+/// psql's command that runs a `COPY` from the client.
+const PSQL_COPY: &str = "\\copy";
 
 fn is_identifier_start(ch: char) -> bool {
     // Allow ASCII letters and underscore for the first character.
@@ -3179,7 +3835,7 @@ fn is_identifier_start(ch: char) -> bool {
     ch.is_ascii_alphabetic() || ch == '_'
 }
 
-fn is_identifier_continue(ch: char) -> bool {
+pub(super) fn is_identifier_continue(ch: char) -> bool {
     // Base identifier continuation: alphanumeric, underscore, and Unicode.
     // Does NOT include $ or # — those are dialect-specific via extra_identifier_chars().
     // Use Lexer::is_ident_continue() for dialect-aware checks.

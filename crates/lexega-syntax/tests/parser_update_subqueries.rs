@@ -12,7 +12,7 @@ fn test_update_with_subquery_in_set_clause() {
 
     let script = parse_sql(src).expect("Failed to parse");
 
-    if let Some(ast::AstStmt::Update(update)) = script.stmts.first().map(|s| s) {
+    if let Some(ast::AstStmt::Update(update)) = script.stmts.first() {
         // Should have exactly 1 assignment
         assert_eq!(update.set_assignments.len(), 1, "Expected 1 SET assignment");
 
@@ -55,7 +55,7 @@ fn test_update_with_multiple_subqueries() {
 
     let script = parse_sql(src).expect("Failed to parse");
 
-    if let Some(ast::AstStmt::Update(update)) = script.stmts.first().map(|s| s) {
+    if let Some(ast::AstStmt::Update(update)) = script.stmts.first() {
         // Should have exactly 3 assignments
         assert_eq!(
             update.set_assignments.len(),
@@ -90,7 +90,7 @@ fn test_update_with_real_from_and_subquery() {
 
     let script = parse_sql(src).expect("Failed to parse");
 
-    if let Some(ast::AstStmt::Update(update)) = script.stmts.first().map(|s| s) {
+    if let Some(ast::AstStmt::Update(update)) = script.stmts.first() {
         // Should have exactly 2 assignments
         assert_eq!(
             update.set_assignments.len(),

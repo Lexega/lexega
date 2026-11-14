@@ -56,6 +56,7 @@ fn scoped_temp_table_is_analyzed_not_opaque() {
 
 #[test]
 fn scoped_temp_table_parses_as_a_table() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     // The helper's expect asserts an AstStmt::CreateTable was produced (not a
     // procedure, not opaque).
     let (scoped, temporary) = scoped_temp_flags("CREATE PROCEDURE SCOPED TEMP TABLE tt (a INT);");
@@ -65,6 +66,7 @@ fn scoped_temp_table_parses_as_a_table() {
 
 #[test]
 fn scoped_temporary_keyword_variant() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let (scoped, temporary) = scoped_temp_flags(
         "CREATE OR REPLACE PROCEDURE SCOPED TEMPORARY TABLE db.sch.tt (a INT, b VARCHAR(10));",
     );
@@ -76,6 +78,7 @@ fn scoped_temporary_keyword_variant() {
 
 #[test]
 fn ordinary_temporary_table_is_not_scoped() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let (scoped, temporary) = scoped_temp_flags("CREATE TEMPORARY TABLE t (a INT);");
     assert!(!scoped, "a session temp table is not procedure-scoped");
     assert!(temporary);
@@ -83,6 +86,7 @@ fn ordinary_temporary_table_is_not_scoped() {
 
 #[test]
 fn ordinary_table_is_neither() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let (scoped, temporary) = scoped_temp_flags("CREATE TABLE t (a INT);");
     assert!(!scoped);
     assert!(!temporary);

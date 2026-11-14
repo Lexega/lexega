@@ -99,22 +99,46 @@ pub fn format_select(printer: &mut Printer, stmt: &AstStmt) -> Result<(), Format
 /// Format a SELECT statement (internal implementation)
 fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), FormatterError> {
     with_recursion_guard!(printer, "SELECT statement", {
+        // The statement starts at its `(` where it is parenthesised, or at a
+        // `WITH` written before the `(`.
+        let parens = select
+            .paren_syntax_id
+            .and_then(|id| printer.get_subquery(id));
+        let start = [
+            Some(select.span.start),
+            parens.map(|p| p.span.start),
+            select.with_clause.as_ref().map(|w| w.span.start),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(select.span.start);
         // Set source cursor to start of this statement for trivia tracking
-        printer.reset_token_index_at(select.span.start);
+        printer.reset_token_index_at(start);
 
         // Emit any leading comments attached to this SELECT statement (V2 gap-based)
-        printer.emit_comments_before(select.span.start);
+        printer.emit_comments_before(start);
 
-        // Format WITH clause (CTEs) if present
+        // The WITH clause, before the parentheses or inside them.
+        let with_inside = match (&select.with_clause, parens) {
+            (Some(with_clause), Some(parens)) => with_clause.span.start > parens.span.start,
+            (Some(_), None) | (None, Some(_)) | (None, None) => false,
+        };
         if let Some(ref with_clause) = select.with_clause {
-            format_with_clause(printer, with_clause)?;
-            printer.newline();
+            if !with_inside {
+                format_with_clause(printer, with_clause)?;
+                printer.newline();
+            }
         }
 
         // Emit opening paren if this SELECT is parenthesized (e.g., in set operations)
         if let Some(paren_id) = select.paren_syntax_id {
-            if let Some(subquery) = printer.get_subquery(paren_id) {
-                printer.push_token_id(subquery.l_paren);
+            push_open_parens(printer, paren_id);
+        }
+        if let Some(ref with_clause) = select.with_clause {
+            if with_inside {
+                format_with_clause(printer, with_clause)?;
+                printer.newline();
             }
         }
 
@@ -128,7 +152,27 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
         }
 
         // Set quantifier (DISTINCT/ALL)
-        if let Some(quantifier) = select.set_quantifier.as_deref() {
+        // MySQL's select options, written in source order with ALL /
+        // DISTINCT among them.
+        if !select.select_options.is_empty() {
+            let quantifier = match select.set_quantifier.as_deref() {
+                Some(
+                    crate::ast::AstSetQuantifier::All | crate::ast::AstSetQuantifier::Distinct,
+                ) => select.set_quantifier_span,
+                Some(crate::ast::AstSetQuantifier::DistinctOn { .. }) | None => None,
+            };
+            let mut words: Vec<Span> = select
+                .select_options
+                .iter()
+                .copied()
+                .chain(quantifier)
+                .collect();
+            words.sort_by_key(|span| span.start);
+            for word in words {
+                printer.push(" ");
+                printer.push_keyword_span(word);
+            }
+        } else if let Some(quantifier) = select.set_quantifier.as_deref() {
             printer.push(" ");
             match quantifier {
                 crate::ast::AstSetQuantifier::All => {
@@ -220,6 +264,39 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
             _ => false,
         };
 
+        // `INTO :var1, :var2` (Snowflake / MySQL / Oracle / PL/pgSQL), where
+        // it was written: PL/pgSQL may write it before the select list.
+        let format_into_vars = |printer: &mut Printer, vars: &[Span], strict_span: Option<Span>| {
+            printer.push(" ");
+            printer.push_keyword("INTO");
+            if let Some(strict_span) = strict_span {
+                printer.space();
+                printer.push_span(strict_span);
+            }
+            for (idx, var_span) in vars.iter().enumerate() {
+                if idx > 0 {
+                    printer.push_comma();
+                }
+                if printer.config().space_after_comma || idx == 0 {
+                    printer.space();
+                }
+                printer.push_span(*var_span);
+            }
+        };
+        let leading_into = match select.into_target.as_deref() {
+            Some(crate::ast::AstSelectIntoTarget::ScriptingVars { vars, strict_span })
+                if vars
+                    .first()
+                    .is_some_and(|var| var.start < select.projection.span.start) =>
+            {
+                Some((vars.as_slice(), *strict_span))
+            }
+            Some(_) | None => None,
+        };
+        if let Some((vars, strict_span)) = leading_into {
+            format_into_vars(printer, vars, strict_span);
+        }
+
         if multiline_projection {
             printer.newline();
             // Always indent when multiline, regardless of indent_select_items config
@@ -236,22 +313,18 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
         //   - ScriptingVars: `INTO :var1, :var2` (Snowflake / MySQL / Oracle).
         //   - NewTable: `INTO [TEMP|TEMPORARY|UNLOGGED] tbl [ON filegroup]`
         //     (MSSQL / PostgreSQL CTAS).
-        if let Some(it) = select.into_target.as_deref() {
+        if let Some(it) = select
+            .into_target
+            .as_deref()
+            .filter(|_| leading_into.is_none())
+        {
             match it {
-                crate::ast::AstSelectIntoTarget::ScriptingVars(vars) if !vars.is_empty() => {
-                    printer.push(" ");
-                    printer.push_keyword("INTO");
-                    for (idx, var_span) in vars.iter().enumerate() {
-                        if idx > 0 {
-                            printer.push_comma();
-                        }
-                        if printer.config().space_after_comma || idx == 0 {
-                            printer.space();
-                        }
-                        printer.push_span(*var_span);
-                    }
+                crate::ast::AstSelectIntoTarget::ScriptingVars { vars, strict_span }
+                    if !vars.is_empty() =>
+                {
+                    format_into_vars(printer, vars, *strict_span);
                 }
-                crate::ast::AstSelectIntoTarget::ScriptingVars(_) => {
+                crate::ast::AstSelectIntoTarget::ScriptingVars { .. } => {
                     // Empty list — no INTO emission.
                 }
                 crate::ast::AstSelectIntoTarget::NewTable(nt) => {
@@ -308,14 +381,36 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
             format_where_clause_tracked(printer, where_clause, search_after)?;
         }
 
+        // CONNECT BY written before GROUP BY / HAVING / QUALIFY, where it is.
+        let grouping_start = [
+            select.group_by.as_ref().map(|g| g.span.start),
+            select.having.as_ref().map(|c| c.span.start),
+            select.qualify.as_ref().map(|c| c.span.start),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let connect_by_first = select
+            .connect_by
+            .as_ref()
+            .zip(grouping_start)
+            .is_some_and(|(connect_by, grouping)| connect_by.span.start < grouping);
+        if connect_by_first {
+            if let Some(ref connect_by) = select.connect_by {
+                format_connect_by_clause(printer, connect_by)?;
+            }
+        }
+
         // GROUP BY clause
         if let Some(ref group_by) = select.group_by {
             printer.newline_if_needed();
-            // Search after WHERE or FROM or SELECT
+            // Search after CONNECT BY or WHERE or FROM or SELECT
             let search_after = select
-                .where_clause
+                .connect_by
                 .as_ref()
+                .filter(|_| connect_by_first)
                 .map(|c| c.span.end)
+                .or_else(|| select.where_clause.as_ref().map(|c| c.span.end))
                 .or_else(|| select.from.last().map(|t| get_from_item_span(t).end))
                 .unwrap_or(select.select_span.end);
             format_group_by_clause_tracked(printer, group_by, search_after)?;
@@ -351,8 +446,10 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
         }
 
         // CONNECT BY clause (hierarchical queries)
-        if let Some(ref connect_by) = select.connect_by {
-            format_connect_by_clause(printer, connect_by)?;
+        if !connect_by_first {
+            if let Some(ref connect_by) = select.connect_by {
+                format_connect_by_clause(printer, connect_by)?;
+            }
         }
 
         // WINDOW clause (named window definitions, PostgreSQL)
@@ -469,16 +566,14 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
         }
 
         // Dialect extension clauses that trail standard SELECT clauses.
-        for clause_span in select.post_locking_extension_clauses.iter() {
+        for clause in select.post_locking_extension_clauses.iter() {
             printer.newline_if_needed();
-            printer.push_span(*clause_span);
+            printer.push_span(clause.span);
         }
 
         // Emit closing paren if this SELECT is parenthesized (e.g., in set operations)
         if let Some(paren_id) = select.paren_syntax_id {
-            if let Some(subquery) = printer.get_subquery(paren_id) {
-                printer.push_token_id(subquery.r_paren);
-            }
+            push_close_parens(printer, paren_id, select.outer_tail.as_deref())?;
         }
 
         // Emit semicolon if captured from scripting context
@@ -488,6 +583,76 @@ fn format_select_inner(printer: &mut Printer, select: &AstSelect) -> Result<(), 
 
         Ok(())
     })
+}
+
+/// The `(`s around a parenthesised query, `id` the outermost pair: each
+/// from the source, outermost first, with the comments after it.
+pub(crate) fn push_open_parens(printer: &mut Printer, id: crate::syntax::SyntaxSubqueryId) {
+    let mut next = Some(id);
+    while let Some(parens) = next.and_then(|id| printer.get_subquery(id)) {
+        printer.push_token_id(parens.l_paren);
+        next = parens.inner;
+    }
+}
+
+/// The `)`s around a parenthesised query, `id` the outermost pair: each
+/// from the source, innermost first, and the query's `tail` after the `)`
+/// it is written after.
+pub(crate) fn push_close_parens(
+    printer: &mut Printer,
+    id: crate::syntax::SyntaxSubqueryId,
+    tail: Option<&crate::ast::AstQueryTail>,
+) -> Result<(), FormatterError> {
+    let mut pairs = Vec::new();
+    let mut next = Some(id);
+    while let Some(parens) = next.and_then(|id| printer.get_subquery(id)) {
+        pairs.push(parens);
+        next = parens.inner;
+    }
+    let mut tail = tail;
+    for (at, parens) in pairs.iter().enumerate().rev() {
+        printer.push_token_id(parens.r_paren);
+        // The tail is written here where it stands inside the next pair out,
+        // or there is none.
+        let here = at
+            .checked_sub(1)
+            .and_then(|outer| pairs.get(outer))
+            .is_none_or(|outer| tail.is_some_and(|t| t.query_span.end < outer.span.end));
+        if here {
+            format_outer_tail(printer, tail.take(), parens.r_paren)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `ORDER BY` / `LIMIT` / `OFFSET` written after the `)` of a
+/// parenthesised query, `r_paren` that `)`.
+pub(crate) fn format_outer_tail(
+    printer: &mut Printer,
+    tail: Option<&crate::ast::AstQueryTail>,
+    r_paren: crate::cst::TokenId,
+) -> Result<(), FormatterError> {
+    let Some(tail) = tail else {
+        return Ok(());
+    };
+    let body_end = printer
+        .get_token_by_id(r_paren)
+        .map_or(tail.query_span.start, |t| t.span.end);
+    if let Some(ref order_by) = tail.order_by {
+        printer.newline();
+        format_order_by_clause_tracked(printer, order_by, body_end)?;
+    }
+    let limit_prev_end = tail.order_by.as_ref().map_or(body_end, |o| o.span.end);
+    format_limit_offset_tail(
+        printer,
+        tail.limit.as_deref(),
+        tail.offset.as_deref(),
+        tail.limit_keyword_span,
+        tail.fetch_clause_span,
+        tail.offset_keyword_span,
+        tail.limit_offset_comma_span,
+        limit_prev_end,
+    )
 }
 
 pub fn format_with_clause(
@@ -1205,7 +1370,7 @@ fn format_projection(
 
                     if !prev_has_internal_commas {
                         if leading_comma && multiline {
-                            printer.newline_if_needed();
+                            printer.break_before_comma();
                             // Leading comma style - emit comma before current item
                             let prev_span = get_projection_item_span(prev_item);
                             let curr_span = get_projection_item_span(item);
@@ -1216,7 +1381,7 @@ fn format_projection(
                         } else {
                             // Trailing comma style - comma was emitted after previous item
                             if multiline {
-                                printer.newline_if_needed();
+                                printer.break_before_item(get_projection_item_span(item));
                             } else {
                                 printer.space();
                             }
@@ -1319,6 +1484,14 @@ fn format_projection_item(
                 printer.push_span(at.assign_op_span);
                 printer.push(" ");
             }
+            // T-SQL `column_alias = expression`: the alias and its `=` first.
+            let alias_first = select_item.alias_first.zip(select_item.alias.as_ref());
+            if let Some((eq, alias)) = alias_first {
+                format_identifier(printer, &alias.ident)?;
+                printer.push(" ");
+                printer.push_span(eq);
+                printer.push(" ");
+            }
 
             // Recursively format expression
             format_expression(printer, &select_item.expr)?;
@@ -1331,7 +1504,7 @@ fn format_projection_item(
             let last_line_width = last_line.trim_start().len();
 
             // Format alias if present
-            if let Some(ref alias) = select_item.alias {
+            if let Some(alias) = select_item.alias.as_ref().filter(|_| alias_first.is_none()) {
                 // Calculate padding for alignment if enabled
                 if max_expr_width > 0 && last_line_width <= max_expr_width {
                     let padding = max_expr_width - last_line_width + 1; // +1 for minimum space
@@ -1411,6 +1584,14 @@ fn format_projection_item_collect_alignment(
                 printer.push_span(at.assign_op_span);
                 printer.push(" ");
             }
+            // T-SQL `column_alias = expression`: the alias and its `=` first.
+            let alias_first = select_item.alias_first.zip(select_item.alias.as_ref());
+            if let Some((eq, alias)) = alias_first {
+                format_identifier(printer, &alias.ident)?;
+                printer.push(" ");
+                printer.push_span(eq);
+                printer.push(" ");
+            }
 
             // Recursively format expression
             format_expression(printer, &select_item.expr)?;
@@ -1427,7 +1608,7 @@ fn format_projection_item_collect_alignment(
             let mut alignment_info: Option<(usize, usize)> = None;
 
             // Format alias if present
-            if let Some(ref alias) = select_item.alias {
+            if let Some(alias) = select_item.alias.as_ref().filter(|_| alias_first.is_none()) {
                 // Record position BEFORE adding the single space (where padding would be inserted)
                 let padding_insert_pos = printer.output_pos();
 
@@ -1982,7 +2163,7 @@ fn format_from_clause_tracked(
 
             if leading_comma && multi_line {
                 // Leading comma style: newline, then comma before current item
-                printer.newline_if_needed();
+                printer.break_before_comma();
                 if prev_end > 0 && curr_start < u32::MAX {
                     printer.push_comma_from_source(prev_end, curr_start);
                 } else {
@@ -1999,7 +2180,14 @@ fn format_from_clause_tracked(
                     printer.push_comma();
                 }
                 if multi_line {
-                    printer.newline_if_needed();
+                    match &item.kind {
+                        FromItemKind::TableRef(table_ref) => {
+                            printer.break_before_item(table_ref.span)
+                        }
+                        FromItemKind::JinjaBlock(_) | FromItemKind::JinjaTableName(_) => {
+                            printer.newline_if_needed()
+                        }
+                    }
                 } else {
                     // Always add space after comma in FROM clauses for readability
                     // (FROM t1,t2 looks wrong; FROM t1, t2 is correct)
@@ -2445,8 +2633,11 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
             }
         }
 
-        // Handle subquery: (SELECT ...)
-        if let Some(ref subquery) = table.subquery {
+        // An aliased join group: the group as written, not the `SELECT *`
+        // it is read as.
+        if let Some(group_table) = aliased_group_table(table) {
+            format_table_ref(printer, group_table)?;
+        } else if let Some(ref subquery) = table.subquery {
             if table.lateral_keyword_span.is_some() {
                 printer.push_keyword("LATERAL");
                 printer.space();
@@ -2549,6 +2740,10 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
                     }
                 }
 
+                // MySQL's `ROW` before the row.
+                if let Some(Some(row)) = values.row_keywords.get(idx) {
+                    printer.push_keyword_span(*row);
+                }
                 // Emit row opening paren with trivia from CST
                 if let Some(id) = values.syntax_id {
                     if let Some(syntax) = printer.get_values(id) {
@@ -2638,8 +2833,9 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
                     .next()
                     .unwrap_or("");
                 let is_tvf = printer.dialect().is_table_valued_function(first_word);
-                if is_tvf {
-                    // Direct table-valued function call (e.g., UNNEST([1,2,3]))
+                if is_tvf || table.name.parts.is_some() {
+                    // Direct table-valued function call (e.g., UNNEST([1,2,3])),
+                    // or one called after its name (`dbo.fn(1)`)
                     format_expression(printer, table_func)?;
                 } else {
                     // Non-lateral UDTF uses TABLE(...) wrapper (Snowflake style)
@@ -2655,7 +2851,10 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
                 printer.push_keyword_span(only_span);
                 printer.space();
             }
-            format_object_ref(printer, &table.name)?;
+            match table.stream_span {
+                Some(stream_span) => printer.push_span(stream_span),
+                None => format_object_ref(printer, &table.name)?,
+            }
         }
 
         // Format MySQL partition selection: tbl PARTITION (p0, p1) — between
@@ -2669,6 +2868,12 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
         if let Some(schema_span) = table.tvf_schema_span {
             printer.push(" ");
             printer.push_span(schema_span);
+        }
+
+        // PostgreSQL `WITH ORDINALITY`.
+        if let Some(ordinality_span) = table.with_ordinality_span {
+            printer.space();
+            printer.push_keyword_span(ordinality_span);
         }
 
         // Format stage options: ( FILE_FORMAT => '...', PATTERN => '...' )
@@ -2691,9 +2896,14 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
             && table.result_alias.is_some()
             && (table.pivot.is_some() || table.unpivot.is_some());
 
-        // Format alias if present and NOT deferred
-        if !defer_alias {
+        // Format alias if present and NOT deferred; an aliased join group's
+        // is written after its `)`.
+        if !defer_alias && aliased_group_table(table).is_none() {
             format_table_alias_helper(printer, table)?;
+            // A table function's column-definition list, as written.
+            if let Some(definitions) = table.column_definitions_span {
+                printer.push_span(definitions);
+            }
         }
 
         // Format WITH OFFSET [AS alias] (BigQuery UNNEST modifier)
@@ -2848,6 +3058,7 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
             if Some(idx) == paren_inner_count {
                 if let Some(pg) = table.paren_group.as_deref() {
                     printer.push_span(pg.rparen_span);
+                    push_group_alias(printer, pg);
                 }
             }
             if printer.config().joins_on_newlines {
@@ -2860,6 +3071,7 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
             let inner_count = paren_inner_count.unwrap_or(0);
             if inner_count >= table.joins.len() {
                 printer.push_span(pg.rparen_span);
+                push_group_alias(printer, pg);
             }
         }
 
@@ -2867,6 +3079,29 @@ pub fn format_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<()
 
         Ok(())
     })
+}
+
+/// The tables of an aliased join group (`(a JOIN b ON …) AS j`), which the
+/// reference holds as the `SELECT *` over them it is read as.
+fn aliased_group_table(table: &AstTableRef) -> Option<&AstTableRef> {
+    table.paren_group.as_deref()?.alias_span?;
+    let Some(crate::ast::AstStmt::Select(select)) = table.subquery.as_deref() else {
+        return None;
+    };
+    match &select.from.first()?.kind {
+        crate::ast::FromItemKind::TableRef(group_table) => Some(group_table),
+        crate::ast::FromItemKind::JinjaBlock(_) | crate::ast::FromItemKind::JinjaTableName(_) => {
+            None
+        }
+    }
+}
+
+/// The alias written after a join group's `)`, as written.
+fn push_group_alias(printer: &mut Printer, group: &crate::ast::ParenGroupInfo) {
+    if let Some(alias_span) = group.alias_span {
+        printer.space();
+        printer.push_span(alias_span);
+    }
 }
 
 /// Format AT/BEFORE time travel clause
@@ -3096,16 +3331,11 @@ fn format_unpivot_clause(
 ) -> Result<(), FormatterError> {
     printer.push_keyword_span(unpivot.unpivot_span);
 
-    // INCLUDE/EXCLUDE NULLS
+    // INCLUDE/EXCLUDE NULLS, only where written: a dialect without the
+    // clause rejects it.
     if let Some(include_exclude_nulls_span) = unpivot.include_exclude_nulls_span {
         printer.push(" ");
         printer.push_keyword_span(include_exclude_nulls_span);
-    } else if unpivot.include_nulls {
-        printer.push(" ");
-        printer.push_keyword("INCLUDE NULLS");
-    } else {
-        printer.push(" ");
-        printer.push_keyword("EXCLUDE NULLS");
     }
 
     printer.push(" ");
@@ -3988,6 +4218,7 @@ fn calculate_join_alignment_widths(
             }
         } else {
             match join.kind {
+                AstJoinKind::Inner if join.straight_join_span.is_some() => "STRAIGHT_JOIN".len(),
                 AstJoinKind::Inner => "JOIN".len(),
                 AstJoinKind::LeftOuter => "LEFT OUTER JOIN".len(),
                 AstJoinKind::RightOuter => "RIGHT OUTER JOIN".len(),
@@ -3998,8 +4229,11 @@ fn calculate_join_alignment_widths(
                 AstJoinKind::NaturalLeftOuter => "NATURAL LEFT OUTER JOIN".len(),
                 AstJoinKind::NaturalRightOuter => "NATURAL RIGHT OUTER JOIN".len(),
                 AstJoinKind::NaturalFullOuter => "NATURAL FULL OUTER JOIN".len(),
+                AstJoinKind::LeftSemi => "LEFT SEMI JOIN".len(),
+                AstJoinKind::LeftAnti => "LEFT ANTI JOIN".len(),
             }
         };
+        let join_keyword_width = join_keyword_width + join_hint_width(join);
         max_join_keyword_width = max_join_keyword_width.max(join_keyword_width);
 
         // Calculate table reference width if align_join_conditions is enabled
@@ -4018,6 +4252,20 @@ fn calculate_join_alignment_widths(
     }
 
     (max_join_keyword_width, max_table_width)
+}
+
+/// `LEFT SEMI JOIN` / `SEMI JOIN` or `LEFT ANTI JOIN` / `ANTI JOIN`, with
+/// `LEFT` where the source writes it; the keywords' width.
+fn format_semi_or_anti_join(printer: &mut Printer, side: &str) -> usize {
+    let has_left = printer.has_keyword_before("LEFT", "JOIN");
+    if has_left {
+        printer.push_keyword("LEFT");
+        printer.push(" ");
+    }
+    printer.push_keyword(side);
+    printer.push(" ");
+    printer.push_keyword("JOIN");
+    usize::from(has_left) * "LEFT ".len() + side.len() + " JOIN".len()
 }
 
 /// Format just the table reference part of a join (for width calculation)
@@ -4039,7 +4287,8 @@ fn format_join_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<(
             printer.push_keyword("LATERAL");
             printer.push(" ");
             format_expression(printer, table_func)?;
-        } else if is_tvf {
+        } else if is_tvf || table.name.parts.is_some() {
+            // A built-in table function, or one called after its name.
             format_expression(printer, table_func)?;
         } else {
             printer.push_keyword("TABLE");
@@ -4065,6 +4314,20 @@ fn format_join_table_ref(printer: &mut Printer, table: &AstTableRef) -> Result<(
     emit_suffix_inline_fragments(printer, &table.suffix_inline_fragments);
 
     Ok(())
+}
+
+/// Prints the T-SQL join hint `join` is written with, before its `JOIN`.
+fn push_join_hint(printer: &mut Printer, join: &crate::ast::AstJoin) {
+    if let Some(hint) = join.join_hint {
+        printer.push_keyword_span(hint.span);
+        printer.push(" ");
+    }
+}
+
+/// The width the join hint of `join` adds to its join keywords.
+fn join_hint_width(join: &crate::ast::AstJoin) -> usize {
+    join.join_hint
+        .map_or(0, |hint| (hint.span.end - hint.span.start) as usize + 1)
 }
 
 fn format_join(
@@ -4146,14 +4409,20 @@ fn format_join(
     }
 
     let join_keyword_width = match join.kind {
+        // MySQL `STRAIGHT_JOIN`, written in place of `JOIN`.
+        AstJoinKind::Inner if join.straight_join_span.is_some() => {
+            printer.push_keyword("STRAIGHT_JOIN");
+            "STRAIGHT_JOIN".len()
+        }
         AstJoinKind::Inner => {
             // Check if source had explicit INNER keyword
             let has_inner = printer.has_keyword_before("INNER", "JOIN");
             if has_inner {
                 printer.push_keyword("INNER");
                 printer.push(" ");
+                push_join_hint(printer, join);
                 printer.push_keyword("JOIN");
-                "INNER JOIN".len()
+                "INNER JOIN".len() + join_hint_width(join)
             } else {
                 printer.push_keyword("JOIN");
                 "JOIN".len()
@@ -4168,12 +4437,14 @@ fn format_join(
                 printer.push_keyword("OUTER");
                 printer.push(" ");
             }
+            push_join_hint(printer, join);
             printer.push_keyword("JOIN");
-            if normalize || has_outer {
-                "LEFT OUTER JOIN".len()
-            } else {
-                "LEFT JOIN".len()
-            }
+            join_hint_width(join)
+                + if normalize || has_outer {
+                    "LEFT OUTER JOIN".len()
+                } else {
+                    "LEFT JOIN".len()
+                }
         }
         AstJoinKind::RightOuter => {
             printer.push_keyword("RIGHT");
@@ -4183,12 +4454,14 @@ fn format_join(
                 printer.push_keyword("OUTER");
                 printer.push(" ");
             }
+            push_join_hint(printer, join);
             printer.push_keyword("JOIN");
-            if normalize || has_outer {
-                "RIGHT OUTER JOIN".len()
-            } else {
-                "RIGHT JOIN".len()
-            }
+            join_hint_width(join)
+                + if normalize || has_outer {
+                    "RIGHT OUTER JOIN".len()
+                } else {
+                    "RIGHT JOIN".len()
+                }
         }
         AstJoinKind::FullOuter => {
             printer.push_keyword("FULL");
@@ -4198,12 +4471,14 @@ fn format_join(
                 printer.push_keyword("OUTER");
                 printer.push(" ");
             }
+            push_join_hint(printer, join);
             printer.push_keyword("JOIN");
-            if normalize || has_outer {
-                "FULL OUTER JOIN".len()
-            } else {
-                "FULL JOIN".len()
-            }
+            join_hint_width(join)
+                + if normalize || has_outer {
+                    "FULL OUTER JOIN".len()
+                } else {
+                    "FULL JOIN".len()
+                }
         }
         AstJoinKind::Cross => {
             printer.push_keyword("CROSS");
@@ -4211,6 +4486,8 @@ fn format_join(
             printer.push_keyword("JOIN");
             "CROSS JOIN".len()
         }
+        AstJoinKind::LeftSemi => format_semi_or_anti_join(printer, "SEMI"),
+        AstJoinKind::LeftAnti => format_semi_or_anti_join(printer, "ANTI"),
         AstJoinKind::Asof => {
             printer.push_keyword("ASOF");
             printer.push(" ");
@@ -4540,7 +4817,7 @@ fn format_group_by_body(
                     // Not first item
                     let item_start = item.expr.span().start;
                     if leading_comma && multiline {
-                        printer.newline_if_needed();
+                        printer.break_before_comma();
                         printer.push_comma_from_source(prev, item_start);
                         if printer.config().space_after_comma {
                             printer.space();
@@ -4549,7 +4826,7 @@ fn format_group_by_body(
                         // Trailing comma style
                         printer.push_comma_from_source(prev, item_start);
                         if multiline {
-                            printer.newline_if_needed();
+                            printer.break_before_item(item.expr.span());
                         } else if printer.config().space_after_comma {
                             printer.space();
                         }
@@ -4577,14 +4854,17 @@ fn format_group_by_body(
                     AstGroupElementKind::Expr(item) => {
                         format_expression(printer, &item.expr)?;
                     }
-                    AstGroupElementKind::Cube(items) => {
-                        format_group_paren_op(printer, "CUBE", items)?;
+                    AstGroupElementKind::Cube { items, parens } => {
+                        format_group_paren_op(printer, "CUBE", items, *parens)?;
                     }
-                    AstGroupElementKind::Rollup(items) => {
-                        format_group_paren_op(printer, "ROLLUP", items)?;
+                    AstGroupElementKind::Rollup { items, parens } => {
+                        format_group_paren_op(printer, "ROLLUP", items, *parens)?;
                     }
-                    AstGroupElementKind::GroupingSets(sets) => {
-                        format_group_grouping_sets(printer, sets)?;
+                    AstGroupElementKind::GroupingSets { sets, parens } => {
+                        format_group_grouping_sets(printer, sets, *parens)?;
+                    }
+                    AstGroupElementKind::EmptySet => {
+                        printer.push_span(element.span);
                     }
                 }
             }
@@ -4611,9 +4891,10 @@ fn format_group_paren_op(
     printer: &mut Printer,
     keyword: &str,
     items: &[crate::ast::AstGroupItem],
+    parens: Span,
 ) -> Result<(), FormatterError> {
     printer.push_keyword(keyword);
-    printer.push("(");
+    push_group_list_paren(printer, parens, Paren::Open);
     let mut prev_end: Option<u32> = None;
     for item in items.iter() {
         if let Some(prev) = prev_end {
@@ -4625,27 +4906,71 @@ fn format_group_paren_op(
         format_expression(printer, &item.expr)?;
         prev_end = Some(item.expr.span().end);
     }
-    printer.push(")");
+    push_group_list_paren(printer, parens, Paren::Close);
     Ok(())
+}
+
+/// Which parenthesis of a list.
+#[derive(Clone, Copy)]
+enum Paren {
+    Open,
+    Close,
+}
+
+/// Prints the `(` or `)` of a `CUBE`, `ROLLUP` or `GROUPING SETS` list
+/// (`parens`, the list's `( … )`) from source, with the comments around it.
+fn push_group_list_paren(printer: &mut Printer, parens: Span, paren: Paren) {
+    match paren {
+        Paren::Open => printer.push_span(Span {
+            start: parens.start,
+            end: parens.start + 1,
+        }),
+        Paren::Close => printer.push_span(Span {
+            start: parens.end - 1,
+            end: parens.end,
+        }),
+    }
 }
 
 /// Format a `GROUPING SETS(...)` operator, starting at the keyword.
 fn format_group_grouping_sets(
     printer: &mut Printer,
-    sets: &[Vec<crate::ast::AstGroupItem>],
+    sets: &[crate::ast::AstGroupingSet],
+    parens: Span,
 ) -> Result<(), FormatterError> {
-    printer.push_keyword("GROUPING SETS");
-    printer.push("(");
-    for (i, set) in sets.iter().enumerate() {
-        if i > 0 {
-            printer.push_comma();
+    printer.push_keyword("GROUPING");
+    printer.push(" ");
+    printer.push_keyword("SETS");
+    push_group_list_paren(printer, parens, Paren::Open);
+    let mut prev_set_end: Option<u32> = None;
+    for set in sets.iter() {
+        let set_span = set.parens.or_else(|| {
+            let first = set.items.first()?.expr.span();
+            let last = set.items.last()?.expr.span();
+            Some(Span {
+                start: first.start,
+                end: last.end,
+            })
+        });
+        if let Some(prev) = prev_set_end {
+            match set_span {
+                Some(span) => printer.push_comma_from_source(prev, span.start),
+                None => printer.push_comma(),
+            }
             if printer.config().space_after_comma {
                 printer.space();
             }
         }
-        printer.push("(");
+        prev_set_end = set_span.map(|span| span.end);
+        // A set's parentheses, where it is written in them, from source.
+        if let Some(parens) = set.parens {
+            printer.push_span(Span {
+                start: parens.start,
+                end: parens.start + 1,
+            });
+        }
         let mut prev_end: Option<u32> = None;
-        for item in set.iter() {
+        for item in set.items.iter() {
             if let Some(prev) = prev_end {
                 printer.push_comma_from_source(prev, item.expr.span().start);
                 if printer.config().space_after_comma {
@@ -4655,9 +4980,14 @@ fn format_group_grouping_sets(
             format_expression(printer, &item.expr)?;
             prev_end = Some(item.expr.span().end);
         }
-        printer.push(")");
+        if let Some(parens) = set.parens {
+            printer.push_span(Span {
+                start: parens.end - 1,
+                end: parens.end,
+            });
+        }
     }
-    printer.push(")");
+    push_group_list_paren(printer, parens, Paren::Close);
     Ok(())
 }
 
@@ -4749,6 +5079,10 @@ fn format_connect_by_clause(
     printer.push(" ");
     printer.push_keyword("BY");
     printer.push(" ");
+    if let Some(nocycle) = connect_by.nocycle {
+        printer.push_keyword_span(nocycle);
+        printer.push(" ");
+    }
 
     // Format CONNECT BY conditions (joined by AND in source)
     for (idx, condition) in connect_by.conditions.iter().enumerate() {
@@ -4823,7 +5157,7 @@ fn format_order_by_body(
         } else if i > 0 {
             // Not first item - emit comma
             if leading_comma && multiline {
-                printer.newline_if_needed();
+                printer.break_before_comma();
                 if let Some(end_pos) = prev_item_end {
                     printer.push_comma_from_source(end_pos, item.span.start);
                 } else {
@@ -4840,7 +5174,7 @@ fn format_order_by_body(
                     printer.push_comma();
                 }
                 if multiline {
-                    printer.newline_if_needed();
+                    printer.break_before_item(item.span);
                 } else if printer.config().space_after_comma {
                     printer.space();
                 }
@@ -5063,6 +5397,123 @@ fn format_object_ref(
     Ok(())
 }
 
+/// The text of `operator` where its source is not at hand.
+fn binary_operator_text(operator: crate::ast::BinaryOperator) -> &'static str {
+    use crate::ast::BinaryOperator;
+    match operator {
+        BinaryOperator::Plus => "+",
+        BinaryOperator::Minus => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::Divide => "/",
+        BinaryOperator::Modulo => "%",
+        BinaryOperator::IntegerDivide => "DIV",
+        BinaryOperator::Equal => "=",
+        BinaryOperator::NotEqual => "!=",
+        BinaryOperator::LessThan => "<",
+        BinaryOperator::LessThanOrEqual => "<=",
+        BinaryOperator::GreaterThan => ">",
+        BinaryOperator::GreaterThanOrEqual => ">=",
+        BinaryOperator::NullSafeEqual => "<=>",
+        BinaryOperator::And => "AND",
+        BinaryOperator::Or => "OR",
+        BinaryOperator::LogicalOr => "||",
+        BinaryOperator::Not => "NOT",
+        BinaryOperator::LogicalAnd => "&&",
+        BinaryOperator::Xor => "XOR",
+        BinaryOperator::Concat => "||",
+        BinaryOperator::Like => "LIKE",
+        BinaryOperator::ILike => "ILIKE",
+        BinaryOperator::RLike => "RLIKE",
+        BinaryOperator::Distance => "<->",
+        // PostgreSQL array operators
+        BinaryOperator::ArrayContains => "@>",
+        BinaryOperator::ArrayContainedBy => "<@",
+        BinaryOperator::ArrayOverlap => "&&",
+        // PostgreSQL JSON operators
+        BinaryOperator::JsonField => "->",
+        BinaryOperator::JsonFieldText => "->>",
+        BinaryOperator::JsonPath => "#>",
+        BinaryOperator::JsonPathText => "#>>",
+        BinaryOperator::JsonContains => "@?",
+        BinaryOperator::JsonExists => "??",
+        BinaryOperator::JsonExistsAny => "?|",
+        BinaryOperator::JsonExistsAll => "?&",
+        // PostgreSQL regex operators
+        BinaryOperator::RegexMatch => "~",
+        BinaryOperator::RegexMatchI => "~*",
+        BinaryOperator::RegexNotMatch => "!~",
+        BinaryOperator::RegexNotMatchI => "!~*",
+        // Bitwise operators
+        BinaryOperator::LeftShift => "<<",
+        BinaryOperator::RightShift => ">>",
+        BinaryOperator::BitwiseXor => "^",
+        BinaryOperator::BitwiseXorPg => "#",
+        BinaryOperator::BitwiseAnd => "&",
+        BinaryOperator::BitwiseOr => "|",
+        BinaryOperator::Exponent => "^",
+        // PostgreSQL text-search, string and period operators
+        BinaryOperator::QueryMatch => "@@",
+        BinaryOperator::StartsWith => "^@",
+        BinaryOperator::Overlaps => "OVERLAPS",
+        // MySQL operators
+        BinaryOperator::SoundsLike => "SOUNDS LIKE",
+        BinaryOperator::MemberOf => "MEMBER OF",
+        // Prefix operators
+        BinaryOperator::BitwiseNot => "~",
+        BinaryOperator::Assign => ":=",
+        BinaryOperator::SquareRoot => "|/",
+        BinaryOperator::AbsoluteValue => "@",
+        BinaryOperator::BinaryCast => "BINARY",
+    }
+}
+
+/// The operator between two operands, with the spacing around it.
+fn format_infix_operator(
+    printer: &mut Printer,
+    operator: crate::ast::BinaryOperator,
+    syntax_id: crate::syntax::SyntaxBinaryOpId,
+) {
+    use crate::ast::BinaryOperator;
+    // Determine if operator is a keyword
+    let is_keyword_op = matches!(
+        operator,
+        BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Not
+            | BinaryOperator::Xor
+            | BinaryOperator::IntegerDivide
+            | BinaryOperator::Like
+            | BinaryOperator::ILike
+            | BinaryOperator::RLike
+            | BinaryOperator::Overlaps
+            | BinaryOperator::SoundsLike
+            | BinaryOperator::MemberOf
+    );
+
+    // Apply spacing before operator
+    if printer.config().spaces_around_operators {
+        printer.push(" ");
+    }
+
+    // Emit the operator's words with their trivia
+    if let Some(syntax) = printer.get_binary_op(syntax_id) {
+        printer.push_span(syntax.span);
+    } else {
+        // Fallback: reconstruct operator text (should not happen)
+        let op_str = binary_operator_text(operator);
+        if is_keyword_op {
+            printer.push_keyword(op_str);
+        } else {
+            printer.push(op_str);
+        }
+    }
+
+    // Apply spacing after operator
+    if printer.config().spaces_around_operators {
+        printer.push(" ");
+    }
+}
+
 pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), FormatterError> {
     with_recursion_guard!(printer, "expression", {
         // Leading trivia is handled by push_span/push_keyword_span/push_identifier_span centrally
@@ -5181,7 +5632,7 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
 
                         if leading_comma && start_new_line {
                             // Leading comma style on new line: newline then comma
-                            printer.newline();
+                            printer.break_before_comma();
                             printer.push_comma();
                             if printer.config().space_after_comma {
                                 printer.space();
@@ -5190,7 +5641,7 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
                             // Trailing comma style or same line continuation
                             printer.push_comma();
                             if start_new_line {
-                                printer.newline();
+                                printer.break_before_item(item.span());
                             } else if printer.config().space_after_comma {
                                 printer.space();
                             }
@@ -5279,87 +5730,48 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
                 }
                 printer.push(" ");
                 format_expression(printer, right)?;
-            } else {
-                // Normal binary operator - format left, operator, right
-                format_expression(printer, left)?;
-
-                // Determine if operator is a keyword
-                let is_keyword_op = matches!(
-                    operator,
-                    BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Not |
-                    BinaryOperator::Like | BinaryOperator::ILike | BinaryOperator::RLike
-                );
-
-                // Apply spacing before operator
-                if printer.config().spaces_around_operators {
-                    printer.push(" ");
-                }
-
-                // Emit operator token with trivia
+            } else if matches!(
+                operator,
+                BinaryOperator::BitwiseNot
+                    | BinaryOperator::SquareRoot
+                    | BinaryOperator::AbsoluteValue
+                    | BinaryOperator::BinaryCast
+            ) {
+                // A prefix symbol: the operator token, then the operand; a
+                // word stands apart from it.
                 if let Some(syntax) = printer.get_binary_op(*syntax_id) {
                     printer.push_token_id(syntax.op_token);
                 } else {
-                    // Fallback: reconstruct operator text (should not happen)
-                    let op_str = match operator {
-                        BinaryOperator::Plus => "+",
-                        BinaryOperator::Minus => "-",
-                        BinaryOperator::Multiply => "*",
-                        BinaryOperator::Divide => "/",
-                        BinaryOperator::Modulo => "%",
-                        BinaryOperator::Equal => "=",
-                        BinaryOperator::NotEqual => "!=",
-                        BinaryOperator::LessThan => "<",
-                        BinaryOperator::LessThanOrEqual => "<=",
-                        BinaryOperator::GreaterThan => ">",
-                        BinaryOperator::GreaterThanOrEqual => ">=",
-                        BinaryOperator::NullSafeEqual => "<=>",
-                        BinaryOperator::And => "AND",
-                        BinaryOperator::Or => "OR",
-                        BinaryOperator::LogicalOr => "||",
-                        BinaryOperator::Not => "NOT",
-                        BinaryOperator::Concat => "||",
-                        BinaryOperator::Like => "LIKE",
-                        BinaryOperator::ILike => "ILIKE",
-                        BinaryOperator::RLike => "RLIKE",
-                        BinaryOperator::Distance => "<->",
-                        // PostgreSQL array operators
-                        BinaryOperator::ArrayContains => "@>",
-                        BinaryOperator::ArrayContainedBy => "<@",
-                        BinaryOperator::ArrayOverlap => "&&",
-                        // PostgreSQL JSON operators
-                        BinaryOperator::JsonField => "->",
-                        BinaryOperator::JsonFieldText => "->>",
-                        BinaryOperator::JsonPath => "#>",
-                        BinaryOperator::JsonPathText => "#>>",
-                        BinaryOperator::JsonContains => "@?",
-                        BinaryOperator::JsonExists => "??",
-                        // PostgreSQL regex operators
-                        BinaryOperator::RegexMatch => "~",
-                        BinaryOperator::RegexMatchI => "~*",
-                        BinaryOperator::RegexNotMatch => "!~",
-                        BinaryOperator::RegexNotMatchI => "!~*",
-                        // Bitwise operators
-                        BinaryOperator::LeftShift => "<<",
-                        BinaryOperator::RightShift => ">>",
-                        BinaryOperator::BitwiseXor => "^",
-                        BinaryOperator::BitwiseXorPg => "#",
-                    };
-                    if is_keyword_op {
-                        printer.push_keyword(op_str);
-                    } else {
-                        printer.push(op_str);
-                    }
+                    printer.push(binary_operator_text(*operator));
                 }
-
-                // Apply spacing after operator
-                if printer.config().spaces_around_operators {
+                if matches!(operator, BinaryOperator::BinaryCast) {
                     printer.push(" ");
                 }
-
-                // Recursively format right operand
+                format_expression(printer, right)?;
+            } else {
+                // Normal binary operator - format left, operator, right
+                format_expression(printer, left)?;
+                format_infix_operator(printer, *operator, *syntax_id);
                 format_expression(printer, right)?;
             }
 
+            Ok(())
+        }
+
+        // A run of operators: each operand, the operator between each pair
+        AstExpr::OperatorChain {
+            operands,
+            operators,
+            ..
+        } => {
+            let mut operands = operands.iter();
+            if let Some(first) = operands.next() {
+                format_expression(printer, first)?;
+            }
+            for (operator, operand) in operators.iter().zip(operands) {
+                format_infix_operator(printer, operator.operator, operator.syntax_id);
+                format_expression(printer, operand)?;
+            }
             Ok(())
         }
 
@@ -5576,12 +5988,16 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
                 }
             }
 
-            // Arguments
+            // Arguments; one a keyword introduces follows the last with no comma.
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
-                    printer.push_comma();
-                    if printer.config().space_after_comma {
+                    if is_introduced_argument(arg) {
                         printer.space();
+                    } else {
+                        printer.push_comma();
+                        if printer.config().space_after_comma {
+                            printer.space();
+                        }
                     }
                 }
                 format_function_arg(printer, arg)?;
@@ -5804,6 +6220,11 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             printer.push_token_id(syntax_var.colon);
             // Emit variable name
             printer.push_span(*name_span);
+            Ok(())
+        }
+
+        AstExpr::SessionVarRef { span, .. } => {
+            printer.push_span(*span);
             Ok(())
         }
 
@@ -6278,6 +6699,13 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             Ok(())
         }
 
+        AstExpr::ConnectByRoot {
+            keyword_span, expr, ..
+        } => {
+            printer.push_keyword_span(*keyword_span);
+            printer.space();
+            format_expression(printer, expr)
+        }
         AstExpr::Prior { expr, .. } => {
             printer.push_keyword("PRIOR");
             printer.push(" ");
@@ -6294,17 +6722,35 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
         } => {
             format_expression(printer, expr)?;
 
-            printer.push(" ");
-            printer.push_keyword_span(*is_span);
-
-            if let Some(not) = not_span {
-                printer.push(" ");
-                printer.push_keyword_span(*not);
+            // A keyword the postfix spelling does not have is an empty span.
+            for keyword in [Some(*is_span), *not_span, Some(*null_span)]
+                .into_iter()
+                .flatten()
+            {
+                if keyword.start < keyword.end {
+                    printer.push(" ");
+                    printer.push_keyword_span(keyword);
+                }
             }
 
-            printer.push(" ");
-            printer.push_keyword_span(*null_span);
+            Ok(())
+        }
 
+        AstExpr::IsPredicate {
+            expr,
+            is_span,
+            not_span,
+            predicate_span,
+            ..
+        } => {
+            format_expression(printer, expr)?;
+            for keyword in [Some(*is_span), *not_span].into_iter().flatten() {
+                printer.push(" ");
+                printer.push_keyword_span(keyword);
+            }
+            // The predicate's words as written
+            printer.push(" ");
+            printer.push_span(*predicate_span);
             Ok(())
         }
 
@@ -6517,8 +6963,15 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             syntax_id,
             field_span,
             expr,
+            odbc_fn,
+            span,
             ..
         } => {
+            // In an ODBC escape: verbatim, braces and all, as a call there is.
+            if odbc_fn.is_some() {
+                printer.push_span(*span);
+                return Ok(());
+            }
             // Get syntax node for EXTRACT tokens
             let syntax_extract = printer
                 .get_extract(*syntax_id)
@@ -6565,8 +7018,15 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             syntax_id,
             needle,
             haystack,
+            odbc_fn,
+            span,
             ..
         } => {
+            // In an ODBC escape: verbatim, braces and all, as a call there is.
+            if odbc_fn.is_some() {
+                printer.push_span(*span);
+                return Ok(());
+            }
             // Get syntax node for POSITION tokens
             let syntax_position = printer
                 .get_position(*syntax_id)
@@ -6587,7 +7047,7 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
 
         AstExpr::Trim {
             syntax_id,
-            spec_span,
+            spec,
             chars,
             source,
             ..
@@ -6600,7 +7060,7 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             printer.push_token_id(syntax_trim.lparen);
             // Optional trim-spec keyword (BOTH/LEADING/TRAILING) — emit from the
             // AST span so source casing is preserved (mirrors EXTRACT's field).
-            if let Some(spec) = spec_span {
+            if let Some((_, spec)) = spec {
                 printer.push_span(*spec);
                 printer.push(" ");
             }
@@ -6720,7 +7180,7 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
         } => {
             // ODBC escape form ({fn F(args)}): span covers the braces — emit
             // verbatim (Pattern A) so the escape survives round-trips.
-            if *odbc_fn {
+            if odbc_fn.is_some() {
                 printer.push_span(*span);
                 return Ok(());
             }
@@ -6759,11 +7219,15 @@ pub fn format_expression(printer: &mut Printer, expr: &AstExpr) -> Result<(), Fo
             let mut prev_end: Option<u32> = None;
             for arg in args.iter() {
                 if let Some(prev) = prev_end {
-                    // Search for comma between previous arg and this arg
-                    let arg_start = get_function_arg_span(arg).start;
-                    printer.push_comma_from_source(prev, arg_start);
-                    if printer.config().space_after_comma {
+                    if is_introduced_argument(arg) {
                         printer.space();
+                    } else {
+                        // Search for comma between previous arg and this arg
+                        let arg_start = get_function_arg_span(arg).start;
+                        printer.push_comma_from_source(prev, arg_start);
+                        if printer.config().space_after_comma {
+                            printer.space();
+                        }
                     }
                 }
                 format_function_arg(printer, arg)?;
@@ -7215,6 +7679,16 @@ fn format_expression_with_boolean_splitting(
                 return Ok(());
             }
 
+            if matches!(
+                operator,
+                BinaryOperator::BitwiseNot
+                    | BinaryOperator::SquareRoot
+                    | BinaryOperator::AbsoluteValue
+                    | BinaryOperator::BinaryCast
+            ) {
+                return format_expression(printer, expr);
+            }
+
             let is_boolean = matches!(operator, BinaryOperator::And | BinaryOperator::Or);
 
             if is_boolean {
@@ -7292,9 +7766,9 @@ fn format_expression_with_boolean_splitting(
                     printer.push(" ");
                 }
 
-                // Emit operator token with trivia
+                // Emit the operator's words with their trivia
                 if let Some(syntax) = printer.get_binary_op(*syntax_id) {
-                    printer.push_token_id(syntax.op_token);
+                    printer.push_span(syntax.span);
                 } else {
                     // Fallback: reconstruct operator text
                     let op_str = match operator {
@@ -7389,8 +7863,28 @@ fn format_expression_with_boolean_splitting(
             Ok(())
         }
 
+        // A run of operators below AND / OR stays on one line
+        AstExpr::OperatorChain { .. } => format_expression(printer, expr),
+
         // For all other expression types, delegate to normal formatter
         _ => format_expression(printer, expr),
+    }
+}
+
+/// Whether a keyword, not a comma, separates this argument from the last.
+fn is_introduced_argument(arg: &crate::ast::AstFunctionArg) -> bool {
+    use crate::ast::AstFunctionArg;
+    match arg {
+        AstFunctionArg::Introduced { .. } => true,
+        AstFunctionArg::Positional(_)
+        | AstFunctionArg::Named { .. }
+        | AstFunctionArg::Lambda { .. }
+        | AstFunctionArg::AliasedArg { .. }
+        | AstFunctionArg::BulkArg { .. }
+        | AstFunctionArg::Unparsed { .. }
+        | AstFunctionArg::Table { .. }
+        | AstFunctionArg::DataType { .. }
+        | AstFunctionArg::NonValue { .. } => false,
     }
 }
 
@@ -7416,6 +7910,17 @@ fn get_function_arg_span(arg: &crate::ast::AstFunctionArg) -> crate::lexer::Span
         }
         AstFunctionArg::BulkArg { bulk_span, value } => crate::lexer::Span {
             start: bulk_span.start,
+            end: value.span().end,
+        },
+        AstFunctionArg::Unparsed { span }
+        | AstFunctionArg::Table { span, .. }
+        | AstFunctionArg::DataType { span, .. }
+        | AstFunctionArg::NonValue { span, .. } => *span,
+        AstFunctionArg::Introduced {
+            keyword_span,
+            value,
+        } => crate::lexer::Span {
+            start: keyword_span.start,
             end: value.span().end,
         },
     }
@@ -7473,7 +7978,83 @@ fn format_function_arg(
             printer.space();
             format_expression(printer, value)
         }
+        AstFunctionArg::Unparsed { span } | AstFunctionArg::Table { span, .. } => {
+            printer.push_span(*span);
+            Ok(())
+        }
+        AstFunctionArg::DataType { data_type, .. } => format_type_argument(printer, data_type),
+        // As the identifier and call it was read as before: each word in
+        // identifier case (`day`, `WEEK(MONDAY)`).
+        AstFunctionArg::NonValue { span, .. } => {
+            printer.push_words_within(*span);
+            Ok(())
+        }
+        AstFunctionArg::Introduced {
+            keyword_span,
+            value,
+        } => {
+            printer.push_keyword_span(*keyword_span);
+            printer.space();
+            match value {
+                crate::ast::AstIntroducedValue::Expr(value) => format_expression(printer, value),
+                crate::ast::AstIntroducedValue::DataType { data_type, .. } => {
+                    format_type_argument(printer, data_type)
+                }
+                crate::ast::AstIntroducedValue::Name(name) => format_identifier(printer, name),
+            }
+        }
     }
+}
+
+/// A call's data-type argument, printed as the call's other words are: its
+/// name and a `MAX` length in identifier case, a number as written, the
+/// parentheses and comma from the source.
+fn format_type_argument(
+    printer: &mut Printer,
+    data_type: &crate::ast::AstDataType,
+) -> Result<(), FormatterError> {
+    use crate::ast::AstDataType;
+    match data_type {
+        AstDataType::Simple { name_span } => printer.push_identifier_span_v2(*name_span),
+        AstDataType::WithPrecision {
+            syntax_id,
+            name_span,
+            precision_span,
+        } => {
+            let syntax = printer.get_type_precision(*syntax_id).ok_or_else(|| {
+                FormatterError::MissingSyntaxNode("SyntaxTypePrecision".to_string())
+            })?;
+            printer.push_identifier_span_v2(*name_span);
+            printer.push_token_id(syntax.l_paren);
+            printer.push_identifier_span_v2(*precision_span);
+            printer.push_token_id(syntax.r_paren);
+        }
+        AstDataType::WithPrecisionScale {
+            syntax_id,
+            name_span,
+            precision_span,
+            scale_span,
+        } => {
+            let syntax = printer
+                .get_type_precision_scale(*syntax_id)
+                .ok_or_else(|| {
+                    FormatterError::MissingSyntaxNode("SyntaxTypePrecisionScale".to_string())
+                })?;
+            printer.push_identifier_span_v2(*name_span);
+            printer.push_token_id(syntax.l_paren);
+            printer.push_span(*precision_span);
+            printer.push_comma_from_source(precision_span.end, scale_span.start);
+            if printer.config().space_after_comma {
+                printer.space();
+            }
+            printer.push_span(*scale_span);
+            printer.push_token_id(syntax.r_paren);
+        }
+        AstDataType::Parameterized { .. } | AstDataType::CompoundInterval { .. } => {
+            format_data_type(printer, data_type)?;
+        }
+    }
+    Ok(())
 }
 
 fn format_data_type(

@@ -6,7 +6,7 @@
 //! Covers:
 //! - Parsing (REPAIR vs MSCK REPAIR, qualified names, backtick identifiers, optional suffix)
 //! - Formatting (semantic preservation)
-//! - Risk analysis (info signal generation, tables_read)
+//! - Risk analysis (info finding generation, tables_read)
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -44,10 +44,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
@@ -140,28 +139,28 @@ fn format_repair_table_multistatement() {
 // ============================================================================
 
 #[test]
-fn risk_repair_table_info_signal() {
+fn risk_repair_table_info_finding() {
     let sql = "REPAIR TABLE my_table;";
     let report = dbx_analyze(sql);
 
     assert!(
         report.summary.info_count >= 1,
-        "Should have info signal for REPAIR TABLE, got: {:?}",
+        "Should have info finding for REPAIR TABLE, got: {:?}",
         report.summary
     );
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-REPAIR"),
-        "Should find INFO-DBX-TBL-REPAIR signal"
+        has_finding(&report, "INFO-DBX-TBL-REPAIR"),
+        "Should find INFO-DBX-TBL-REPAIR finding"
     );
 }
 
 #[test]
-fn risk_msck_repair_table_info_signal() {
+fn risk_msck_repair_table_info_finding() {
     let sql = "MSCK REPAIR TABLE my_table ADD PARTITIONS;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-REPAIR"),
+        has_finding(&report, "INFO-DBX-TBL-REPAIR"),
         "MSCK REPAIR TABLE should trigger INFO-DBX-TBL-REPAIR"
     );
 }

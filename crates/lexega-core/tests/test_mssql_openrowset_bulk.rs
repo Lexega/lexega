@@ -32,7 +32,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
         .expect("merge against built-ins succeeds");
     AnalysisConfig {
         dialect: Some(dialect::mssql()),
-        custom_rules: Some(merged),
+        custom_rules: Some(merged.into()),
         ..Default::default()
     }
 }
@@ -40,8 +40,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
 fn rule_ids_with(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -54,8 +53,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 /// is pretty-printed, so byte-exactness is not asserted — only that no token,
 /// the `BULK` keyword included, is lost).
 fn parses_token_safe(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("formatter must preserve all tokens (including BULK)");

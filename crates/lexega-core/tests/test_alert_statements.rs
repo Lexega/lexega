@@ -16,18 +16,31 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
+}
+
+/// Rule ids across findings and context.
+fn analyze_and_get_entries(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    let mut rules = extract_rule_ids(&report.findings);
+    rules.extend(extract_rule_ids(&report.context));
+    rules
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -58,35 +71,36 @@ fn test_alert_formatting_variants() {
 
 #[test]
 fn test_alert_create_and_drop() {
-    let rules = analyze_and_get_rules(
+    let rules = analyze_and_get_context(
         "CREATE ALERT a WAREHOUSE = wh SCHEDULE = '1 MINUTE' IF (EXISTS (SELECT 1)) THEN INSERT INTO log VALUES (1);",
     );
     assert!(rules.contains("SNW-ALERT-NEW"), "got {rules:?}");
 
     let report = analyze_risk("DROP ALERT IF EXISTS a;").expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(&report.findings);
     assert!(rules.contains("SNW-ALERT-DROP"), "got {rules:?}");
     assert!(
-        report.summary.high_count >= 1,
-        "dropping an alert is high severity"
+        report.summary.low_count >= 1,
+        "dropping an alert is low severity"
     );
 }
 
 #[test]
 fn test_alert_resume_suspend() {
-    let rules = analyze_and_get_rules("ALTER ALERT a RESUME;");
+    let rules = analyze_and_get_context("ALTER ALERT a RESUME;");
     assert!(rules.contains("SNW-ALERT-RESUME"), "got {rules:?}");
 
-    let rules = analyze_and_get_rules("ALTER ALERT a SUSPEND;");
+    let rules = analyze_and_get_context("ALTER ALERT a SUSPEND;");
     assert!(rules.contains("SNW-ALERT-SUSPEND"), "got {rules:?}");
 }
 
 #[test]
 fn test_alert_modify_action_and_condition() {
-    let rules = analyze_and_get_rules("ALTER ALERT a MODIFY ACTION DELETE FROM staging WHERE 1=1;");
+    let rules =
+        analyze_and_get_context("ALTER ALERT a MODIFY ACTION DELETE FROM staging WHERE 1=1;");
     assert!(rules.contains("SNW-ALERT-ACTION-CHG"), "got {rules:?}");
 
-    let rules = analyze_and_get_rules("ALTER ALERT a MODIFY CONDITION EXISTS (SELECT 1 FROM t);");
+    let rules = analyze_and_get_context("ALTER ALERT a MODIFY CONDITION EXISTS (SELECT 1 FROM t);");
     assert!(rules.contains("SNW-ALERT-COND-CHG"), "got {rules:?}");
 }
 
@@ -102,13 +116,13 @@ fn test_alert_unparseable_action_body() {
 
 #[test]
 fn test_alert_set_unset_fire_no_action_rules() {
-    let rules = analyze_and_get_rules("ALTER ALERT a SET WAREHOUSE = wh2 SCHEDULE = '5 MINUTE';");
+    let rules = analyze_and_get_entries("ALTER ALERT a SET WAREHOUSE = wh2 SCHEDULE = '5 MINUTE';");
     assert!(
         !rules.contains("SNW-ALERT-ACTION-CHG") && !rules.contains("SNW-ALERT-COND-CHG"),
         "SET must not fire MODIFY rules, got {rules:?}"
     );
 
-    let rules = analyze_and_get_rules("ALTER ALERT a UNSET COMMENT;");
+    let rules = analyze_and_get_entries("ALTER ALERT a UNSET COMMENT;");
     assert!(
         !rules.contains("SNW-ALERT-ACTION-CHG"),
         "UNSET must not fire ACTION-CHG, got {rules:?}"
@@ -121,7 +135,7 @@ fn test_alert_action_body_not_analyzed_standalone() {
     // body fragmented into a standalone DELETE that fired DML-WRITE-UNBOUNDED
     // out of context. Now it is recognized as the alert's action and must
     // NOT produce a standalone DML finding (mirrors the TASK body model).
-    let rules = analyze_and_get_rules(
+    let rules = analyze_and_get_entries(
         "CREATE ALERT a WAREHOUSE = wh SCHEDULE = '1 MINUTE' IF (EXISTS (SELECT 1)) THEN DELETE FROM staging;",
     );
     assert!(rules.contains("SNW-ALERT-NEW"), "got {rules:?}");
@@ -139,7 +153,8 @@ fn test_alert_condition_query_not_analyzed_standalone() {
         "CREATE ALERT a WAREHOUSE = wh SCHEDULE = '1 MINUTE' IF (EXISTS (SELECT * FROM t WHERE 1=1)) THEN CALL p();",
     )
     .expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let mut rules = extract_rule_ids(&report.findings);
+    rules.extend(extract_rule_ids(&report.context));
     assert!(
         rules.iter().all(|r| r.starts_with("SNW-ALERT-")),
         "only alert rules should fire, got {rules:?}"

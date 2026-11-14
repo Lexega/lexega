@@ -11,8 +11,10 @@ use lexega_core::dialect::SnowflakeDialect;
 use std::sync::Arc;
 
 fn analyze_bq(sql: &str) -> AnalysisReport {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(bigquery());
+    let config = AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    };
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
@@ -24,19 +26,19 @@ fn analyze_sf(sql: &str) -> AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
-fn signal_ids(report: &AnalysisReport) -> Vec<String> {
+fn finding_ids(report: &AnalysisReport) -> Vec<String> {
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -51,9 +53,9 @@ fn test_bq_export_aws_leak() {
         aws_access_key_id='AKIAIOSFODNN7EXAMPLE') AS SELECT * FROM my_table;"#;
     let report = analyze_bq(sql);
     assert!(
-        has_signal(&report, "BQ-EXPORT-AWS-LEAK"),
-        "Hardcoded AWS key in EXPORT DATA should trigger BQ-EXPORT-AWS-LEAK. Signals: {:?}",
-        signal_ids(&report)
+        has_finding(&report, "BQ-EXPORT-AWS-LEAK"),
+        "Hardcoded AWS key in EXPORT DATA should trigger BQ-EXPORT-AWS-LEAK. Findings: {:?}",
+        finding_ids(&report)
     );
 }
 
@@ -63,9 +65,9 @@ fn test_c052_b_bq_hardcoded_password_in_export_data() {
         password='supersecret123') AS SELECT * FROM my_table;"#;
     let report = analyze_bq(sql);
     assert!(
-        has_signal(&report, "BQ-EXPORT-PWD-LEAK"),
-        "Hardcoded password in EXPORT DATA should trigger BQ-EXPORT-PWD-LEAK. Signals: {:?}",
-        signal_ids(&report)
+        has_finding(&report, "BQ-EXPORT-PWD-LEAK"),
+        "Hardcoded password in EXPORT DATA should trigger BQ-EXPORT-PWD-LEAK. Findings: {:?}",
+        finding_ids(&report)
     );
 }
 
@@ -75,9 +77,9 @@ fn test_c052_c_bq_hardcoded_api_key_in_export_data() {
         api_key='sk-test-1234567890abcdef') AS SELECT * FROM my_table;"#;
     let report = analyze_bq(sql);
     assert!(
-        has_signal(&report, "BQ-EXPORT-APIKEY-LEAK"),
-        "Hardcoded API key in EXPORT DATA should trigger BQ-EXPORT-APIKEY-LEAK. Signals: {:?}",
-        signal_ids(&report)
+        has_finding(&report, "BQ-EXPORT-APIKEY-LEAK"),
+        "Hardcoded API key in EXPORT DATA should trigger BQ-EXPORT-APIKEY-LEAK. Findings: {:?}",
+        finding_ids(&report)
     );
 }
 
@@ -86,9 +88,9 @@ fn test_c052_d_bq_hardcoded_connection_string_in_export_data() {
     let sql = r#"EXPORT DATA OPTIONS(uri='s3://bucket/data/*', format='CSV',
         connection_string='postgresql://user:password123@host:5432/db') AS SELECT * FROM my_table;"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-EXPORT-CONNSTR-LEAK"),
-        "Hardcoded connection string in EXPORT DATA should trigger BQ-EXPORT-CONNSTR-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-EXPORT-CONNSTR-LEAK"),
+        "Hardcoded connection string in EXPORT DATA should trigger BQ-EXPORT-CONNSTR-LEAK. Findings: {:?}",
+        finding_ids(&report));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -102,9 +104,9 @@ fn test_c052_c_bq_load_hardcoded_api_key_in_load_data() {
         uris=['s3://bucket/*'], api_key='sk-prod-abcdefghij1234');"#;
     let report = analyze_bq(sql);
     assert!(
-        has_signal(&report, "BQ-LOAD-APIKEY-LEAK"),
-        "Hardcoded API key in LOAD DATA should trigger BQ-LOAD-APIKEY-LEAK. Signals: {:?}",
-        signal_ids(&report)
+        has_finding(&report, "BQ-LOAD-APIKEY-LEAK"),
+        "Hardcoded API key in LOAD DATA should trigger BQ-LOAD-APIKEY-LEAK. Findings: {:?}",
+        finding_ids(&report)
     );
 }
 
@@ -113,9 +115,9 @@ fn test_c052_d_bq_load_hardcoded_connection_string_in_load_data() {
     let sql = r#"LOAD DATA INTO my_table FROM FILES(format='CSV',
         uris=['gs://bucket/*']) WITH CONNECTION 'mysql://admin:s3cret@db.host.com:3306/mydb';"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-LOAD-CONNSTR-LEAK"),
-        "Hardcoded connection string in LOAD DATA should trigger BQ-LOAD-CONNSTR-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-LOAD-CONNSTR-LEAK"),
+        "Hardcoded connection string in LOAD DATA should trigger BQ-LOAD-CONNSTR-LEAK. Findings: {:?}",
+        finding_ids(&report));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -128,9 +130,21 @@ fn test_c052_b_bq_ext_hardcoded_password_in_external_table() {
     let sql = r#"CREATE EXTERNAL TABLE my_dataset.ext_table
         OPTIONS(format='CSV', uris=['s3://bucket/*'], password='mysecretpass');"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-EXTTBL-PWD-LEAK"),
-        "Hardcoded password in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-PWD-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-EXTTBL-PWD-LEAK"),
+        "Hardcoded password in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-PWD-LEAK. Findings: {:?}",
+        finding_ids(&report));
+}
+
+#[test]
+fn a_bigquery_option_written_in_double_quotes_is_read_as_a_string() {
+    let sql = r#"CREATE EXTERNAL TABLE my_dataset.ext_table
+        OPTIONS(format="CSV", uris=["gs://bucket/*"], password="mysecretpass");"#;
+    let report = analyze_bq(sql);
+    assert!(
+        has_finding(&report, "BQ-EXTTBL-PWD-LEAK"),
+        "A double-quoted password should trigger BQ-EXTTBL-PWD-LEAK. Findings: {:?}",
+        finding_ids(&report)
+    );
 }
 
 #[test]
@@ -138,9 +152,9 @@ fn test_c052_c_bq_ext_hardcoded_api_key_in_external_table() {
     let sql = r#"CREATE EXTERNAL TABLE my_dataset.ext_table
         OPTIONS(format='CSV', uris=['s3://bucket/*'], api_key='sk-live-abcdefghij9876');"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-EXTTBL-APIKEY-LEAK"),
-        "Hardcoded API key in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-APIKEY-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-EXTTBL-APIKEY-LEAK"),
+        "Hardcoded API key in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-APIKEY-LEAK. Findings: {:?}",
+        finding_ids(&report));
 }
 
 #[test]
@@ -149,9 +163,9 @@ fn test_c052_d_bq_ext_hardcoded_connection_string_in_external_table() {
         OPTIONS(format='CSV', uris=['s3://bucket/*'],
         connection_string='postgresql://admin:hunter2@db.example.com:5432/prod');"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-EXTTBL-CONNSTR-LEAK"),
-        "Hardcoded connection string in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-CONNSTR-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-EXTTBL-CONNSTR-LEAK"),
+        "Hardcoded connection string in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-CONNSTR-LEAK. Findings: {:?}",
+        finding_ids(&report));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -166,9 +180,9 @@ fn test_bq_model_connstr_leak_hardcoded_connection_string_in_model() {
         connection_string='mysql://user:pass@host:3306/db') AS
         SELECT * FROM `dataset.training_data`;"#;
     let report = analyze_bq(sql);
-    assert!(has_signal(&report, "BQ-MODEL-CONNSTR-LEAK"),
-        "Hardcoded connection string in CREATE MODEL should trigger BQ-MODEL-CONNSTR-LEAK. Signals: {:?}",
-        signal_ids(&report));
+    assert!(has_finding(&report, "BQ-MODEL-CONNSTR-LEAK"),
+        "Hardcoded connection string in CREATE MODEL should trigger BQ-MODEL-CONNSTR-LEAK. Findings: {:?}",
+        finding_ids(&report));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -182,8 +196,8 @@ fn test_cred_apikey_leak_in_create_stage() {
         CREDENTIALS=(API_KEY='sk-prod-1234567890abcdef');"#;
     let report = analyze_sf(sql);
     assert!(
-        has_signal(&report, "CRED-APIKEY-LEAK"),
-        "Hardcoded API key in CREATE STAGE should trigger CRED-APIKEY-LEAK. Signals: {:?}",
-        signal_ids(&report)
+        has_finding(&report, "CRED-APIKEY-LEAK"),
+        "Hardcoded API key in CREATE STAGE should trigger CRED-APIKEY-LEAK. Findings: {:?}",
+        finding_ids(&report)
     );
 }

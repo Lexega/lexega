@@ -9,9 +9,10 @@ use lexega_core::dialect::bigquery;
 use lexega_core::{format_sql_with_config, verify_formatting_safe_with_dialect, FormatterConfig};
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify_bq(sql: &str) {
@@ -122,19 +123,22 @@ fn test_drop_table_function_if_exists() {
 // ============================================================================
 
 #[test]
-fn test_create_table_function_governance_signal() {
+fn test_create_table_function_governance_finding() {
     let sql = "CREATE TABLE FUNCTION mydataset.my_tvf(x INT64)
 RETURNS TABLE<a STRING, b INT64>
 AS SELECT a, b FROM my_table WHERE id = x;";
 
     let report = analyze_risk(sql).expect("should analyze CREATE TABLE FUNCTION");
 
-    // Should produce governance signal for function creation
+    // Should produce a context entry for function creation
     assert!(
-        report.summary.total_reported_signals > 0,
-        "Should generate governance signals for CREATE TABLE FUNCTION. Signals: {:?}",
         report
-            .signals
+            .context
+            .iter()
+            .any(|s| s.rule_id() == Some("UDF-NEW")),
+        "Should generate UDF-NEW context for CREATE TABLE FUNCTION. Context: {:?}",
+        report
+            .context
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),
@@ -151,10 +155,13 @@ AS SELECT a, b FROM my_table WHERE id = x;";
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // The function creation itself should generate at least 1 signal
+    // The function creation itself should generate at least 1 context entry
     assert!(
-        report.summary.total_reported_signals > 0,
-        "CREATE TABLE FUNCTION should generate at least 1 governance signal"
+        report
+            .context
+            .iter()
+            .any(|s| s.rule_id() == Some("UDF-NEW")),
+        "CREATE TABLE FUNCTION should generate UDF-NEW context"
     );
 }
 
@@ -168,11 +175,12 @@ DROP TABLE FUNCTION ds.tvf3;
 
     let report = analyze_risk(sql).expect("should analyze multi-TVF script");
 
-    // Signals are deduplicated by rule ID — test evidence_count, not signal count
+    // Findings are deduplicated by rule ID — test evidence_count, not finding count
     // (per BUILTIN_RULES_COOKBOOK: "Test evidence count for multi-occurrence")
     let total_evidence: usize = report
-        .signals
+        .context
         .iter()
+        .filter(|f| f.rule_id() == Some("UDF-NEW"))
         .map(|f| match f {
             RuleMatch::Analysis(ref p) => p.evidence_count.unwrap_or(1),
         })

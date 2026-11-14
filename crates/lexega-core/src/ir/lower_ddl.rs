@@ -34,7 +34,9 @@ use std::rc::Rc;
 
 use crate::ast;
 use crate::ast::types::AstStmt;
+use crate::context::node_metadata::IdentKey;
 use crate::facts::identity::ObjectKind;
+use crate::ir::normalize::NameKind;
 use crate::ir::normalize_identifier;
 use crate::lexer::Span;
 
@@ -55,11 +57,159 @@ use super::statement_plan::StatementPlan;
 /// required for body-bearing variants whose inner statements lower
 /// recursively via [`super::lower_dispatch::lower_stmt`]; non-body
 /// variants ignore everything but `inputs.source`.
+///
+/// A target that names a relation or a principal keeps each part as
+/// written; any other target holds each part folded.
 pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
+    let mut plan = lower_ddl_plan(stmt, inputs)?;
+    if !target_names_a_relation(stmt, &plan) && !target_names_a_principal(&plan) {
+        if let Some(target) = plan.target.as_mut() {
+            fold_target_parts(target);
+        }
+    }
+    Some(plan)
+}
+
+/// Whether `plan` drops, replaces, renames or swaps a schema or a
+/// database, and with it the relations it holds.
+pub(crate) fn changes_a_namespace(plan: &DdlPlan) -> bool {
+    if !matches!(plan.object_kind, ObjectKind::Schema | ObjectKind::Database) {
+        return false;
+    }
+    match plan.action {
+        DdlAction::Drop => true,
+        DdlAction::Create => plan.options.or_replace,
+        DdlAction::Alter | DdlAction::Rename => plan.schema_mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                DdlSchemaMutation::RenameTo { .. } | DdlSchemaMutation::SwapWith { .. }
+            )
+        }),
+        DdlAction::BulkLoad
+        | DdlAction::Truncate
+        | DdlAction::Comment
+        | DdlAction::Refresh
+        | DdlAction::Grant
+        | DdlAction::Revoke
+        | DdlAction::Execute
+        | DdlAction::Configure
+        | DdlAction::ControlFlow
+        | DdlAction::Transaction
+        | DdlAction::Backup
+        | DdlAction::Restore => false,
+    }
+}
+
+/// Whether the target of `plan`, lowered from `stmt`, names a relation: a
+/// table, a view, a materialized, dynamic or external table, the table a
+/// load writes, or a BigQuery snapshot table.
+pub(crate) fn target_names_a_relation(stmt: &AstStmt, plan: &DdlPlan) -> bool {
+    match plan.object_kind {
+        ObjectKind::Table
+        | ObjectKind::View
+        | ObjectKind::MaterializedView
+        | ObjectKind::DynamicTable
+        | ObjectKind::ExternalTable => true,
+        ObjectKind::Stage | ObjectKind::Generic => match plan.action {
+            DdlAction::BulkLoad => true,
+            DdlAction::Create => matches!(stmt, AstStmt::BqCreateSnapshotTable(_)),
+            DdlAction::Alter
+            | DdlAction::Drop
+            | DdlAction::Rename
+            | DdlAction::Truncate
+            | DdlAction::Comment
+            | DdlAction::Refresh
+            | DdlAction::Grant
+            | DdlAction::Revoke
+            | DdlAction::Execute
+            | DdlAction::Configure
+            | DdlAction::ControlFlow
+            | DdlAction::Transaction
+            | DdlAction::Backup
+            | DdlAction::Restore => false,
+        },
+        ObjectKind::Schema
+        | ObjectKind::Database
+        | ObjectKind::Tag
+        | ObjectKind::Procedure
+        | ObjectKind::Function
+        | ObjectKind::Trigger
+        | ObjectKind::FileFormat
+        | ObjectKind::Pipe
+        | ObjectKind::Stream
+        | ObjectKind::ApiIntegration
+        | ObjectKind::StorageIntegration
+        | ObjectKind::ExternalAccessIntegration
+        | ObjectKind::NotificationIntegration
+        | ObjectKind::SecurityIntegration
+        | ObjectKind::Warehouse
+        | ObjectKind::Task
+        | ObjectKind::Alert
+        | ObjectKind::NetworkRule
+        | ObjectKind::ResourceMonitor
+        | ObjectKind::Secret
+        | ObjectKind::Sequence
+        | ObjectKind::Role
+        | ObjectKind::User
+        | ObjectKind::Share
+        | ObjectKind::Account
+        | ObjectKind::Session
+        | ObjectKind::MaskingPolicy
+        | ObjectKind::RowAccessPolicy
+        | ObjectKind::NetworkPolicy
+        | ObjectKind::SessionPolicy
+        | ObjectKind::PasswordPolicy
+        | ObjectKind::AggregationPolicy
+        | ObjectKind::ProjectionPolicy
+        | ObjectKind::JoinPolicy
+        | ObjectKind::DataMetricFunction
+        | ObjectKind::ReplicationGroup
+        | ObjectKind::AuthenticationPolicy
+        | ObjectKind::PgExtension
+        | ObjectKind::PgDomain
+        | ObjectKind::PgType
+        | ObjectKind::PgPublication
+        | ObjectKind::PgSubscription
+        | ObjectKind::PgRule
+        | ObjectKind::BqModel
+        | ObjectKind::Catalog
+        | ObjectKind::Volume
+        | ObjectKind::ExternalLocation
+        | ObjectKind::StorageCredential
+        | ObjectKind::Metastore
+        | ObjectKind::Datashare
+        | ObjectKind::Index
+        | ObjectKind::Group
+        | ObjectKind::ExternalSchema
+        | ObjectKind::FailoverGroup
+        | ObjectKind::Synonym => false,
+    }
+}
+
+/// Whether the target of `plan` names a principal: a role, a user, a
+/// group, or a login a principal statement names.
+fn target_names_a_principal(plan: &DdlPlan) -> bool {
+    plan.principal_options.is_some()
+        || matches!(
+            plan.object_kind,
+            ObjectKind::Role | ObjectKind::User | ObjectKind::Group
+        )
+}
+
+/// Fold each part of `target` as the identifier normaliser does.
+fn fold_target_parts(target: &mut DdlTarget) {
+    target.name = normalize_identifier(&target.name);
+    for part in [&mut target.schema, &mut target.db].into_iter().flatten() {
+        *part = normalize_identifier(part);
+    }
+}
+
+fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
     let source = inputs.source;
     match stmt {
         // ---- Query-bearing — lower via lower_query, not here. ----
         AstStmt::Select(_)
+        | AstStmt::Perform(_)
         | AstStmt::SetSelect(_)
         | AstStmt::ValuesQuery(_)
         | AstStmt::Insert(_)
@@ -68,7 +218,8 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         | AstStmt::Update(_)
         | AstStmt::Delete(_)
         | AstStmt::Merge(_)
-        | AstStmt::Explain(_) => None,
+        | AstStmt::Explain(_)
+        | AstStmt::PsqlGexec(_) => None,
 
         // ---- Opaque / Error / Jinja / batch separator — no DDL. ----
         AstStmt::OpaqueContent { .. }
@@ -76,16 +227,19 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         | AstStmt::JinjaPlaceholder { .. }
         | AstStmt::JinjaConditionalStmt(_)
         | AstStmt::Error { .. }
-        | AstStmt::GoBatchSeparator { .. } => None,
+        | AstStmt::GoBatchSeparator { .. }
+        | AstStmt::SqlcmdCommand { .. } => None,
 
         // ---- CREATE — Snowflake/core ----
         AstStmt::CreateTable(s) => Some(plan(
             DdlAction::Create,
             ObjectKind::Table,
-            target_from(s.name_span, source),
+            target_from_name(&s.name, source),
             DdlOptions {
                 or_replace: s.or_replace_span.is_some(),
-                temporary: s.temp_kind_span.is_some(),
+                if_not_exists: s.if_not_exists_span.is_some(),
+                temporary: s.persistence == Some(crate::ast::AstTablePersistence::Temporary),
+                transient: s.persistence == Some(crate::ast::AstTablePersistence::Transient),
                 ..DdlOptions::default()
             },
             s.node_id,
@@ -94,7 +248,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         AstStmt::CreateView(s) => Some(plan(
             DdlAction::Create,
             ObjectKind::View,
-            target_from(s.name_span, source),
+            target_from_name(&s.name, source),
             DdlOptions {
                 or_replace: s.or_replace_span.is_some(),
                 temporary: s.temp_kind_span.is_some(),
@@ -106,7 +260,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         AstStmt::CreateDynamicTable(s) => Some(simple(
             DdlAction::Create,
             ObjectKind::DynamicTable,
-            target_from(s.name_span, source),
+            target_from_name(&s.name, source),
             s.node_id,
             s.span,
         )),
@@ -287,7 +441,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             let mut bq_options = if credential_spans.is_empty() {
                 None
             } else {
-                Some(extract_bq_options_from_spans(&credential_spans, source))
+                Some(extract_bq_options_from_spans(
+                    &credential_spans,
+                    source,
+                    inputs.placeholder_spans,
+                ))
             };
             // Lift the DATA_SOURCE binding (an identifier value the string-literal
             // harvest skips) as a keyed option so the PolyBase federated-access
@@ -335,6 +493,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
 
@@ -355,7 +514,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             let bq_options = if credential_spans.is_empty() {
                 None
             } else {
-                Some(extract_bq_options_from_spans(&credential_spans, source))
+                Some(extract_bq_options_from_spans(
+                    &credential_spans,
+                    source,
+                    inputs.placeholder_spans,
+                ))
             };
             Some(DdlPlan {
                 action: DdlAction::Create,
@@ -380,6 +543,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
 
@@ -432,7 +596,8 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 | ast::AstAlterAccountActionKind::UnsetAuthenticationPolicy { .. } => {
                     ObjectKind::Generic
                 }
-                ast::AstAlterAccountActionKind::Set { .. }
+                ast::AstAlterAccountActionKind::SetPolicy { .. }
+                | ast::AstAlterAccountActionKind::Set { .. }
                 | ast::AstAlterAccountActionKind::Unset { .. } => ObjectKind::Account,
             };
             Some(simple(
@@ -575,7 +740,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         AstStmt::AlterTable(s) => Some(DdlPlan {
             action: DdlAction::Alter,
             object_kind: ObjectKind::Table,
-            target: target_from(s.name_span, source),
+            target: target_from_name(&s.name, source),
             body: Vec::new(),
             options: DdlOptions::default(),
             node_id: s.node_id,
@@ -595,6 +760,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
         // MySQL RENAME TABLE a TO b [, c TO d]: one plan, one RenameTo
         // mutation per pair. Each mutation carries its own pair source so
@@ -634,28 +800,38 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
-        AstStmt::AlterView(s) => Some(simple(
-            DdlAction::Alter,
-            ObjectKind::View,
-            target_from(s.name_span, source),
-            s.node_id,
-            s.span,
-        )),
-        AstStmt::AlterMaterializedView(s) => Some(simple(
-            DdlAction::Alter,
-            ObjectKind::MaterializedView,
-            target_from(s.name_span, source),
-            s.node_id,
-            s.span,
-        )),
-        AstStmt::AlterDynamicTable(s) => Some(simple(
-            DdlAction::Alter,
-            ObjectKind::DynamicTable,
-            target_from(s.name_span, source),
-            s.node_id,
-            s.span,
-        )),
+        AstStmt::AlterView(s) => Some(DdlPlan {
+            schema_mutations: alter_view_schema_mutations(&s.action.kind, source),
+            ..simple(
+                DdlAction::Alter,
+                ObjectKind::View,
+                target_from(s.name_span, source),
+                s.node_id,
+                s.span,
+            )
+        }),
+        AstStmt::AlterMaterializedView(s) => Some(DdlPlan {
+            schema_mutations: alter_materialized_view_schema_mutations(&s.action.kind, source),
+            ..simple(
+                DdlAction::Alter,
+                ObjectKind::MaterializedView,
+                target_from(s.name_span, source),
+                s.node_id,
+                s.span,
+            )
+        }),
+        AstStmt::AlterDynamicTable(s) => Some(DdlPlan {
+            schema_mutations: alter_dynamic_table_schema_mutations(&s.action.kind),
+            ..simple(
+                DdlAction::Alter,
+                ObjectKind::DynamicTable,
+                target_from(s.name_span, source),
+                s.node_id,
+                s.span,
+            )
+        }),
         AstStmt::AlterFunction(s) => Some(simple(
             DdlAction::Alter,
             ObjectKind::Function,
@@ -705,20 +881,26 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
-        AstStmt::AlterDatabase(s) => Some(simple(
-            DdlAction::Alter,
-            ObjectKind::Database,
-            target_from(s.name_span, source),
-            s.node_id,
-            s.span,
-        )),
-        AstStmt::AlterSchema(s) => Some(simple(
-            DdlAction::Alter,
-            ObjectKind::Schema,
-            target_from(s.name_span, source),
-            s.node_id,
-            s.span,
-        )),
+        AstStmt::AlterDatabase(s) => Some(DdlPlan {
+            schema_mutations: alter_database_schema_mutations(&s.action.kind),
+            ..simple(
+                DdlAction::Alter,
+                ObjectKind::Database,
+                target_from(s.name_span, source),
+                s.node_id,
+                s.span,
+            )
+        }),
+        AstStmt::AlterSchema(s) => Some(DdlPlan {
+            schema_mutations: alter_schema_schema_mutations(&s.action.kind),
+            ..simple(
+                DdlAction::Alter,
+                ObjectKind::Schema,
+                target_from(s.name_span, source),
+                s.node_id,
+                s.span,
+            )
+        }),
 
         // ---- DROP — Snowflake/core ----
         AstStmt::Drop(s) => {
@@ -741,7 +923,9 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 // to `Table` when the span is absent (recovery-path
                 // parse).
                 classify_drop_object(s, source),
-                optional_target_from(s.target_name_span, source),
+                s.target_name
+                    .as_ref()
+                    .and_then(|name| target_from_name(name, source)),
                 DdlOptions {
                     if_exists: s.if_exists_span.is_some(),
                     cascade,
@@ -1210,10 +1394,14 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
 
         // ---- Client file commands: PUT / GET / REMOVE / LIST ----
+        // The stage the command names; a user or table stage keeps its text.
         AstStmt::StageFileCommand(s) => Some(simple(
             DdlAction::Configure,
             ObjectKind::Generic,
-            optional_target_from(s.stage_ref_span, source),
+            s.stage
+                .as_ref()
+                .and_then(|stage| target_from_name(&stage.name, source))
+                .or_else(|| optional_target_from(s.stage_ref_span, source)),
             s.node_id,
             s.span,
         )),
@@ -1253,13 +1441,28 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
 
         // ---- TRUNCATE / SHOW / DESCRIBE / USE ----
-        AstStmt::Truncate(s) => Some(simple(
-            DdlAction::Truncate,
-            ObjectKind::Table,
-            optional_target_from(s.target_table_span, source),
-            s.node_id,
-            s.span,
-        )),
+        AstStmt::Truncate(s) => Some(DdlPlan {
+            truncated: s
+                .tables
+                .iter()
+                .map(|table| {
+                    Some(super::ddl_plan::TruncatedTable {
+                        target: target_from_name(&table.name, source)?,
+                        only: table.only_span.is_some(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default(),
+            ..simple(
+                DdlAction::Truncate,
+                ObjectKind::Table,
+                s.target_table
+                    .as_ref()
+                    .and_then(|name| target_from_name(name, source)),
+                s.node_id,
+                s.span,
+            )
+        }),
         AstStmt::Show(s) => {
             let mut plan = simple(
                 DdlAction::Configure,
@@ -1324,11 +1527,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 s.node_id,
                 s.span,
             );
-            plan.body = s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default();
+            plan.body = lower_bodies(stmt, inputs);
             Some(plan)
         }
         AstStmt::Vacuum(s) => Some(simple(
@@ -1569,13 +1768,21 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 s.span,
             ))
         }
-        AstStmt::PgPrepare(s) => Some(simple(
-            DdlAction::Execute,
-            ObjectKind::Procedure,
-            target_from(s.name, source),
-            s.node_id,
-            s.span,
-        )),
+        // The statement `PREPARE … AS` holds is its body; `PREPARE …
+        // FROM <expr>` holds SQL text.
+        AstStmt::PgPrepare(s) => Some(DdlPlan {
+            body: match s.from_expr {
+                None => lower_body(std::slice::from_ref(&*s.body), inputs),
+                Some(_) => Vec::new(),
+            },
+            ..simple(
+                DdlAction::Execute,
+                ObjectKind::Procedure,
+                target_from(s.name, source),
+                s.node_id,
+                s.span,
+            )
+        }),
         AstStmt::PgExecute(s) => Some(simple(
             DdlAction::Execute,
             ObjectKind::Procedure,
@@ -1583,9 +1790,18 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
+        // A prepared statement, which no procedure is.
+        // T-SQL `CREATE RULE`: a value constraint object.
+        AstStmt::MssqlCreateRule(s) => Some(simple(
+            DdlAction::Create,
+            ObjectKind::Generic,
+            target_from(s.name, source),
+            s.node_id,
+            s.span,
+        )),
         AstStmt::PgDeallocate(s) => Some(simple(
             DdlAction::Drop,
-            ObjectKind::Procedure,
+            ObjectKind::Generic,
             None,
             s.node_id,
             s.span,
@@ -1676,10 +1892,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
-        AstStmt::PgCreateRule(s) => Some(simple(
+        AstStmt::PgCreateRule(s) => Some(with_body(
             DdlAction::Create,
             ObjectKind::PgRule,
             None,
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -1873,7 +2090,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         // ---- BigQuery ----
         AstStmt::BqExportData(s) => {
             let body = outermost_select_body(&s.query, source);
-            let bq_options = Some(extract_bq_options_from_spans(&[s.options_span], source));
+            let bq_options = Some(extract_bq_options_from_spans(
+                &[s.options_span],
+                source,
+                inputs.placeholder_spans,
+            ));
             Some(DdlPlan {
                 action: DdlAction::BulkLoad,
                 object_kind: ObjectKind::Stage,
@@ -1897,6 +2118,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
         AstStmt::BqLoadData(s) => {
@@ -1904,7 +2126,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             if let Some(sp) = s.trailing_clauses_span {
                 credential_spans.push(sp);
             }
-            let bq_options = Some(extract_bq_options_from_spans(&credential_spans, source));
+            let bq_options = Some(extract_bq_options_from_spans(
+                &credential_spans,
+                source,
+                inputs.placeholder_spans,
+            ));
             Some(DdlPlan {
                 action: DdlAction::BulkLoad,
                 object_kind: ObjectKind::Generic,
@@ -1928,12 +2154,17 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
-        AstStmt::MysqlLoadData(s) => Some(simple(
+        AstStmt::MysqlLoadData(s) => Some(plan(
             DdlAction::BulkLoad,
             ObjectKind::Table,
             s.target_table_span.and_then(|sp| target_from(sp, source)),
+            DdlOptions {
+                replaces_duplicates: s.replace_span.is_some(),
+                ..DdlOptions::default()
+            },
             s.node_id,
             s.span,
         )),
@@ -1948,11 +2179,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 s.node_id,
                 s.span,
             );
-            plan.body = s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default();
+            plan.body = lower_bodies(stmt, inputs);
             Some(plan)
         }
         AstStmt::AlterEvent(s) => {
@@ -1963,11 +2190,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 s.node_id,
                 s.span,
             );
-            plan.body = s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default();
+            plan.body = lower_bodies(stmt, inputs);
             Some(plan)
         }
         // MySQL trigger: lower the inline body so its statements analyze
@@ -1980,11 +2203,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 s.node_id,
                 s.span,
             );
-            plan.body = s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default();
+            plan.body = lower_bodies(stmt, inputs);
             Some(plan)
         }
         AstStmt::BqAssert(s) => {
@@ -2029,12 +2248,22 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options: None,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
+        // Published as the table a later statement reads: each part as
+        // written, so a quoted part keeps its case.
         AstStmt::BqCreateSnapshotTable(s) => Some(simple(
             DdlAction::Create,
             ObjectKind::Generic,
-            target_from(s.snapshot_name_span, source),
+            crate::ir::utils::written_name_parts(source, &s.name).map(|(db, schema, name)| {
+                DdlTarget {
+                    name,
+                    schema,
+                    db,
+                    span: s.name.span,
+                }
+            }),
             s.node_id,
             s.span,
         )),
@@ -2097,7 +2326,11 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             if let Some(sp) = s.remote_connection_span {
                 credential_spans.push(sp);
             }
-            let bq_options = Some(extract_bq_options_from_spans(&credential_spans, source));
+            let bq_options = Some(extract_bq_options_from_spans(
+                &credential_spans,
+                source,
+                inputs.placeholder_spans,
+            ));
             Some(DdlPlan {
                 action: DdlAction::Create,
                 object_kind: ObjectKind::BqModel,
@@ -2124,10 +2357,15 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
         AstStmt::BqAlterModel(s) => {
-            let bq_options = Some(extract_bq_options_from_spans(&[s.set_options_span], source));
+            let bq_options = Some(extract_bq_options_from_spans(
+                &[s.set_options_span],
+                source,
+                inputs.placeholder_spans,
+            ));
             Some(DdlPlan {
                 action: DdlAction::Alter,
                 object_kind: ObjectKind::BqModel,
@@ -2151,10 +2389,15 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
         AstStmt::BqExportModel(s) => {
-            let bq_options = Some(extract_bq_options_from_spans(&[s.options_span], source));
+            let bq_options = Some(extract_bq_options_from_spans(
+                &[s.options_span],
+                source,
+                inputs.placeholder_spans,
+            ));
             Some(DdlPlan {
                 action: DdlAction::BulkLoad,
                 object_kind: ObjectKind::BqModel,
@@ -2178,6 +2421,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
                 bq_options,
                 show: None,
                 synonym: None,
+                truncated: Vec::new(),
             })
         }
         AstStmt::BqDropModel(s) => Some(simple(
@@ -2360,7 +2604,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         AstStmt::CreateForeignTable(s) => Some(simple(
             DdlAction::Create,
             ObjectKind::Generic,
-            target_from(s.name_span, source),
+            target_from_name(&s.name, source),
             s.node_id,
             s.span,
         )),
@@ -2424,7 +2668,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
         // Impersonation context switch / restore — session-scoped, no
         // governance target object; `kind: mssql_execute_as` /
-        // `mssql_revert` facts carry the recognition signal.
+        // `mssql_revert` facts carry what is recognized.
         AstStmt::MssqlExecuteAs(s) => Some(simple(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
@@ -2464,36 +2708,28 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
-        AstStmt::MssqlTryCatch(s) => {
-            let mut body = lower_body(&s.try_body, inputs);
-            body.extend(lower_body(&s.catch_body, inputs));
-            Some(with_body(
-                DdlAction::ControlFlow,
-                ObjectKind::Generic,
-                None,
-                body,
-                s.node_id,
-                s.span,
-            ))
-        }
-        AstStmt::MssqlIf(s) => {
-            let mut body = lower_body(&s.then_body, inputs);
-            body.extend(lower_body(&s.else_body, inputs));
-            Some(with_body(
-                DdlAction::ControlFlow,
-                ObjectKind::Generic,
-                None,
-                body,
-                s.node_id,
-                s.span,
-            ))
-        }
+        AstStmt::MssqlTryCatch(s) => Some(with_body(
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+            None,
+            lower_bodies(stmt, inputs),
+            s.node_id,
+            s.span,
+        )),
+        AstStmt::MssqlIf(s) => Some(with_body(
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+            None,
+            lower_bodies(stmt, inputs),
+            s.node_id,
+            s.span,
+        )),
 
         AstStmt::MssqlWhile(s) => Some(with_body(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2506,8 +2742,17 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
         // RECONFIGURE applies pending server config; no governance target,
         // a control-flow no-op like PRINT. `kind: reconfigure` facts carry
-        // the recognition signal for any rule that wants to match it.
+        // what is recognized, for any rule that wants to match it.
         AstStmt::Reconfigure { node_id, span, .. } => Some(simple(
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+            None,
+            *node_id,
+            *span,
+        )),
+        // CHECKPOINT, KILL, SHUTDOWN: server commands with no governance
+        // target; `kind: mssql_server_command` carries them.
+        AstStmt::MssqlServerCommand { node_id, span } => Some(simple(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
@@ -2530,7 +2775,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
         // MySQL SET is not lowered to a DDL/governance plan in this batch;
         // its dynamic-SQL value taint is wired in dynsql_taint, not here.
-        AstStmt::MysqlSet(_) => None,
+        AstStmt::MysqlSet(_) | AstStmt::MysqlUnlockTables(_) => None,
         // ALTER SESSION SET/UNSET is handled by its own SessionPlan block
         // in lib.rs (rich `ddl.session.*` facts), not the generic DDL path.
         AstStmt::AlterSession(_) => None,
@@ -2561,6 +2806,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
         AstStmt::MssqlWaitfor(s) => Some(simple(
             DdlAction::ControlFlow,
@@ -2583,14 +2829,10 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
-        AstStmt::CreateMssqlTrigger(s) => Some(with_body(
-            DdlAction::Create,
-            ObjectKind::Trigger,
-            target_from(s.name_span, source),
-            lower_body(&s.body, inputs),
-            s.node_id,
-            s.span,
-        )),
+        AstStmt::CreateMssqlTrigger(s) => Some(DdlPlan {
+            body: lower_bodies(stmt, inputs),
+            ..lower_mssql_trigger_definition(s, source)
+        }),
         AstStmt::DropMssqlTrigger(s) => Some(plan(
             DdlAction::Drop,
             ObjectKind::Trigger,
@@ -2605,6 +2847,31 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
+        AstStmt::MssqlTriggerState(s) => {
+            use crate::ast::types::{MssqlTriggerScope, MssqlTriggerStateAction};
+            let target = match &s.scope {
+                MssqlTriggerScope::Object(object) => target_from_name(object, source),
+                MssqlTriggerScope::Database | MssqlTriggerScope::AllServer => None,
+            };
+            let mut p = simple(
+                DdlAction::Alter,
+                ObjectKind::Trigger,
+                target,
+                s.node_id,
+                s.span,
+            );
+            p.pg_trigger_state = Some(crate::ir::ddl_plan::IrTriggerStateDetail {
+                action: match s.action {
+                    MssqlTriggerStateAction::Enable => {
+                        crate::ir::ddl_plan::IrTriggerStateAction::Enable
+                    }
+                    MssqlTriggerStateAction::Disable => {
+                        crate::ir::ddl_plan::IrTriggerStateAction::Disable
+                    }
+                },
+            });
+            Some(p)
+        }
         AstStmt::MssqlBulkInsert(s) => Some(simple(
             DdlAction::BulkLoad,
             ObjectKind::Generic,
@@ -2646,14 +2913,10 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
 
         // ---- Procedure / Function definitions (inline variants) ----
         AstStmt::CreateProcedure(s) => Some(DdlPlan {
-            action: DdlAction::Create,
+            action: definition_action(s.verb),
             object_kind: ObjectKind::Procedure,
             target: target_from(s.name_span, source),
-            body: s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default(),
+            body: lower_bodies(stmt, inputs),
             options: DdlOptions {
                 or_replace: s.or_replace_span.is_some(),
                 ..DdlOptions::default()
@@ -2675,16 +2938,13 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
         AstStmt::CreateFunction(s) => Some(DdlPlan {
-            action: DdlAction::Create,
+            action: definition_action(s.verb),
             object_kind: ObjectKind::Function,
             target: target_from(s.name_span, source),
-            body: s
-                .body_stmt
-                .as_deref()
-                .map(|inner| lower_body(std::slice::from_ref(inner), inputs))
-                .unwrap_or_default(),
+            body: lower_bodies(stmt, inputs),
             options: DdlOptions {
                 or_replace: s.or_replace_span.is_some(),
                 temporary: s.temp_keyword_span.is_some(),
@@ -2708,6 +2968,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
         AstStmt::CreateTableFunction(s) => Some(DdlPlan {
             action: DdlAction::Create,
@@ -2741,6 +3002,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             bq_options: None,
             show: None,
             synonym: None,
+            truncated: Vec::new(),
         }),
 
         // ---- Inline scripting variants ----
@@ -2749,14 +3011,12 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             // and the BEGIN..END body. Both are sequences of inner
             // AstStmts; flatten into the single body slot in source
             // order — decls first, then BEGIN..END body. The
-            // EXCEPTION section is span-only and not lowered.
-            let mut body = lower_body(&s.decls, inputs);
-            body.extend(lower_body(&s.body, inputs));
+            // EXCEPTION section is not lowered.
             Some(with_body(
                 DdlAction::ControlFlow,
                 ObjectKind::Generic,
                 None,
-                body,
+                lower_bodies(stmt, inputs),
                 s.node_id,
                 s.span,
             ))
@@ -2773,32 +3033,22 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             // single source-ordered Vec. The branch conditions
             // themselves are AstExpr — predicate semantics live
             // outside DdlPlan.body and are not lowered here.
-            let mut body = Vec::new();
-            for branch in &s.branches {
-                body.extend(lower_body(&branch.body, inputs));
-            }
-            body.extend(lower_body(&s.else_body, inputs));
             Some(with_body(
                 DdlAction::ControlFlow,
                 ObjectKind::Generic,
                 None,
-                body,
+                lower_bodies(stmt, inputs),
                 s.node_id,
                 s.span,
             ))
         }
         AstStmt::CaseStmt(s) => {
             // Same shape as If: flatten WHEN-branch bodies + ELSE body.
-            let mut body = Vec::new();
-            for branch in &s.branches {
-                body.extend(lower_body(&branch.body, inputs));
-            }
-            body.extend(lower_body(&s.else_body, inputs));
             Some(with_body(
                 DdlAction::ControlFlow,
                 ObjectKind::Generic,
                 None,
-                body,
+                lower_bodies(stmt, inputs),
                 s.node_id,
                 s.span,
             ))
@@ -2887,11 +3137,12 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             s.node_id,
             s.span,
         )),
+        // The query a FOR loop iterates, then its body.
         AstStmt::For(s) => Some(with_body(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2899,7 +3150,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2907,7 +3158,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2915,7 +3166,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2923,7 +3174,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             DdlAction::ControlFlow,
             ObjectKind::Generic,
             None,
-            lower_body(&s.body, inputs),
+            lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
         )),
@@ -2968,6 +3219,38 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             None,
             *node_id,
             *span,
+        )),
+        // MySQL administration: the kind carries it.
+        AstStmt::MysqlAdmin(admin) => Some(simple(
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+            None,
+            admin.node_id,
+            admin.span,
+        )),
+        // MySQL's function from a shared library.
+        AstStmt::MysqlCreateLoadableFunction(f) => Some(simple(
+            DdlAction::Create,
+            ObjectKind::Function,
+            target_from(f.name, source),
+            f.node_id,
+            f.span,
+        )),
+        // Snowflake `EXECUTE TASK`: runs the task now.
+        AstStmt::ExecuteTask(t) => Some(simple(
+            DdlAction::Execute,
+            ObjectKind::Task,
+            target_from(t.name, source),
+            t.node_id,
+            t.span,
+        )),
+        // MySQL `DO`: expressions evaluated for their effect.
+        AstStmt::MysqlDo(d) => Some(simple(
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+            None,
+            d.node_id,
+            d.span,
         )),
         AstStmt::FetchCursor { node_id, span, .. } => Some(simple(
             DdlAction::ControlFlow,
@@ -3024,7 +3307,7 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         )),
 
         // ---- Transaction control ----
-        AstStmt::BeginTransaction { node_id, span } => Some(simple(
+        AstStmt::BeginTransaction { node_id, span, .. } => Some(simple(
             DdlAction::Transaction,
             ObjectKind::Generic,
             None,
@@ -3044,6 +3327,13 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             None,
             *node_id,
             *span,
+        )),
+        AstStmt::Savepoint(s) => Some(simple(
+            DdlAction::Transaction,
+            ObjectKind::Generic,
+            None,
+            s.node_id,
+            s.span,
         )),
 
         // ---- Session variable / Pipe chain ----
@@ -3066,12 +3356,12 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
         AstStmt::CopyIntoTable {
             node_id,
             span,
-            table_name_span,
+            table_name,
             ..
         } => Some(simple(
             DdlAction::BulkLoad,
             ObjectKind::Stage,
-            target_from(*table_name_span, source),
+            target_from_name(table_name, source),
             *node_id,
             *span,
         )),
@@ -3089,10 +3379,15 @@ pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan>
             *node_id,
             *span,
         )),
-        AstStmt::RedshiftCopy { node_id, span, .. } => Some(simple(
+        AstStmt::RedshiftCopy {
+            node_id,
+            span,
+            name_span,
+            ..
+        } => Some(simple(
             DdlAction::BulkLoad,
             ObjectKind::Stage,
-            None,
+            target_from(*name_span, source),
             *node_id,
             *span,
         )),
@@ -3295,6 +3590,210 @@ fn lower_show(s: &crate::ast::AstShow) -> crate::ir::ddl_plan::ShowPlanIr {
     }
 }
 
+/// The action of a statement defining a module: a T-SQL `ALTER`
+/// restating the definition alters it; `CREATE OR ALTER` creates.
+fn definition_action(verb: crate::ast::AstDefinitionVerb) -> DdlAction {
+    match verb {
+        crate::ast::AstDefinitionVerb::Create | crate::ast::AstDefinitionVerb::CreateOrAlter => {
+            DdlAction::Create
+        }
+        crate::ast::AstDefinitionVerb::Alter => DdlAction::Alter,
+    }
+}
+
+/// The definition of a T-SQL trigger, its body left out (the body's
+/// statements are analysed as statements of their own); the lowering of
+/// the statement adds the body to it.
+pub(crate) fn lower_mssql_trigger_definition(
+    s: &crate::ast::types::AstCreateMssqlTrigger,
+    source: &str,
+) -> DdlPlan {
+    simple(
+        definition_action(s.verb),
+        ObjectKind::Trigger,
+        target_from(s.name_span, source),
+        s.node_id,
+        s.span,
+    )
+}
+
+/// The column a view's `RENAME [COLUMN] a TO b` renames; names not read for
+/// a rename of the view and for an action kept as written (a new `AS`
+/// query); no mutation for any other action of an `ALTER VIEW`.
+fn alter_view_schema_mutations(
+    action: &crate::ast::AstAlterViewActionKind,
+    source: &str,
+) -> Vec<DdlSchemaMutation> {
+    use crate::ast::AstAlterViewActionKind as K;
+    match action {
+        K::RenameColumn {
+            old_name_span,
+            new_name_span,
+            ..
+        } => renamed_column(*old_name_span, *new_name_span, source),
+        K::RenameTo { .. } | K::OpaqueRemainder { .. } => vec![DdlSchemaMutation::NamesUnread],
+        K::SetOptions { .. }
+        | K::AlterColumnSetOptions { .. }
+        | K::SetSecure { .. }
+        | K::UnsetSecure { .. }
+        | K::SetComment { .. }
+        | K::UnsetComment { .. }
+        | K::SetChangeTracking { .. }
+        | K::SetTag { .. }
+        | K::UnsetTag { .. }
+        | K::AddRowAccessPolicy { .. }
+        | K::DropRowAccessPolicy { .. }
+        | K::DropAllRowAccessPolicies { .. }
+        | K::SetAggregationPolicy { .. }
+        | K::UnsetAggregationPolicy { .. }
+        | K::SetJoinPolicy { .. }
+        | K::UnsetJoinPolicy { .. }
+        | K::AlterColumn { .. }
+        | K::AddColumn { .. }
+        | K::DataMetricFunction { .. } => Vec::new(),
+    }
+}
+
+/// What an `ALTER SCHEMA` does to the names of the relations it holds:
+/// names not read where it renames or swaps the schema, or where its action
+/// is kept as written (T-SQL's `TRANSFER`); no mutation for any other.
+fn alter_schema_schema_mutations(
+    action: &crate::ast::AstAlterSchemaActionKind,
+) -> Vec<DdlSchemaMutation> {
+    use crate::ast::AstAlterSchemaActionKind as K;
+    match action {
+        K::RenameTo { .. } | K::SwapWith { .. } | K::Unknown(_) => {
+            vec![DdlSchemaMutation::NamesUnread]
+        }
+        K::SetProperties { .. }
+        | K::UnsetProperties { .. }
+        | K::SetTag { .. }
+        | K::UnsetTag { .. }
+        | K::SetComment { .. }
+        | K::UnsetComment { .. }
+        | K::EnableManagedAccess { .. }
+        | K::DisableManagedAccess { .. }
+        | K::SetManagedAccess { .. }
+        | K::UnsetManagedAccess { .. }
+        | K::SetDbProperties { .. }
+        | K::OwnerTo { .. }
+        | K::PredictiveOptimization { .. }
+        | K::DefaultCollation { .. }
+        | K::SetTags { .. }
+        | K::UnsetTags { .. } => Vec::new(),
+    }
+}
+
+/// [`alter_schema_schema_mutations`] for `ALTER DATABASE`; a refresh of a
+/// replica loads another database's relations under its names.
+fn alter_database_schema_mutations(
+    action: &crate::ast::AstAlterDatabaseActionKind,
+) -> Vec<DdlSchemaMutation> {
+    use crate::ast::AstAlterDatabaseActionKind as K;
+    match action {
+        K::RenameTo { .. } | K::SwapWith { .. } | K::Refresh { .. } | K::Unknown(_) => {
+            vec![DdlSchemaMutation::NamesUnread]
+        }
+        K::SetProperties { .. }
+        | K::UnsetProperties { .. }
+        | K::SetTag { .. }
+        | K::UnsetTag { .. }
+        | K::SetComment { .. }
+        | K::UnsetComment { .. }
+        | K::EnableReplication { .. }
+        | K::DisableReplication { .. }
+        | K::EnableFailover { .. }
+        | K::DisableFailover { .. }
+        | K::Primary { .. } => Vec::new(),
+    }
+}
+
+/// What an `ALTER DYNAMIC TABLE` does to the names of its values: names
+/// not read where it renames or swaps the table, or where its action is
+/// kept as written; no mutation for any other.
+fn alter_dynamic_table_schema_mutations(
+    action: &crate::ast::AstAlterDynamicTableActionKind,
+) -> Vec<DdlSchemaMutation> {
+    use crate::ast::AstAlterDynamicTableActionKind as K;
+    match action {
+        K::RenameTo { .. } | K::SwapWith { .. } | K::Unknown { .. } => {
+            vec![DdlSchemaMutation::NamesUnread]
+        }
+        K::Suspend { .. }
+        | K::Resume { .. }
+        | K::Refresh { .. }
+        | K::Set { .. }
+        | K::Unset { .. }
+        | K::SetComment { .. }
+        | K::UnsetComment { .. }
+        | K::ClusterBy { .. }
+        | K::DropClusteringKey { .. }
+        | K::SuspendRecluster { .. }
+        | K::ResumeRecluster { .. }
+        | K::SetColumnComment { .. }
+        | K::UnsetColumnComment { .. }
+        | K::AddRowAccessPolicy { .. }
+        | K::DropRowAccessPolicy { .. }
+        | K::DropAllRowAccessPolicies { .. }
+        | K::SetAggregationPolicy { .. }
+        | K::UnsetAggregationPolicy { .. }
+        | K::SetColumnMaskingPolicy { .. }
+        | K::UnsetColumnMaskingPolicy { .. }
+        | K::SetColumnProjectionPolicy { .. }
+        | K::UnsetColumnProjectionPolicy { .. }
+        | K::SetTag { .. }
+        | K::UnsetTag { .. }
+        | K::SetColumnTag { .. }
+        | K::UnsetColumnTag { .. }
+        | K::AddSearchOptimization { .. }
+        | K::DropSearchOptimization { .. }
+        | K::SuspendSearchOptimization { .. }
+        | K::ResumeSearchOptimization { .. } => Vec::new(),
+    }
+}
+
+/// [`alter_view_schema_mutations`] for `ALTER MATERIALIZED VIEW`.
+fn alter_materialized_view_schema_mutations(
+    action: &crate::ast::AstAlterMaterializedViewActionKind,
+    source: &str,
+) -> Vec<DdlSchemaMutation> {
+    use crate::ast::AstAlterMaterializedViewActionKind as K;
+    match action {
+        K::RenameColumn {
+            old_name_span,
+            new_name_span,
+            ..
+        } => renamed_column(*old_name_span, *new_name_span, source),
+        K::RenameTo { .. } | K::OpaqueRemainder { .. } => vec![DdlSchemaMutation::NamesUnread],
+        K::SetOptions { .. }
+        | K::AddRowAccessPolicy { .. }
+        | K::DropRowAccessPolicy { .. }
+        | K::DropAllRowAccessPolicies { .. }
+        | K::AlterColumn { .. }
+        | K::SetSecure { .. }
+        | K::UnsetSecure { .. }
+        | K::SetComment { .. }
+        | K::UnsetComment { .. }
+        | K::SetTag { .. }
+        | K::UnsetTag { .. } => Vec::new(),
+    }
+}
+
+/// The column the name at `old` names renamed to the one at `new`; its
+/// columns not read where either name is not.
+fn renamed_column(old: Span, new: Span, source: &str) -> Vec<DdlSchemaMutation> {
+    let name = |span: Span| {
+        source
+            .get(span.start as usize..span.end as usize)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    };
+    match (name(old), name(new)) {
+        (Some(from), Some(to)) => vec![DdlSchemaMutation::RenameColumn { from, to }],
+        (Some(_) | None, None) | (None, Some(_)) => vec![DdlSchemaMutation::ColumnsUnread],
+    }
+}
+
 fn simple(
     action: DdlAction,
     object_kind: ObjectKind,
@@ -3325,6 +3824,7 @@ fn simple(
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
 }
 
@@ -3360,6 +3860,7 @@ fn plan(
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
 }
 
@@ -3399,6 +3900,7 @@ fn with_body(
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
 }
 
@@ -3584,7 +4086,7 @@ fn project_ast_principal_source(
         A::FromCertificate => I::FromCertificate,
         A::FromAsymmetricKey => I::FromAsymmetricKey,
         A::FromWindows => I::FromWindows,
-        A::ForLogin => I::ForLogin,
+        A::ForLogin { .. } => I::ForLogin,
         A::WithoutLogin => I::WithoutLogin,
         A::Unparsed => I::Unparsed,
     }
@@ -3645,6 +4147,7 @@ fn build_principal_options_ir(
         password_literal: options
             .password_literal
             .map(|sp| literal_content_span(sp, source)),
+        password_set: options.password_set,
         mysql_host: options
             .mysql_host
             .map(|sp| literal_content_span(sp, source)),
@@ -3671,6 +4174,7 @@ fn build_principal_options_ir(
         snowflake_user: options
             .snowflake_user
             .as_ref()
+            .filter(|s| s.has_property())
             .map(|s| lower_snowflake_user_options(s, source)),
         mssql_login: options
             .mssql_login
@@ -3741,7 +4245,8 @@ fn lower_snowflake_user_options(
         mins_to_unlock: num(s.mins_to_unlock),
         rsa_public_key_set: s.rsa_public_key_set,
         rsa_public_key_2_set: s.rsa_public_key_2_set,
-        network_policy: text(s.network_policy),
+        network_policy: text(s.network_policy.as_ref().map(|policy| policy.span)),
+        network_policy_unset: s.network_policy_unset,
     }
 }
 
@@ -3798,6 +4303,7 @@ fn lower_create_principal(s: &crate::ast::types::AstCreatePrincipal, source: &st
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
 }
 
@@ -3837,6 +4343,7 @@ fn lower_alter_principal(s: &crate::ast::types::AstAlterPrincipal, source: &str)
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
 }
 
@@ -3864,6 +4371,7 @@ fn lower_drop_principal(s: &crate::ast::types::AstDropPrincipal, source: &str) -
         principal_options: Some(crate::ir::ddl_plan::PrincipalOptionsIr {
             principal_kind: project_ast_principal_kind(s.principal_kind),
             password_literal: None,
+            password_set: false,
             mysql_host: None,
             server_scope: s.server_scope,
             membership: None,
@@ -3883,7 +4391,32 @@ fn lower_drop_principal(s: &crate::ast::types::AstDropPrincipal, source: &str) -
         bq_options: None,
         show: None,
         synonym: None,
+        truncated: Vec::new(),
     }
+}
+
+/// The bodies `stmt` holds ([`AstStmt::bodies`]) its plan holds, each
+/// lowered ([`lower_body`]) in the order written: every one but a block's
+/// exception handlers, a `DECLARE … HANDLER`'s action and an `INSERT …
+/// EXEC`'s `EXEC`.
+fn lower_bodies(stmt: &AstStmt, inputs: &IrLowerInputs) -> Vec<Rc<StatementPlan>> {
+    stmt.bodies()
+        .into_iter()
+        .filter(|body| match body.role {
+            crate::ast::BodyRole::ExceptionHandler
+            | crate::ast::BodyRole::HandlerAction
+            | crate::ast::BodyRole::InsertExec => false,
+            crate::ast::BodyRole::Declarations
+            | crate::ast::BodyRole::Block
+            | crate::ast::BodyRole::Branch
+            | crate::ast::BodyRole::Else
+            | crate::ast::BodyRole::Loop
+            | crate::ast::BodyRole::LoopQuery
+            | crate::ast::BodyRole::Catch
+            | crate::ast::BodyRole::Routine => true,
+        })
+        .flat_map(|body| lower_body(body.stmts, inputs))
+        .collect()
 }
 
 /// Lower each [`AstStmt`] in `stmts` via
@@ -3899,7 +4432,30 @@ fn lower_drop_principal(s: &crate::ast::types::AstDropPrincipal, source: &str) -
 /// inner statements stand on their own alongside top-level statements.
 /// Recursion is natural — an inner DDL with its own body lowers through
 /// this same path and emits its own inner statements first.
+///
+/// A body nested deeper than the stack lets the analyzer walk
+/// ([`super::lower::enter_nested`]) is not lowered: it is held as one
+/// opaque statement whose reason says so.
 fn lower_body(stmts: &[AstStmt], inputs: &IrLowerInputs) -> Vec<Rc<StatementPlan>> {
+    let (Some(first), Some(last)) = (stmts.first(), stmts.last()) else {
+        return Vec::new();
+    };
+    let Some(_frame) = super::lower::enter_nested() else {
+        let span = Span {
+            start: first.span().start,
+            end: last.span().end,
+        };
+        return vec![Rc::new(StatementPlan::Rel(Rc::new(
+            super::plan::RelPlan::Opaque {
+                stmt_node_id: first.node_id(),
+                reason: super::strict::OpaqueReason::NestingTooDeep {
+                    depth: super::lower::nested_depth(),
+                },
+                hints: Vec::new(),
+                span,
+            },
+        )))];
+    };
     stmts
         .iter()
         .filter_map(|s| match super::lower_dispatch::lower_stmt(s, inputs) {
@@ -3916,10 +4472,9 @@ fn lower_body(stmts: &[AstStmt], inputs: &IrLowerInputs) -> Vec<Rc<StatementPlan
                         &plan,
                         &bindings,
                         inputs.func_catalog,
-                        Some(&catalog_ctx as &dyn crate::ir::catalog_context::CatalogContext),
-                        inputs.reasoning,
                     );
                     sink.rel(
+                        s.span(),
                         &plan,
                         &bindings,
                         &catalog_ctx,
@@ -3935,7 +4490,7 @@ fn lower_body(stmts: &[AstStmt], inputs: &IrLowerInputs) -> Vec<Rc<StatementPlan
                 privilege_plan,
             }) => {
                 if let Some(sink) = inputs.flatten_body_into {
-                    sink.ddl(&plan, privilege_plan.as_ref());
+                    sink.ddl(s.span(), &plan, privilege_plan.as_ref());
                 }
                 Some(Rc::new(StatementPlan::Ddl(Rc::new(plan))))
             }
@@ -3990,8 +4545,6 @@ fn collect_bq_assert_inner_reads(
             &plan,
             &bindings,
             inputs.func_catalog,
-            None,
-            inputs.reasoning,
         );
         for t in derived.tables_read {
             if !reads.contains(&t) {
@@ -4018,6 +4571,11 @@ fn collect_ast_expr_subqueries<'a>(
     out: &mut Vec<&'a AstStmt>,
 ) {
     use crate::ast::types::AstExpr;
+    // An expression nested deeper than the stack lets the analyzer walk is
+    // not read.
+    let Some(_frame) = super::lower::enter_nested() else {
+        return;
+    };
     match expr {
         AstExpr::ScalarSubquery { subquery, .. }
         | AstExpr::SubqueryArg { subquery, .. }
@@ -4039,6 +4597,7 @@ fn collect_ast_expr_subqueries<'a>(
         AstExpr::Parenthesized { expr: inner, .. }
         | AstExpr::Spread { expr: inner, .. }
         | AstExpr::IsNull { expr: inner, .. }
+        | AstExpr::IsPredicate { expr: inner, .. }
         | AstExpr::Cast { expr: inner, .. }
         | AstExpr::TryCast { expr: inner, .. }
         | AstExpr::SafeCast { expr: inner, .. }
@@ -4046,6 +4605,7 @@ fn collect_ast_expr_subqueries<'a>(
         | AstExpr::Extract { expr: inner, .. }
         | AstExpr::Collate { expr: inner, .. }
         | AstExpr::Prior { expr: inner, .. }
+        | AstExpr::ConnectByRoot { expr: inner, .. }
         | AstExpr::ExplSnowIdent { arg: inner, .. } => {
             collect_ast_expr_subqueries(inner, out);
         }
@@ -4059,7 +4619,7 @@ fn collect_ast_expr_subqueries<'a>(
             collect_ast_expr_subqueries(match_call, out);
             collect_ast_expr_subqueries(search, out);
         }
-        AstExpr::LogicalChain { operands, .. } => {
+        AstExpr::LogicalChain { operands, .. } | AstExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 collect_ast_expr_subqueries(operand, out);
             }
@@ -4156,8 +4716,33 @@ fn collect_ast_expr_subqueries<'a>(
                     crate::ast::AstFunctionArg::AliasedArg { value, .. } => {
                         collect_ast_expr_subqueries(value, out);
                     }
-                    crate::ast::AstFunctionArg::BulkArg { value, .. } => {
+                    crate::ast::AstFunctionArg::BulkArg { value, .. }
+                    | crate::ast::AstFunctionArg::Introduced {
+                        value: crate::ast::AstIntroducedValue::Expr(value),
+                        ..
+                    } => {
                         collect_ast_expr_subqueries(value, out);
+                    }
+                    crate::ast::AstFunctionArg::Unparsed { .. }
+                    | crate::ast::AstFunctionArg::DataType { .. }
+                    | crate::ast::AstFunctionArg::NonValue { .. }
+                    | crate::ast::AstFunctionArg::Introduced {
+                        value:
+                            crate::ast::AstIntroducedValue::DataType { .. }
+                            | crate::ast::AstIntroducedValue::Name(_),
+                        ..
+                    } => {}
+                    crate::ast::AstFunctionArg::Table {
+                        partition_by,
+                        order_by,
+                        ..
+                    } => {
+                        for e in partition_by {
+                            collect_ast_expr_subqueries(e, out);
+                        }
+                        for item in order_by {
+                            collect_ast_expr_subqueries(&item.expr, out);
+                        }
                     }
                 }
             }
@@ -4177,8 +4762,33 @@ fn collect_ast_expr_subqueries<'a>(
                     crate::ast::AstFunctionArg::AliasedArg { value, .. } => {
                         collect_ast_expr_subqueries(value, out);
                     }
-                    crate::ast::AstFunctionArg::BulkArg { value, .. } => {
+                    crate::ast::AstFunctionArg::BulkArg { value, .. }
+                    | crate::ast::AstFunctionArg::Introduced {
+                        value: crate::ast::AstIntroducedValue::Expr(value),
+                        ..
+                    } => {
                         collect_ast_expr_subqueries(value, out);
+                    }
+                    crate::ast::AstFunctionArg::Unparsed { .. }
+                    | crate::ast::AstFunctionArg::DataType { .. }
+                    | crate::ast::AstFunctionArg::NonValue { .. }
+                    | crate::ast::AstFunctionArg::Introduced {
+                        value:
+                            crate::ast::AstIntroducedValue::DataType { .. }
+                            | crate::ast::AstIntroducedValue::Name(_),
+                        ..
+                    } => {}
+                    crate::ast::AstFunctionArg::Table {
+                        partition_by,
+                        order_by,
+                        ..
+                    } => {
+                        for e in partition_by {
+                            collect_ast_expr_subqueries(e, out);
+                        }
+                        for item in order_by {
+                            collect_ast_expr_subqueries(&item.expr, out);
+                        }
                     }
                 }
             }
@@ -4244,6 +4854,7 @@ fn collect_ast_expr_subqueries<'a>(
         | AstExpr::JinjaConditional { .. }
         | AstExpr::PositionRef { .. }
         | AstExpr::ScriptingVarRef { .. }
+        | AstExpr::SessionVarRef { .. }
         | AstExpr::QualifiedStar { .. }
         | AstExpr::UnqualifiedStar { .. }
         | AstExpr::DbtRef { .. }
@@ -4273,17 +4884,25 @@ fn collect_ast_expr_subqueries<'a>(
 ///
 /// Both vectors are populated independently — the same literal can
 /// appear in both (as the value of a key=value pair AND as a content
-/// candidate). Returns the populated detail unconditionally; an empty
+/// candidate). A value that overlaps one of `placeholders` is injected
+/// later and is no pair's literal; the content harvest keeps it, a
+/// templated location still naming its scheme. Returns the populated
+/// detail unconditionally; an empty
 /// `IrBqOptionsDetail` is the right semantic projection for a BQ
 /// statement that carries no credential surface (rules `exists: …`
 /// against the empty vecs naturally don't match).
 fn extract_bq_options_from_spans(
     spans: &[Span],
     source: &str,
+    placeholders: &[Span],
 ) -> crate::ir::ddl_plan::IrBqOptionsDetail {
-    use crate::lexer::{tokenize, LiteralKind, Operator, Token, TokenKind};
+    use crate::ir::span_extract::string_literal_value;
+    use crate::lexer::{tokenize_with_dialect, LiteralKind, Operator, Token, TokenKind};
 
     let mut detail = crate::ir::ddl_plan::IrBqOptionsDetail::default();
+    // The clauses are read as the statement's dialect writes them: a
+    // BigQuery `"…"` is a string.
+    let dialect = crate::ir::normalize::dialect_in_force();
 
     let is_trivia = |k: &TokenKind| {
         matches!(
@@ -4310,7 +4929,7 @@ fn extract_bq_options_from_spans(
             continue;
         }
         let span_text = &source[start..end];
-        let tokens = tokenize(span_text).tokens;
+        let tokens = tokenize_with_dialect(span_text, dialect.as_ref()).tokens;
         let token_text = |tok: &Token| -> Option<&str> {
             let s = tok.span.start as usize;
             let e = tok.span.end as usize;
@@ -4318,16 +4937,6 @@ fn extract_bq_options_from_spans(
                 None
             } else {
                 Some(&span_text[s..e])
-            }
-        };
-        let strip_string_literal = |raw: &str| -> Option<String> {
-            let raw = raw.trim();
-            if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-                Some(raw[1..raw.len() - 1].replace("''", "'"))
-            } else if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-                Some(raw[1..raw.len() - 1].to_string())
-            } else {
-                None
             }
         };
         fn strip_ident_quotes(raw: &str) -> &str {
@@ -4347,8 +4956,22 @@ fn extract_bq_options_from_spans(
             }
             if matches!(tok.kind, TokenKind::Literal(LiteralKind::String)) {
                 if let Some(raw) = token_text(tok) {
-                    if let Some(value) = strip_string_literal(raw) {
-                        detail.all_literal_values.push(value);
+                    if let Some(value) = string_literal_value(raw) {
+                        let written = Span {
+                            start: sp.start + tok.span.start,
+                            end: sp.start + tok.span.end,
+                        };
+                        detail
+                            .all_literal_values
+                            .push(crate::ir::ddl_plan::IrBqLiteral {
+                                value,
+                                url_password_literals:
+                                    crate::ir::span_extract::url_password_literals(
+                                        written,
+                                        source,
+                                        placeholders,
+                                    ),
+                            });
                     }
                 }
             }
@@ -4374,10 +4997,18 @@ fn extract_bq_options_from_spans(
             ) {
                 continue;
             }
+            let written = tokens[val_idx].span;
+            let value_span = Span {
+                start: sp.start + written.start,
+                end: sp.start + written.end,
+            };
+            if placeholders.iter().any(|p| p.overlaps(value_span)) {
+                continue;
+            }
             let Some(value_raw) = token_text(&tokens[val_idx]) else {
                 continue;
             };
-            let Some(value_literal) = strip_string_literal(value_raw) else {
+            let Some(value_literal) = string_literal_value(value_raw) else {
                 continue;
             };
             detail.options.push(crate::ir::ddl_plan::IrBqOptionPair {
@@ -4472,22 +5103,63 @@ pub(crate) fn target_from(span: Span, source: &str) -> Option<DdlTarget> {
     })
 }
 
+/// The target `name` names, each part as written, as [`target_from`]
+/// reads it; a name the parser did not read as dotted parts is read from
+/// its text.
+pub(crate) fn target_from_name(name: &crate::ast::AstObjectRef, source: &str) -> Option<DdlTarget> {
+    let written: Option<Vec<String>> = name.parts.as_ref().and_then(|parts| {
+        parts
+            .iter()
+            .map(|part| {
+                let span = part.as_ref()?.span();
+                source
+                    .get(span.start as usize..span.end as usize)
+                    .map(str::to_string)
+            })
+            .collect()
+    });
+    // `IDENTIFIER('…')`: the parts its string writes.
+    let written = written.or_else(|| {
+        let (db, schema, table) = crate::ir::utils::written_name_parts(source, name)?;
+        Some([db, schema, Some(table)].into_iter().flatten().collect())
+    });
+    let Some(mut written) = written else {
+        return target_from(name.span, source);
+    };
+    let table = written.pop()?;
+    let schema = written.pop();
+    let db = written.pop();
+    Some(DdlTarget {
+        name: table,
+        schema,
+        db,
+        span: name.span,
+    })
+}
+
 #[inline]
 fn optional_target_from(span: Option<Span>, source: &str) -> Option<DdlTarget> {
     target_from(span?, source)
 }
 
-/// Walk an `AstAlterTable.actions` list and collect the per-element
-/// typed identity for the three ALTER actions that mutate schema in
-/// a cross-statement-reference-invalidating way: `RenameTo`,
-/// `AddColumn`, `DropColumn`. Every other variant is enumerated
-/// explicitly with an empty arm to satisfy closed-enum
-/// discipline.
+/// Walk an `AstAlterTable.actions` list and collect what each action
+/// does to the table's identity and columns: `RenameTo`, `AddColumn`,
+/// `DropColumn`, `RenameColumn` (also a `CHANGE` whose names differ),
+/// `SwapWith`, and `ColumnsUnread` for an action whose effect on the
+/// columns is not read. The actions read as keeping the columns are
+/// named explicitly and carry no mutation.
 fn collect_alter_table_schema_mutations(
     s: &crate::ast::AstAlterTable,
     source: &str,
 ) -> Vec<DdlSchemaMutation> {
     use crate::ast::AstAlterTableActionKind as K;
+    use crate::ast::AstNamedTableAction as N;
+    let name = |span: Span| {
+        source
+            .get(span.start as usize..span.end as usize)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    };
     let mut out = Vec::new();
     for action in &s.actions {
         match &action.kind {
@@ -4500,68 +5172,145 @@ fn collect_alter_table_schema_mutations(
                 }
             }
             K::AddColumn { columns, .. } => {
+                if columns.is_empty() {
+                    out.push(DdlSchemaMutation::ColumnsUnread);
+                }
                 for col_def in columns {
-                    let Some(name_span) = col_def.name_span else {
-                        continue;
-                    };
-                    let Some(text) = source.get(name_span.start as usize..name_span.end as usize)
-                    else {
-                        continue;
-                    };
-                    if text.trim().is_empty() {
-                        continue;
+                    match col_def.name_span.and_then(name) {
+                        Some(column_name) => out.push(DdlSchemaMutation::AddColumn { column_name }),
+                        None => out.push(DdlSchemaMutation::ColumnsUnread),
                     }
-                    out.push(DdlSchemaMutation::AddColumn {
-                        column_name: text.to_string(),
-                    });
+                    // A column computed from others shows their values.
+                    if col_def.virtual_expr_span.is_some() {
+                        out.push(DdlSchemaMutation::NamesUnread);
+                    }
                 }
             }
-            K::DropColumn {
-                columns,
-                columns_span,
+            K::DropColumn { columns, .. } => {
+                if columns.is_empty() {
+                    out.push(DdlSchemaMutation::ColumnsUnread);
+                }
+                for col_span in columns {
+                    match name(*col_span) {
+                        Some(column_name) => {
+                            out.push(DdlSchemaMutation::DropColumn { column_name })
+                        }
+                        None => out.push(DdlSchemaMutation::ColumnsUnread),
+                    }
+                }
+            }
+            K::RenameColumn {
+                old_name_span,
+                new_name_span,
+                ..
+            }
+            | K::ChangeColumn {
+                old_name_span,
+                new_name_span,
+                ..
+            } => match (name(*old_name_span), name(*new_name_span)) {
+                (Some(from), Some(to)) => {
+                    // A `CHANGE` that keeps the name redefines the column only.
+                    let renamed = IdentKey::new_as(&from, NameKind::Column)
+                        != IdentKey::new_as(&to, NameKind::Column);
+                    // A `CHANGE` redefines the column, its type first; a
+                    // `RENAME COLUMN` keeps its type.
+                    let retyped = matches!(action.kind, K::ChangeColumn { .. });
+                    if renamed {
+                        out.push(DdlSchemaMutation::RenameColumn {
+                            from,
+                            to: to.clone(),
+                        });
+                    }
+                    if retyped {
+                        out.push(DdlSchemaMutation::SetColumnType {
+                            column_name: to,
+                            data_type: None,
+                        });
+                    }
+                }
+                (Some(_) | None, None) | (None, Some(_)) => {
+                    out.push(DdlSchemaMutation::ColumnsUnread)
+                }
+            },
+            K::SwapWith {
+                other_table_span, ..
+            } => match target_from(*other_table_span, source) {
+                Some(other) => out.push(DdlSchemaMutation::SwapWith { other }),
+                None => out.push(DdlSchemaMutation::ColumnsUnread),
+            },
+            K::SetColumnTag {
+                column_name_span,
+                tags,
                 ..
             } => {
-                if !columns.is_empty() {
-                    for col_span in columns {
-                        let Some(text) = source.get(col_span.start as usize..col_span.end as usize)
-                        else {
-                            continue;
-                        };
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        out.push(DdlSchemaMutation::DropColumn {
-                            column_name: text.to_string(),
-                        });
-                    }
-                } else {
-                    // Parser fallback: comma-separated names packed
-                    // into a single span. Split at comma boundaries.
-                    let Some(text) =
-                        source.get(columns_span.start as usize..columns_span.end as usize)
-                    else {
-                        continue;
-                    };
-                    for part in text.split(',') {
-                        let name = part.trim();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        out.push(DdlSchemaMutation::DropColumn {
-                            column_name: name.to_string(),
-                        });
+                if let Some(column_name) = name(*column_name_span) {
+                    let tags = written_tags(tags, source);
+                    out.push(DdlSchemaMutation::SetColumnTags { column_name, tags });
+                }
+            }
+            K::UnsetColumnTag {
+                column_name_span,
+                tags,
+                ..
+            } => {
+                if let Some(column_name) = name(*column_name_span) {
+                    let tags = written_tags(tags, source);
+                    out.push(DdlSchemaMutation::UnsetColumnTags { column_name, tags });
+                }
+            }
+            // Kept as written: what it does to the columns and the names
+            // of their values is not read.
+            K::GovernanceSpan { .. } | K::Unknown { .. } => {
+                out.push(DdlSchemaMutation::ColumnsUnread);
+                out.push(DdlSchemaMutation::NamesUnread);
+            }
+            // The table's rows move to another name, or another table's
+            // rows to its name.
+            K::SetSchema { .. }
+            | K::AttachPartition { .. }
+            | K::DetachPartition { .. }
+            | K::SwitchTo { .. } => out.push(DdlSchemaMutation::NamesUnread),
+            K::AlterColumn {
+                column_name_span,
+                altered_type: crate::ast::AstAlteredType::Changed { type_span },
+                ..
+            } => match name(*column_name_span) {
+                Some(column_name) => out.push(DdlSchemaMutation::SetColumnType {
+                    column_name,
+                    data_type: type_span.and_then(name),
+                }),
+                None => out.push(DdlSchemaMutation::ColumnsUnread),
+            },
+            K::AlterColumnSetDataType {
+                column_name_span,
+                data_type_span,
+                ..
+            } => match name(*column_name_span) {
+                Some(column_name) => out.push(DdlSchemaMutation::SetColumnType {
+                    column_name,
+                    data_type: name(*data_type_span),
+                }),
+                None => out.push(DdlSchemaMutation::ColumnsUnread),
+            },
+            // Each column of a list of alterations may have its type
+            // changed; the new type is not read.
+            K::AlterColumnList { columns, .. } => {
+                for column in columns {
+                    match name(*column) {
+                        Some(column_name) => out.push(DdlSchemaMutation::SetColumnType {
+                            column_name,
+                            data_type: None,
+                        }),
+                        None => out.push(DdlSchemaMutation::ColumnsUnread),
                     }
                 }
             }
-            // None of the following ALTER actions invalidate cross-
-            // statement table or column references for the Q-FLOW-*
-            // family. Enumerated explicitly — when a new
-            // `AstAlterTableActionKind` variant is added that DOES
-            // affect schema identity, it lands here with a compile
-            // error.
-            K::RenameColumn { .. }
-            | K::SwapWith { .. }
-            | K::AlterColumn { .. }
+            // Read as keeping every column, its name and its type.
+            K::AlterColumn {
+                altered_type: crate::ast::AstAlteredType::Kept,
+                ..
+            }
             | K::AddConstraint { .. }
             | K::DropConstraint { .. }
             | K::ClusterBy { .. }
@@ -4587,8 +5336,6 @@ fn collect_alter_table_schema_mutations(
             | K::UnsetColumnProjectionPolicy { .. }
             | K::SetTag { .. }
             | K::UnsetTag { .. }
-            | K::SetColumnTag { .. }
-            | K::UnsetColumnTag { .. }
             | K::AddSearchOptimization { .. }
             | K::DropSearchOptimization { .. }
             | K::SetDataMetricSchedule { .. }
@@ -4602,17 +5349,253 @@ fn collect_alter_table_schema_mutations(
             | K::DropPrimaryKey { .. }
             | K::AlterColumnSetOptions { .. }
             | K::AlterColumnDropNotNull { .. }
-            | K::AlterColumnSetDataType { .. }
             | K::AlterColumnSetDefault { .. }
             | K::AlterColumnDropDefault { .. }
             | K::SetTblProperties { .. }
             | K::UnsetTblProperties { .. }
             | K::RowLevelSecurity { .. }
-            | K::GovernanceSpan { .. }
-            | K::Unknown { .. } => {}
+            | K::OwnerTo { .. } => {}
+            K::NamedAction { kind, .. } => match kind {
+                // A parent's rows shown under the table's name, or a
+                // partition's moved: neither link is stated.
+                N::Inherit | N::PartitionMaintenance => out.push(DdlSchemaMutation::NamesUnread),
+                N::DropConstraint
+                | N::DropIndex
+                | N::DropForeignKey
+                | N::DropCheck
+                | N::DropPartition
+                | N::DropPeriod
+                | N::AddPrimaryKey
+                | N::AddUnique
+                | N::AddCheck
+                | N::AddIndex
+                | N::AddPartition
+                | N::AddPeriod
+                | N::AddDefault
+                | N::CheckConstraint
+                | N::NocheckConstraint
+                | N::EnableTrigger
+                | N::DisableTrigger
+                | N::ChangeTracking
+                | N::FiletableNamespace
+                | N::Rebuild
+                | N::RenameIndex
+                | N::RenameConstraint
+                | N::AlterIndex
+                | N::AlterConstraint
+                | N::ValidateConstraint
+                | N::TableOption
+                | N::NoInherit
+                | N::ReplicaIdentity
+                | N::Distribution
+                | N::RuleState
+                | N::SearchOptimization
+                | N::DropUnique
+                | N::ResetOptions
+                | N::RowLevelSecurity
+                | N::KeysState
+                | N::DropFeature
+                | N::PredictiveOptimization => {}
+            },
         }
     }
     out
+}
+
+/// What `s` drops of what its table declares: its primary key, a
+/// constraint or an index by name (or one whose name is not read), the
+/// `NOT NULL` of a column dropped or redefined without it, and, for an
+/// action not read, every declaration.
+pub(crate) fn dropped_declarations(
+    s: &crate::ast::AstAlterTable,
+    source: &str,
+) -> Vec<crate::catalog::DroppedDeclaration> {
+    use crate::ast::AstAlterTableActionKind as K;
+    use crate::ast::AstNamedTableAction as N;
+    use crate::catalog::DroppedDeclaration as D;
+    let name = |span: Span, kind: NameKind| {
+        source
+            .get(span.start as usize..span.end as usize)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| IdentKey::new_as(text, kind))
+    };
+    let mut out = Vec::new();
+    for action in &s.actions {
+        match &action.kind {
+            K::DropPrimaryKey { .. } => out.push(D::PrimaryKey),
+            K::DropConstraint { name_span, .. } => {
+                out.push(D::Constraint(name(*name_span, NameKind::Relation)))
+            }
+            K::AlterColumnDropNotNull {
+                column_name_span, ..
+            } => {
+                if let Some(column) = name(*column_name_span, NameKind::Column) {
+                    out.push(D::NotNull(column));
+                }
+            }
+            K::NamedAction {
+                kind, name_span, ..
+            } => match kind {
+                N::DropConstraint => out.push(D::Constraint(
+                    name_span.and_then(|span| name(span, NameKind::Relation)),
+                )),
+                N::DropUnique => out.push(D::Constraint(None)),
+                N::DropIndex => out.push(D::Index(
+                    name_span.and_then(|span| name(span, NameKind::Relation)),
+                )),
+                N::AddCheck
+                | N::AddDefault
+                | N::AddIndex
+                | N::AddPartition
+                | N::AddPeriod
+                | N::AddPrimaryKey
+                | N::AddUnique
+                | N::AlterConstraint
+                | N::AlterIndex
+                | N::ChangeTracking
+                | N::CheckConstraint
+                | N::DisableTrigger
+                | N::Distribution
+                | N::DropCheck
+                | N::DropFeature
+                | N::DropForeignKey
+                | N::DropPartition
+                | N::DropPeriod
+                | N::EnableTrigger
+                | N::FiletableNamespace
+                | N::Inherit
+                | N::NoInherit
+                | N::KeysState
+                | N::NocheckConstraint
+                | N::PartitionMaintenance
+                | N::PredictiveOptimization
+                | N::Rebuild
+                | N::RenameConstraint
+                | N::RenameIndex
+                | N::ReplicaIdentity
+                | N::ResetOptions
+                | N::RowLevelSecurity
+                | N::RuleState
+                | N::SearchOptimization
+                | N::TableOption
+                | N::ValidateConstraint => {}
+            },
+            // A column redefined keeps its `NOT NULL` only where the
+            // definition writes it; an operation on another part keeps it.
+            K::AlterColumn {
+                column_name_span,
+                nullability,
+                ..
+            } => match nullability {
+                crate::ast::AstAlteredNullability::Redefined { not_null: false } => {
+                    out.extend(name(*column_name_span, NameKind::Column).map(D::NotNull));
+                }
+                crate::ast::AstAlteredNullability::Redefined { not_null: true }
+                | crate::ast::AstAlteredNullability::Kept => {}
+            },
+            K::ChangeColumn {
+                old_name_span,
+                new_name_span,
+                null_written,
+                ..
+            } => {
+                if *null_written != Some(false) {
+                    for column in [old_name_span, new_name_span] {
+                        out.extend(name(*column, NameKind::Column).map(D::NotNull));
+                    }
+                }
+            }
+            K::AlterColumnList { columns, .. } => {
+                out.extend(
+                    columns
+                        .iter()
+                        .filter_map(|column| name(*column, NameKind::Column))
+                        .map(D::NotNull),
+                );
+            }
+            K::Unknown { .. } | K::GovernanceSpan { .. } => out.push(D::Every),
+            K::AddColumn { .. }
+            | K::AddConstraint { .. }
+            | K::AddDataMetricFunction { .. }
+            | K::AddRowAccessPolicy(_)
+            | K::AddSearchOptimization { .. }
+            | K::AddStorageLifecyclePolicy { .. }
+            | K::AlterColumnDropDefault { .. }
+            | K::AlterColumnSetDataType { .. }
+            | K::AlterColumnSetDefault { .. }
+            | K::AlterColumnSetOptions { .. }
+            | K::AttachPartition { .. }
+            | K::ClusterBy { .. }
+            | K::DetachPartition { .. }
+            | K::DropAllRowAccessPolicies { .. }
+            | K::DropClusteringKey { .. }
+            | K::DropColumn { .. }
+            | K::DropColumnMask { .. }
+            | K::DropDataMetricFunction { .. }
+            | K::DropRowAccessPolicy { .. }
+            | K::DropRowFilter { .. }
+            | K::DropSearchOptimization { .. }
+            | K::DropStorageLifecyclePolicy { .. }
+            | K::OwnerTo { .. }
+            | K::RenameColumn { .. }
+            | K::RenameTo { .. }
+            | K::ResumeRecluster { .. }
+            | K::RowLevelSecurity { .. }
+            | K::Set { .. }
+            | K::SetAggregationPolicy { .. }
+            | K::SetColumnMask { .. }
+            | K::SetColumnMaskingPolicy(_)
+            | K::SetColumnProjectionPolicy(_)
+            | K::SetColumnTag { .. }
+            | K::SetDataMetricSchedule { .. }
+            | K::SetDefaultCollate { .. }
+            | K::SetJoinPolicy { .. }
+            | K::SetOptions { .. }
+            | K::SetRowFilter { .. }
+            | K::SetSchema { .. }
+            | K::SetTag { .. }
+            | K::SetTblProperties { .. }
+            | K::SuspendRecluster { .. }
+            | K::SwapWith { .. }
+            | K::SwitchTo { .. }
+            | K::Unset { .. }
+            | K::UnsetAggregationPolicy { .. }
+            | K::UnsetColumnMaskingPolicy { .. }
+            | K::UnsetColumnProjectionPolicy { .. }
+            | K::UnsetColumnTag { .. }
+            | K::UnsetDataMetricSchedule { .. }
+            | K::UnsetJoinPolicy { .. }
+            | K::UnsetTag { .. }
+            | K::UnsetTblProperties { .. } => {}
+        }
+    }
+    out
+}
+
+/// The tags `tags` write, each as a catalog records a tag: the parts of its
+/// name folded as the dialect folds a name, and its value where it is a
+/// string literal. A tag whose name is not read as one to three parts is
+/// left out.
+pub(crate) fn written_tags(
+    tags: &[crate::ast::AstTagRef],
+    source: &str,
+) -> Vec<crate::catalog::CatalogTag> {
+    tags.iter()
+        .filter_map(|tag| {
+            let (database, schema, name) = crate::ir::utils::written_name_parts(source, &tag.name)?;
+            let tag_value = tag.value.and_then(|value| {
+                crate::ir::span_extract::string_literal_value(crate::ir::utils::slice_span(
+                    source, value,
+                )?)
+            });
+            Some(crate::catalog::CatalogTag {
+                tag_database: database.as_deref().map(normalize_identifier),
+                tag_schema: schema.as_deref().map(normalize_identifier),
+                tag_name: normalize_identifier(&name),
+                tag_value,
+            })
+        })
+        .collect()
 }
 
 /// Classify a generic `AstStmt::Drop` by reading the `object_type_span`
@@ -4660,12 +5643,20 @@ fn classify_drop_object(s: &crate::ast::AstDrop, source: &str) -> ObjectKind {
     }
 }
 
-/// Split a `db.schema.name` string into normalized identifier
-/// components. Honors the active dialect's quoting style by
-/// delegating to [`normalize_identifier`] for each component.
-/// Whitespace inside the qualified name is skipped at the top
-/// level; it is preserved inside quoted segments.
-fn split_qualified(s: &str) -> Vec<String> {
+/// Split a `db.schema.name` string into its components, each as
+/// written: a segment quoted with `"…"`, `` `…` `` or `[…]` is kept
+/// whole, quotes included. Whitespace inside the qualified name is
+/// skipped at the top level; it is preserved inside quoted segments.
+/// `IDENTIFIER('…')` is split as the name its string writes.
+pub(crate) fn split_qualified(s: &str) -> Vec<String> {
+    match crate::ir::utils::identifier_string_name(s) {
+        Some(written) => split_qualified_text(&written),
+        None => split_qualified_text(s),
+    }
+}
+
+/// [`split_qualified`] of a name written as text, never `IDENTIFIER(…)`.
+fn split_qualified_text(s: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut quote_close: Option<char> = None;
@@ -4694,7 +5685,7 @@ fn split_qualified(s: &str) -> Vec<String> {
                 '.' => {
                     let trimmed = current.trim();
                     if !trimmed.is_empty() {
-                        parts.push(normalize_identifier(trimmed));
+                        parts.push(trimmed.to_string());
                     }
                     current.clear();
                 }
@@ -4709,7 +5700,84 @@ fn split_qualified(s: &str) -> Vec<String> {
 
     let trimmed = current.trim();
     if !trimmed.is_empty() {
-        parts.push(normalize_identifier(trimmed));
+        parts.push(trimmed.to_string());
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::catalog::{CatalogDialect, FunctionCatalog};
+    use crate::ir::plan::RelPlan;
+    use crate::ir::strict::{OpaqueReason, StrictMode};
+    use crate::ir::types::SessionContext;
+
+    /// The bodies `plan` holds at any depth that were not lowered for
+    /// being nested too deep.
+    fn too_deep_bodies(plan: &DdlPlan) -> usize {
+        let mut found = 0;
+        let mut open: Vec<&StatementPlan> = plan.body.iter().map(|s| s.as_ref()).collect();
+        while let Some(next) = open.pop() {
+            match next {
+                StatementPlan::Ddl(inner) => open.extend(inner.body.iter().map(|s| s.as_ref())),
+                StatementPlan::Rel(rel) => {
+                    if let RelPlan::Opaque {
+                        reason: OpaqueReason::NestingTooDeep { .. },
+                        ..
+                    } = rel.as_ref()
+                    {
+                        found += 1;
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn bodies_nested_past_the_stack_are_held_as_one_opaque_statement() {
+        let src: String = (0..300)
+            .map(|k| {
+                format!("CREATE PROCEDURE p{k}() BEGIN IF 1 THEN DELETE FROM orders; END IF;\n")
+            })
+            .collect();
+        let lowered = std::thread::Builder::new()
+            .stack_size(crate::parser::core::MIN_PARSE_STACK_BYTES)
+            .spawn(move || {
+                let _scope = crate::ir::normalize::set_normalization_dialect("mysql");
+                let dialect = crate::dialect::mysql();
+                let lex = crate::lexer::tokenize_with_dialect(&src, dialect.as_ref());
+                let script = crate::parser::try_parse_script_with_dialect(
+                    &src,
+                    &lex.tokens,
+                    dialect.as_ref(),
+                )
+                .expect("parses");
+                let catalog = FunctionCatalog::for_dialect(CatalogDialect::Default);
+                let session = SessionContext::default();
+                let inputs = IrLowerInputs {
+                    source: &src,
+                    placeholder_spans: &[],
+                    strict: StrictMode::Permissive,
+                    func_catalog: &catalog,
+                    session: &session,
+                    meaning: dialect.syntax_meaning(),
+                    catalog: None,
+                    model_catalog: None,
+                    reasoning: &crate::facts::reasoning::RecognitionOnly,
+                    flatten_body_into: None,
+                };
+                script
+                    .stmts
+                    .iter()
+                    .filter_map(|stmt| lower_ddl_stmt(stmt, &inputs))
+                    .map(|plan| too_deep_bodies(&plan))
+                    .sum::<usize>()
+            })
+            .expect("spawns")
+            .join()
+            .expect("lowers without overflowing the stack");
+        assert!(lowered > 0, "no body was held as nested too deep");
+    }
 }

@@ -20,11 +20,12 @@
 
 use crate::ast::types::{
     AstBqAlterModel, AstBqCreateModel, AstBqDropModel, AstBqExportData, AstBqExportModel,
-    AstBqSimpleUtility, AstStmt,
+    AstBqSimpleUtility, AstObjectRef, AstStmt,
 };
-use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
+use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, LiteralKind, Operator, Punctuation, Span, Token, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::create_table::PolicyClause;
 
 impl<'a> Parser<'a> {
     // ───────────────────────────────────────────────────────────────
@@ -32,7 +33,9 @@ impl<'a> Parser<'a> {
     // ───────────────────────────────────────────────────────────────
 
     /// Consume all tokens until semicolon (or EOF), returning the end offset.
+    /// The text is not read: its secrets are recorded as unparsed text's are.
     fn bq_consume_until_semi(&mut self, start: u32) -> u32 {
+        let from = self.idx;
         let mut end = start;
         while let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -44,6 +47,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.record_unparsed_secrets(from, self.idx);
         end
     }
 
@@ -59,33 +63,6 @@ impl<'a> Parser<'a> {
             node_id: self.id_gen.next(),
             span,
         }))
-    }
-
-    /// Parse a dot-separated qualified name (e.g., project.dataset.table).
-    /// Returns the name string and its span.
-    fn bq_parse_qualified_name(&mut self) -> ParseResult<(String, Span)> {
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-        let start = first.span.start;
-        let mut end = first.span.end;
-        let mut name = first.lexeme(self.source).to_string();
-
-        // Consume additional .identifier parts
-        while let Some(dot_tok) = self.peek_non_trivia() {
-            if !matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            self.advance(); // consume dot
-            let part = self.advance().ok_or_eof(
-                self.current_span(),
-                vec!["identifier after dot".to_string()],
-            )?;
-            name = format!("{}.{}", name, part.lexeme(self.source));
-            end = part.span.end;
-        }
-
-        Ok((name, Span { start, end }))
     }
 
     /// Parse parenthesized content, returning span from '(' through ')'.
@@ -250,28 +227,12 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // consume CONNECTION
 
-        // Parse qualified connection name: project.dataset.connection_name
-        // Use dot-separated pattern: first ident, then dot+ident pairs
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["connection name".to_string()])?;
-        let mut end = first.span.end;
-
-        while let Some(dot_tok) = self.peek_non_trivia() {
-            if !matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            self.advance(); // consume dot
-            let part = self.advance().ok_or_eof(
-                self.current_span(),
-                vec!["connection name part".to_string()],
-            )?;
-            end = part.span.end;
-        }
+        // Qualified connection name: project.dataset.connection_name
+        let connection = self.parse_object_name_span()?;
 
         Ok(Some(Span {
             start: with_start,
-            end,
+            end: connection.end,
         }))
     }
 
@@ -302,6 +263,7 @@ impl<'a> Parser<'a> {
         }
         let options_tok = self.advance().unwrap();
         let start = options_tok.span.start;
+        self.record_option_list_secrets(self.idx);
 
         // Expect opening paren
         let lparen = self.peek_non_trivia().ok_or_else(|| {
@@ -418,26 +380,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse target table name (dot-separated: project.dataset.table)
-        let table_first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["table name".to_string()])?;
-        let table_start = table_first.span.start;
-        let mut table_end = table_first.span.end;
-
-        while let Some(dot_tok) = self.peek_non_trivia() {
-            if !matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            self.advance(); // consume dot
-            let part = self
-                .advance()
-                .ok_or_eof(self.current_span(), vec!["table name part".to_string()])?;
-            table_end = part.span.end;
-        }
-        let target_table_span = Span {
-            start: table_start,
-            end: table_end,
-        };
+        let target_table_span = self.parse_object_name_span()?;
 
         // Skip optional column spec: (col1 TYPE, col2 TYPE, ...)
         if let Some(tok) = self.peek_non_trivia() {
@@ -602,6 +545,7 @@ impl<'a> Parser<'a> {
             ));
         }
         self.advance(); // consume FILES
+        self.record_option_list_secrets(self.idx);
 
         // Expect (...)
         let lparen = self.peek_non_trivia().ok_or_else(|| {
@@ -665,6 +609,7 @@ impl<'a> Parser<'a> {
     /// Consume tokens until the matching RParen (depth starts at 1).
     /// Returns the end offset of the closing RParen.
     fn bq_consume_balanced_parens_inner(&mut self) -> u32 {
+        let from = self.idx;
         let mut depth: u32 = 1;
         let mut last_end = 0u32;
         while depth > 0 {
@@ -679,12 +624,14 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         last_end
     }
 
     // ───────────────────────────────────────────────────────────────
     // ASSERT
-    //   ASSERT expression [AS description]
+    //   ASSERT expression [, message] [AS description]
     // ───────────────────────────────────────────────────────────────
 
     pub(crate) fn try_parse_bq_assert(&mut self) -> ParseResult<AstStmt> {
@@ -703,10 +650,23 @@ impl<'a> Parser<'a> {
         let expression = self.parse_expr()?;
         let mut end = expression.span().end;
 
+        // Optional `, message` (PL/pgSQL).
+        let message = if matches!(
+            self.peek_non_trivia().map(|t| &t.kind),
+            Some(TokenKind::Punctuation(Punctuation::Comma))
+        ) {
+            self.advance();
+            let message = self.parse_expr()?;
+            end = message.span().end;
+            Some(Box::new(message))
+        } else {
+            None
+        };
+
         // Check for optional AS description
         let description_span = if let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Keyword(Keyword::As)) {
-                let as_tok = self.advance().unwrap();
+                let as_tok = self.advance().expect_invariant("AS consumed after peek");
                 let as_start = as_tok.span.start;
 
                 // Expect string literal for description
@@ -731,7 +691,9 @@ impl<'a> Parser<'a> {
                     ));
                 }
 
-                let desc_tok = self.advance().unwrap();
+                let desc_tok = self
+                    .advance()
+                    .expect_invariant("ASSERT description consumed after peek");
                 end = desc_tok.span.end;
                 Some(Span {
                     start: as_start,
@@ -751,6 +713,7 @@ impl<'a> Parser<'a> {
             span: stmt_span,
             keyword_span,
             expression: Box::new(expression),
+            message,
             description_span,
         };
         Ok(AstStmt::BqAssert(Box::new(ast)))
@@ -824,7 +787,10 @@ impl<'a> Parser<'a> {
         };
 
         // Parse snapshot name (qualified identifier)
-        let (_, snapshot_name_span) = self.bq_parse_qualified_name()?;
+        let name_start_idx = self.idx;
+        let snapshot_name_span = self.parse_object_name_span()?;
+        let name_id = self.id_gen.next();
+        let name = self.object_ref_of_range(name_start_idx, self.idx, name_id);
 
         // Expect CLONE (Identifier)
         let clone_tok = self
@@ -838,7 +804,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse source table name
-        let (_, source_table_span) = self.bq_parse_qualified_name()?;
+        let source_table_span = self.parse_object_name_span()?;
 
         // Consume trailing clauses (FOR SYSTEM_TIME AS OF ..., OPTIONS) until semicolon
         let mut end = source_table_span.end;
@@ -854,6 +820,9 @@ impl<'a> Parser<'a> {
             }
             if self.is_statement_keyword(tok) {
                 break;
+            }
+            if tok.lexeme(self.source).eq_ignore_ascii_case("OPTIONS") {
+                self.record_option_list_secrets(self.idx + 1);
             }
             has_trailing = true;
             end = tok.span.end;
@@ -876,6 +845,7 @@ impl<'a> Parser<'a> {
                 span,
                 keyword_span,
                 snapshot_name_span,
+                name,
                 source_table_span,
                 trailing_clauses_span,
             },
@@ -937,7 +907,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse index name
-        let (_, index_name_span) = self.bq_parse_qualified_name()?;
+        let index_name_span = self.parse_object_name_span()?;
 
         // Expect ON (Keyword)
         let on_tok = self
@@ -951,7 +921,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse table name
-        let (_, table_span) = self.bq_parse_qualified_name()?;
+        let table_span = self.parse_object_name_span()?;
 
         // Parse column list in parentheses
         let columns_span = self.bq_parse_paren_content()?;
@@ -965,6 +935,7 @@ impl<'a> Parser<'a> {
                 && tok.lexeme(self.source).eq_ignore_ascii_case("OPTIONS")
             {
                 self.advance(); // OPTIONS
+                self.record_option_list_secrets(self.idx);
                 let opts = self.bq_parse_paren_content()?;
                 options_span = Some(Span {
                     start: tok.span.start,
@@ -1028,7 +999,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse index name
-        let (_, index_name_span) = self.bq_parse_qualified_name()?;
+        let index_name_span = self.parse_object_name_span()?;
 
         // Expect ON (Keyword)
         let on_tok = self
@@ -1042,7 +1013,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse table name
-        let (_, table_span) = self.bq_parse_qualified_name()?;
+        let table_span = self.parse_object_name_span()?;
 
         let span = Span {
             start,
@@ -1107,7 +1078,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse index name
-        let (_, index_name_span) = self.bq_parse_qualified_name()?;
+        let index_name_span = self.parse_object_name_span()?;
 
         // Expect ON (Keyword)
         let on_tok = self
@@ -1121,7 +1092,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse table name
-        let (_, table_span) = self.bq_parse_qualified_name()?;
+        let table_span = self.parse_object_name_span()?;
 
         // Parse column list in parentheses
         let columns_span = self.bq_parse_paren_content()?;
@@ -1153,6 +1124,7 @@ impl<'a> Parser<'a> {
             {
                 let opts_start = tok.span.start;
                 self.advance(); // OPTIONS
+                self.record_option_list_secrets(self.idx);
                 let opts = self.bq_parse_paren_content()?;
                 options_span = Some(Span {
                     start: opts_start,
@@ -1217,7 +1189,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse index name
-        let (_, index_name_span) = self.bq_parse_qualified_name()?;
+        let index_name_span = self.parse_object_name_span()?;
 
         // Expect ON (Keyword)
         let on_tok = self
@@ -1231,7 +1203,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse table name
-        let (_, table_span) = self.bq_parse_qualified_name()?;
+        let table_span = self.parse_object_name_span()?;
 
         let span = Span {
             start,
@@ -1256,7 +1228,10 @@ impl<'a> Parser<'a> {
             .advance()
             .ok_or_eof(self.current_span(), vec!["ALTER".to_string()])?;
         let start = alter_tok.span.start;
+        let first = self.idx;
         let end = self.bq_consume_until_semi(start);
+        // The statement is kept as written, its text unparsed.
+        self.record_unparsed_secrets(first, self.idx);
         Ok(self.make_bq_simple(start, end, AstStmt::BqAlterVectorIndex))
     }
 
@@ -1352,7 +1327,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse table name (qualified: project.dataset.table or db.schema.table)
-        let (_, table_name_span) = self.bq_parse_qualified_name()?;
+        let table_name_span = self.parse_object_name_span()?;
 
         // Optional schema definition: (column_name type, ...)
         let schema_span = if let Some(tok) = self.peek_non_trivia() {
@@ -1546,7 +1521,10 @@ impl<'a> Parser<'a> {
         let mut copy_grants_span: Option<Span> = None;
         let mut comment_span: Option<Span> = None;
         let mut row_access_policy_span: Option<Span> = None;
+        let mut row_access_policy: Option<AstObjectRef> = None;
+        let mut row_access_policy_columns: Vec<Span> = Vec::new();
         let mut tag_span: Option<Span> = None;
+        let mut tags: Vec<crate::ast::AstTagRef> = Vec::new();
         // Redshift Spectrum
         let mut stored_as_span: Option<Span> = None;
         let mut row_format_span: Option<Span> = None;
@@ -1559,6 +1537,7 @@ impl<'a> Parser<'a> {
                 if tok.lexeme(self.source).eq_ignore_ascii_case("OPTIONS") {
                     let options_start = tok.span.start;
                     self.advance(); // consume OPTIONS
+                    self.record_option_list_secrets(self.idx);
                     let paren_span = self.bq_parse_paren_content()?;
                     options_span = Some(Span {
                         start: options_start,
@@ -1583,7 +1562,7 @@ impl<'a> Parser<'a> {
                                         end: ct.span.end,
                                     });
                                 } else {
-                                    let (_, conn_name_span) = self.bq_parse_qualified_name()?;
+                                    let conn_name_span = self.parse_object_name_span()?;
                                     connection_span = Some(Span {
                                         start: with_start,
                                         end: conn_name_span.end,
@@ -1792,8 +1771,10 @@ impl<'a> Parser<'a> {
                         } else {
                             // ROW ACCESS POLICY — restore and reuse the helper.
                             self.idx = saved;
-                            let clause_end = self.parse_ext_row_access_policy()?;
-                            row_access_policy_span = Some(clause_end);
+                            let (clause_span, clause) = self.parse_ext_row_access_policy()?;
+                            row_access_policy_span = Some(clause_span);
+                            (row_access_policy, row_access_policy_columns) =
+                                PolicyClause::parts(clause);
                         }
                         continue;
                     }
@@ -1804,10 +1785,11 @@ impl<'a> Parser<'a> {
                         self.advance(); // TAG
                         if let Some(p) = self.peek_non_trivia() {
                             if matches!(p.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                                let paren = self.bq_parse_paren_content()?;
+                                let (paren_end, read) = self.parse_tag_assignments_in_parens()?;
+                                tags = read;
                                 tag_span = Some(Span {
                                     start: clause_start,
-                                    end: paren.end,
+                                    end: paren_end,
                                 });
                             }
                         }
@@ -1836,11 +1818,13 @@ impl<'a> Parser<'a> {
                             }
                             Some(next) if matches!(next.kind, TokenKind::Keyword(Keyword::Row)) => {
                                 // WITH ROW ACCESS POLICY name ON (col)
-                                let rap = self.parse_ext_row_access_policy()?;
+                                let (rap, clause) = self.parse_ext_row_access_policy()?;
                                 row_access_policy_span = Some(Span {
                                     start: with_start,
                                     end: rap.end,
                                 });
+                                (row_access_policy, row_access_policy_columns) =
+                                    PolicyClause::parts(clause);
                             }
                             Some(next) if matches!(next.kind, TokenKind::Keyword(Keyword::Tag)) => {
                                 // WITH TAG (name = 'val', ...)
@@ -1848,10 +1832,12 @@ impl<'a> Parser<'a> {
                                 if let Some(p) = self.peek_non_trivia() {
                                     if matches!(p.kind, TokenKind::Punctuation(Punctuation::LParen))
                                     {
-                                        let paren = self.bq_parse_paren_content()?;
+                                        let (paren_end, read) =
+                                            self.parse_tag_assignments_in_parens()?;
+                                        tags = read;
                                         tag_span = Some(Span {
                                             start: with_start,
-                                            end: paren.end,
+                                            end: paren_end,
                                         });
                                     }
                                 }
@@ -2029,7 +2015,10 @@ impl<'a> Parser<'a> {
                 copy_grants_span,
                 comment_span,
                 row_access_policy_span,
+                row_access_policy,
+                row_access_policy_columns,
                 tag_span,
+                tags,
                 stored_as_span,
                 row_format_span,
                 redshift_iam_role_span,
@@ -2094,7 +2083,7 @@ impl<'a> Parser<'a> {
         };
 
         // Schema name
-        let (_, name_span) = self.bq_parse_qualified_name()?;
+        let name_span = self.parse_object_name_span()?;
         let mut end = name_span.end;
 
         // FROM <source> [<source2>]
@@ -2341,8 +2330,16 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse ROW ACCESS POLICY name ON (col_list).
-    /// Cursor is at the ROW token. Returns the full clause span.
-    fn parse_ext_row_access_policy(&mut self) -> ParseResult<Span> {
+    /// Cursor is at the ROW token. Returns the full clause span, and the
+    /// policy and columns where the name is read.
+    fn parse_ext_row_access_policy(&mut self) -> ParseResult<(Span, Option<PolicyClause>)> {
+        self.skip_trivia();
+        if let Some(clause) = self.row_access_policy_at(self.idx) {
+            let start = self.tokens[self.idx].span.start;
+            self.idx = clause.next;
+            let end = self.tokens[clause.next - 1].span.end;
+            return Ok((Span { start, end }, Some(clause)));
+        }
         let row_tok = self
             .advance()
             .ok_or_eof(self.current_span(), vec!["ROW".to_string()])?;
@@ -2361,7 +2358,7 @@ impl<'a> Parser<'a> {
             }
         }
         // Policy name (possibly qualified: db.schema.policy_name)
-        let (_, name_span) = self.bq_parse_qualified_name()?;
+        let name_span = self.parse_object_name_span()?;
         let mut clause_end = name_span.end;
 
         // ON (col_list)
@@ -2377,10 +2374,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(Span {
-            start: clause_start,
-            end: clause_end,
-        })
+        Ok((
+            Span {
+                start: clause_start,
+                end: clause_end,
+            },
+            None,
+        ))
     }
 
     /// Check whether a token represents the start of a new CREATE EXTERNAL TABLE
@@ -2512,7 +2512,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse model name (qualified, may be backtick-quoted)
-        let (_name, model_name_span) = self.bq_parse_qualified_name()?;
+        let model_name_span = self.parse_object_name_span()?;
 
         // Parse optional clauses in order: TRANSFORM, INPUT, OUTPUT, REMOTE, OPTIONS, AS
         let mut transform_span: Option<Span> = None;
@@ -2620,7 +2620,7 @@ impl<'a> Parser<'a> {
                     let default_tok = self.advance().unwrap();
                     default_tok.span.end
                 } else {
-                    let (_conn_name, conn_span) = self.bq_parse_qualified_name()?;
+                    let conn_span = self.parse_object_name_span()?;
                     conn_span.end
                 };
                 remote_connection_span = Some(Span {
@@ -2723,7 +2723,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse model name
-        let (_name, model_name_span) = self.bq_parse_qualified_name()?;
+        let model_name_span = self.parse_object_name_span()?;
 
         // Expect SET OPTIONS(...)
         let set_tok = self
@@ -2794,7 +2794,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse model name
-        let (_name, model_name_span) = self.bq_parse_qualified_name()?;
+        let model_name_span = self.parse_object_name_span()?;
 
         // Expect OPTIONS(...)
         let options_span = self.parse_bq_export_options()?;
@@ -2866,7 +2866,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse model name
-        let (_name, model_name_span) = self.bq_parse_qualified_name()?;
+        let model_name_span = self.parse_object_name_span()?;
 
         let span = Span {
             start,

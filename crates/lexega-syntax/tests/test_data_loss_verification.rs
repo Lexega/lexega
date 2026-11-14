@@ -150,7 +150,7 @@ fn test_trailing_semicolon_ok() {
     // This might succeed or fail depending on how semicolons are handled
     // The key is it shouldn't crash and should give clear error if it fails
     match result {
-        Ok(_) => assert!(true, "Parsed successfully"),
+        Ok(_) => {}
         Err(e) => {
             let msg = e.message();
             assert!(

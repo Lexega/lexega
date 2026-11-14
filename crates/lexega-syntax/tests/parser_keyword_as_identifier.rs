@@ -156,7 +156,7 @@ fn test_real_snowflake_query_keyword_as_table_alias() {
 
     // Should parse the FROM clause
     assert!(
-        select.from.len() > 0,
+        !select.from.is_empty(),
         "Expected at least one table in FROM clause"
     );
 

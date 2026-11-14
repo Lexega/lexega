@@ -16,25 +16,184 @@
 //! property on the `triggers` object, so IDE auto-complete works and
 //! invalid paths surface as schema errors without a runtime evaluation.
 
-use serde::Deserialize;
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
+
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::facts::RiskLevel;
 
-use super::signal::EmissionMode;
+use super::finding::EmissionMode;
+use super::loader::LoadError;
 
 /// Wire version of the v1 rules file format. Bump on any breaking
 /// schema change; the embedded `schema_version` const lets customer
 /// tooling pin to a specific revision.
-pub const V1_RULES_SCHEMA_VERSION: u32 = 1;
+pub const V1_RULES_SCHEMA_VERSION: u32 = 2;
 
 /// A custom rules file. Each entry under `rules:` either defines a
 /// new rule or overrides settings on an existing built-in rule.
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct V1RulesFile {
+    /// Named value lists, keyed by list name. An entry defines a new
+    /// list, or `extend`s or `replace`s a built-in one.
+    #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(with = "Option<BTreeMap<String, V1ListEntry>>")
+    )]
+    pub lists: Option<V1Lists>,
     /// List of rule entries. Rules are evaluated in the order they
-    /// appear in the file.
-    pub rules: Vec<V1RuleEntry>,
+    /// appear in the file. May be omitted in a file that holds `lists:`
+    /// or `masking:`.
+    #[serde(default)]
+    pub rules: Option<Vec<V1RuleEntry>>,
+    /// What a report may print of the values a statement writes, beyond
+    /// what the engine knows holds no secret.
+    #[serde(default)]
+    pub masking: Option<MaskingPolicy>,
+}
+
+/// The organization's masking policy: the catalog classifications that
+/// mark a column as holding no secret. Empty unless a rule file says
+/// otherwise, so nothing is printed that the engine does not know holds
+/// no secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MaskingPolicy {
+    /// The catalog tags marking a column that holds no secret. A string a
+    /// statement writes into, or compares with, a column the catalog
+    /// gives one of these tags is printed, unless the column's name is a
+    /// credential's.
+    #[serde(default)]
+    pub shown_column_tags: Vec<ShownColumnTag>,
+}
+
+/// A catalog tag that marks a column as holding no secret.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ShownColumnTag {
+    /// The tag's name, matched in any case; written with its schema, or
+    /// database and schema (`governance.tags.sensitivity`), it matches the
+    /// tag of that place only.
+    pub tag: String,
+    /// The value the tag holds, matched exactly; any value where omitted.
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+impl ShownColumnTag {
+    /// Whether `tag`, a tag a catalog records on a column, is this one.
+    pub fn marks(&self, tag: &crate::catalog::CatalogTag) -> bool {
+        let fold = |part: &str| crate::ir::normalize::normalize_identifier(part);
+        let mut parts = self.tag.rsplit('.');
+        let name = parts.next().unwrap_or("");
+        let schema = parts.next();
+        let database = parts.next();
+        let agrees = |written: Option<&str>, recorded: Option<&str>| match (written, recorded) {
+            (Some(written), Some(recorded)) => fold(written) == fold(recorded),
+            (Some(_), None) => false,
+            (None, Some(_) | None) => true,
+        };
+        fold(name) == fold(&tag.tag_name)
+            && agrees(schema, tag.tag_schema.as_deref())
+            && agrees(database, tag.tag_database.as_deref())
+            && self
+                .value
+                .as_deref()
+                .is_none_or(|value| tag.tag_value.as_deref() == Some(value))
+    }
+}
+
+/// The `lists:` map as written, in file order, so a repeated list name
+/// can be reported instead of silently overwriting the first.
+#[derive(Debug, Clone, Default)]
+pub struct V1Lists(Vec<(String, V1ListEntry)>);
+
+impl V1Lists {
+    /// The entries keyed by list name; a repeated name is an error.
+    pub(crate) fn into_map(self) -> Result<BTreeMap<String, V1ListEntry>, LoadError> {
+        let mut map = BTreeMap::new();
+        for (name, entry) in self.0 {
+            match map.entry(name) {
+                Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                Entry::Occupied(taken) => {
+                    return Err(LoadError::DuplicateList {
+                        list: taken.key().clone(),
+                    })
+                }
+            }
+        }
+        Ok(map)
+    }
+}
+
+impl<'de> Deserialize<'de> for V1Lists {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PairsVisitor;
+
+        impl<'de> Visitor<'de> for PairsVisitor {
+            type Value = V1Lists;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of list names to list entries")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<V1Lists, A::Error> {
+                let mut pairs = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some(pair) = access.next_entry()? {
+                    pairs.push(pair);
+                }
+                Ok(V1Lists(pairs))
+            }
+        }
+
+        deserializer.deserialize_map(PairsVisitor)
+    }
+}
+
+/// One entry under `lists:`. Holds exactly one of: a definition
+/// (`values` and/or `patterns`, at least one non-empty), `extend`, or
+/// `replace`. Items must be strings; quote values such as `1234`.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct V1ListEntry {
+    /// Literal values, compared ignoring ASCII case.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
+    pub values: Option<Vec<serde_json::Value>>,
+    /// Glob patterns (`*` matches any run of characters), compared
+    /// ignoring ASCII case. A pattern of only `*` is rejected.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
+    pub patterns: Option<Vec<serde_json::Value>>,
+    /// Add to a built-in list.
+    #[serde(default)]
+    pub extend: Option<V1ListBody>,
+    /// Replace the contents of a built-in list. An empty body empties it.
+    #[serde(default)]
+    pub replace: Option<V1ListBody>,
+}
+
+/// The values and patterns of an `extend` or `replace`.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct V1ListBody {
+    /// Literal values, compared ignoring ASCII case.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
+    pub values: Option<Vec<serde_json::Value>>,
+    /// Glob patterns (`*` matches any run of characters), compared
+    /// ignoring ASCII case. A pattern of only `*` is rejected.
+    #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<Vec<String>>"))]
+    pub patterns: Option<Vec<serde_json::Value>>,
 }
 
 /// A single rule entry. Each entry either defines a new rule or
@@ -63,12 +222,12 @@ pub struct V1RuleEntry {
     /// with any live rule id. Defaults to none.
     #[serde(default)]
     pub former_ids: Vec<String>,
-    /// Severity attached to every signal this rule fires. Required
+    /// Severity attached to every finding this rule raises. Required
     /// when defining a new rule. When overriding a built-in, omit to
     /// keep the built-in's severity.
     #[serde(default)]
     pub risk_level: Option<RiskLevel>,
-    /// Message shown with each signal this rule fires. Supports
+    /// Message shown with each finding this rule raises. Supports
     /// `{path.to.field}` placeholders that are filled in with values
     /// from the matched statement. Required when defining a new
     /// rule. When overriding a built-in, omit to keep the built-in's
@@ -81,12 +240,12 @@ pub struct V1RuleEntry {
     /// `triggers`).
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// How many signals fire per matched statement. Defaults to
+    /// How many findings a matched statement raises. Defaults to
     /// `once`. Cannot be set when overriding a built-in.
     #[serde(default)]
     pub emission: Option<EmissionMode>,
-    /// When `true`, every signal this rule fires is kept as its own
-    /// finding instead of being merged with similar findings of the
+    /// When `true`, every finding this rule raises is kept on its own
+    /// instead of being merged with similar findings of the
     /// same rule. Use for compliance-style rules where each
     /// occurrence is a separate review item (for example,
     /// `SNW-UNKNOWN`, where each unrecognized statement is its own
@@ -169,8 +328,63 @@ mod schema_gen {
         // `#[schemars(schema_with = "predicate_schema")]`. Definitions
         // (Predicate, PredicatePathMatch, all walked fact paths) are
         // now in `root.definitions`.
+        constrain_list_entry(&mut root);
         prune_unreferenced_definitions(&mut root);
         root
+    }
+
+    /// A `lists:` entry is exactly one of a definition (`values` and/or
+    /// `patterns`), `extend` or `replace`; the derived object schema
+    /// admits any mix of the four keys and a null `extend` / `replace`.
+    fn constrain_list_entry(root: &mut RootSchema) {
+        let Some(Schema::Object(entry)) = root.definitions.get_mut("V1ListEntry") else {
+            return;
+        };
+        let Some(derived) = entry.object.take() else {
+            return;
+        };
+        let closed = |properties: Map<String, Schema>, required: &[&str]| SchemaObject {
+            instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Object))),
+            object: Some(Box::new(ObjectValidation {
+                required: required.iter().map(|key| key.to_string()).collect(),
+                properties,
+                additional_properties: Some(Box::new(Schema::Bool(false))),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let carrying = |key: &str| {
+            let mut properties = Map::new();
+            properties.insert(key.to_string(), Schema::Object(ref_obj("V1ListBody")));
+            Schema::Object(closed(properties, &[key]))
+        };
+        let strings = || {
+            Schema::Object(array_of(Schema::Object(typed_instance(
+                InstanceType::String,
+            ))))
+        };
+        let mut items = Map::new();
+        for key in ["values", "patterns"] {
+            if let Some(Schema::Object(derived_key)) = derived.properties.get(key) {
+                let mut typed = strings();
+                if let Schema::Object(object) = &mut typed {
+                    object.metadata = derived_key.metadata.clone();
+                }
+                items.insert(key.to_string(), typed);
+            }
+        }
+        let mut definition = closed(items, &[]);
+        if let Some(object) = definition.object.as_mut() {
+            object.min_properties = Some(1);
+        }
+        entry.subschemas = Some(Box::new(SubschemaValidation {
+            one_of: Some(vec![
+                Schema::Object(definition),
+                carrying("extend"),
+                carrying("replace"),
+            ]),
+            ..Default::default()
+        }));
     }
 
     /// Re-exported so consumers (and downstream tooling tests) can pin
@@ -197,6 +411,7 @@ mod schema_gen {
         );
         register(generator, "PredicateCountOpBlock", count_op_block_def());
         register(generator, "PredicateRangeBlock", range_block_def());
+        register(generator, "PredicateFieldReference", field_reference_def());
         register(generator, "PredicateOpaqueValue", opaque_value_def());
         register(generator, "PredicateScalarValue", scalar_value_def());
         register(generator, "PredicateVecValue", vec_value_def());
@@ -442,7 +657,7 @@ mod schema_gen {
             "Match against a list of `{0}` items. Pick exactly one: \
              `exists` (at least one item matches), `all` (every item \
              matches), `none` (no item matches), `each` (emit one \
-             signal per matching item), or `count` (compare the number \
+             finding per matching item), or `count` (compare the number \
              of items).",
             type_name
         ));
@@ -497,7 +712,7 @@ mod schema_gen {
             "Match against a list-valued field. Pick exactly one: \
              `exists` (at least one item matches), `all` (every item \
              matches), `none` (no item matches), `each` (emit one \
-             signal per matching item), or `count` (compare the number \
+             finding per matching item), or `count` (compare the number \
              of items).",
         );
         s.subschemas = Some(Box::new(SubschemaValidation {
@@ -585,6 +800,10 @@ mod schema_gen {
             Schema::Object(obj_with_single_required("contains", enum_ref())),
             Schema::Object(obj_with_single_required("contains_any", enum_list())),
             Schema::Object(obj_with_single_required("contains_all", enum_list())),
+            Schema::Object(obj_with_single_required(
+                "all_in_field",
+                Schema::Object(ref_obj("PredicateFieldReference")),
+            )),
         ];
         let op_block = SchemaObject {
             subschemas: Some(Box::new(SubschemaValidation {
@@ -679,6 +898,8 @@ mod schema_gen {
             ),
             ("in", lit_list()),
             ("not_in", lit_list()),
+            ("in_list", list_names()),
+            ("not_in_list", list_names()),
             (
                 "exists",
                 Schema::Object(typed_instance(InstanceType::Boolean)),
@@ -699,8 +920,10 @@ mod schema_gen {
             "Operator block for a single-value field. Pick exactly one: \
              `eq` (equals), `neq` (not equals), `gt` / `lt` / `gte` / \
              `lte` (numeric comparison), `matches` (glob pattern), \
-             `in` / `not_in` (set membership), `exists` / `is_null` \
-             (presence checks), `range` (inclusive range).",
+             `in` / `not_in` (set membership), `in_list` / `not_in_list` \
+             (membership of a named list from `lists:`, ignoring case), \
+             `exists` / `is_null` (presence checks), `range` (inclusive \
+             range).",
         );
         s.subschemas = Some(Box::new(SubschemaValidation {
             one_of: Some(one_of),
@@ -717,6 +940,10 @@ mod schema_gen {
             ("contains", lit()),
             ("contains_any", lit_list()),
             ("contains_all", lit_list()),
+            (
+                "all_in_field",
+                Schema::Object(ref_obj("PredicateFieldReference")),
+            ),
         ];
 
         let one_of: Vec<Schema> = branches
@@ -729,7 +956,9 @@ mod schema_gen {
              matches when the named value appears in the list; \
              `contains_any` matches when any of the listed values \
              appear; `contains_all` matches when all listed values \
-             appear.",
+             appear; `all_in_field` matches when every item of the \
+             list is in the list another field of the same item \
+             holds.",
         );
         s.subschemas = Some(Box::new(SubschemaValidation {
             one_of: Some(one_of),
@@ -785,6 +1014,22 @@ mod schema_gen {
             required,
             properties: props,
             additional_properties: Some(Box::new(Schema::Bool(false))),
+            ..Default::default()
+        }));
+        s
+    }
+
+    fn field_reference_def() -> SchemaObject {
+        let mut s = description(
+            "Another field of the same item, as a dotted path (the \
+             statement's own fields outside every `exists` / `all` / \
+             `none` / `each`). Never a literal. An absent or null field \
+             is the empty list; a field that is not a list holds no \
+             item, so the comparison does not hold.",
+        );
+        s.instance_type = Some(SingleOrVec::Single(Box::new(InstanceType::String)));
+        s.string = Some(Box::new(schemars::schema::StringValidation {
+            pattern: Some(r"^[^.]+(\.[^.]+)*$".to_string()),
             ..Default::default()
         }));
         s
@@ -1473,6 +1718,22 @@ mod schema_gen {
         }
     }
 
+    /// A list name, or a non-empty array of list names.
+    fn list_names() -> Schema {
+        let name = || Schema::Object(typed_instance(InstanceType::String));
+        let mut many = array_of(name());
+        if let Some(array) = many.array.as_mut() {
+            array.min_items = Some(1);
+        }
+        Schema::Object(SchemaObject {
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(vec![name(), Schema::Object(many)]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
     fn array_of(item: Schema) -> SchemaObject {
         SchemaObject {
             instance_type: Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
@@ -1529,6 +1790,45 @@ mod schema_gen {
         schemars::schema::Metadata {
             description: Some(text.to_string()),
             ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_list_entry_is_one_of_definition_extend_replace() {
+            let root = generate_v1_rules_schema();
+            let Some(Schema::Object(entry)) = root.definitions.get("V1ListEntry") else {
+                panic!("V1ListEntry is in the schema");
+            };
+            assert!(entry.object.is_none(), "the keys sit in the branches");
+            let branches = entry
+                .subschemas
+                .as_ref()
+                .and_then(|s| s.one_of.as_ref())
+                .map_or(0, Vec::len);
+            assert_eq!(branches, 3);
+            let definition = entry
+                .subschemas
+                .as_ref()
+                .and_then(|s| s.one_of.as_ref())
+                .and_then(|branches| branches.first());
+            let Some(Schema::Object(definition)) = definition else {
+                panic!("the definition branch is an object schema");
+            };
+            let properties = definition.object.as_ref().map(|o| &o.properties);
+            for key in ["values", "patterns"] {
+                let Some(Some(Schema::Object(item))) = properties.map(|p| p.get(key)) else {
+                    panic!("{key} is a property of the definition branch");
+                };
+                assert_eq!(
+                    item.instance_type,
+                    Some(SingleOrVec::Single(Box::new(InstanceType::Array))),
+                    "{key} is a non-null array"
+                );
+            }
         }
     }
 }

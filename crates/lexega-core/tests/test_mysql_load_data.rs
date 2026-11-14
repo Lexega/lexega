@@ -24,7 +24,7 @@ fn mysql_cfg() -> AnalysisConfig {
 fn rule_ids_cfg(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
+        .findings
         .iter()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
@@ -35,8 +35,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mysql();
+    let config = FormatterConfig {
+        dialect: dialect::mysql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");

@@ -1,12 +1,12 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-/// Tests for MSSQL SQL Server 2025 statement support and risk signals.
+/// Tests for MSSQL SQL Server 2025 statement support and risk findings.
 ///
 /// Tests cover:
 ///   1. Parsing produces correct AST variants (not OpaqueContent)
 ///   2. Formatting preserves semantic tokens
-///   3. Risk analysis emits correct security/governance signals
+///   3. Risk analysis emits correct security/governance findings
 ///   4. Multi-statement evidence counting
 ///   5. |= compound assignment lexer token
 use lexega_core::analyzer::{AnalysisConfig, RuleMatch};
@@ -22,9 +22,10 @@ use std::sync::Arc;
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn parse_mssql(sql: &str) -> Vec<AstStmt> {
@@ -79,20 +80,22 @@ fn format_verify_variant(sql: &str, expected_variant: &str) {
     format_verify(sql);
 }
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_mssql(sql: &str) -> HashSet<String> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(MsSqlDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(MsSqlDialect)),
+        ..Default::default()
+    };
     match analyze_risk_with_policy_config(sql, &config) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(report.entries()),
         Err(e) => {
             eprintln!("Risk analysis error (MSSQL dialect): {:?}", e);
             HashSet::new()
@@ -101,8 +104,10 @@ fn analyze_mssql(sql: &str) -> HashSet<String> {
 }
 
 fn analyze_mssql_report(sql: &str) -> lexega_core::analyzer::AnalysisReport {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(MsSqlDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(MsSqlDialect)),
+        ..Default::default()
+    };
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
@@ -300,11 +305,11 @@ fn test_regexp_matches_tvf() {
 }
 
 // ============================================================================
-// CREATE EXTERNAL MODEL — Risk Signals
+// CREATE EXTERNAL MODEL — Risk Findings
 // ============================================================================
 
 #[test]
-fn test_create_external_model_emits_created_signal() {
+fn test_create_external_model_emits_created_finding() {
     let rules = analyze_mssql(
         "CREATE EXTERNAL MODEL my_gpt WITH (LOCATION = 'https://endpoint.com/', API_FORMAT = 'OPEN_AI', MODEL_TYPE = EMBEDDINGS, MODEL = 'ada-002');",
     );
@@ -316,19 +321,22 @@ fn test_create_external_model_emits_created_signal() {
 }
 
 #[test]
-fn test_create_external_model_emits_remote_signal() {
-    let rules = analyze_mssql(
+fn test_create_external_model_emits_one_created_finding() {
+    let report = analyze_mssql_report(
         "CREATE EXTERNAL MODEL my_gpt WITH (LOCATION = 'https://endpoint.com/', API_FORMAT = 'OPEN_AI', MODEL_TYPE = EMBEDDINGS, MODEL = 'ada-002');",
     );
-    assert!(
-        rules.contains("MSSQL-EXTMDL-RMT"),
-        "MSSQL-EXTMDL-RMT should fire for CREATE EXTERNAL MODEL (remote connection). Got: {:?}",
-        rules
+    let count = report
+        .entries()
+        .filter(|m| m.rule_id() == Some("MSSQL-EXTMDL-NEW"))
+        .count();
+    assert_eq!(
+        count, 1,
+        "MSSQL-EXTMDL-NEW should fire once for CREATE EXTERNAL MODEL"
     );
 }
 
 #[test]
-fn test_alter_external_model_emits_modified_signal() {
+fn test_alter_external_model_emits_modified_finding() {
     let rules = analyze_mssql(
         "ALTER EXTERNAL MODEL my_model SET (LOCATION = 'https://new.com/', MODEL = 'gpt-4o');",
     );
@@ -340,7 +348,7 @@ fn test_alter_external_model_emits_modified_signal() {
 }
 
 #[test]
-fn test_drop_external_model_emits_dropped_signal() {
+fn test_drop_external_model_emits_dropped_finding() {
     let rules = analyze_mssql("DROP EXTERNAL MODEL my_model;");
     assert!(
         rules.contains("INFO-MSSQL-EXTMDL-DROP"),
@@ -360,8 +368,7 @@ fn test_create_external_model_multi_statement_evidence() {
     );
 
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|f| matches!(f, RuleMatch::Analysis(g) if g.matched_rule == "MSSQL-EXTMDL-NEW"))
         .map(|f| match f {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -376,11 +383,11 @@ fn test_create_external_model_multi_statement_evidence() {
 }
 
 // ============================================================================
-// CREATE VECTOR INDEX — Risk Signals
+// CREATE VECTOR INDEX — Risk Findings
 // ============================================================================
 
 #[test]
-fn test_create_vector_index_emits_signal() {
+fn test_create_vector_index_emits_finding() {
     let rules = analyze_mssql(
         "CREATE VECTOR INDEX idx_embedding ON dbo.articles(content_embedding) WITH (METRIC = 'cosine', TYPE = 'DiskANN');",
     );
@@ -392,11 +399,11 @@ fn test_create_vector_index_emits_signal() {
 }
 
 // ============================================================================
-// CREATE LOGIN — Risk Signals
+// CREATE LOGIN — Risk Findings
 // ============================================================================
 
 #[test]
-fn test_create_login_emits_created_signal() {
+fn test_create_login_emits_created_finding() {
     let rules = analyze_mssql("CREATE LOGIN new_admin WITH PASSWORD = 'P@ss123';");
     assert!(
         rules.contains("MSSQL-LOGIN-NEW"),
@@ -406,7 +413,7 @@ fn test_create_login_emits_created_signal() {
 }
 
 #[test]
-fn test_create_login_external_emits_remote_signal() {
+fn test_create_login_external_emits_remote_finding() {
     let rules = analyze_mssql("CREATE LOGIN [bob@contoso.com] FROM EXTERNAL PROVIDER;");
     assert!(
         rules.contains("MSSQL-LOGIN-NEW"),
@@ -421,7 +428,7 @@ fn test_create_login_external_emits_remote_signal() {
 }
 
 #[test]
-fn test_create_login_with_object_id_emits_remote_signal() {
+fn test_create_login_with_object_id_emits_remote_finding() {
     let rules = analyze_mssql(
         "CREATE LOGIN [myapp] FROM EXTERNAL PROVIDER WITH OBJECT_ID = '12345', TYPE = X;",
     );
@@ -433,7 +440,7 @@ fn test_create_login_with_object_id_emits_remote_signal() {
 }
 
 #[test]
-fn test_create_login_password_no_external_signal() {
+fn test_create_login_password_no_external_finding() {
     let rules = analyze_mssql("CREATE LOGIN new_user WITH PASSWORD = 'StrongP@ss1';");
     assert!(
         !rules.contains("MSSQL-LOGIN-EXT"),
@@ -443,11 +450,11 @@ fn test_create_login_password_no_external_signal() {
 }
 
 // ============================================================================
-// CREATE USER — Risk Signals
+// CREATE USER — Risk Findings
 // ============================================================================
 
 #[test]
-fn test_create_user_emits_created_signal() {
+fn test_create_user_emits_created_finding() {
     let rules = analyze_mssql("CREATE USER app_user FOR LOGIN app_login;");
     assert!(
         rules.contains("MSSQL-USER-NEW"),
@@ -457,7 +464,7 @@ fn test_create_user_emits_created_signal() {
 }
 
 #[test]
-fn test_create_user_external_emits_remote_signal() {
+fn test_create_user_external_emits_remote_finding() {
     let rules = analyze_mssql("CREATE USER [bob@contoso.com] FROM EXTERNAL PROVIDER;");
     assert!(
         rules.contains("MSSQL-USER-NEW"),
@@ -472,7 +479,7 @@ fn test_create_user_external_emits_remote_signal() {
 }
 
 #[test]
-fn test_create_user_for_login_no_external_signal() {
+fn test_create_user_for_login_no_external_finding() {
     let rules = analyze_mssql("CREATE USER app_user FOR LOGIN app_login;");
     assert!(
         !rules.contains("MSSQL-USER-EXT"),
@@ -482,7 +489,7 @@ fn test_create_user_for_login_no_external_signal() {
 }
 
 #[test]
-fn test_create_user_without_login_no_external_signal() {
+fn test_create_user_without_login_no_external_finding() {
     let rules = analyze_mssql("CREATE USER svc_account WITHOUT LOGIN;");
     assert!(
         !rules.contains("MSSQL-USER-EXT"),
@@ -512,17 +519,21 @@ CREATE USER [svc@contoso.com] FROM EXTERNAL PROVIDER
 "#;
 
     let report = analyze_mssql_report(sql);
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
 
-    // All expected signals should fire
+    // All expected findings should fire
     assert!(
         rules.contains("MSSQL-EXTMDL-NEW"),
         "Missing MSSQL-EXTMDL-NEW in {:?}",
         rules
     );
-    assert!(
-        rules.contains("MSSQL-EXTMDL-RMT"),
-        "Missing MSSQL-EXTMDL-RMT in {:?}",
+    assert_eq!(
+        report
+            .entries()
+            .filter(|m| m.rule_id() == Some("MSSQL-EXTMDL-NEW"))
+            .count(),
+        1,
+        "MSSQL-EXTMDL-NEW should fire once in {:?}",
         rules
     );
     assert!(

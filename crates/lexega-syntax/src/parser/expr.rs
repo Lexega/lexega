@@ -11,9 +11,10 @@
 //! - Subqueries in expressions
 
 use crate::ast::*;
+use crate::dialect::WordOperator;
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult};
-use crate::lexer::{Keyword, Span, Token, TokenKind};
-use crate::parser::core::{track_depth, Parser, ParserMode};
+use crate::lexer::{Keyword, Punctuation, Span, Token, TokenKind};
+use crate::parser::core::{track_depth, Parser};
 use crate::parser::scripting::expr_span_end;
 
 /// Introducer of an ODBC escape clause in expression position.
@@ -124,6 +125,21 @@ fn flatten_expr(expr: AstExpr) -> AstExpr {
             right: Box::new(flatten_expr(*right)),
             span,
             syntax_id,
+        },
+
+        AstExpr::OperatorChain {
+            node_id,
+            operands,
+            operators,
+            span,
+        } => AstExpr::OperatorChain {
+            node_id,
+            operands: operands
+                .into_iter()
+                .map(|operand| Box::new(flatten_expr(*operand)))
+                .collect(),
+            operators,
+            span,
         },
 
         AstExpr::Parenthesized {
@@ -261,6 +277,81 @@ fn rebuild_binary_chain(
     result
 }
 
+/// A precedence level of left-associative operators. A run of operators of
+/// one level is one [`AstExpr::OperatorChain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainLevel {
+    /// `+`, `-`, `||` as concatenation, `<->`
+    Additive,
+    /// `*`, `/`, `%`, `DIV`, `MOD`
+    Multiplicative,
+    /// `<<`, `>>`, `^`, `#`, `&`, `|`
+    Bitwise,
+    /// MySQL's `XOR`
+    ExclusiveOr,
+}
+
+impl ChainLevel {
+    /// The level `operator` chains at; `None` where it does not chain.
+    pub(crate) fn of(operator: BinaryOperator) -> Option<Self> {
+        use BinaryOperator as Op;
+        match operator {
+            Op::Plus | Op::Minus | Op::Concat | Op::Distance => Some(Self::Additive),
+            Op::Multiply | Op::Divide | Op::Modulo | Op::IntegerDivide => {
+                Some(Self::Multiplicative)
+            }
+            Op::LeftShift
+            | Op::RightShift
+            | Op::BitwiseXor
+            | Op::BitwiseXorPg
+            | Op::BitwiseAnd
+            | Op::BitwiseOr => Some(Self::Bitwise),
+            Op::Xor => Some(Self::ExclusiveOr),
+            Op::Equal
+            | Op::NotEqual
+            | Op::LessThan
+            | Op::LessThanOrEqual
+            | Op::GreaterThan
+            | Op::GreaterThanOrEqual
+            | Op::NullSafeEqual
+            | Op::And
+            | Op::Or
+            | Op::Not
+            | Op::LogicalAnd
+            | Op::LogicalOr
+            | Op::Like
+            | Op::ILike
+            | Op::RLike
+            | Op::ArrayContains
+            | Op::ArrayContainedBy
+            | Op::ArrayOverlap
+            | Op::JsonField
+            | Op::JsonFieldText
+            | Op::JsonPath
+            | Op::JsonPathText
+            | Op::JsonContains
+            | Op::JsonExists
+            | Op::RegexMatch
+            | Op::RegexMatchI
+            | Op::RegexNotMatch
+            | Op::RegexNotMatchI
+            | Op::Exponent
+            | Op::BitwiseNot
+            | Op::Assign
+            | Op::QueryMatch
+            | Op::JsonExistsAny
+            | Op::JsonExistsAll
+            | Op::StartsWith
+            | Op::Overlaps
+            | Op::SquareRoot
+            | Op::AbsoluteValue
+            | Op::SoundsLike
+            | Op::MemberOf
+            | Op::BinaryCast => None,
+        }
+    }
+}
+
 // ============================================================================
 // Pratt Parser: Binding Power Definitions
 // ============================================================================
@@ -283,8 +374,16 @@ pub(crate) fn infix_binding_power(
         // || as logical OR (MySQL): same precedence as OR keyword
         TokenKind::Operator(Operator::PipePipe) if !dialect.pipe_pipe_is_concat() => Some((10, 11)),
 
-        // AND (left-associative)
-        TokenKind::Keyword(Keyword::And) => Some((20, 21)),
+        // XOR (MySQL): between OR and AND
+        TokenKind::Identifier {
+            word_operator: Some(WordOperator::Xor),
+            ..
+        } => Some((15, 16)),
+
+        // AND, and `&&` where it is the logical AND (left-associative)
+        TokenKind::Keyword(Keyword::And) | TokenKind::Operator(Operator::AmpAmpAnd) => {
+            Some((20, 21))
+        }
 
         // Comparison operators: =, !=, <>, <, <=, >, >=, <=> (null-safe)
         TokenKind::Operator(Operator::Eq)
@@ -294,7 +393,9 @@ pub(crate) fn infix_binding_power(
         | TokenKind::Operator(Operator::Le)
         | TokenKind::Operator(Operator::Gt)
         | TokenKind::Operator(Operator::Ge)
-        | TokenKind::Operator(Operator::LtEqGt) => Some((30, 31)),
+        | TokenKind::Operator(Operator::LtEqGt)
+        | TokenKind::Operator(Operator::BangLt)
+        | TokenKind::Operator(Operator::BangGt) => Some((30, 31)),
 
         // LIKE, ILIKE, RLIKE, REGEXP - same precedence as comparison
         TokenKind::Keyword(Keyword::Like)
@@ -309,10 +410,15 @@ pub(crate) fn infix_binding_power(
         | TokenKind::Operator(Operator::PipePipe)  // concat case (guard above handles OR case)
         | TokenKind::Operator(Operator::LtMinusGt) => Some((40, 41)),
 
-        // Multiplication/division/modulo (left-associative)
+        // Multiplication/division/modulo, and the words MySQL writes two
+        // of them as (left-associative)
         TokenKind::Operator(Operator::Star)
         | TokenKind::Operator(Operator::Slash)
-        | TokenKind::Operator(Operator::Percent) => Some((50, 51)),
+        | TokenKind::Operator(Operator::Percent)
+        | TokenKind::Identifier {
+            word_operator: Some(WordOperator::IntegerDivide | WordOperator::Modulo),
+            ..
+        } => Some((50, 51)),
 
         // PostgreSQL array/JSON operators - same precedence as comparison
         TokenKind::Operator(Operator::AtGt)          // @> contains
@@ -322,9 +428,19 @@ pub(crate) fn infix_binding_power(
         | TokenKind::Operator(Operator::MinusGtGt)   // ->> JSON field as text (PG/MySQL)
         | TokenKind::Operator(Operator::HashGt)      // #> JSON path
         | TokenKind::Operator(Operator::HashGtGt)    // #>> JSON path as text
-        | TokenKind::Operator(Operator::AtQuestion)  // @? JSON contains
         | TokenKind::Operator(Operator::QuestionQuestion)  // ?? JSON exists
         => Some((30, 31)),
+
+        // PostgreSQL's other operators: below addition, above comparison
+        // (left-associative). A `?` after an operand is the key-exists
+        // operator.
+        TokenKind::Operator(Operator::AtQuestion)    // @? JSON path exists
+        | TokenKind::Placeholder                     // ? key exists
+        | TokenKind::Operator(Operator::QuestionBar) // ?| any key exists
+        | TokenKind::Operator(Operator::QuestionAmp) // ?& all keys exist
+        | TokenKind::Operator(Operator::AtAt)        // @@ text-search / path match
+        | TokenKind::Operator(Operator::CaretAt)     // ^@ starts with
+        => Some((35, 36)),
 
         // PostgreSQL regex operators - same precedence as LIKE
         TokenKind::Operator(Operator::Tilde)          // ~ regex match
@@ -334,12 +450,20 @@ pub(crate) fn infix_binding_power(
         | TokenKind::Operator(Operator::RegexNotMatchI) // !~* regex not match case-insensitive
         => Some((30, 31)),
 
-        // Bit operators - between addition and multiplication
+        // Bit operators - below addition, above comparison (left-associative).
+        // An engine may group mixed arithmetic and bitwise operators
+        // differently; that changes no analysis, since every one of these
+        // operators gives NULL where an operand is NULL.
         TokenKind::Operator(Operator::LtLt)   // << left shift
         | TokenKind::Operator(Operator::GtGt) // >> right shift
-        | TokenKind::Operator(Operator::Caret) // ^ XOR / power
+        | TokenKind::Operator(Operator::Caret) // ^ XOR
         | TokenKind::Operator(Operator::Hash)  // # bitwise XOR (PostgreSQL)
-        => Some((45, 46)),
+        | TokenKind::Operator(Operator::Amp)   // & AND
+        | TokenKind::Operator(Operator::Bar)   // | OR
+        => Some((35, 36)),
+
+        // Exponentiation (PostgreSQL ^) - above multiplication (left-associative)
+        TokenKind::Operator(Operator::Power) => Some((60, 61)),
 
         _ => None,
     }
@@ -347,11 +471,16 @@ pub(crate) fn infix_binding_power(
 
 /// Binding power for compound predicates that need special parsing.
 /// Returns (left_bp, right_bp) at comparison level.
-/// These predicates are: IS, IN, BETWEEN, LIKE, ILIKE, RLIKE
+/// These predicates are: IS, IN, BETWEEN, LIKE, ILIKE, RLIKE, and the
+/// postfix ISNULL and NOTNULL
 #[inline]
 pub(crate) fn compound_predicate_binding_power(tok: &Token) -> Option<(u8, u8)> {
     match &tok.kind {
         TokenKind::Keyword(Keyword::Is)
+        | TokenKind::Identifier {
+            word_operator: Some(WordOperator::IsNull | WordOperator::NotNull),
+            ..
+        }
         | TokenKind::Keyword(Keyword::In)
         | TokenKind::Keyword(Keyword::Not) // NOT IN, NOT LIKE, NOT BETWEEN
         | TokenKind::Keyword(Keyword::Between)
@@ -399,6 +528,130 @@ pub(crate) fn is_expr_terminator(tok: &Token, paren_depth: i32) -> bool {
 
 // Implementation methods will be added here via:
 impl<'a> Parser<'a> {
+    /// Runs `read`; where it gives `None`, the tokens it consumed are given
+    /// back and the recovery errors it recorded dropped.
+    pub(crate) fn try_read<T>(&mut self, read: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        let (from, errors) = (self.idx, self.recovery_errors.len());
+        let found = read(self);
+        if found.is_none() {
+            self.idx = from;
+            self.recovery_errors.truncate(errors);
+        }
+        found
+    }
+
+    /// An expression that parses with no recovery, `None` where it does not
+    /// or needed one (the tokens consumed are given back by [`Self::try_read`]).
+    pub(crate) fn parse_expr_without_recovery(&mut self) -> Option<AstExpr> {
+        let errors = self.recovery_errors.len();
+        let expr = self.parse_expr().ok()?;
+        (self.recovery_errors.len() == errors).then_some(expr)
+    }
+
+    /// The expression the tokens written exactly over `span` are, where a
+    /// statement reader carved `span` out by its tokens: `None` where they
+    /// are not one expression that parses with no recovery. The parser's
+    /// place is left as it was.
+    pub(crate) fn expr_written_at(&mut self, span: Span) -> Option<AstExpr> {
+        let first = self.tokens.partition_point(|t| t.span.start < span.start);
+        if self.tokens.get(first)?.span.start != span.start {
+            return None;
+        }
+        let at = self.idx;
+        self.idx = first;
+        let expr = self.try_read(|p| {
+            let expr = p.parse_expr_without_recovery()?;
+            let last = p.tokens.get(p.idx.checked_sub(1)?)?;
+            (last.span.end == span.end).then_some(expr)
+        });
+        self.idx = at;
+        expr
+    }
+
+    /// The expression written after the keyword `span` starts with
+    /// (`DEFAULT …`, `AS (…)`), to `span`'s end ([`Self::expr_written_at`]).
+    pub(crate) fn expr_after_keyword(&mut self, span: Span) -> Option<AstExpr> {
+        let keyword = self.tokens.partition_point(|t| t.span.start < span.start);
+        let first = self.tokens.get(keyword + 1)?;
+        if first.span.start >= span.end {
+            return None;
+        }
+        self.expr_written_at(Span {
+            start: first.span.start,
+            end: span.end,
+        })
+    }
+
+    /// A parenthesized expression, `(` next: its span with the parentheses
+    /// and the expression inside them. `None`, the tokens given back, where
+    /// what the parentheses hold is not one expression.
+    pub(crate) fn parse_parenthesized_expr(&mut self) -> Option<(Span, AstExpr)> {
+        self.try_read(|p| {
+            let lparen = p
+                .advance()
+                .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))?;
+            let expr = p.parse_expr_without_recovery()?;
+            let rparen = p
+                .advance()
+                .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)))?;
+            Some((
+                Span {
+                    start: lparen.span.start,
+                    end: rparen.span.end,
+                },
+                expr,
+            ))
+        })
+    }
+
+    /// The prefix operator `operator` at the current token, applied to the
+    /// operand `read_operand` reads after it: a binary operation whose left
+    /// operand is an empty literal where the operator starts, as the prefix
+    /// `NOT` is (a boolean for `NOT`, a number for the others).
+    pub(crate) fn parse_prefix_operation(
+        &mut self,
+        operator: crate::ast::BinaryOperator,
+        read_operand: impl FnOnce(&mut Self) -> ParseResult<AstExpr>,
+    ) -> ParseResult<AstExpr> {
+        let op_token = self.current_token_id();
+        let op_span = self
+            .advance()
+            .expect_invariant("prefix operator after peek")
+            .span;
+        let operand = read_operand(self)?;
+        let span = Span {
+            start: op_span.start,
+            end: crate::parser::scripting::expr_span_end(&operand),
+        };
+        let syntax_id = self
+            .syntax_arena
+            .alloc_binary_op(crate::syntax::SyntaxBinaryOp {
+                op_token,
+                span: op_span,
+            });
+        let empty = Span {
+            start: op_span.start,
+            end: op_span.start,
+        };
+        let literal = if operator == crate::ast::BinaryOperator::Not {
+            AstLiteral::Boolean { span: empty }
+        } else {
+            AstLiteral::Number { span: empty }
+        };
+        let empty_left = AstExpr::Literal {
+            node_id: self.id_gen.next(),
+            literal,
+        };
+        Ok(AstExpr::BinaryOp {
+            node_id: self.id_gen.next(),
+            left: Box::new(empty_left),
+            operator,
+            syntax_id,
+            right: Box::new(operand),
+            span,
+        })
+    }
+
     /// Try to parse an expression, on failure create an Error node and skip to a recovery point.
     /// Used for error-tolerant parsing in function arguments and other expression contexts.
     ///
@@ -432,6 +685,18 @@ impl<'a> Parser<'a> {
             .peek()
             .is_some_and(|t| matches!(t.kind, TokenKind::Unknown))
         {
+            return Err(recovery_error);
+        }
+        // So is a `$$` string the lexer gives as words whose closer is not
+        // written, in a dialect where such words are a string.
+        let unclosed_dollar_quote = self.dialect.dollar_strings_written_as_words()
+            && self.one_literal_at(self.idx).is_some_and(|literal| {
+                literal.spelling == crate::parser::principal::LiteralSpelling::UnclosedDollarQuoted
+                    && crate::parser::core::is_dollar_quote_delimiter(
+                        &self.tokens[literal.first].kind,
+                    )
+            });
+        if unclosed_dollar_quote {
             return Err(recovery_error);
         }
 
@@ -525,66 +790,65 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Check if a token is a recognized INTERVAL time unit (DAY, HOUR, MONTH, etc.)
-    fn is_interval_time_unit(tok: &Token, source: &str) -> bool {
-        let lexeme = tok.lexeme(source);
-        matches!(
-            lexeme.to_ascii_uppercase().as_str(),
-            "DAY"
-                | "DAYS"
-                | "HOUR"
-                | "HOURS"
-                | "MINUTE"
-                | "MINUTES"
-                | "SECOND"
-                | "SECONDS"
-                | "MILLISECOND"
-                | "MILLISECONDS"
-                | "MICROSECOND"
-                | "MICROSECONDS"
-                | "MONTH"
-                | "MONTHS"
-                | "YEAR"
-                | "YEARS"
-                | "WEEK"
-                | "WEEKS"
-                | "QUARTER"
-                | "QUARTERS"
-        )
+    /// Whether a token is an INTERVAL's unit: a date part an INTERVAL may
+    /// take, written by its name or plural (DAY, HOURS, …), or a compound
+    /// unit (`HOUR_MINUTE`) where the dialect's INTERVAL takes one.
+    fn is_interval_time_unit(&self, tok: &Token) -> bool {
+        crate::ast::DatePart::from_name(tok.lexeme(self.source)).is_some_and(|part| {
+            part.is_interval_unit()
+                || (self.dialect.compound_interval_units() && part.is_compound_interval_unit())
+        })
     }
 
     /// Parse the tail of an interval literal after the `INTERVAL` keyword (or
-    /// the `{interval` ODBC introducer): value literal + optional time unit
-    /// [TO unit]. Returns the end byte offset of the last consumed token.
+    /// the `{interval` ODBC introducer): value + optional time unit [TO
+    /// unit]. The value is a string or numeric literal, or an expression
+    /// followed by its unit (`INTERVAL n + 1 DAY`, as BigQuery, MySQL and
+    /// Databricks write a count). Returns the end byte offset of the last
+    /// consumed token.
     fn parse_interval_literal_tail(&mut self) -> ParseResult<u32> {
-        // Accept string literal OR numeric literal after INTERVAL
-        let value_tok = self.advance().ok_or_else(|| {
+        let value_tok = self.peek().ok_or_else(|| {
             ParseError::unexpected_eof(
                 self.current_span(),
                 vec!["literal after INTERVAL".to_string()],
             )
         })?;
-
-        let is_valid_value = matches!(
+        let literal_value = matches!(
             value_tok.kind,
             TokenKind::Literal(crate::lexer::LiteralKind::String)
                 | TokenKind::Literal(crate::lexer::LiteralKind::Number)
         );
 
-        if !is_valid_value {
-            return Err(ParseError::unexpected_token(
-                value_tok.span,
-                vec!["string or numeric literal".to_string()],
-                Parser::token_description(value_tok, self.source),
-            ));
-        }
-
-        let mut end = value_tok.span.end;
+        let mut end = if literal_value {
+            self.advance()
+                .expect_invariant("interval value after peek")
+                .span
+                .end
+        } else {
+            let count = self.parse_expr()?;
+            match self.peek() {
+                Some(unit) if self.is_interval_time_unit(unit) => {}
+                Some(found) => {
+                    return Err(ParseError::unexpected_token(
+                        found.span,
+                        vec!["interval unit".to_string()],
+                        Parser::token_description(found, self.source),
+                    ))
+                }
+                None => {
+                    return Err(ParseError::unexpected_eof(
+                        self.current_span(),
+                        vec!["interval unit".to_string()],
+                    ))
+                }
+            }
+            expr_span_end(&count)
+        };
 
         // Optionally consume time unit (DAY, HOUR, MONTH, YEAR, SECOND, MINUTE, etc.)
         // These are typically identifiers or keywords
         if let Some(unit_tok) = self.peek() {
-            if Self::is_interval_time_unit(unit_tok, self.source) {
+            if self.is_interval_time_unit(unit_tok) {
                 let unit = self
                     .advance()
                     .expect_invariant("time unit token after peek");
@@ -597,7 +861,7 @@ impl<'a> Parser<'a> {
                         let save_idx = self.idx;
                         self.advance(); // consume TO
                         if let Some(end_unit_tok) = self.peek() {
-                            if Self::is_interval_time_unit(end_unit_tok, self.source) {
+                            if self.is_interval_time_unit(end_unit_tok) {
                                 let end_unit =
                                     self.advance().expect_invariant("end time unit after peek");
                                 end = end_unit.span.end;
@@ -682,7 +946,8 @@ impl<'a> Parser<'a> {
         if !matches!(
             tok.kind,
             TokenKind::Identifier {
-                kind: crate::lexer::IdentifierKind::Unquoted
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
             }
         ) {
             return None;
@@ -732,10 +997,19 @@ impl<'a> Parser<'a> {
                 })
             }
             OdbcExprIntro::Fn => {
-                let mut inner = self.parse_primary_expr_in_mode()?;
+                let call = self.peek().map(|t| t.span.start);
+                let enclosing = std::mem::replace(&mut self.odbc_call, call);
+                let inner = self.parse_primary_expr_in_mode();
+                self.odbc_call = enclosing;
+                let mut inner = inner?;
                 let rcurly_span = self.expect_odbc_rcurly()?;
-                if let AstExpr::FunctionCall { odbc_fn, span, .. } = &mut inner {
-                    *odbc_fn = true;
+                // A call, or the special forms ODBC lists among its scalar
+                // functions: `{fn EXTRACT(YEAR FROM d)}`, `{fn POSITION(a IN b)}`.
+                if let AstExpr::FunctionCall { odbc_fn, span, .. }
+                | AstExpr::Extract { odbc_fn, span, .. }
+                | AstExpr::Position { odbc_fn, span, .. } = &mut inner
+                {
+                    *odbc_fn = Some(*span);
                     *span = Span {
                         start: lcurly_span.start,
                         end: rcurly_span.end,
@@ -965,6 +1239,7 @@ impl<'a> Parser<'a> {
                         // After dot, any keyword can be an identifier
                         if self.can_be_identifier_after_dot_token(second_tok) {
                             qualifier = Some(AstObjectRef {
+                                name_kind: crate::ast::AstTableNameKind::Catalog,
                                 node_id: self.id_gen.next(),
                                 span: first_span,
                                 // Column qualifier: per-part decomposition
@@ -985,6 +1260,8 @@ impl<'a> Parser<'a> {
                 name: AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: name_span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 },
             });
 
@@ -1145,6 +1422,8 @@ impl<'a> Parser<'a> {
                     name: AstIdentifier {
                         node_id: self.id_gen.next(),
                         span: col_tok.span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
                     },
                 },
             });
@@ -1342,12 +1621,16 @@ impl<'a> Parser<'a> {
                     name: AstIdentifier {
                         node_id: self.id_gen.next(),
                         span: col_span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
                     },
                 },
                 as_span,
                 alias: AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: alias_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 },
             });
 
@@ -1425,11 +1708,8 @@ impl<'a> Parser<'a> {
     /// Parse a data type specification for CAST operations.
     /// Supports: TYPE, TYPE(precision), TYPE(precision, scale)
     pub(crate) fn parse_data_type(&mut self) -> Option<ParseResult<AstDataType>> {
-        let type_tok = self.peek()?;
-        if !self.can_be_identifier_token(type_tok) {
-            return None;
-        }
-        let name_span = self.advance()?.span;
+        self.peek()?;
+        let name_span = self.take_name_span(crate::parser::core::NamePosition::DataType)?;
 
         // Check for compound INTERVAL types: INTERVAL YEAR [(p)] [TO MONTH], etc.
         {
@@ -1558,6 +1838,20 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+
+        // MySQL's `SIGNED INTEGER` / `UNSIGNED INT`: one type named by both words.
+        let name_text = &self.source[name_span.start as usize..name_span.end as usize];
+        let name_span = if (name_text.eq_ignore_ascii_case("SIGNED")
+            || name_text.eq_ignore_ascii_case("UNSIGNED"))
+            && (self.is_word(self.peek(), "INT") || self.is_word(self.peek(), "INTEGER"))
+        {
+            Span {
+                start: name_span.start,
+                end: self.advance()?.span.end,
+            }
+        } else {
+            name_span
+        };
 
         // Check for optional precision/scale
         if let Some(lp) = self.peek() {
@@ -1818,10 +2112,10 @@ impl<'a> Parser<'a> {
         // `AstExpr::Literal(String)`. The span covers the whole region and the
         // value is derived from the span alone — never from inner token kinds —
         // so opacity/value are identical to the pre-change single-token form.
-        // Gated on the dialect flag (Snowflake's `$$` is a genuine identifier).
+        // A `$$` string Snowflake writes as words is read below, by the
+        // literal reader.
         let is_dollar_string = self.dialect.supports_dollar_quoted_strings()
-            && matches!(tok.kind, TokenKind::Identifier { .. })
-            && crate::parser::core::is_dollar_quote_tag(tok.lexeme(self.source));
+            && crate::parser::core::is_dollar_quote_delimiter(&tok.kind);
         if is_dollar_string {
             // Reassemble opener-through-matching-closer into one literal span
             // (shared with `COMMENT ON … IS $$…$$`); the value is derived from
@@ -1866,6 +2160,7 @@ impl<'a> Parser<'a> {
                     let mut call = self.parse_function_call_from_lparen(
                         name_span,
                         Some((approx_token_id, approx_span)),
+                        crate::parser::expr_functions::CallSite::Expression,
                     )?;
                     // Extend the call span to cover the APPROXIMATE keyword.
                     if let AstExpr::FunctionCall { span, .. } = &mut call {
@@ -1884,12 +2179,37 @@ impl<'a> Parser<'a> {
             ParseError::unexpected_eof(self.current_span(), vec!["expression".to_string()])
         })?;
 
+        if self.is_session_variable(tok) {
+            let var_tok = self
+                .advance()
+                .expect_invariant("session variable token available after peek");
+            return Ok(AstExpr::SessionVarRef {
+                node_id: self.id_gen.next(),
+                name_span: Span {
+                    start: var_tok.span.start + 1,
+                    end: var_tok.span.end,
+                },
+                span: var_tok.span,
+            });
+        }
+
+        // MySQL's prefix `BINARY`, a cast of one operand and its postfix
+        // operators, where the dialect reserves the word: an operand follows.
+        let binary_cast = self.word_at(self.idx, "BINARY")
+            && self.dialect.is_reserved_keyword("BINARY")
+            && self
+                .peek_ahead(1)
+                .is_some_and(|next| !is_expr_terminator(next, 0));
+        if binary_cast {
+            return self.parse_prefix_operation(
+                crate::ast::BinaryOperator::BinaryCast,
+                Self::parse_mul_expr_in_mode,
+            );
+        }
+
         match &tok.kind {
-            // Placeholder for bind parameters: ? (scripting mode, or inside an
-            // ODBC escape clause — ODBC SQL is parameterized)
-            TokenKind::Placeholder
-                if matches!(self.mode, ParserMode::Scripting) || self.odbc_depth > 0 =>
-            {
+            // Bind parameter `?`, where an operand starts.
+            TokenKind::Placeholder => {
                 let placeholder_tok = self.advance().ok_or_else(|| {
                     ParseError::unexpected_eof(self.current_span(), vec!["?".to_string()])
                 })?;
@@ -1900,6 +2220,52 @@ impl<'a> Parser<'a> {
             }
             // NEW: Jinja expression with parsed content: {{ expr }}
             TokenKind::JinjaExprOpen => {
+                // A word written against the template makes it a column name
+                // (`{{ s }}_c`), unless more is written against it, or a `.`
+                // or `(` follows.
+                if let Some((next, span, name)) =
+                    self.templated_part_at(self.idx)
+                        .filter(|(next, span, name)| {
+                            let has_word = name
+                                .pieces
+                                .iter()
+                                .any(|p| matches!(p, crate::ast::AstNamePiece::Word(_)));
+                            let continued = self.tokens.get(*next).is_some_and(|t| {
+                                (t.span.start == span.end
+                                    && matches!(
+                                        t.kind,
+                                        TokenKind::JinjaComment
+                                            | TokenKind::Identifier { .. }
+                                            | TokenKind::Literal(
+                                                crate::lexer::LiteralKind::StringFragment
+                                            )
+                                    ))
+                                    || matches!(
+                                        t.kind,
+                                        TokenKind::Punctuation(
+                                            crate::lexer::Punctuation::Dot
+                                                | crate::lexer::Punctuation::LParen
+                                        )
+                                    )
+                            });
+                            has_word && !continued
+                        })
+                {
+                    self.idx = next;
+                    return Ok(AstExpr::Ident {
+                        node_id: self.id_gen.next(),
+                        column_ref: crate::ast::AstColumnRef {
+                            node_id: self.id_gen.next(),
+                            qualifier: None,
+                            name: AstIdentifier {
+                                node_id: self.id_gen.next(),
+                                span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: Some(Box::new(name)),
+                            },
+                        },
+                    });
+                }
                 let start_span = tok.span;
                 self.advance(); // consume {{
                 let open_token_id = self.last_token_id();
@@ -2070,10 +2436,12 @@ impl<'a> Parser<'a> {
                     syntax_id: None,
                 })
             }
-            // Scripting variable reference :my_var.
+            // Scripting variable or bind parameter `:my_var`, or positional
+            // bind `:1`, where an operand starts (a `:` after an operand is a
+            // path, read there); not a sqlcmd command line's `:`.
             // Note: Variable names can be keywords (e.g., :pattern, :like, :select)
             TokenKind::Punctuation(crate::lexer::Punctuation::Colon)
-                if matches!(self.mode, ParserMode::Scripting) =>
+                if !self.is_sqlcmd_command(tok) =>
             {
                 let colon_token_id = self.current_token_id();
                 let colon_tok = self.advance().ok_or_else(|| {
@@ -2082,6 +2450,20 @@ impl<'a> Parser<'a> {
                 let next = self.peek().ok_or_else(|| {
                     ParseError::unexpected_eof(self.current_span(), vec!["identifier".to_string()])
                 })?;
+                // A positional bind `:1`: digits written against the colon.
+                if next.kind == TokenKind::Literal(crate::lexer::LiteralKind::Number)
+                    && next.span.start == colon_tok.span.end
+                    && next.lexeme(self.source).bytes().all(|b| b.is_ascii_digit())
+                {
+                    let position_tok = self.advance().expect_invariant("bind position after peek");
+                    return Ok(AstExpr::Placeholder {
+                        node_id: self.id_gen.next(),
+                        span: Span {
+                            start: colon_tok.span.start,
+                            end: position_tok.span.end,
+                        },
+                    });
+                }
                 if self.can_be_identifier_token(next) {
                     let ident_tok = self.advance().expect_invariant(
                         "identifier token confirmed by peek for scripting variable",
@@ -2288,17 +2670,13 @@ impl<'a> Parser<'a> {
                     }
                     TokenKind::Literal(crate::lexer::LiteralKind::Position) => {
                         let pos_tok = self.advance().expect_invariant("position after peek");
-                        let full_span = Span {
-                            start: plus_tok.span.start,
-                            end: pos_tok.span.end,
-                        };
                         let dollar_span = Span {
-                            start: full_span.start + 1,
-                            end: full_span.start + 2,
+                            start: pos_tok.span.start,
+                            end: pos_tok.span.start + 1,
                         };
                         let index_span = Span {
                             start: dollar_span.end,
-                            end: full_span.end,
+                            end: pos_tok.span.end,
                         };
                         Ok(AstExpr::PositionRef {
                             node_id: self.id_gen.next(),
@@ -2308,12 +2686,62 @@ impl<'a> Parser<'a> {
                             index_span,
                         })
                     }
+                    TokenKind::Literal(crate::lexer::LiteralKind::Parameter) => {
+                        let param_tok = self.advance().expect_invariant("parameter after peek");
+                        Ok(AstExpr::Placeholder {
+                            node_id: self.id_gen.next(),
+                            span: Span {
+                                start: plus_tok.span.start,
+                                end: param_tok.span.end,
+                            },
+                        })
+                    }
+                    TokenKind::Literal(crate::lexer::LiteralKind::Money) => {
+                        let tok = self.advance().expect_invariant("money after peek");
+                        Ok(AstExpr::Literal {
+                            node_id: self.id_gen.next(),
+                            literal: AstLiteral::Money {
+                                span: Span {
+                                    start: plus_tok.span.start,
+                                    end: tok.span.end,
+                                },
+                                amount_span: Span {
+                                    start: tok.span.start + 1,
+                                    end: tok.span.end,
+                                },
+                            },
+                        })
+                    }
                     _ => Err(ParseError::invalid_expression(
                         plus_tok.span,
                         "Expected number or positional ref after +".to_string(),
                     )),
                 }
             }
+            // Bitwise NOT: a prefix `~`, which binds to the operand tighter than
+            // `*` and looser than `^`. It is a binary operation with an empty
+            // left operand, as the prefix NOT is.
+            TokenKind::Operator(crate::lexer::Operator::Tilde) => self
+                .parse_prefix_operation(crate::ast::BinaryOperator::BitwiseNot, |p| {
+                    p.parse_expr_bp(55)
+                }),
+            // MySQL's prefix `!`, NOT of one operand and its postfix
+            // operators: `!a = b` is `(!a) = b`.
+            TokenKind::Operator(crate::lexer::Operator::Bang) => self.parse_prefix_operation(
+                crate::ast::BinaryOperator::Not,
+                Self::parse_mul_expr_in_mode,
+            ),
+            // PostgreSQL's prefix square root `|/` and absolute value `@`,
+            // whose operand runs to the level of its other operators:
+            // `|/ a + b` is `|/ (a + b)`, `|/ a > 2` is `(|/ a) > 2`.
+            TokenKind::Operator(crate::lexer::Operator::BarSlash) => self
+                .parse_prefix_operation(crate::ast::BinaryOperator::SquareRoot, |p| {
+                    p.parse_expr_bp(36)
+                }),
+            TokenKind::Operator(crate::lexer::Operator::At) => self
+                .parse_prefix_operation(crate::ast::BinaryOperator::AbsoluteValue, |p| {
+                    p.parse_expr_bp(36)
+                }),
             // Unary minus for numeric literals, positional refs, and general expressions
             TokenKind::Operator(crate::lexer::Operator::Minus) => {
                 let minus_token_id = self.current_token_id();
@@ -2322,8 +2750,8 @@ impl<'a> Parser<'a> {
                     ParseError::unexpected_eof(self.current_span(), vec!["expression".to_string()])
                 })?;
 
-                // Fast path for literal numbers and positional refs to preserve
-                // the simple -1 and -$1 forms without creating a binary op node
+                // Fast path for literal numbers and parameters to preserve
+                // the simple -1 form without creating a binary op node
                 match &next.kind {
                     TokenKind::Literal(crate::lexer::LiteralKind::Number) => {
                         let num_tok = self.advance().expect_invariant("number after peek");
@@ -2336,34 +2764,60 @@ impl<'a> Parser<'a> {
                             literal: AstLiteral::Number { span },
                         })
                     }
-                    TokenKind::Literal(crate::lexer::LiteralKind::Position) => {
-                        let pos_tok = self.advance().expect_invariant("position after peek");
-                        let full_span = Span {
-                            start: minus_tok.span.start,
-                            end: pos_tok.span.end,
-                        };
-                        let dollar_span = Span {
-                            start: full_span.start + 1,
-                            end: full_span.start + 2,
-                        };
-                        let index_span = Span {
-                            start: dollar_span.end,
-                            end: full_span.end,
-                        };
-                        Ok(AstExpr::PositionRef {
+                    TokenKind::Literal(crate::lexer::LiteralKind::Parameter) => {
+                        let param_tok = self.advance().expect_invariant("parameter after peek");
+                        Ok(AstExpr::Placeholder {
                             node_id: self.id_gen.next(),
-                            qualifier: None,
-                            dot_span: None,
-                            dollar_span,
-                            index_span,
+                            span: Span {
+                                start: minus_tok.span.start,
+                                end: param_tok.span.end,
+                            },
                         })
                     }
                     // General case: parse the expression after minus as a unary operation
                     // This handles cases like -p_days, -(x + y), -func(), etc.
                     _ => {
-                        // Parse the operand at primary expression level to avoid
-                        // precedence issues (e.g., -a*b should be -(a*b) not (-a)*b)
-                        let operand = self.parse_expr()?;
+                        let operand = if matches!(
+                            next.kind,
+                            TokenKind::Literal(crate::lexer::LiteralKind::Money)
+                        ) {
+                            // A money literal is negated alone.
+                            let tok = self.advance().expect_invariant("money after peek");
+                            AstExpr::Literal {
+                                node_id: self.id_gen.next(),
+                                literal: AstLiteral::Money {
+                                    span: tok.span,
+                                    amount_span: Span {
+                                        start: tok.span.start + 1,
+                                        end: tok.span.end,
+                                    },
+                                },
+                            }
+                        } else if matches!(
+                            next.kind,
+                            TokenKind::Literal(crate::lexer::LiteralKind::Position)
+                        ) {
+                            // A positional column is negated alone.
+                            let pos_tok = self.advance().expect_invariant("position after peek");
+                            let dollar_span = Span {
+                                start: pos_tok.span.start,
+                                end: pos_tok.span.start + 1,
+                            };
+                            AstExpr::PositionRef {
+                                node_id: self.id_gen.next(),
+                                qualifier: None,
+                                dot_span: None,
+                                dollar_span,
+                                index_span: Span {
+                                    start: dollar_span.end,
+                                    end: pos_tok.span.end,
+                                },
+                            }
+                        } else {
+                            // Parse the operand at primary expression level to avoid
+                            // precedence issues (e.g., -a*b should be -(a*b) not (-a)*b)
+                            self.parse_expr()?
+                        };
                         let span = Span {
                             start: minus_tok.span.start,
                             end: operand.span().end,
@@ -2416,6 +2870,28 @@ impl<'a> Parser<'a> {
                     index_span,
                 })
             }
+            // Money literal: $<n>, $<n>.<m>
+            TokenKind::Literal(crate::lexer::LiteralKind::Money) => {
+                let tok = self.advance().expect_invariant("money after peek");
+                Ok(AstExpr::Literal {
+                    node_id: self.id_gen.next(),
+                    literal: AstLiteral::Money {
+                        span: tok.span,
+                        amount_span: Span {
+                            start: tok.span.start + 1,
+                            end: tok.span.end,
+                        },
+                    },
+                })
+            }
+            // Bind parameter: $<n>
+            TokenKind::Literal(crate::lexer::LiteralKind::Parameter) => {
+                let param_tok = self.advance().expect_invariant("parameter after peek");
+                Ok(AstExpr::Placeholder {
+                    node_id: self.id_gen.next(),
+                    span: param_tok.span,
+                })
+            }
             TokenKind::Literal(crate::lexer::LiteralKind::Number) => {
                 let tok = self.advance().expect_invariant("number after peek");
                 Ok(AstExpr::Literal {
@@ -2425,9 +2901,25 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Literal(crate::lexer::LiteralKind::String) => {
                 let tok = self.advance().expect_invariant("string after peek");
+                let mut parts = vec![tok.span];
+                // Strings written one after another, where the dialect joins them.
+                while self.dialect.adjacent_string_literals_join()
+                    && self.peek().is_some_and(|next| {
+                        matches!(
+                            next.kind,
+                            TokenKind::Literal(crate::lexer::LiteralKind::String)
+                        )
+                    })
+                {
+                    parts.push(self.advance().expect_invariant("string after peek").span);
+                }
+                let literal = match parts.as_slice() {
+                    [one] => AstLiteral::String { span: *one },
+                    [_, _, ..] | [] => AstLiteral::Adjacent { parts },
+                };
                 Ok(AstExpr::Literal {
                     node_id: self.id_gen.next(),
-                    literal: AstLiteral::String { span: tok.span },
+                    literal,
                 })
             }
             TokenKind::Literal(crate::lexer::LiteralKind::StringFragment) => {
@@ -2468,13 +2960,50 @@ impl<'a> Parser<'a> {
                     },
                 })
             }
+            // T-SQL's trigger predicate `UPDATE(col)`: whether the statement
+            // that fired the trigger wrote `col`. Kept as its text, the column
+            // being the trigger table's, read by no query.
+            TokenKind::Keyword(Keyword::Update)
+                if self.peek_ahead(1).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                    )
+                }) =>
+            {
+                let start = self
+                    .advance()
+                    .expect_invariant("UPDATE after peek")
+                    .span
+                    .start;
+                self.advance(); // (
+                let mut depth = 1u32;
+                let mut end = start;
+                while depth > 0 {
+                    let inner = self.advance().ok_or_else(|| {
+                        ParseError::unexpected_eof(self.current_span(), vec![")".to_string()])
+                    })?;
+                    match inner.kind {
+                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => depth -= 1,
+                        _ => {}
+                    }
+                    end = inner.span.end;
+                }
+                Ok(AstExpr::Placeholder {
+                    node_id: self.id_gen.next(),
+                    span: Span { start, end },
+                })
+            }
             // Allow certain keywords to be used as function names when followed by '('
-            // This handles RLIKE(...), ILIKE(...), LIKE(...), REPLACE(...), IF(...), etc. which can be both
+            // This handles RLIKE(...), ILIKE(...), LIKE(...), REPLACE(...), IF(...), REPEAT(...), etc. which can be both
             // infix operators/control flow and function calls depending on syntax
             // Also handles MATCH_RECOGNIZE functions: FIRST(...), LAST(...), NEXT(...)
             // GROUPING(...) is the aggregate companion to GROUPING SETS / CUBE / ROLLUP
             // VALUES(col) is MySQL's ON DUPLICATE KEY UPDATE accessor for
-            // the would-be-inserted value; only call-shaped uses match.
+            // the would-be-inserted value; only call-shaped uses match. One
+            // a `.` follows qualifies a name (PostgreSQL's `insert.id`), read
+            // below where the dialect writes the word as a name.
             TokenKind::Keyword(
                 Keyword::Rlike
                 | Keyword::Regexp
@@ -2486,9 +3015,17 @@ impl<'a> Parser<'a> {
                 | Keyword::Replace
                 | Keyword::If
                 | Keyword::Insert
+                | Keyword::Repeat
                 | Keyword::Grouping
                 | Keyword::Values,
-            ) => {
+            ) if !(self.can_be_identifier_token(tok)
+                && self.peek_ahead(1).is_some_and(|next| {
+                    matches!(
+                        next.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
+                    )
+                })) =>
+            {
                 // Peek ahead to see if this is followed by '('
                 let save_idx = self.idx;
                 let tok = self.advance().expect_invariant("keyword after peek");
@@ -2499,7 +3036,11 @@ impl<'a> Parser<'a> {
                         TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                     ) {
                         // This is a function call - use the shared helper
-                        let expr = self.parse_function_call_from_lparen(tok.span, None)?;
+                        let expr = self.parse_function_call_from_lparen(
+                            tok.span,
+                            None,
+                            crate::parser::expr_functions::CallSite::Expression,
+                        )?;
                         return Ok(expr);
                     }
                 }
@@ -2579,43 +3120,92 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            // `CONNECT_BY_ROOT expr` (Snowflake), the word written before an
+            // operand; no dialect reserves it, so a column of that name read
+            // before an alias written without `AS` reads as the operator.
+            TokenKind::Identifier {
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
+            } if tok
+                .lexeme(self.source)
+                .eq_ignore_ascii_case("CONNECT_BY_ROOT")
+                && self.peek_ahead(1).is_some_and(|next| {
+                    matches!(
+                        next.kind,
+                        TokenKind::Identifier { .. }
+                            | TokenKind::Literal(_)
+                            | TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                    )
+                }) =>
+            {
+                let keyword_span = self
+                    .advance()
+                    .expect_invariant("CONNECT_BY_ROOT after peek")
+                    .span;
+                let expr = self.parse_mul_expr_in_mode()?;
+                let span = Span {
+                    start: keyword_span.start,
+                    end: expr_span_end(&expr),
+                };
+                Ok(AstExpr::ConnectByRoot {
+                    node_id: self.id_gen.next(),
+                    keyword_span,
+                    expr: Box::new(expr),
+                    span,
+                })
+            }
             TokenKind::Identifier { .. } => {
-                let tok = self.advance().expect_invariant("identifier after peek");
-
-                // BigQuery raw/byte string prefix: r'...', b'...', rb'...', br'...'
-                // The lexer produces the prefix as a separate Identifier token
-                // immediately adjacent to the string literal.
-                let lexeme = tok.lexeme(self.source);
-                if matches!(
-                    lexeme,
-                    "r" | "R" | "b" | "B" | "rb" | "RB" | "Rb" | "rB" | "br" | "BR" | "Br" | "bR"
-                ) {
-                    if let Some(next) = self.peek() {
-                        if matches!(
-                            next.kind,
-                            TokenKind::Literal(crate::lexer::LiteralKind::String)
-                        ) && next.span.start == tok.span.end
-                        {
-                            let str_tok = self
-                                .advance()
-                                .expect_invariant("string literal after prefix");
-                            let combined_span = Span {
-                                start: tok.span.start,
-                                end: str_tok.span.end,
-                            };
-                            return Ok(AstExpr::Literal {
-                                node_id: self.id_gen.next(),
-                                literal: crate::ast::AstLiteral::String {
-                                    span: combined_span,
-                                },
-                            });
+                // A string with its prefix or charset introducer (`X'41'`,
+                // `N'…'`, `r'…'`, `_utf8mb4'…'`, `_binary '…'`, `_binary
+                // 0x…`), or, where the dialect writes one so, a `$$…$$`
+                // string the lexer gives as words between two `$$`
+                // delimiters (`$$a$$`, `$$a b$$`), read by the one literal
+                // reader. A lexer that reads tagged dollar quotes gives them
+                // as delimiters too, read above; a word like `$a$` is a name.
+                use crate::parser::principal::LiteralSpelling;
+                let at = self.idx;
+                let untagged_dollar = self.dialect.dollar_strings_written_as_words()
+                    && crate::parser::core::is_dollar_quote_delimiter(&tok.kind);
+                let prefixed = self.one_literal_at(at).filter(|literal| {
+                    let read = match literal.spelling {
+                        LiteralSpelling::DollarQuoted | LiteralSpelling::UnclosedDollarQuoted => {
+                            untagged_dollar
                         }
+                        LiteralSpelling::Quoted | LiteralSpelling::Number => literal.past > at + 1,
+                        // Read as the string-with-template it is, elsewhere.
+                        LiteralSpelling::Templated => false,
+                    };
+                    literal.first == at && read
+                });
+                if let Some(literal) = prefixed {
+                    if literal.spelling == LiteralSpelling::UnclosedDollarQuoted {
+                        // No closer: the statement is not read on to the end
+                        // of the text.
+                        return Err(ParseError::new(
+                            tok.span,
+                            ParseErrorKind::InvalidExpression {
+                                message: "A `$$` string is not closed".to_string(),
+                            },
+                        ));
                     }
+                    let span = Span {
+                        start: self.tokens[at].span.start,
+                        end: self.tokens[literal.past - 1].span.end,
+                    };
+                    self.idx = literal.past;
+                    return Ok(AstExpr::Literal {
+                        node_id: self.id_gen.next(),
+                        literal: crate::ast::AstLiteral::String { span },
+                    });
                 }
+
+                let tok = self.advance().expect_invariant("identifier after peek");
 
                 let ident = AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: tok.span,
+                    kind: crate::ast::AstIdentifierKind::of(&tok.kind),
+                    templated: None,
                 };
 
                 // Check for qualified star: identifier.*
@@ -2643,6 +3233,7 @@ impl<'a> Parser<'a> {
                                     .advance()
                                     .expect_invariant("Star token should be available after peek");
                                 let qualifier = AstObjectRef {
+                                    name_kind: crate::ast::AstTableNameKind::Catalog,
                                     node_id: self.id_gen.next(),
                                     span: tok.span,
                                     parts: None, // column qualifier; see AstObjectRef::parts
@@ -2727,7 +3318,23 @@ impl<'a> Parser<'a> {
                 // Also handles t.{{ jinja_var }} for Jinja expressions as member names.
                 let mut qualifier: Option<AstObjectRef> = None;
                 let mut name_span = ident.span;
+                // The token the column name starts at.
+                let mut name_at = at;
                 let full_qualifier_start = ident.span.start;
+                // A qualifier a template writes some of (`a_{{ s }}.id`) is
+                // one name.
+                if let Some((next, span, _)) = self.templated_part_at(at).filter(|(next, _, _)| {
+                    *next > self.idx
+                        && self.tokens.get(*next).is_some_and(|t| {
+                            matches!(
+                                t.kind,
+                                TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
+                            )
+                        })
+                }) {
+                    self.idx = next;
+                    name_span = span;
+                }
 
                 // Loop to handle multi-level qualification (db.schema.table.column)
                 loop {
@@ -2747,10 +3354,16 @@ impl<'a> Parser<'a> {
 
                             // Check what comes after the dot (skip trivia/comments)
                             if let Some(second) = self.peek_non_trivia() {
-                                // Handle qualified position reference: src.$1 (terminal - don't loop)
+                                // Handle qualified position reference: src.$1 (terminal - don't loop).
+                                // After a dot a `$<n>` is a position, however the dialect
+                                // reads a bare one.
                                 if matches!(
                                     second.kind,
-                                    TokenKind::Literal(crate::lexer::LiteralKind::Position)
+                                    TokenKind::Literal(
+                                        crate::lexer::LiteralKind::Position
+                                            | crate::lexer::LiteralKind::Parameter
+                                            | crate::lexer::LiteralKind::Money
+                                    )
                                 ) {
                                     let pos_tok =
                                         self.advance().expect_invariant("position after peek");
@@ -2766,6 +3379,7 @@ impl<'a> Parser<'a> {
                                     return Ok(AstExpr::PositionRef {
                                         node_id: self.id_gen.next(),
                                         qualifier: Some(AstObjectRef {
+                                            name_kind: crate::ast::AstTableNameKind::Catalog,
                                             node_id: self.id_gen.next(),
                                             span: Span {
                                                 start: full_qualifier_start,
@@ -2784,6 +3398,7 @@ impl<'a> Parser<'a> {
                                         self.advance().expect_invariant("peek confirmed token");
                                     // Push the current name into the qualifier, make second the new name
                                     qualifier = Some(AstObjectRef {
+                                        name_kind: crate::ast::AstTableNameKind::Catalog,
                                         node_id: self.id_gen.next(),
                                         span: Span {
                                             start: full_qualifier_start,
@@ -2793,12 +3408,14 @@ impl<'a> Parser<'a> {
                                         identifier_arg: None,
                                     });
                                     name_span = second.span;
+                                    name_at = self.idx - 1;
                                     // Continue loop to check for more dots
                                     continue;
                                 } else if matches!(second.kind, TokenKind::JinjaExprOpen) {
                                     // Jinja expression as member: t.{{ col_name }}
                                     // Parse the Jinja expression and use its span as the name
                                     let jinja_start = second.span.start;
+                                    name_at = self.idx;
                                     self.advance(); // consume {{
 
                                     // Consume tokens until we hit }}
@@ -2814,6 +3431,7 @@ impl<'a> Parser<'a> {
 
                                     // Push current name into qualifier, make Jinja the new name
                                     qualifier = Some(AstObjectRef {
+                                        name_kind: crate::ast::AstTableNameKind::Catalog,
                                         node_id: self.id_gen.next(),
                                         span: Span {
                                             start: full_qualifier_start,
@@ -2841,6 +3459,8 @@ impl<'a> Parser<'a> {
                 let _base_ident = AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: name_span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 };
                 // TRY_CAST(expr AS type) - handle as special identifier function
                 if tok.lexeme(self.source).eq_ignore_ascii_case("TRY_CAST") && qualifier.is_none() {
@@ -3029,7 +3649,31 @@ impl<'a> Parser<'a> {
                                 if self.can_be_identifier_token(field_tok)
                                     || matches!(field_tok.kind, TokenKind::Identifier { .. })
                                 {
-                                    let field_span = field_tok.span;
+                                    let mut field_span = field_tok.span;
+                                    let mut part =
+                                        self.dialect.date_part(field_tok.lexeme(self.source));
+                                    // BigQuery's week starting on a day:
+                                    // `EXTRACT(WEEK(MONDAY) FROM d)`.
+                                    if part == Some(crate::ast::DatePart::Week)
+                                        && self.peek().is_some_and(|t| {
+                                            matches!(
+                                                t.kind,
+                                                TokenKind::Punctuation(
+                                                    crate::lexer::Punctuation::LParen
+                                                )
+                                            )
+                                        })
+                                    {
+                                        let from = self.idx;
+                                        match self.weekday_in_parentheses() {
+                                            Some((day, end)) => {
+                                                part =
+                                                    Some(crate::ast::DatePart::WeekStarting(day));
+                                                field_span.end = end;
+                                            }
+                                            None => self.idx = from,
+                                        }
+                                    }
                                     // Check if next token is FROM keyword - if so, use special syntax
                                     if let Some(maybe_from) = self.peek_non_trivia() {
                                         if matches!(
@@ -3084,7 +3728,9 @@ impl<'a> Parser<'a> {
                                                 node_id: self.id_gen.next(),
                                                 syntax_id,
                                                 field_span,
+                                                part,
                                                 expr: Box::new(expr),
+                                                odbc_fn: None,
                                                 span,
                                             });
                                         }
@@ -3167,6 +3813,7 @@ impl<'a> Parser<'a> {
                                             syntax_id,
                                             needle: Box::new(needle),
                                             haystack: Box::new(haystack),
+                                            odbc_fn: None,
                                             span,
                                         });
                                     }
@@ -3192,20 +3839,19 @@ impl<'a> Parser<'a> {
                             TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                         ) {
                             // Optional trim-spec keyword (BOTH/LEADING/TRAILING are
-                            // identifiers). Captured as a span so the formatter emits
-                            // it byte-exact from source, mirroring EXTRACT's field.
-                            let mut spec_span: Option<Span> = None;
+                            // identifiers), with its span so the formatter emits it
+                            // byte-exact from source, mirroring EXTRACT's field.
+                            let mut spec: Option<(crate::ast::TrimSide, Span)> = None;
                             if let Some(spec_tok) = self.peek_non_trivia() {
                                 if matches!(spec_tok.kind, TokenKind::Identifier { .. }) {
-                                    let lx = spec_tok.lexeme(self.source);
-                                    let is_spec = lx.eq_ignore_ascii_case("BOTH")
-                                        || lx.eq_ignore_ascii_case("LEADING")
-                                        || lx.eq_ignore_ascii_case("TRAILING");
-                                    if is_spec {
+                                    let side = crate::ast::TrimSide::from_name(
+                                        spec_tok.lexeme(self.source),
+                                    );
+                                    if let Some(side) = side {
                                         let consumed = self
                                             .advance()
                                             .expect_invariant("trim-spec keyword after peek");
-                                        spec_span = Some(consumed.span);
+                                        spec = Some((side, consumed.span));
                                     }
                                 }
                             }
@@ -3268,7 +3914,7 @@ impl<'a> Parser<'a> {
                                 return Ok(AstExpr::Trim {
                                     node_id: self.id_gen.next(),
                                     syntax_id,
-                                    spec_span,
+                                    spec,
                                     chars,
                                     source: Box::new(source),
                                     span,
@@ -3631,10 +4277,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 if let Some(lp) = self.peek() {
+                    // `(` that opens a statement's query is no argument list.
                     if matches!(
                         lp.kind,
                         TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                    ) {
+                    ) && !self.should_stop_scan_at_statement_start(lp)
+                    {
                         // When there's a qualifier (e.g., SAFE.JSON_VALUE, schema.func),
                         // extend the function name span to include qualifier + dot so the
                         // formatter emits the full qualified reference.
@@ -3646,7 +4294,11 @@ impl<'a> Parser<'a> {
                         } else {
                             name_span
                         };
-                        let expr = self.parse_function_call_from_lparen(full_name_span, None)?;
+                        let expr = self.parse_function_call_from_lparen(
+                            full_name_span,
+                            None,
+                            crate::parser::expr_functions::CallSite::Expression,
+                        )?;
                         return Ok(expr);
                     }
                 }
@@ -3741,8 +4393,20 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                // Check for identifier followed by adjacent Jinja: column_name{{ suffix }}
-                // This handles dbt patterns like dynamic column names
+                // A column name a template writes some of (`c_{{ s }}`,
+                // `t.{{ c }}`) is read whole.
+                let mut templated = None;
+                if let Some((next, span, name)) = self
+                    .templated_part_at(name_at)
+                    .filter(|(next, span, _)| span.start == name_span.start && *next >= self.idx)
+                {
+                    self.idx = next;
+                    name_span = span;
+                    templated = Some(Box::new(name));
+                }
+
+                // Anything else written against the name (a comment, a
+                // string fragment) makes the whole a template placeholder.
                 let start_pos = if let Some(q) = &qualifier {
                     q.span.start
                 } else {
@@ -3814,6 +4478,17 @@ impl<'a> Parser<'a> {
                         name: AstIdentifier {
                             node_id: self.id_gen.next(),
                             span: name_span,
+                            // A name a template writes some of is no one token.
+                            kind: match &templated {
+                                None => self
+                                    .tokens
+                                    .get(name_at)
+                                    .map_or(crate::ast::AstIdentifierKind::Name, |token| {
+                                        crate::ast::AstIdentifierKind::of(&token.kind)
+                                    }),
+                                Some(_) => crate::ast::AstIdentifierKind::Name,
+                            },
+                            templated,
                         },
                     },
                 })
@@ -3947,6 +4622,7 @@ impl<'a> Parser<'a> {
                                 return Ok(AstExpr::QualifiedStar {
                                     node_id: self.id_gen.next(),
                                     qualifier: AstObjectRef {
+                                        name_kind: crate::ast::AstTableNameKind::Catalog,
                                         node_id: self.id_gen.next(),
                                         span: keyword_tok.span,
                                         parts: None, // column qualifier; see AstObjectRef::parts
@@ -3976,8 +4652,11 @@ impl<'a> Parser<'a> {
                                             start: keyword_tok.span.start,
                                             end: ident_tok.span.end,
                                         };
-                                        return self
-                                            .parse_function_call_from_lparen(full_span, None);
+                                        return self.parse_function_call_from_lparen(
+                                            full_span,
+                                            None,
+                                            crate::parser::expr_functions::CallSite::Expression,
+                                        );
                                     }
                                 }
                                 return Ok(AstExpr::Ident {
@@ -3985,6 +4664,7 @@ impl<'a> Parser<'a> {
                                     column_ref: crate::ast::AstColumnRef {
                                         node_id: self.id_gen.next(),
                                         qualifier: Some(AstObjectRef {
+                                            name_kind: crate::ast::AstTableNameKind::Catalog,
                                             node_id: self.id_gen.next(),
                                             span: keyword_tok.span,
                                             parts: None, // column qualifier; see AstObjectRef::parts
@@ -3993,6 +4673,8 @@ impl<'a> Parser<'a> {
                                         name: AstIdentifier {
                                             node_id: self.id_gen.next(),
                                             span: ident_tok.span,
+                                            kind: crate::ast::AstIdentifierKind::Name,
+                                            templated: None,
                                         },
                                     },
                                 });
@@ -4007,7 +4689,11 @@ impl<'a> Parser<'a> {
                         lp.kind,
                         TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                     ) {
-                        return self.parse_function_call_from_lparen(keyword_tok.span, None);
+                        return self.parse_function_call_from_lparen(
+                            keyword_tok.span,
+                            None,
+                            crate::parser::expr_functions::CallSite::Expression,
+                        );
                     }
                 }
 
@@ -4020,6 +4706,8 @@ impl<'a> Parser<'a> {
                         name: AstIdentifier {
                             node_id: self.id_gen.next(),
                             span: keyword_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
                         },
                     },
                 })
@@ -4073,6 +4761,7 @@ impl<'a> Parser<'a> {
                                     select_span: ei_stmt.span(),
                                     r_paren: rparen_token_id,
                                     span,
+                                    inner: None,
                                 };
                                 let syntax_id = self.syntax_arena.alloc_subquery(syntax_subquery);
                                 return Ok(AstExpr::ScalarSubquery {
@@ -4094,75 +4783,30 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                // Check if this is a scalar subquery: (SELECT ...)
-                // Peek ahead to see if the next token is SELECT
-                if let Some(next) = self.peek() {
-                    if matches!(next.kind, TokenKind::Keyword(Keyword::Select)) {
-                        // Save parser index in case SELECT parsing fails
-                        let saved_idx = self.idx;
-
-                        // This is a scalar subquery - parse using natural descent
-                        let subquery_result = self.try_parse_set_or_select_stmt();
-
-                        match subquery_result {
-                            Ok(subquery) => {
-                                // Expect closing paren
-                                let rparen_tok = if let Some(tok) = self.advance() {
-                                    if !matches!(
-                                        tok.kind,
-                                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                                    ) {
-                                        return Err(ParseError::unexpected_token(
-                                            tok.span,
-                                            vec![")".to_string()],
-                                            Parser::token_description(tok, self.source),
-                                        ));
-                                    }
-                                    tok
-                                } else {
-                                    return Err(ParseError::new(
-                                        lparen_tok.span,
-                                        ParseErrorKind::UnexpectedEof {
-                                            expected: vec![")".to_string()],
-                                        },
-                                    ));
-                                };
-
-                                let span = Span {
-                                    start: lparen_tok.span.start,
-                                    end: rparen_tok.span.end,
-                                };
-
-                                // Use lparen_token_id captured BEFORE advance, rparen is the last consumed token
-                                let rparen_token_id = self.last_token_id();
-
-                                let syntax_subquery = crate::syntax::SyntaxSubquery {
-                                    l_paren: lparen_token_id,
-                                    select_span: subquery.span(),
-                                    r_paren: rparen_token_id,
-                                    span,
-                                };
-                                let syntax_id = self.syntax_arena.alloc_subquery(syntax_subquery);
-
-                                return Ok(AstExpr::ScalarSubquery {
-                                    syntax_id,
-                                    subquery: Box::new(subquery),
-                                    span,
-                                    node_id: self.id_gen.next(),
-                                });
-                            }
-                            Err(err) => {
-                                // Fatal errors (e.g., recursion limit) must not be recovered from
-                                if err.kind.is_resource_exhaustion() {
-                                    return Err(err);
-                                }
-                                // SELECT parsing failed - restore parser index to after the lparen
-                                // and treat this as a regular parenthesized expression instead
-                                self.idx = saved_idx;
-                                // Fall through to parse as regular parenthesized expression
-                            }
-                        }
-                    }
+                // A scalar subquery: `(SELECT …)`, `(TABLE t)`, `((SELECT a)
+                // UNION …)`. Parentheses holding more than a query are an
+                // expression's.
+                if let Some(subquery) = crate::parser::set_operations::parenthesised_query(self)? {
+                    let rparen_tok = self.advance().expect_invariant("`)` after the query");
+                    let span = Span {
+                        start: lparen_tok.span.start,
+                        end: rparen_tok.span.end,
+                    };
+                    let rparen_token_id = self.last_token_id();
+                    let syntax_subquery = crate::syntax::SyntaxSubquery {
+                        l_paren: lparen_token_id,
+                        select_span: subquery.span(),
+                        r_paren: rparen_token_id,
+                        span,
+                        inner: None,
+                    };
+                    let syntax_id = self.syntax_arena.alloc_subquery(syntax_subquery);
+                    return Ok(AstExpr::ScalarSubquery {
+                        syntax_id,
+                        subquery: Box::new(subquery),
+                        span,
+                        node_id: self.id_gen.next(),
+                    });
                 }
 
                 // Not a scalar subquery - parse as regular parenthesized expression
@@ -4583,6 +5227,7 @@ impl<'a> Parser<'a> {
                             // Accept both identifiers and keywords as the second part
                             if self.can_be_identifier_token(second) {
                                 qualifier = Some(AstObjectRef {
+                                    name_kind: crate::ast::AstTableNameKind::Catalog,
                                     node_id: self.id_gen.next(),
                                     span: tok.span,
                                     parts: None, // column qualifier; see AstObjectRef::parts
@@ -4602,7 +5247,11 @@ impl<'a> Parser<'a> {
                             TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                         ) {
                             // Looks like a function call - parse it
-                            let expr = self.parse_function_call_from_lparen(name_span, None)?;
+                            let expr = self.parse_function_call_from_lparen(
+                                name_span,
+                                None,
+                                crate::parser::expr_functions::CallSite::Expression,
+                            )?;
                             return Ok(expr);
                         }
                     }
@@ -4617,6 +5266,8 @@ impl<'a> Parser<'a> {
                         name: AstIdentifier {
                             node_id: self.id_gen.next(),
                             span: name_span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
                         },
                     },
                 })

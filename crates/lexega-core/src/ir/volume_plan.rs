@@ -24,15 +24,11 @@ use crate::ast::{
 };
 use crate::lexer::token::Span;
 
-/// Strip surrounding quotes and upper-case a property value span (used for
-/// the normalized recognition values carried on [`IrStorageLocation`]).
+/// A property value span's value, upper-cased (used for the normalized
+/// recognition values carried on [`IrStorageLocation`]).
 fn unquote_upper(source: &str, span: Span) -> Option<String> {
     let raw = source.get(span.start as usize..span.end as usize)?;
-    let out = raw
-        .trim()
-        .trim_matches(|c| c == '\'' || c == '"')
-        .trim()
-        .to_ascii_uppercase();
+    let out = super::span_extract::literal_value_or_name(raw).to_ascii_uppercase();
     if out.is_empty() {
         None
     } else {

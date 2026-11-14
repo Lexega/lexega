@@ -78,8 +78,9 @@ pub fn lower_drop_managed_account_to_plan(s: &AstDrop, source: &str) -> ManagedA
     ManagedAccountPlan {
         action: AccountProvisioningAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: AccountProvisioningOptions {
             or_replace: false,
             if_not_exists: false,
@@ -109,8 +110,9 @@ pub fn lower_drop_account_to_plan(s: &AstDrop, source: &str) -> OrgAccountPlan {
     OrgAccountPlan {
         action: AccountProvisioningAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: AccountProvisioningOptions {
             or_replace: false,
             if_not_exists: false,

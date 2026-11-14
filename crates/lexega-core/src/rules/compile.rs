@@ -18,18 +18,20 @@
 //! Type checking: paths are validated at evaluation time by walking
 //! the runtime JSON tree.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use super::explain::{ExplainTrace, MatchReason, UnmatchReason};
+use super::finding::RuleExplanation;
+use super::lists::{ValueList, ValueLists};
 use super::predicate::{
     FieldName, FieldPath, NumericOp, ParseError, Predicate, PredicateLiteral, Quantifier,
-    RelationalMatch, ScalarMatch, ScalarOp,
+    ScalarMatch, ScalarOp,
 };
-use super::signal::RuleExplanation;
-use crate::facts::{LiteralValue, RuleCategory};
-// Only the test-gated `evaluate`/`evaluate_with_explain` take typed facts.
+use crate::facts::{LiteralValue, RuleCategory, StatementKind};
+// Only the test-gated `matches`/`evaluate_with_explain` take typed facts.
 #[cfg(test)]
 use crate::facts::StatementFacts;
 
@@ -50,6 +52,16 @@ pub enum CompileError {
     /// customer rule at load time rather than letting the rule
     /// compile and silently never fire.
     UnknownRootField { path: String, unknown_root: String },
+    /// An `in_list` / `not_in_list` operator names a list the table does
+    /// not hold. List names are exact.
+    UnknownList { list: String },
+    /// A comparison of the statement's `kind` names a kind no statement
+    /// has: the rule would never fire (or, negated, always would).
+    /// `suggestion` is the nearest kind.
+    UnknownStatementKind {
+        kind: String,
+        suggestion: Option<String>,
+    },
 }
 
 impl std::fmt::Display for CompileError {
@@ -62,6 +74,14 @@ impl std::fmt::Display for CompileError {
                 "unknown root field '{}' in path '{}': not a top-level StatementFacts field",
                 unknown_root, path
             ),
+            Self::UnknownList { list } => write!(f, "unknown list '{}'", list),
+            Self::UnknownStatementKind { kind, suggestion } => {
+                write!(f, "unknown statement kind '{}'", kind)?;
+                match suggestion {
+                    Some(nearest) => write!(f, "; did you mean '{}'?", nearest),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -78,21 +98,17 @@ impl From<ParseError> for CompileError {
 // CompiledPredicate — the closure-bearing handle.
 // ─────────────────────────────────────────────────────────────────────
 
-/// The closure a predicate compiles to: evaluates serialized facts and,
-/// when a trace is passed, records why it matched or not.
-type EvalFn = dyn Fn(&Value, Option<&mut ExplainTrace>) -> EvalResult + Send + Sync;
-
 /// A compiled predicate ready for evaluation against `StatementFacts`.
-/// Cloneable handles share the underlying closure via `Arc`.
+/// Cloneable handles share the built evaluator via `Arc`.
 ///
-/// The underlying closure threads an `Option<&mut ExplainTrace>` so the
-/// same closure serves both the hot path (`evaluate`, no trace
-/// collection) and explain mode (`evaluate_with_explain`, typed trace
-/// entries collected, then projected onto the schema-stable
+/// Evaluation threads an `Option<&mut ExplainTrace>` so the same
+/// evaluator serves both the hot path (`evaluate_value`, no trace
+/// collection) and explain mode (`evaluate_value_with_explain`, typed
+/// trace entries collected, then projected onto the schema-stable
 /// [`RuleExplanation`] string surface at the engine boundary).
 #[derive(Clone)]
 pub struct CompiledPredicate {
-    eval: Arc<EvalFn>,
+    eval: Arc<Evaluator>,
     /// Fact-family dispatch mask (see `predicate_root_mask`). Lets the
     /// engine skip this rule on statements whose facts cannot match it.
     root_mask: u32,
@@ -115,32 +131,37 @@ pub struct CompiledPredicate {
 /// driver) from intermediate `exists:` matches. The flag never
 /// crosses the rules-engine API boundary: `emit_for_match` reads it
 /// to decide emission cardinality, then constructs `FactWitness`
-/// values for the customer-facing `Signal.evidence`. Keeping the
+/// values for the customer-facing `Finding.evidence`. Keeping the
 /// flag here (not on `FactWitness`) ensures the generated JSON
-/// schema for `Signal.evidence.witnesses[*]` stays a stable
+/// schema for `Finding.evidence.witnesses[*]` stays a stable
 /// customer-platform contract independent of engine internals.
+///
+/// `value` borrows the element of the evaluated facts: a finding copies
+/// it only when it is emitted.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct WitnessCandidate {
+pub(crate) struct WitnessCandidate<'v> {
     pub(crate) path: String,
-    pub(crate) value: Value,
+    pub(crate) value: &'v Value,
     pub(crate) from_each: bool,
 }
 
 /// The outcome of evaluating a compiled predicate.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum EvalResult {
-    /// Predicate did not match. No signal emitted.
+pub(crate) enum EvalResult<'v> {
+    /// Predicate did not match. No finding emitted.
     NoMatch,
     /// Predicate matched. `witnesses` carries every relational-quantifier
     /// witness gathered along the way; `from_each` distinguishes
     /// outermost-`each:` matches from intermediate `exists:` matches
     /// so the engine's `emit_for_match` can apply per-witness
     /// emission semantics without the flag leaking onto the public
-    /// `Signal.evidence` surface.
-    Match { witnesses: Vec<WitnessCandidate> },
+    /// `Finding.evidence` surface.
+    Match {
+        witnesses: Vec<WitnessCandidate<'v>>,
+    },
 }
 
-impl EvalResult {
+impl EvalResult<'_> {
     /// Test-only convenience; engine code pattern-matches directly.
     #[cfg(test)]
     pub(crate) fn is_match(&self) -> bool {
@@ -153,12 +174,12 @@ impl CompiledPredicate {
     /// explain trace collected.
     ///
     /// Test-only convenience; serializes `facts` to a JSON value each
-    /// call. Production batch callers serialize once and use
-    /// [`Self::evaluate_value`].
+    /// call and says whether the predicate matches. Production batch
+    /// callers serialize once and use [`Self::evaluate_value`].
     #[cfg(test)]
-    pub(crate) fn evaluate(&self, facts: &StatementFacts) -> EvalResult {
+    pub(crate) fn matches(&self, facts: &StatementFacts) -> bool {
         let value = serde_json::to_value(facts).unwrap_or(Value::Null);
-        (self.eval)(&value, None)
+        self.run(&value, None).is_match()
     }
 
     /// Evaluate against a pre-serialized facts value. The engine
@@ -166,8 +187,17 @@ impl CompiledPredicate {
     /// ([`super::engine::evaluate_rules`]) and reuses it across every
     /// rule, avoiding a per-rule serialization that would dominate
     /// the rule-evaluation cost.
-    pub(crate) fn evaluate_value(&self, value: &Value) -> EvalResult {
-        (self.eval)(value, None)
+    pub(crate) fn evaluate_value<'v>(&self, value: &'v Value) -> EvalResult<'v> {
+        self.run(value, None)
+    }
+
+    fn run<'v>(&self, value: &'v Value, trace: Option<&mut ExplainTrace>) -> EvalResult<'v> {
+        let mut witnesses = Vec::new();
+        if evaluate_node(&self.eval, value, &mut witnesses, Prefix::Root, trace) {
+            EvalResult::Match { witnesses }
+        } else {
+            EvalResult::NoMatch
+        }
     }
 
     /// Fact-family dispatch mask. `0` means "always evaluate"; a
@@ -202,25 +232,36 @@ impl CompiledPredicate {
     /// Test-only convenience; the engine's explain path uses
     /// [`Self::evaluate_value_with_explain`].
     #[cfg(test)]
-    pub(crate) fn evaluate_with_explain(
-        &self,
-        facts: &StatementFacts,
-    ) -> (EvalResult, RuleExplanation) {
+    pub(crate) fn evaluate_with_explain(&self, facts: &StatementFacts) -> (bool, RuleExplanation) {
         let value = serde_json::to_value(facts).unwrap_or(Value::Null);
         let mut trace = ExplainTrace::default();
-        let result = (self.eval)(&value, Some(&mut trace));
-        (result, trace.into_rule_explanation())
+        let matched = self.run(&value, Some(&mut trace)).is_match();
+        (matched, trace.into_rule_explanation())
     }
 
-    /// Explain-mode variant accepting a pre-serialized value. Used
-    /// by the engine's explain path for the same per-statement
-    /// caching reason as [`Self::evaluate_value`].
-    pub(crate) fn evaluate_value_with_explain(
+    /// Explain-mode variant accepting a pre-serialized value.
+    #[cfg(test)]
+    pub(crate) fn evaluate_value_with_explain<'v>(
         &self,
-        value: &Value,
-    ) -> (EvalResult, RuleExplanation) {
-        let mut trace = ExplainTrace::default();
-        let result = (self.eval)(value, Some(&mut trace));
+        value: &'v Value,
+    ) -> (EvalResult<'v>, RuleExplanation) {
+        self.evaluate_value_with_explain_masking(value, None)
+    }
+
+    /// Explain-mode variant accepting a pre-serialized value, each string
+    /// of it the explanation quotes masked where `quoting` holds it. Used
+    /// by the engine's explain path for the same per-statement caching
+    /// reason as [`Self::evaluate_value`].
+    pub(crate) fn evaluate_value_with_explain_masking<'v>(
+        &self,
+        value: &'v Value,
+        quoting: Option<&crate::facts::secrets::QuotingStrings>,
+    ) -> (EvalResult<'v>, RuleExplanation) {
+        let mut trace = ExplainTrace {
+            entries: Vec::new(),
+            quoting,
+        };
+        let result = self.run(value, Some(&mut trace));
         (result, trace.into_rule_explanation())
     }
 }
@@ -239,22 +280,21 @@ impl std::fmt::Debug for CompiledPredicate {
 /// `CompiledPredicate` evaluates against `StatementFacts` at runtime
 /// (serializing to JSON internally for path traversal).
 pub fn compile(predicate: &Predicate) -> Result<CompiledPredicate, CompileError> {
+    compile_with_lists(predicate, &ValueLists::default())
+}
+
+/// [`compile`] with the lists an `in_list` / `not_in_list` operator may
+/// name; a name the table lacks is [`CompileError::UnknownList`].
+pub fn compile_with_lists(
+    predicate: &Predicate,
+    lists: &ValueLists,
+) -> Result<CompiledPredicate, CompileError> {
     validate_root_field_paths(predicate)?;
     let root_mask = predicate_root_mask(predicate);
     let kind_gate = predicate_kind_gate(predicate);
     let category = super::category::category_of_rule(predicate);
     let reads_reasoning = super::depth::reads_reasoning(predicate);
-    let evaluator = build_evaluator(predicate)?;
-    let eval: Arc<EvalFn> = Arc::new(
-        move |value: &Value, trace: Option<&mut ExplainTrace>| -> EvalResult {
-            let mut witnesses = Vec::new();
-            if evaluate_node(&evaluator, value, &mut witnesses, "", trace) {
-                EvalResult::Match { witnesses }
-            } else {
-                EvalResult::NoMatch
-            }
-        },
-    );
+    let eval = Arc::new(build_evaluator(predicate, lists)?);
     Ok(CompiledPredicate {
         eval,
         root_mask,
@@ -274,7 +314,114 @@ pub fn compile(predicate: &Predicate) -> Result<CompiledPredicate, CompileError>
 // predicates (`each:`, `all:`, `none:`, `exists:`) evaluate against
 // a sub-element whose schema differs from `StatementFacts`, so
 // their first segments are NOT validated here.
+//
+// The same scope validates the values the statement's `kind` is
+// compared with: a kind no statement has would make the rule dead (or,
+// negated, always true).
 // ─────────────────────────────────────────────────────────────────────
+
+/// A deserialization error that keeps the variant names serde lists for
+/// an unknown enum value.
+#[derive(Debug)]
+struct UnknownVariant(&'static [&'static str]);
+
+impl std::fmt::Display for UnknownVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown variant, expected one of {}", self.0.join(", "))
+    }
+}
+
+impl std::error::Error for UnknownVariant {}
+
+impl serde::de::Error for UnknownVariant {
+    fn custom<T: std::fmt::Display>(_: T) -> Self {
+        UnknownVariant(&[])
+    }
+
+    fn unknown_variant(_: &str, expected: &'static [&'static str]) -> Self {
+        UnknownVariant(expected)
+    }
+}
+
+/// The statement kind written `name`, or, where there is none, every name
+/// a kind is written as.
+fn statement_kind_named(name: &str) -> Result<StatementKind, &'static [&'static str]> {
+    use serde::de::{value::StrDeserializer, Deserialize};
+    StatementKind::deserialize(StrDeserializer::<UnknownVariant>::new(name)).map_err(|e| e.0)
+}
+
+/// The Levenshtein distance between `a` and `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if ca == *cb {
+                diagonal
+            } else {
+                1 + diagonal.min(above).min(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// The first of `names` within a third of `name`'s length (at least one
+/// edit) of it, the nearest first, ignoring case.
+fn nearest_name(name: &str, names: &[&'static str]) -> Option<&'static str> {
+    let limit = (name.chars().count() / 3).max(1);
+    let lowered = name.to_lowercase();
+    names
+        .iter()
+        .map(|candidate| (edit_distance(&lowered, candidate), *candidate))
+        .filter(|(distance, _)| *distance <= limit)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+/// Refuse a comparison of the statement's `kind` with a name no statement
+/// kind has.
+fn check_statement_kinds(s: &ScalarMatch) -> Result<(), CompileError> {
+    if !is_statement_kind_path(&s.path) {
+        return Ok(());
+    }
+    let literals: &[PredicateLiteral] = match &s.op {
+        ScalarOp::Eq(lit) | ScalarOp::EqExplicit(lit) | ScalarOp::Neq(lit) => {
+            std::slice::from_ref(lit)
+        }
+        ScalarOp::In(lits) | ScalarOp::NotIn(lits) => lits,
+        ScalarOp::Gt(_)
+        | ScalarOp::Lt(_)
+        | ScalarOp::Gte(_)
+        | ScalarOp::Lte(_)
+        | ScalarOp::Matches(_)
+        | ScalarOp::Contains(_)
+        | ScalarOp::ContainsAny(_)
+        | ScalarOp::ContainsAll(_)
+        | ScalarOp::InList(_)
+        | ScalarOp::NotInList(_)
+        | ScalarOp::AllInField(_)
+        | ScalarOp::Exists(_)
+        | ScalarOp::IsNull(_)
+        | ScalarOp::Range { .. } => return Ok(()),
+    };
+    for literal in literals {
+        let PredicateLiteral::String(name) = literal else {
+            continue;
+        };
+        if let Err(kinds) = statement_kind_named(name) {
+            return Err(CompileError::UnknownStatementKind {
+                kind: name.clone(),
+                suggestion: nearest_name(name, kinds).map(str::to_string),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Snake-case names of every top-level field on
 /// `crate::facts::StatementFacts`. Kept in sync with the struct
@@ -383,7 +530,11 @@ fn scalar_is_presence_requiring(op: &ScalarOp) -> bool {
         ScalarOp::Exists(present) => *present,
         // `is_null: false` needs the field; `is_null: true` matches absence.
         ScalarOp::IsNull(null) => !*null,
-        ScalarOp::Eq(_)
+        // An absent list is the empty one, which is in every list.
+        ScalarOp::AllInField(_) => false,
+        ScalarOp::InList(_)
+        | ScalarOp::NotInList(_)
+        | ScalarOp::Eq(_)
         | ScalarOp::EqExplicit(_)
         | ScalarOp::Neq(_)
         | ScalarOp::Gt(_)
@@ -581,8 +732,7 @@ fn kind_literal_bit(lit: &PredicateLiteral) -> Option<usize> {
     let PredicateLiteral::String(s) = lit else {
         return None;
     };
-    let kind: crate::facts::StatementKind =
-        serde_json::from_value(Value::String(s.clone())).ok()?;
+    let kind = statement_kind_named(s).ok()?;
     let idx = kind as usize;
     (idx < KIND_BITS).then_some(idx)
 }
@@ -626,6 +776,9 @@ fn kind_scalar_gate(s: &ScalarMatch) -> KindGate {
         | ScalarOp::Contains(_)
         | ScalarOp::ContainsAny(_)
         | ScalarOp::ContainsAll(_)
+        | ScalarOp::InList(_)
+        | ScalarOp::NotInList(_)
+        | ScalarOp::AllInField(_)
         | ScalarOp::Exists(_)
         | ScalarOp::IsNull(_)
         | ScalarOp::Range { .. } => KindGate::Any,
@@ -682,7 +835,12 @@ fn validate_root_field_paths(p: &Predicate) -> Result<(), CompileError> {
             Ok(())
         }
         Predicate::Not(inner) => validate_root_field_paths(inner),
-        Predicate::Scalar(s) => check_root_segment(&s.path),
+        // Outside a quantifier a compared field is the statement's too.
+        Predicate::Scalar(s) => {
+            check_root_segment(&s.path)?;
+            s.op.compared_field().map_or(Ok(()), check_root_segment)?;
+            check_statement_kinds(s)
+        }
         Predicate::Relational(r) => check_root_segment(&r.path),
     }
 }
@@ -721,26 +879,92 @@ enum Evaluator {
     AnyOf(Vec<Evaluator>),
     Not(Box<Evaluator>),
     Scalar(ScalarMatch),
-    Relational(RelationalMatch),
+    /// An `in_list` / `not_in_list` match with its lists resolved, in the
+    /// order the rule names them.
+    List {
+        scalar: ScalarMatch,
+        lists: Vec<ValueList>,
+    },
+    /// A quantifier match with its body built once.
+    Relational {
+        path: FieldPath,
+        quantified: Quantified,
+    },
 }
 
-fn build_evaluator(p: &Predicate) -> Result<Evaluator, CompileError> {
+/// A quantifier with its body compiled.
+#[derive(Clone)]
+enum Quantified {
+    Exists(Box<Evaluator>),
+    All(Box<Evaluator>),
+    None(Box<Evaluator>),
+    Each(Box<Evaluator>),
+    Count(NumericOp),
+}
+
+fn build_evaluator(p: &Predicate, table: &ValueLists) -> Result<Evaluator, CompileError> {
     Ok(match p {
         Predicate::AllOf(parts) => Evaluator::AllOf(
             parts
                 .iter()
-                .map(build_evaluator)
+                .map(|part| build_evaluator(part, table))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Predicate::AnyOf(parts) => Evaluator::AnyOf(
             parts
                 .iter()
-                .map(build_evaluator)
+                .map(|part| build_evaluator(part, table))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
-        Predicate::Not(inner) => Evaluator::Not(Box::new(build_evaluator(inner)?)),
-        Predicate::Scalar(s) => Evaluator::Scalar(s.clone()),
-        Predicate::Relational(r) => Evaluator::Relational(r.clone()),
+        Predicate::Not(inner) => Evaluator::Not(Box::new(build_evaluator(inner, table)?)),
+        Predicate::Scalar(s) => match &s.op {
+            ScalarOp::InList(refs) | ScalarOp::NotInList(refs) => Evaluator::List {
+                scalar: s.clone(),
+                lists: refs
+                    .names
+                    .iter()
+                    .map(|name| {
+                        table
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| CompileError::UnknownList { list: name.clone() })
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
+            ScalarOp::Eq(_)
+            | ScalarOp::EqExplicit(_)
+            | ScalarOp::Neq(_)
+            | ScalarOp::Gt(_)
+            | ScalarOp::Lt(_)
+            | ScalarOp::Gte(_)
+            | ScalarOp::Lte(_)
+            | ScalarOp::Matches(_)
+            | ScalarOp::In(_)
+            | ScalarOp::NotIn(_)
+            | ScalarOp::Contains(_)
+            | ScalarOp::ContainsAny(_)
+            | ScalarOp::ContainsAll(_)
+            | ScalarOp::AllInField(_)
+            | ScalarOp::Exists(_)
+            | ScalarOp::IsNull(_)
+            | ScalarOp::Range { .. } => Evaluator::Scalar(s.clone()),
+        },
+        Predicate::Relational(r) => Evaluator::Relational {
+            path: r.path.clone(),
+            quantified: match &r.quantifier {
+                Quantifier::Exists(inner) => {
+                    Quantified::Exists(Box::new(build_evaluator(inner, table)?))
+                }
+                Quantifier::All(inner) => Quantified::All(Box::new(build_evaluator(inner, table)?)),
+                Quantifier::None(inner) => {
+                    Quantified::None(Box::new(build_evaluator(inner, table)?))
+                }
+                Quantifier::Each(inner) => {
+                    Quantified::Each(Box::new(build_evaluator(inner, table)?))
+                }
+                Quantifier::Count(op) => Quantified::Count(*op),
+            },
+        },
     })
 }
 
@@ -748,11 +972,43 @@ fn build_evaluator(p: &Predicate) -> Result<Evaluator, CompileError> {
 // Evaluation against a serde_json::Value tree.
 // ─────────────────────────────────────────────────────────────────────
 
-fn evaluate_node(
+/// Where a predicate node is evaluated, as the path text a witness or an
+/// explain-trace entry records: rendered only when one is recorded, so
+/// the hot path builds no string per element and per arm it visits.
+#[derive(Clone, Copy)]
+enum Prefix<'p> {
+    /// The facts root: the empty path.
+    Root,
+    /// `<parent>.<path>`, or `<path>` under an empty parent.
+    Field(&'p Prefix<'p>, &'p FieldPath),
+    /// `<parent>.<index>`: an element of the array at `parent`.
+    Item(&'p Prefix<'p>, usize),
+    /// `<parent>@all_of[<index>]` (explain mode only).
+    AllOfArm(&'p Prefix<'p>, usize),
+    /// `<parent>@any_of[<index>]`
+    AnyOfArm(&'p Prefix<'p>, usize),
+    /// `<parent>@not`
+    Not(&'p Prefix<'p>),
+}
+
+impl Prefix<'_> {
+    fn render(&self) -> String {
+        match self {
+            Prefix::Root => String::new(),
+            Prefix::Field(parent, path) => compose_path(&parent.render(), path),
+            Prefix::Item(parent, index) => format!("{}.{}", parent.render(), index),
+            Prefix::AllOfArm(parent, index) => format!("{}@all_of[{}]", parent.render(), index),
+            Prefix::AnyOfArm(parent, index) => format!("{}@any_of[{}]", parent.render(), index),
+            Prefix::Not(parent) => format!("{}@not", parent.render()),
+        }
+    }
+}
+
+fn evaluate_node<'v>(
     eval: &Evaluator,
-    value: &Value,
-    witnesses: &mut Vec<WitnessCandidate>,
-    path_prefix: &str,
+    value: &'v Value,
+    witnesses: &mut Vec<WitnessCandidate<'v>>,
+    prefix: Prefix<'_>,
     mut trace: Option<&mut ExplainTrace>,
 ) -> bool {
     match eval {
@@ -765,8 +1021,8 @@ fn evaluate_node(
                 let mut all_pass = true;
                 let mut first_failure: Option<usize> = None;
                 for (idx, p) in parts.iter().enumerate() {
-                    let arm_path = format!("{}@all_of[{}]", path_prefix, idx);
-                    let pass = evaluate_node(p, value, witnesses, &arm_path, Some(t));
+                    let arm = Prefix::AllOfArm(&prefix, idx);
+                    let pass = evaluate_node(p, value, witnesses, arm, Some(t));
                     if !pass {
                         all_pass = false;
                         if first_failure.is_none() {
@@ -775,12 +1031,12 @@ fn evaluate_node(
                     }
                 }
                 if all_pass {
-                    t.record_matched(path_prefix, MatchReason::AllOfPass { arm_count });
+                    t.record_matched(&prefix.render(), MatchReason::AllOfPass { arm_count });
                     true
                 } else {
                     let arm_index = first_failure.unwrap_or(0);
                     t.record_unmatched(
-                        path_prefix,
+                        &prefix.render(),
                         UnmatchReason::AllOfArmFailed {
                             arm_index,
                             arm_count,
@@ -791,52 +1047,59 @@ fn evaluate_node(
             } else {
                 parts
                     .iter()
-                    .all(|p| evaluate_node(p, value, witnesses, path_prefix, None))
+                    .all(|p| evaluate_node(p, value, witnesses, prefix, None))
             }
         }
         Evaluator::AnyOf(parts) => {
+            // Every arm is read: each one that matches gives its witnesses.
             let arm_count = parts.len();
+            let mut first_match: Option<usize> = None;
             for (idx, p) in parts.iter().enumerate() {
                 let mut local = Vec::new();
-                let arm_path = format!("{}@any_of[{}]", path_prefix, idx);
-                if evaluate_node(p, value, &mut local, &arm_path, trace.as_deref_mut()) {
+                let arm = Prefix::AnyOfArm(&prefix, idx);
+                if evaluate_node(p, value, &mut local, arm, trace.as_deref_mut()) {
                     witnesses.extend(local);
-                    if let Some(t) = trace.as_deref_mut() {
-                        t.record_matched(
-                            path_prefix,
-                            MatchReason::AnyOfPass {
-                                matched_arm: idx,
-                                arm_count,
-                            },
-                        );
-                    }
-                    return true;
+                    first_match.get_or_insert(idx);
                 }
             }
-            if let Some(t) = trace.as_deref_mut() {
-                t.record_unmatched(path_prefix, UnmatchReason::AnyOfNoArmMatched { arm_count });
+            match (first_match, trace.as_deref_mut()) {
+                (Some(matched_arm), Some(t)) => t.record_matched(
+                    &prefix.render(),
+                    MatchReason::AnyOfPass {
+                        matched_arm,
+                        arm_count,
+                    },
+                ),
+                (None, Some(t)) => t.record_unmatched(
+                    &prefix.render(),
+                    UnmatchReason::AnyOfNoArmMatched { arm_count },
+                ),
+                (Some(_) | None, None) => {}
             }
-            false
+            first_match.is_some()
         }
         Evaluator::Not(inner) => {
             // `not` doesn't propagate witnesses — if its body matched,
             // we wouldn't be here.
             let mut discard = Vec::new();
-            let not_path = format!("{}@not", path_prefix);
+            let not = Prefix::Not(&prefix);
             let inner_matched =
-                evaluate_node(inner, value, &mut discard, &not_path, trace.as_deref_mut());
+                evaluate_node(inner, value, &mut discard, not, trace.as_deref_mut());
             let pass = !inner_matched;
             if let Some(t) = trace.as_deref_mut() {
                 if pass {
-                    t.record_matched(path_prefix, MatchReason::NotPass);
+                    t.record_matched(&prefix.render(), MatchReason::NotPass);
                 } else {
-                    t.record_unmatched(path_prefix, UnmatchReason::NotInverted);
+                    t.record_unmatched(&prefix.render(), UnmatchReason::NotInverted);
                 }
             }
             pass
         }
-        Evaluator::Scalar(s) => evaluate_scalar(s, value, path_prefix, trace),
-        Evaluator::Relational(r) => evaluate_relational(r, value, witnesses, path_prefix, trace),
+        Evaluator::Scalar(s) => evaluate_scalar(s, &[], value, prefix, trace),
+        Evaluator::List { scalar, lists } => evaluate_scalar(scalar, lists, value, prefix, trace),
+        Evaluator::Relational { path, quantified } => {
+            evaluate_relational(path, quantified, value, witnesses, prefix, trace)
+        }
     }
 }
 
@@ -851,8 +1114,7 @@ fn evaluate_node(
 /// authors can write `name.normalized: PUBLIC` once and have it match
 /// in Snowflake/MSSQL (upper-fold) AND PostgreSQL/Databricks
 /// (lower-fold). The active dialect is threaded from the analyzer to
-/// `normalize_identifier` via the thread-local set in
-/// `apply_dialect_normalization`.
+/// `normalize_identifier` by the analysis's dialect scope.
 fn path_is_dialect_folded(path: &FieldPath) -> bool {
     matches!(
         path.segments.last(),
@@ -860,19 +1122,20 @@ fn path_is_dialect_folded(path: &FieldPath) -> bool {
     )
 }
 
-fn fold_string_literal(lit: &PredicateLiteral) -> PredicateLiteral {
+fn fold_string_literal(lit: &PredicateLiteral) -> Cow<'_, PredicateLiteral> {
     match lit {
-        PredicateLiteral::String(s) => {
-            PredicateLiteral::String(crate::ir::normalize::normalize_identifier(s))
-        }
-        other => other.clone(),
+        PredicateLiteral::String(s) => Cow::Owned(PredicateLiteral::String(
+            crate::ir::normalize::normalize_identifier(s),
+        )),
+        other => Cow::Borrowed(other),
     }
 }
 
 fn evaluate_scalar(
     s: &ScalarMatch,
+    lists: &[ValueList],
     root: &Value,
-    path_prefix: &str,
+    prefix: Prefix<'_>,
     mut trace: Option<&mut ExplainTrace>,
 ) -> bool {
     let resolved = resolve_path(root, &s.path);
@@ -880,7 +1143,7 @@ fn evaluate_scalar(
     // trace branches below; scalars never emit witnesses. Build it
     // lazily so the hot path (`trace: None`) skips the allocation —
     // this is per-leaf, per-rule, per-statement work otherwise.
-    let scalar_path = || compose_path(path_prefix, &s.path);
+    let scalar_path = || Prefix::Field(&prefix, &s.path).render();
     let pass: bool;
     let op_name: &'static str = scalar_op_name(&s.op);
     let fold_lits = path_is_dialect_folded(&s.path);
@@ -944,6 +1207,30 @@ fn evaluate_scalar(
                 }
             }
         }
+        (ScalarOp::AllInField(field), left) => {
+            pass = all_in(*left, resolve_path(root, field));
+            if let Some(t) = trace.as_deref_mut() {
+                let actual = left.map_or_else(|| "absent".to_string(), |v| t.render_actual(v));
+                if pass {
+                    t.record_matched(
+                        &scalar_path(),
+                        MatchReason::ScalarOk {
+                            op: op_name,
+                            actual,
+                        },
+                    );
+                } else {
+                    t.record_unmatched(
+                        &scalar_path(),
+                        UnmatchReason::ScalarMismatch {
+                            op: op_name,
+                            expected: render_op_expected(&s.op),
+                            actual,
+                        },
+                    );
+                }
+            }
+        }
         (_, None) => {
             pass = false;
             if let Some(t) = trace.as_deref_mut() {
@@ -956,11 +1243,11 @@ fn evaluate_scalar(
             // dialect's identifier normalizer to each string literal
             // before comparison. Outside that path family the literal
             // is used verbatim.
-            let fold = |lit: &PredicateLiteral| -> PredicateLiteral {
+            let fold = |lit| {
                 if fold_lits {
                     fold_string_literal(lit)
                 } else {
-                    lit.clone()
+                    Cow::Borrowed(lit)
                 }
             };
             pass = match op {
@@ -985,6 +1272,12 @@ fn evaluate_scalar(
                 },
                 ScalarOp::In(list) => list.iter().any(|lit| match_eq(v, &fold(lit))),
                 ScalarOp::NotIn(list) => !list.iter().any(|lit| match_eq(v, &fold(lit))),
+                ScalarOp::InList(_) => {
+                    matches!(v, Value::String(text) if lists.iter().any(|l| l.holds(text)))
+                }
+                ScalarOp::NotInList(_) => {
+                    matches!(v, Value::String(text) if !lists.iter().any(|l| l.holds(text)))
+                }
                 ScalarOp::Contains(lit) => match v {
                     Value::Array(items) => items.iter().any(|e| match_eq(e, &fold(lit))),
                     _ => false,
@@ -1019,11 +1312,14 @@ fn evaluate_scalar(
                     };
                     lo_ok && hi_ok
                 }
-                // Exists / IsNull are handled by the earlier match arms.
-                ScalarOp::Exists(_) | ScalarOp::IsNull(_) => unreachable!(),
+                // Exists / IsNull / AllInField are handled by the earlier
+                // match arms.
+                ScalarOp::Exists(_) | ScalarOp::IsNull(_) | ScalarOp::AllInField(_) => {
+                    unreachable!()
+                }
             };
             if let Some(t) = trace {
-                let actual = render_value_for_trace(v);
+                let actual = t.render_actual(v);
                 if pass {
                     t.record_matched(
                         &scalar_path(),
@@ -1060,9 +1356,12 @@ fn scalar_op_name(op: &ScalarOp) -> &'static str {
         ScalarOp::Matches(_) => "matches",
         ScalarOp::In(_) => "in",
         ScalarOp::NotIn(_) => "not_in",
+        ScalarOp::InList(_) => "in_list",
+        ScalarOp::NotInList(_) => "not_in_list",
         ScalarOp::Contains(_) => "contains",
         ScalarOp::ContainsAny(_) => "contains_any",
         ScalarOp::ContainsAll(_) => "contains_all",
+        ScalarOp::AllInField(_) => "all_in_field",
         ScalarOp::Exists(_) => "exists",
         ScalarOp::IsNull(_) => "is_null",
         ScalarOp::Range { .. } => "range",
@@ -1092,6 +1391,8 @@ fn render_op_expected(op: &ScalarOp) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        ScalarOp::InList(refs) => format!("in_list {}", refs.names.join(", ")),
+        ScalarOp::NotInList(refs) => format!("not_in_list {}", refs.names.join(", ")),
         ScalarOp::Contains(lit) => format!("contains {}", render_literal_for_trace(lit)),
         ScalarOp::ContainsAny(list) => format!(
             "contains_any [{}]",
@@ -1107,6 +1408,7 @@ fn render_op_expected(op: &ScalarOp) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        ScalarOp::AllInField(field) => field.render(),
         ScalarOp::Exists(b) => format!("exists {}", b),
         ScalarOp::IsNull(b) => format!("is_null {}", b),
         ScalarOp::Range {
@@ -1135,49 +1437,33 @@ fn render_literal_for_trace(lit: &PredicateLiteral) -> String {
     }
 }
 
-fn render_value_for_trace(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => format!("{}", b),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => format!("\"{}\"", s),
-        Value::Array(items) => format!("<array len={}>", items.len()),
-        Value::Object(map) => {
-            // Two common tagged shapes get specialized rendering so
-            // the trace reads naturally:
-            //   - tagged enum: `{ "kind": "...", ... }` → render kind
-            //   - IdentName: `{ "normalized": "...", "raw": "..." }`
-            if let Some(k) = map.get("kind").and_then(Value::as_str) {
-                return format!("\"{}\"", k);
-            }
-            if let Some(n) = map.get("normalized").and_then(Value::as_str) {
-                return format!("\"{}\"", n);
-            }
-            format!("<object keys={}>", map.len())
-        }
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Relational evaluation.
 // ─────────────────────────────────────────────────────────────────────
 
-fn evaluate_relational(
-    r: &RelationalMatch,
-    root: &Value,
-    witnesses: &mut Vec<WitnessCandidate>,
-    path_prefix: &str,
+fn evaluate_relational<'v>(
+    path: &FieldPath,
+    quantified: &Quantified,
+    root: &'v Value,
+    witnesses: &mut Vec<WitnessCandidate<'v>>,
+    prefix: Prefix<'_>,
     mut trace: Option<&mut ExplainTrace>,
 ) -> bool {
-    let resolved = resolve_path(root, &r.path);
-    let path_text = compose_path(path_prefix, &r.path);
+    let resolved = resolve_path(root, path);
+    let field = Prefix::Field(&prefix, path);
+    // Read only by explain-trace entries: the hot path renders no path.
+    let path_text = if trace.is_some() {
+        field.render()
+    } else {
+        String::new()
+    };
     let arr = match resolved {
         Some(Value::Array(arr)) => arr,
         Some(_) => {
             // Path resolves but isn't an array. `count: { eq: 0 }` on a
             // non-array still falls through to the array-shape check
             // below — treat as zero-length collection for count only.
-            if let Quantifier::Count(op) = &r.quantifier {
+            if let Quantified::Count(op) = quantified {
                 let pass = numeric_match(op, 0);
                 if let Some(t) = trace.as_deref_mut() {
                     if pass {
@@ -1195,7 +1481,7 @@ fn evaluate_relational(
         }
         None => {
             // Missing path. `count: { eq: 0 }` still meaningful.
-            if let Quantifier::Count(op) = &r.quantifier {
+            if let Quantified::Count(op) = quantified {
                 let pass = numeric_match(op, 0);
                 if let Some(t) = trace.as_deref_mut() {
                     if pass {
@@ -1214,25 +1500,21 @@ fn evaluate_relational(
     };
 
     let total = arr.len();
-    match &r.quantifier {
-        Quantifier::Exists(inner) => {
-            let inner_eval = match build_evaluator(inner) {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
+    match quantified {
+        Quantified::Exists(inner_eval) => {
             for (i, item) in arr.iter().enumerate() {
                 let mut local = Vec::new();
-                let item_path = format!("{}.{}", path_text, i);
+                let item_prefix = Prefix::Item(&field, i);
                 if evaluate_node(
-                    &inner_eval,
+                    inner_eval,
                     item,
                     &mut local,
-                    &item_path,
+                    item_prefix,
                     trace.as_deref_mut(),
                 ) {
                     witnesses.push(WitnessCandidate {
-                        path: item_path,
-                        value: item.clone(),
+                        path: item_prefix.render(),
+                        value: item,
                         from_each: false,
                     });
                     witnesses.extend(local);
@@ -1258,11 +1540,7 @@ fn evaluate_relational(
             }
             false
         }
-        Quantifier::All(inner) => {
-            let inner_eval = match build_evaluator(inner) {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
+        Quantified::All(inner_eval) => {
             // Universal claim on an empty array carries no evidence.
             // Rule authors writing `path: { all: P }` mean "I have at
             // least one element of `path` and every element satisfies
@@ -1281,12 +1559,11 @@ fn evaluate_relational(
             }
             for (i, item) in arr.iter().enumerate() {
                 let mut local = Vec::new();
-                let item_path = format!("{}.{}", path_text, i);
                 if !evaluate_node(
-                    &inner_eval,
+                    inner_eval,
                     item,
                     &mut local,
-                    &item_path,
+                    Prefix::Item(&field, i),
                     trace.as_deref_mut(),
                 ) {
                     if let Some(t) = trace.as_deref_mut() {
@@ -1312,19 +1589,14 @@ fn evaluate_relational(
             }
             true
         }
-        Quantifier::None(inner) => {
-            let inner_eval = match build_evaluator(inner) {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
+        Quantified::None(inner_eval) => {
             for (i, item) in arr.iter().enumerate() {
                 let mut discard = Vec::new();
-                let item_path = format!("{}.{}", path_text, i);
                 if evaluate_node(
-                    &inner_eval,
+                    inner_eval,
                     item,
                     &mut discard,
-                    &item_path,
+                    Prefix::Item(&field, i),
                     trace.as_deref_mut(),
                 ) {
                     if let Some(t) = trace.as_deref_mut() {
@@ -1349,32 +1621,28 @@ fn evaluate_relational(
             }
             true
         }
-        Quantifier::Each(inner) => {
+        Quantified::Each(inner_eval) => {
             // Per-witness emission driver. Predicate satisfaction
             // mirrors `Exists` (one matching witness is enough for
             // the rule to fire), but each matching element is
             // tagged `from_each: true` so the engine's
-            // `emit_for_match` PerWitness path fans out signals
+            // `emit_for_match` PerWitness path fans out findings
             // only over these — not the intermediate `exists:`
             // witnesses gathered along the predicate path.
-            let inner_eval = match build_evaluator(inner) {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
             let mut witness_count = 0usize;
             for (i, item) in arr.iter().enumerate() {
                 let mut local = Vec::new();
-                let item_path = format!("{}.{}", path_text, i);
+                let item_prefix = Prefix::Item(&field, i);
                 if evaluate_node(
-                    &inner_eval,
+                    inner_eval,
                     item,
                     &mut local,
-                    &item_path,
+                    item_prefix,
                     trace.as_deref_mut(),
                 ) {
                     witnesses.push(WitnessCandidate {
-                        path: item_path,
-                        value: item.clone(),
+                        path: item_prefix.render(),
+                        value: item,
                         from_each: true,
                     });
                     witnesses.extend(local);
@@ -1402,7 +1670,7 @@ fn evaluate_relational(
             }
             any
         }
-        Quantifier::Count(op) => {
+        Quantified::Count(op) => {
             let actual = arr.len() as u64;
             let pass = numeric_match(op, actual);
             if let Some(t) = trace {
@@ -1566,10 +1834,9 @@ fn literal_as_f64(lit: &PredicateLiteral) -> Option<f64> {
 fn value_as_str(v: &Value) -> Option<&str> {
     match v {
         Value::String(s) => Some(s),
-        Value::Object(map) => map
-            .get("normalized")
-            .and_then(Value::as_str)
-            .or_else(|| map.get("kind").and_then(Value::as_str)),
+        Value::Object(map) => {
+            identifier_form(v).or_else(|| map.get("kind").and_then(Value::as_str))
+        }
         _ => None,
     }
 }
@@ -1579,6 +1846,45 @@ fn literal_as_str(lit: &PredicateLiteral) -> Option<&str> {
         PredicateLiteral::String(s) => Some(s.as_str()),
         _ => None,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Field comparison.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Whether every item of the list `left` is an item of the list `right`.
+/// An absent or `null` field is the empty list; a field that is present
+/// and not a list makes the comparison not hold.
+fn all_in(left: Option<&Value>, right: Option<&Value>) -> bool {
+    let (Some(left), Some(right)) = (list_items(left), list_items(right)) else {
+        return false;
+    };
+    left.iter()
+        .all(|item| right.iter().any(|other| items_equal(item, other)))
+}
+
+/// The items of a list field: none for an absent or `null` field, `None`
+/// for one that is not a list.
+fn list_items(field: Option<&Value>) -> Option<&[Value]> {
+    match field {
+        None | Some(Value::Null) => Some(&[]),
+        Some(Value::Array(items)) => Some(items),
+        Some(Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_)) => None,
+    }
+}
+
+/// Two items are equal when their values are, two identifiers when their
+/// `normalized` forms are.
+fn items_equal(a: &Value, b: &Value) -> bool {
+    match (identifier_form(a), identifier_form(b)) {
+        (Some(a), Some(b)) => a == b,
+        (None, _) | (_, None) => a == b,
+    }
+}
+
+/// The `normalized` form of an item that is an identifier.
+fn identifier_form(item: &Value) -> Option<&str> {
+    item.as_object()?.get("normalized")?.as_str()
 }
 
 fn numeric_match(op: &NumericOp, len: u64) -> bool {
@@ -1596,7 +1902,7 @@ fn numeric_match(op: &NumericOp, len: u64) -> bool {
 // Glob matching (supports leading-, trailing-, and middle-`*`).
 // ─────────────────────────────────────────────────────────────────────
 
-fn glob_match(pattern: &str, input: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, input: &str) -> bool {
     // Split pattern on '*'; each segment must appear in order.
     let parts: Vec<&str> = pattern.split('*').collect();
     let n = parts.len();
@@ -1687,8 +1993,7 @@ mod tests {
     }
 
     fn compile_yaml(yaml: &str) -> CompiledPredicate {
-        let val: serde_json::Value = serde_yaml_ng::from_str(yaml).expect("yaml parses");
-        let parsed = super::super::predicate::parse_predicate(&val).expect("predicate parses");
+        let parsed = parse_yaml(yaml).expect("predicate parses");
         compile(&parsed).expect("predicate compiles")
     }
 
@@ -1722,6 +2027,7 @@ mod tests {
 
     #[test]
     fn match_eq_externally_tagged_newtype_ident() {
+        let _folding = crate::ir::normalize::default_folding();
         // Privilege::Other(IdentName) shape: { "other": { raw, normalized } }.
         let v =
             serde_json::json!({"other": {"raw": "Control Server", "normalized": "CONTROL SERVER"}});
@@ -1751,20 +2057,20 @@ mod tests {
     fn statement_kind_eq_match() {
         let facts = empty_facts(StatementKind::Select);
         let pred = compile_yaml("kind: select");
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
 
         let pred_neg = compile_yaml("kind: insert");
-        assert!(!pred_neg.evaluate(&facts).is_match());
+        assert!(!pred_neg.matches(&facts));
     }
 
     #[test]
     fn statement_kind_in_list() {
         let facts = empty_facts(StatementKind::Select);
         let pred = compile_yaml("kind: { in: [select, set_select, insert] }");
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
 
         let pred_neg = compile_yaml("kind: { in: [insert, update, delete] }");
-        assert!(!pred_neg.evaluate(&facts).is_match());
+        assert!(!pred_neg.matches(&facts));
     }
 
     #[test]
@@ -1772,17 +2078,17 @@ mod tests {
         let facts = empty_facts(StatementKind::Grant);
         // facts.query is None → query.has_where leaf evaluates to false.
         let pred = compile_yaml("query.has_where: false");
-        assert!(!pred.evaluate(&facts).is_match());
+        assert!(!pred.matches(&facts));
     }
 
     #[test]
     fn option_field_exists_handles_none() {
         let facts = empty_facts(StatementKind::Grant);
         let pred = compile_yaml("query: { exists: false }");
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
 
         let pred_neg = compile_yaml("query: { exists: true }");
-        assert!(!pred_neg.evaluate(&facts).is_match());
+        assert!(!pred_neg.matches(&facts));
     }
 
     #[test]
@@ -1795,7 +2101,7 @@ all_of:
   - query: { exists: false }
 "#,
         );
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
     }
 
     #[test]
@@ -1808,7 +2114,32 @@ any_of:
   - kind: grant
 "#,
         );
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
+    }
+
+    #[test]
+    fn any_of_gives_the_witnesses_of_every_matching_arm() {
+        let pred = compile_yaml(
+            r#"
+any_of:
+  - query.reads_table:
+      each:
+        in_catalog: false
+  - query.writes_table:
+      each:
+        in_catalog: false
+"#,
+        );
+        let value = serde_json::json!({
+            "query": {
+                "reads_table": [{"in_catalog": false}, {"in_catalog": true}],
+                "writes_table": [{"in_catalog": false}],
+            }
+        });
+        let EvalResult::Match { witnesses } = pred.evaluate_value(&value) else {
+            panic!("any_of matches");
+        };
+        assert_eq!(witnesses.len(), 2);
     }
 
     #[test]
@@ -1820,7 +2151,7 @@ not:
   kind: insert
 "#,
         );
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
     }
 
     #[test]
@@ -1829,7 +2160,7 @@ not:
         // facts.query is None, so query.scopes resolves to nothing.
         // count: { eq: 0 } should still match.
         let pred = compile_yaml("query.scopes: { count: { eq: 0 } }");
-        assert!(pred.evaluate(&facts).is_match());
+        assert!(pred.matches(&facts));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1840,8 +2171,8 @@ not:
     fn explain_scalar_mismatch_records_actual_value() {
         let facts = empty_facts(StatementKind::Select);
         let pred = compile_yaml("kind: grant");
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(!result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(!matched);
         assert!(exp.matched_paths.is_empty());
         assert_eq!(exp.unmatched_paths.len(), 1);
         let entry = &exp.unmatched_paths[0];
@@ -1855,8 +2186,8 @@ not:
     fn explain_scalar_match_records_matched_path() {
         let facts = empty_facts(StatementKind::Grant);
         let pred = compile_yaml("kind: grant");
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(matched);
         assert_eq!(exp.matched_paths.len(), 1);
         assert!(exp.unmatched_paths.is_empty());
         assert!(exp.matched_paths[0].contains("kind"));
@@ -1867,8 +2198,8 @@ not:
         let facts = empty_facts(StatementKind::Grant);
         // facts.query is None; query.has_where path does not resolve.
         let pred = compile_yaml("query.has_where: false");
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(!result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(!matched);
         assert_eq!(exp.unmatched_paths.len(), 1);
         assert!(
             exp.unmatched_paths[0].contains("path did not resolve"),
@@ -1889,8 +2220,8 @@ all_of:
   - query.has_where: false
 "#,
         );
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(!result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(!matched);
         // Should record: arm 0 matched (kind), arm 1 path-not-resolved
         // (query.has_where), and outer all_of arm-1-failed.
         let matched_kind = exp.matched_paths.iter().any(|e| e.contains("kind"));
@@ -1932,8 +2263,8 @@ any_of:
   - kind: update
 "#,
         );
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(matched);
         // The successful arm at index 1 should be recorded.
         let has_any_of_match = exp
             .matched_paths
@@ -1957,8 +2288,8 @@ any_of:
   - kind: delete
 "#,
         );
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(!result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(!matched);
         let has_no_match = exp
             .unmatched_paths
             .iter()
@@ -1975,8 +2306,8 @@ any_of:
         let facts = empty_facts(StatementKind::Grant);
         // facts.query is None, count resolves to 0; predicate wants > 0.
         let pred = compile_yaml("query.scopes: { count: { gt: 0 } }");
-        let (result, exp) = pred.evaluate_with_explain(&facts);
-        assert!(!result.is_match());
+        let (matched, exp) = pred.evaluate_with_explain(&facts);
+        assert!(!matched);
         let has_count_mismatch = exp
             .unmatched_paths
             .iter()
@@ -2013,15 +2344,16 @@ any_of:
     #[test]
     fn kind_gate_in_with_unknown_member_widens_to_any() {
         // One unresolvable member widens the whole op — never a false skip.
-        assert_eq!(
-            gate("kind: { in: [select, not_a_real_kind] }"),
-            KindGate::Any
-        );
+        // `compile` refuses such a predicate, so the gate is read from the
+        // parsed predicate.
+        let parsed = parse_yaml("kind: { in: [select, not_a_real_kind] }").expect("parses");
+        assert_eq!(predicate_kind_gate(&parsed), KindGate::Any);
     }
 
     #[test]
     fn kind_gate_unknown_literal_is_any() {
-        assert_eq!(gate("kind: not_a_real_kind"), KindGate::Any);
+        let parsed = parse_yaml("kind: not_a_real_kind").expect("parses");
+        assert_eq!(predicate_kind_gate(&parsed), KindGate::Any);
     }
 
     #[test]
@@ -2121,5 +2453,373 @@ any_of:
         // In-range sanity: the set kind isn't skipped; a different one is.
         assert!(!g.skips(StatementKind::Select as usize));
         assert!(g.skips(StatementKind::Insert as usize));
+    }
+
+    // ── Comparing two fields ──────────────────────────────────────────
+
+    /// Whether `yaml` matches the serialized facts `facts`.
+    fn holds(yaml: &str, facts: Value) -> bool {
+        compile_yaml(yaml).evaluate_value(&facts).is_match()
+    }
+
+    const LEFT_IN_RIGHT: &str = "query.left: { all_in_field: query.right }";
+
+    #[test]
+    fn all_in_field_holds_when_every_item_is_in_the_other_list() {
+        use serde_json::json;
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": ["a", "b"], "right": ["b", "c", "a"]}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": ["a", "d"], "right": ["a", "b"]}})
+        ));
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [], "right": []}})
+        ));
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [1, 1], "right": [1]}})
+        ));
+    }
+
+    #[test]
+    fn all_in_field_reads_an_absent_or_null_field_as_the_empty_list() {
+        use serde_json::json;
+        // No item on the left: in any list.
+        assert!(holds(LEFT_IN_RIGHT, json!({"query": {"right": ["a"]}})));
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": null, "right": ["a"]}})
+        ));
+        assert!(holds(LEFT_IN_RIGHT, json!({"query": {}})));
+        assert!(holds(LEFT_IN_RIGHT, json!({"query": null})));
+        // No item on the right: only the empty list is in it.
+        assert!(!holds(LEFT_IN_RIGHT, json!({"query": {"left": ["a"]}})));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": ["a"], "right": null}})
+        ));
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [], "right": null}})
+        ));
+    }
+
+    #[test]
+    fn all_in_field_does_not_hold_on_a_field_that_is_not_a_list() {
+        use serde_json::json;
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": "a", "right": ["a"]}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": ["a"], "right": "a"}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": {"x": 1}, "right": [{"x": 1}]}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [], "right": false}})
+        ));
+        // Negated, a field that is not a list reads as "not all in".
+        assert!(holds(
+            "not: { query.left: { all_in_field: query.right } }",
+            json!({"query": {"left": "a", "right": ["a"]}})
+        ));
+    }
+
+    #[test]
+    fn all_in_field_resolves_its_field_against_the_element_matched() {
+        use serde_json::json;
+        let facts = json!({"query": {
+            "items": [
+                {"left": ["a"], "right": ["a", "b"]},
+                {"left": ["c"], "right": ["a"]},
+            ],
+            "right": ["c"],
+        }});
+        let rule = "query.items: { each: { left: { all_in_field: right } } }";
+        let EvalResult::Match { witnesses } = compile_yaml(rule).evaluate_value(&facts) else {
+            panic!("the first item's list is in its own `right`");
+        };
+        let matched: Vec<&str> = witnesses
+            .iter()
+            .filter(|witness| witness.from_each)
+            .map(|witness| witness.path.as_str())
+            .collect();
+        assert_eq!(matched, ["query.items.0"]);
+        // A field nested in the element.
+        assert!(holds(
+            "query.items: { exists: { left: { all_in_field: inner.right } } }",
+            json!({"query": {"items": [{"left": ["a"], "inner": {"right": ["a"]}}]}})
+        ));
+    }
+
+    /// A witness's path names each quantifier and `any_of` arm it was
+    /// found under, the same in the hot path and in explain mode, and its
+    /// value is the element matched.
+    #[test]
+    fn witness_paths_name_the_quantifiers_and_arms_they_were_found_under() {
+        use serde_json::json;
+        let facts = json!({"query": {"scopes": [
+            {"projections": [{"k": 1}]},
+            {"projections": [{"k": 1}, {"k": 2}]},
+        ]}});
+        let rule = "query.scopes: { each: { any_of: [ \
+                    { projections: { each: { k: 3 } } }, \
+                    { projections: { exists: { not: { k: 1 } } } } ] } }";
+        let expected = [
+            (
+                "query.scopes.1",
+                true,
+                json!({"projections": [{"k": 1}, {"k": 2}]}),
+            ),
+            (
+                "query.scopes.1@any_of[1].projections.1",
+                false,
+                json!({"k": 2}),
+            ),
+        ];
+        let compiled = compile_yaml(rule);
+        let (explained, _) = compiled.evaluate_value_with_explain(&facts);
+        for result in [compiled.evaluate_value(&facts), explained] {
+            let EvalResult::Match { witnesses } = result else {
+                panic!("the second scope has a projection whose k is not 1");
+            };
+            let got: Vec<(&str, bool, &Value)> = witnesses
+                .iter()
+                .map(|w| (w.path.as_str(), w.from_each, w.value))
+                .collect();
+            let want: Vec<(&str, bool, &Value)> =
+                expected.iter().map(|(p, e, v)| (*p, *e, v)).collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn all_in_field_compares_identifiers_by_their_normalized_form() {
+        use serde_json::json;
+        let ident = |raw: &str, normalized: &str| json!({"raw": raw, "normalized": normalized});
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [ident("Email", "EMAIL")], "right": [ident("\"EMAIL\"", "EMAIL")]}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [ident("email", "email")], "right": [ident("EMAIL", "EMAIL")]}})
+        ));
+        // Labels compare as values: a unit label, a named one.
+        assert!(holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [{"other": "GOV.TAGS.PII"}, "pii"], "right": ["pii", {"other": "GOV.TAGS.PII"}]}})
+        ));
+        assert!(!holds(
+            LEFT_IN_RIGHT,
+            json!({"query": {"left": [{"other": "GOV.TAGS.PII"}], "right": [{"other": "PII"}]}})
+        ));
+    }
+
+    #[test]
+    fn all_in_field_neither_gates_the_family_nor_bounds_the_kind() {
+        let compiled = compile_yaml(LEFT_IN_RIGHT);
+        assert_eq!(compiled.root_mask(), 0);
+        assert_eq!(compiled.kind_gate(), &KindGate::Any);
+    }
+
+    #[test]
+    fn all_in_field_checks_its_fields_root_outside_a_quantifier() {
+        let parse = |yaml: &str| {
+            let val: Value = serde_yaml_ng::from_str(yaml).expect("yaml parses");
+            super::super::predicate::parse_predicate(&val).expect("predicate parses")
+        };
+        assert!(matches!(
+            compile(&parse("query.left: { all_in_field: qurey.right }")),
+            Err(CompileError::UnknownRootField { unknown_root, .. }) if unknown_root == "qurey"
+        ));
+        // Inside a quantifier the field is the element's, of any name.
+        assert!(compile(&parse(
+            "query.items: { exists: { left: { all_in_field: qurey } } }"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_statement_kind_no_statement_has_is_refused_with_the_nearest_kind() {
+        for (yaml, kind, suggestion) in [
+            ("kind: delet", "delet", Some("delete")),
+            ("kind: DELETE", "DELETE", Some("delete")),
+            ("kind: {in: [select, delet]}", "delet", Some("delete")),
+            ("kind: {neq: selct}", "selct", Some("select")),
+            ("kind: {not_in: [grnt]}", "grnt", Some("grant")),
+            (
+                "kind: nothing_like_a_statement_kind_at_all",
+                "nothing_like_a_statement_kind_at_all",
+                None,
+            ),
+        ] {
+            let parsed = parse_yaml(yaml).expect("predicate parses");
+            assert_eq!(
+                compile(&parsed).err(),
+                Some(CompileError::UnknownStatementKind {
+                    kind: kind.to_string(),
+                    suggestion: suggestion.map(str::to_string),
+                }),
+                "{yaml}"
+            );
+        }
+        for yaml in [
+            "kind: {in: [select, grant]}",
+            "kind: {neq: select}",
+            // Inside a quantifier `kind` is the element's, of any value.
+            "diff.events: {exists: {kind: statement_added}}",
+            // Only the top-level `kind` is the statement's.
+            "privilege.target.kind: schema",
+        ] {
+            let parsed = parse_yaml(yaml).expect("predicate parses");
+            assert!(compile(&parsed).is_ok(), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn explain_all_in_field_names_the_operator_and_the_field() {
+        let facts = serde_json::json!({"query": {"left": ["a", "d"], "right": ["a"]}});
+        let (result, exp) = compile_yaml(LEFT_IN_RIGHT).evaluate_value_with_explain(&facts);
+        assert!(!result.is_match());
+        assert!(
+            exp.unmatched_paths
+                .iter()
+                .any(|entry| entry.contains("query.left all_in_field query.right")),
+            "{:?}",
+            exp.unmatched_paths
+        );
+    }
+
+    // ── Named value lists ─────────────────────────────────────────────
+
+    fn list_table() -> ValueLists {
+        let entries = serde_yaml_ng::from_str(
+            "dummies: {values: [REPLACE_ME]}\n\
+             credential_references: {values: [x]}\n\
+             refs: {values: [From_Pipeline], patterns: [\"{{*secrets.*}}\", \"vault:*\"]}\n",
+        )
+        .expect("list yaml parses");
+        super::super::lists::define_builtin_lists(entries).expect("lists define")
+    }
+
+    fn parse_yaml(yaml: &str) -> Result<Predicate, ParseError> {
+        let val: Value = serde_yaml_ng::from_str(yaml).expect("yaml parses");
+        super::super::predicate::parse_predicate(&val)
+    }
+
+    fn holds_with_lists(yaml: &str, facts: Value) -> bool {
+        let parsed = parse_yaml(yaml).expect("predicate parses");
+        compile_with_lists(&parsed, &list_table())
+            .expect("predicate compiles")
+            .evaluate_value(&facts)
+            .is_match()
+    }
+
+    fn x(value: Value) -> Value {
+        serde_json::json!({"query": {"x": value}})
+    }
+
+    #[test]
+    fn in_list_matches_values_and_patterns_ignoring_case() {
+        let yaml = "query.x: { in_list: refs }";
+        assert!(holds_with_lists(yaml, x("from_pipeline".into())));
+        assert!(holds_with_lists(yaml, x("{{ SECRETS.pw }}".into())));
+        assert!(!holds_with_lists(yaml, x("S3cret!".into())));
+    }
+
+    #[test]
+    fn not_in_list_over_two_lists() {
+        let yaml = "query.x: { not_in_list: [dummies, refs] }";
+        assert!(!holds_with_lists(yaml, x("REPLACE_ME".into())));
+        assert!(!holds_with_lists(yaml, x("vault:kv/a".into())));
+        assert!(holds_with_lists(yaml, x("S3cret!".into())));
+    }
+
+    #[test]
+    fn list_ops_read_strings_only() {
+        use serde_json::json;
+        for yaml in [
+            "query.x: { in_list: refs }",
+            "query.x: { not_in_list: refs }",
+        ] {
+            assert!(!holds_with_lists(yaml, x(json!(5))), "{yaml}");
+            assert!(!holds_with_lists(yaml, x(Value::Null)), "{yaml}");
+            assert!(!holds_with_lists(yaml, x(json!(["a"]))), "{yaml}");
+            assert!(!holds_with_lists(yaml, json!({"query": {}})), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn unknown_list_is_a_compile_error() {
+        let parsed = parse_yaml("query.x: { in_list: nope }").expect("predicate parses");
+        assert!(matches!(
+            compile_with_lists(&parsed, &list_table()),
+            Err(CompileError::UnknownList { list }) if list == "nope"
+        ));
+    }
+
+    #[test]
+    fn list_names_are_case_sensitive() {
+        let parsed =
+            parse_yaml("query.x: { in_list: Credential_References }").expect("predicate parses");
+        assert!(matches!(
+            compile_with_lists(&parsed, &list_table()),
+            Err(CompileError::UnknownList { list }) if list == "Credential_References"
+        ));
+    }
+
+    #[test]
+    fn non_string_list_name_is_a_parse_error() {
+        for yaml in [
+            "query.x: { in_list: 3 }",
+            "query.x: { in_list: [] }",
+            "query.x: { not_in_list: [refs, 3] }",
+        ] {
+            assert!(
+                matches!(parse_yaml(yaml), Err(ParseError::InvalidLiteral { .. })),
+                "{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_ops_resolve_inside_quantifier_bodies() {
+        use serde_json::json;
+        let yaml = "query.items: { exists: { value: { not_in_list: refs } } }";
+        let facts = |v: &str| json!({"query": {"items": [{"value": v}]}});
+        assert!(holds_with_lists(yaml, facts("S3cret!")));
+        assert!(!holds_with_lists(yaml, facts("vault:kv/a")));
+        let parsed = parse_yaml("query.items: { none: { value: { in_list: nope } } }")
+            .expect("predicate parses");
+        assert!(matches!(
+            compile_with_lists(&parsed, &list_table()),
+            Err(CompileError::UnknownList { list }) if list == "nope"
+        ));
+    }
+
+    #[test]
+    fn explain_renders_list_names() {
+        let parsed = parse_yaml("query.x: { not_in_list: [dummies, refs] }").expect("parses");
+        let compiled = compile_with_lists(&parsed, &list_table()).expect("compiles");
+        let facts = x("REPLACE_ME".into());
+        let (result, exp) = compiled.evaluate_value_with_explain(&facts);
+        assert!(!result.is_match());
+        assert!(
+            exp.unmatched_paths
+                .iter()
+                .any(|entry| entry.contains("not_in_list dummies, refs")),
+            "{:?}",
+            exp.unmatched_paths
+        );
     }
 }

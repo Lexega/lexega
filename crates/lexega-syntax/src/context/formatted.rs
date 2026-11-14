@@ -28,6 +28,20 @@ pub struct FormattedContext {
 
     /// Line/column index for fast diagnostics
     line_index: LineIndex,
+
+    /// Every span the formatter copied as written, in output order.
+    copied_spans: Vec<CopiedSpan>,
+}
+
+/// Bytes the formatter copied from the source as written (a routine body in
+/// another language, a function body, a type written as read) and where
+/// they stand in the formatted text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopiedSpan {
+    /// The bytes in the source.
+    pub source: Span,
+    /// The same bytes in the formatted text.
+    pub output: Span,
 }
 
 /// Indentation tracking
@@ -83,12 +97,24 @@ impl FormattedContext {
             span_map,
             indentation,
             line_index,
+            copied_spans: Vec::new(),
         })
+    }
+
+    /// The spans the formatter copied as written, in output order.
+    pub(crate) fn with_copied_spans(mut self, copied_spans: Vec<CopiedSpan>) -> Self {
+        self.copied_spans = copied_spans;
+        self
     }
 
     /// Get formatted SQL
     pub fn formatted_sql(&self) -> &str {
         &self.formatted_sql
+    }
+
+    /// The spans the formatter copied as written, in output order.
+    pub fn copied_spans(&self) -> &[CopiedSpan] {
+        &self.copied_spans
     }
 
     /// Get span map

@@ -115,8 +115,9 @@ pub fn lower_drop_file_format_to_plan(s: &AstDrop, source: &str) -> FileFormatPl
     FileFormatPlan {
         action: FileFormatAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_name(source, name)),
         options: FileFormatOptions {
             or_replace: false,
             if_not_exists: false,
@@ -132,7 +133,7 @@ pub fn lower_drop_file_format_to_plan(s: &AstDrop, source: &str) -> FileFormatPl
 }
 
 /// Find the property whose name matches `key` (case-insensitive) and return
-/// its value text, upper-cased with surrounding single quotes stripped.
+/// its value, upper-cased: a string literal's value, or the text as written.
 fn property_value(properties: &[AstObjectProperty], source: &str, key: &str) -> Option<String> {
     properties.iter().find_map(|prop| {
         let name = span_text(source, prop.name_span).trim();
@@ -140,25 +141,29 @@ fn property_value(properties: &[AstObjectProperty], source: &str, key: &str) -> 
             return None;
         }
         let value_span = prop.value_span?;
-        let raw = span_text(source, value_span).trim();
-        Some(unquote_literal(raw).to_ascii_uppercase())
+        let raw = span_text(source, value_span);
+        Some(super::span_extract::literal_value_or_text(raw).to_ascii_uppercase())
     })
-}
-
-/// Strip surrounding `'…'` quotes and fold `''` escapes if present;
-/// otherwise return the input unchanged.
-fn unquote_literal(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        raw[1..raw.len() - 1].replace("''", "'")
-    } else {
-        raw.to_string()
-    }
 }
 
 fn span_text(source: &str, span: Span) -> &str {
     source
         .get(span.start as usize..span.end as usize)
         .unwrap_or("")
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> FileFormatTarget {
+    let Some((db, schema, name_text)) = crate::ir::utils::written_name_parts(source, name) else {
+        return target_from_span(source, name.span);
+    };
+    FileFormatTarget {
+        name: name_text,
+        schema,
+        db,
+        span: name.span,
+    }
 }
 
 fn target_from_span(source: &str, span: Span) -> FileFormatTarget {

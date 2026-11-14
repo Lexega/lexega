@@ -17,7 +17,20 @@ pub fn format_pg_copy(printer: &mut Printer, stmt: &AstPgCopy) -> Result<(), For
         if let Some(syntax_arena) = printer.syntax_arena() {
             let syntax = *syntax_arena.get_pg_copy_stmt(syntax_id);
             let _ = syntax_arena;
-            printer.push_keyword_token_id(syntax.copy_keyword);
+            // psql's `\copy` names a command whose case it reads: as written.
+            let psql = printer
+                .get_token_by_id(syntax.copy_keyword)
+                .map(|token| token.span)
+                .filter(|span| {
+                    printer
+                        .source()
+                        .get(span.start as usize..)
+                        .is_some_and(|text| text.starts_with('\\'))
+                });
+            match psql {
+                Some(span) => printer.push_span(span),
+                None => printer.push_keyword_token_id(syntax.copy_keyword),
+            }
         } else {
             printer.push_keyword("COPY");
         }

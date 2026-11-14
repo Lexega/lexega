@@ -27,7 +27,8 @@
 //!   `ColumnIdAllocator` during lowering and returned with the plan.
 //! - [`ScanIndex`] — maps the [`crate::ast::NodeId`] held in
 //!   [`ColumnOrigin::Table`] to the [`TableRef`] of the producing
-//!   `Scan` or `CteRef`. Built once per plan via
+//!   `Scan`, and each column a `CteRef` or `DerivedTable` lists to the
+//!   table column the plan pairs it with. Built once per plan via
 //!   [`build_scan_index`] (linear walk).
 //!
 //! With both side-tables, a `ScalarExpr::Column { column }` resolves
@@ -58,26 +59,86 @@
 //! [`ColumnBinding`]: crate::ir::column::ColumnBinding
 //! [`ColumnOrigin::Table`]: crate::ir::column::ColumnOrigin
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::NodeId;
 use crate::context::node_metadata::{CaseWhenFact, ColumnRef, ExpressionFact, TableRef};
-use crate::ir::column::{BindingTable, ColumnOrigin};
-use crate::ir::plan::{RelPlan, ResolvedFunc};
-use crate::ir::scalar::{FieldStep, Lit, QuantifiedRhs, Quantifier, ScalarExpr};
+use crate::ir::column::{BindingTable, ColumnId, ColumnOrigin};
+use crate::ir::pairing::PairingSteps;
+use crate::ir::plan::{Assignment, RelPlan, ResolvedFunc};
+use crate::ir::scalar::{ComparisonOp, FieldStep, Lit, QuantifiedRhs, Quantifier, ScalarExpr};
 
-/// Map from the `NodeId` carried in [`ColumnOrigin::Table`] to the
-/// [`TableRef`] of the `Scan` (or `CteRef`) that produced the
-/// column. Built once per plan by [`build_scan_index`].
-pub type ScanIndex = HashMap<NodeId, TableRef>;
+/// The tables of a plan's sources, and the table column each column a
+/// reference lists leads to. Built once per plan by
+/// [`build_scan_index`].
+#[derive(Debug, Default)]
+pub struct ScanIndex {
+    /// The [`TableRef`] of each `Scan`, `CteRef`, `ModelRef` and DML
+    /// target, by the `NodeId` carried in [`ColumnOrigin::Table`].
+    tables: HashMap<NodeId, TableRef>,
+    /// The table-origin column each column a `CteRef` or `DerivedTable`
+    /// lists is, where the plan's pairing reaches one.
+    sources: BTreeMap<ColumnId, ColumnId>,
+}
+
+impl ScanIndex {
+    /// The table of the source or DML target with node id `node`.
+    pub fn get(&self, node: &NodeId) -> Option<&TableRef> {
+        self.tables.get(node)
+    }
+
+    /// The table `assignment` writes: that of the node whose row it
+    /// writes, else the statement's `target`.
+    pub(crate) fn written_table<'s>(
+        &'s self,
+        assignment: &Assignment,
+        target: &'s TableRef,
+    ) -> &'s TableRef {
+        self.get(&assignment.written_node).unwrap_or(target)
+    }
+
+    /// The table `column` resolves to: its own for a table column, the
+    /// paired table column's for a column a reference lists, none for
+    /// an unattributed column.
+    pub(crate) fn table_of(&self, column: ColumnId, bindings: &BindingTable) -> Option<&TableRef> {
+        let source = self.source_column(column, bindings)?;
+        let binding = bindings.get(source)?;
+        match &binding.origin {
+            ColumnOrigin::Table { table_node, .. } => self.tables.get(table_node),
+            ColumnOrigin::Unattributed { .. }
+            | ColumnOrigin::Computed { .. }
+            | ColumnOrigin::Merged { .. }
+            | ColumnOrigin::SetOp { .. }
+            | ColumnOrigin::OuterRef { .. }
+            | ColumnOrigin::RecursiveRef { .. } => None,
+        }
+    }
+
+    /// The column of a source `column` is: itself for a table column
+    /// and for an unattributed one, whose source is unknown, else the
+    /// table column the plan's pairing leads to, if any.
+    pub(crate) fn source_column(
+        &self,
+        column: ColumnId,
+        bindings: &BindingTable,
+    ) -> Option<ColumnId> {
+        match &bindings.get(column)?.origin {
+            ColumnOrigin::Table { .. } | ColumnOrigin::Unattributed { .. } => Some(column),
+            ColumnOrigin::Computed { .. } | ColumnOrigin::Merged { .. } => {
+                self.sources.get(&column).copied()
+            }
+            ColumnOrigin::SetOp { .. }
+            | ColumnOrigin::OuterRef { .. }
+            | ColumnOrigin::RecursiveRef { .. } => None,
+        }
+    }
+}
 
 /// Walk the plan once, recording every base-table `Scan`, every
-/// `CteRef`, and every `ModelRef` keyed by their `node_id`. All three
-/// kinds can appear as the `table_node` in [`ColumnOrigin::Table`]
-/// (CTE references to single-scan bodies redirect column allocation
-/// through the leaf scan's `NodeId`; references to general CTE
-/// bodies allocate against the `CteRef`'s own `NodeId`; cross-model
-/// `ModelRef`s carry their own `NodeId` for cross-scope resolution).
+/// `CteRef`, and every `ModelRef` keyed by their `node_id`, and every
+/// DML target keyed by its `target_node`, then the table column each
+/// column a `CteRef` or `DerivedTable` lists leads to through the
+/// plan's pairing.
 ///
 /// Descent uses the standard `RelPlanVisitor` framework: relational
 /// descent via [`walk_rel_plan`](crate::ir::visitor::walk_rel_plan) is closed-enum exhaustive over
@@ -87,23 +148,81 @@ pub type ScanIndex = HashMap<NodeId, TableRef>;
 /// Scan/CteRef/ModelRef the column-refs walker can reach is
 /// resolvable through this index.
 pub fn build_scan_index(plan: &RelPlan) -> ScanIndex {
+    build_scan_index_over(&[plan])
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many scan indexes this thread has built.
+    static BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many scan indexes this thread has built.
+#[cfg(test)]
+pub(crate) fn scan_indexes_built() -> usize {
+    BUILT.with(std::cell::Cell::get)
+}
+
+/// As [`build_scan_index`], over several plans of one statement: its
+/// own and those its expressions hold outside it.
+pub(crate) fn build_scan_index_over(plans: &[&RelPlan]) -> ScanIndex {
     use super::visitor::{walk_rel_plan, RelPlanVisitor};
+    #[cfg(test)]
+    BUILT.with(|built| built.set(built.get() + 1));
 
     struct Builder {
-        index: ScanIndex,
+        tables: HashMap<NodeId, TableRef>,
     }
     impl<'a> RelPlanVisitor<'a> for Builder {
         fn visit_rel_plan(&mut self, plan: &'a RelPlan) {
             match plan {
                 RelPlan::Scan { table, node_id, .. } => {
-                    self.index.insert(*node_id, table.clone());
+                    self.tables.insert(*node_id, table.clone());
                 }
                 RelPlan::CteRef { name, node_id, .. } => {
-                    self.index
+                    self.tables
                         .insert(*node_id, TableRef::new(name.as_str().to_string()));
                 }
                 RelPlan::ModelRef { model, node_id, .. } => {
-                    self.index.insert(*node_id, model_ref_to_table_ref(model));
+                    self.tables.insert(*node_id, model_ref_to_table_ref(model));
+                }
+                RelPlan::Insert {
+                    target,
+                    target_node,
+                    ..
+                }
+                | RelPlan::Update {
+                    target,
+                    target_node,
+                    ..
+                }
+                | RelPlan::Delete {
+                    target,
+                    target_node,
+                    ..
+                }
+                | RelPlan::Merge {
+                    target,
+                    target_node,
+                    ..
+                } => {
+                    self.tables.insert(*target_node, target.clone());
+                }
+                RelPlan::MultiInsert {
+                    unconditional_clauses,
+                    when_clauses,
+                    else_clauses,
+                    ..
+                } => {
+                    let whens = when_clauses.iter().flat_map(|when| &when.targets);
+                    for target in unconditional_clauses
+                        .iter()
+                        .chain(whens)
+                        .chain(else_clauses)
+                    {
+                        self.tables
+                            .insert(target.target_node, target.target.clone());
+                    }
                 }
                 RelPlan::Values { .. }
                 | RelPlan::TableFunction { .. }
@@ -128,22 +247,29 @@ pub fn build_scan_index(plan: &RelPlan) -> ScanIndex {
                 | RelPlan::SetOp { .. }
                 | RelPlan::WithScope { .. }
                 | RelPlan::Explain { .. }
-                | RelPlan::CreateAsQuery { .. }
-                | RelPlan::Insert { .. }
-                | RelPlan::Update { .. }
-                | RelPlan::Delete { .. }
-                | RelPlan::Merge { .. }
-                | RelPlan::MultiInsert { .. } => {}
+                | RelPlan::CreateAsQuery { .. } => {}
             }
             walk_rel_plan(self, plan);
         }
     }
 
     let mut b = Builder {
-        index: ScanIndex::new(),
+        tables: HashMap::new(),
     };
-    b.visit_rel_plan(plan);
-    b.index
+    let mut sources = BTreeMap::new();
+    for plan in plans {
+        b.visit_rel_plan(plan);
+        let steps = PairingSteps::of(plan);
+        sources.extend(
+            steps
+                .reference_columns()
+                .filter_map(|column| Some((column, steps.source_column(column)?))),
+        );
+    }
+    ScanIndex {
+        tables: b.tables,
+        sources,
+    }
 }
 
 /// Reconstruct a [`TableRef`] for a `ResolvedModel` boundary from
@@ -196,18 +322,10 @@ pub fn scalar_to_expression_fact(
     match expr {
         ScalarExpr::Column { column, .. } => {
             let (display_name, resolved_table) = match bindings.get(*column) {
-                Some(binding) => {
-                    let table = match &binding.origin {
-                        ColumnOrigin::Table { table_node, .. } => {
-                            scan_index.get(table_node).cloned()
-                        }
-                        ColumnOrigin::Computed { .. }
-                        | ColumnOrigin::SetOp { .. }
-                        | ColumnOrigin::OuterRef { .. }
-                        | ColumnOrigin::RecursiveRef { .. } => None,
-                    };
-                    (binding.display_name.clone(), table)
-                }
+                Some(binding) => (
+                    binding.display_name.clone(),
+                    scan_index.table_of(*column, bindings).cloned(),
+                ),
                 None => (String::new(), None),
             };
             let mut col = ColumnRef::new(display_name);
@@ -244,6 +362,20 @@ pub fn scalar_to_expression_fact(
                 .map(|o| scalar_to_expression_fact(o, bindings, scan_index))
                 .collect(),
         },
+        ScalarExpr::OperatorChain {
+            operands,
+            operators,
+            ..
+        } => ExpressionFact::OperatorChain {
+            operators: operators
+                .iter()
+                .map(|op| op.as_sql_str().to_string())
+                .collect(),
+            operands: operands
+                .iter()
+                .map(|o| scalar_to_expression_fact(o, bindings, scan_index))
+                .collect(),
+        },
         // Pattern matches project to a dedicated typed
         // `ExpressionFact::Like` (negation and ESCAPE are first-class), not
         // a nested `BinaryOp { operator: "NOT LIKE" }` +
@@ -273,7 +405,8 @@ pub fn scalar_to_expression_fact(
             args,
             named_args,
             distinct,
-            ..
+            non_values,
+            span: _,
         } => {
             let name = resolved_func_display_name(func);
             // Positional and named arguments project
@@ -292,6 +425,7 @@ pub fn scalar_to_expression_fact(
             ExpressionFact::Function {
                 name,
                 args: arg_facts,
+                non_values: non_values.clone(),
                 is_distinct: *distinct,
             }
         }
@@ -399,10 +533,6 @@ pub fn scalar_to_expression_fact(
             right,
             ..
         } => {
-            let q_str = match quantifier {
-                Quantifier::Any => "ANY",
-                Quantifier::All => "ALL",
-            };
             let right_fact = match right {
                 QuantifiedRhs::Subquery(subquery, _) => {
                     let tables = collect_subquery_table_names(subquery);
@@ -420,22 +550,54 @@ pub fn scalar_to_expression_fact(
                     negated: *negated,
                 },
             };
-            let cmp = ExpressionFact::BinaryOp {
-                left: Box::new(scalar_to_expression_fact(left, bindings, scan_index)),
-                operator: format!("{} {}", op.as_sql_str(), q_str),
-                right: Box::new(right_fact),
+            quantified_cmp_fact(
+                *op,
+                *quantifier,
+                *negated,
+                scalar_to_expression_fact(left, bindings, scan_index),
+                right_fact,
+            )
+        }
+        // The row is published as a call of `ROW` with its elements, the
+        // comparison as the one over a scalar subquery or the quantified
+        // one it states.
+        ScalarExpr::RowCmp {
+            op,
+            quantifier,
+            negated,
+            left,
+            subquery,
+            ..
+        } => {
+            let row = ExpressionFact::Function {
+                name: "ROW".to_string(),
+                args: left
+                    .iter()
+                    .map(|e| scalar_to_expression_fact(e, bindings, scan_index))
+                    .collect(),
+                is_distinct: false,
+                non_values: Vec::new(),
             };
-            // Preserve the `UnaryOp("NOT", ...)` wrapper shape
-            // for negated quantified comparisons. The IR canonicalized
-            // the NOT into the typed `negated` field, but downstream
-            // consumers expect the wrap.
-            if *negated {
-                ExpressionFact::UnaryOp {
-                    operator: "NOT".to_string(),
-                    operand: Box::new(cmp),
-                }
-            } else {
-                cmp
+            let tables_referenced = collect_subquery_table_names(subquery);
+            match quantifier {
+                None => ExpressionFact::BinaryOp {
+                    left: Box::new(row),
+                    operator: op.as_sql_str().to_string(),
+                    right: Box::new(ExpressionFact::Subquery {
+                        tables_referenced,
+                        kind: "scalar".to_string(),
+                    }),
+                },
+                Some(quantifier) => quantified_cmp_fact(
+                    *op,
+                    *quantifier,
+                    *negated,
+                    row,
+                    ExpressionFact::Subquery {
+                        tables_referenced,
+                        kind: "quantified".to_string(),
+                    },
+                ),
             }
         }
         ScalarExpr::WindowFn { call, .. } => {
@@ -449,6 +611,7 @@ pub fn scalar_to_expression_fact(
                 name,
                 args: arg_facts,
                 is_distinct: call.distinct,
+                non_values: Vec::new(),
             }
         }
         ScalarExpr::FieldAccess {
@@ -490,6 +653,35 @@ pub fn scalar_to_expression_fact(
     }
 }
 
+/// `left <op> ANY|ALL right`. A negated comparison keeps the
+/// `UnaryOp("NOT", …)` wrapper downstream consumers expect, though the
+/// plan states the negation as a field.
+fn quantified_cmp_fact(
+    op: ComparisonOp,
+    quantifier: Quantifier,
+    negated: bool,
+    left: ExpressionFact,
+    right: ExpressionFact,
+) -> ExpressionFact {
+    let q_str = match quantifier {
+        Quantifier::Any => "ANY",
+        Quantifier::All => "ALL",
+    };
+    let cmp = ExpressionFact::BinaryOp {
+        left: Box::new(left),
+        operator: format!("{} {}", op.as_sql_str(), q_str),
+        right: Box::new(right),
+    };
+    if negated {
+        ExpressionFact::UnaryOp {
+            operator: "NOT".to_string(),
+            operand: Box::new(cmp),
+        }
+    } else {
+        cmp
+    }
+}
+
 fn lit_to_expression_fact(value: &Lit) -> ExpressionFact {
     let (text, kind) = match value {
         Lit::Null => ("NULL".to_string(), "null"),
@@ -499,7 +691,7 @@ fn lit_to_expression_fact(value: &Lit) -> ExpressionFact {
         Lit::Str(s) => (s.clone(), "string"),
         Lit::Bytes { tag, value } => (format!("{}'{}'", tag, value), "string"),
         Lit::Typed { type_name, value } => (format!("{} '{}'", type_name, value), "string"),
-        Lit::Variant(s) => (s.clone(), "string"),
+        Lit::Variant(s) | Lit::Variable { written: s, .. } => (s.clone(), "string"),
     };
     ExpressionFact::Literal {
         value: text,

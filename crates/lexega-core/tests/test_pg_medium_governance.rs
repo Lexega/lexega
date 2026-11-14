@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Tests for PostgreSQL governance signals: extension and view drops, rules,
+//! Tests for PostgreSQL governance findings: extension and view drops, rules,
 //! triggers, session settings.
 //!
 //!   PG-EXT-DROP  – DROP EXTENSION              (High)
@@ -41,7 +41,7 @@ fn pg_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| match s {
+    report.entries().any(|s| match s {
         RuleMatch::Analysis(g) => g.matched_rule == rule_id,
     })
 }
@@ -56,10 +56,9 @@ fn pg_format(sql: &str) -> String {
 
 fn rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> Vec<&str> {
     report
-        .signals
-        .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.as_str()),
+        .entries()
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => g.matched_rule.as_str(),
         })
         .collect()
 }
@@ -90,7 +89,7 @@ fn test_drop_extension_cascade_format() {
 }
 
 #[test]
-fn test_drop_extension_signal_fires() {
+fn test_drop_extension_finding_fires() {
     let report = pg_analyze("DROP EXTENSION pgcrypto;");
     assert!(
         has_rule(&report, "PG-EXT-DROP"),
@@ -128,8 +127,7 @@ fn test_drop_extension_multi_statement_evidence() {
     let sql = "DROP EXTENSION pgcrypto;\nDROP EXTENSION hstore;";
     let report = pg_analyze(sql);
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "PG-EXT-DROP"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -161,7 +159,7 @@ fn test_alter_view_owner_format() {
 }
 
 #[test]
-fn test_alter_view_signal_fires() {
+fn test_alter_view_finding_fires() {
     let report = pg_analyze("ALTER VIEW my_view RENAME TO new_view;");
     assert!(
         has_rule(&report, "VIEW-CHG"),
@@ -205,7 +203,7 @@ fn test_drop_view_cascade_format() {
 }
 
 #[test]
-fn test_drop_view_signal_fires() {
+fn test_drop_view_finding_fires() {
     let report = pg_analyze("DROP VIEW my_view;");
     assert!(
         has_rule(&report, "VIEW-DROP"),
@@ -250,7 +248,7 @@ fn test_alter_rule_format_roundtrip() {
 }
 
 #[test]
-fn test_alter_rule_signal_fires() {
+fn test_alter_rule_finding_fires() {
     let report = pg_analyze("ALTER RULE my_rule ON my_table RENAME TO new_rule;");
     assert!(
         has_rule(&report, "PG-RULE-CHG"),
@@ -294,7 +292,7 @@ fn test_drop_rule_cascade_format() {
 }
 
 #[test]
-fn test_drop_rule_signal_fires() {
+fn test_drop_rule_finding_fires() {
     let report = pg_analyze("DROP RULE my_rule ON my_table;");
     assert!(
         has_rule(&report, "PG-RULE-DROP"),
@@ -367,7 +365,7 @@ fn test_enable_replica_trigger_format() {
 }
 
 #[test]
-fn test_disable_trigger_signal_fires() {
+fn test_disable_trigger_finding_fires() {
     let report = pg_analyze("ALTER TABLE my_table DISABLE TRIGGER audit_trigger;");
     assert!(
         has_rule(&report, "PG-TRIG-OFF"),
@@ -377,7 +375,7 @@ fn test_disable_trigger_signal_fires() {
 }
 
 #[test]
-fn test_enable_trigger_signal_fires() {
+fn test_enable_trigger_finding_fires() {
     let report = pg_analyze("ALTER TABLE my_table ENABLE TRIGGER audit_trigger;");
     assert!(
         has_rule(&report, "INFO-PG-TRIG-ON"),
@@ -387,7 +385,7 @@ fn test_enable_trigger_signal_fires() {
 }
 
 #[test]
-fn test_disable_trigger_all_signal() {
+fn test_disable_trigger_all_finding() {
     let report = pg_analyze("ALTER TABLE my_table DISABLE TRIGGER ALL;");
     assert!(
         has_rule(&report, "PG-TRIG-OFF"),
@@ -397,7 +395,7 @@ fn test_disable_trigger_all_signal() {
 }
 
 #[test]
-fn test_enable_always_trigger_signal() {
+fn test_enable_always_trigger_finding() {
     let report = pg_analyze("ALTER TABLE my_table ENABLE ALWAYS TRIGGER my_trigger;");
     assert!(
         has_rule(&report, "INFO-PG-TRIG-ON"),
@@ -420,8 +418,7 @@ fn test_disable_trigger_multi_statement_evidence() {
     let sql = "ALTER TABLE t1 DISABLE TRIGGER tr1;\nALTER TABLE t2 DISABLE TRIGGER tr2;";
     let report = pg_analyze(sql);
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "PG-TRIG-OFF"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -467,7 +464,7 @@ fn test_set_session_authorization_format() {
 }
 
 #[test]
-fn test_set_role_signal_fires() {
+fn test_set_role_finding_fires() {
     let report = pg_analyze("SET ROLE admin;");
     assert!(
         has_rule(&report, "PG-ROLE-SET"),
@@ -477,7 +474,7 @@ fn test_set_role_signal_fires() {
 }
 
 #[test]
-fn test_set_session_authorization_signal_fires() {
+fn test_set_session_authorization_finding_fires() {
     let report = pg_analyze("SET SESSION AUTHORIZATION 'admin_user';");
     assert!(
         has_rule(&report, "PG-ROLE-SET"),
@@ -528,7 +525,7 @@ fn test_reset_search_path_format() {
 }
 
 #[test]
-fn test_set_search_path_signal_fires() {
+fn test_set_search_path_finding_fires() {
     let report = pg_analyze("SET search_path TO public, my_schema;");
     assert!(
         has_rule(&report, "PG-SESSION-CHG"),
@@ -538,7 +535,7 @@ fn test_set_search_path_signal_fires() {
 }
 
 #[test]
-fn test_reset_fires_session_state_signal() {
+fn test_reset_fires_session_state_finding() {
     let report = pg_analyze("RESET ROLE;");
     assert!(
         has_rule(&report, "PG-SESSION-CHG"),
@@ -575,7 +572,7 @@ fn test_set_work_mem_format() {
 }
 
 #[test]
-fn test_set_generic_signal_fires() {
+fn test_set_generic_finding_fires() {
     let report = pg_analyze("SET statement_timeout TO '5s';");
     assert!(
         has_rule(&report, "PG-SESSION-SET"),
@@ -611,7 +608,7 @@ fn test_mixed_medium_multi_statement_format() {
 }
 
 #[test]
-fn test_mixed_medium_multi_statement_signals() {
+fn test_mixed_medium_multi_statement_findings() {
     let sql = "\
         DROP EXTENSION pgcrypto;\n\
         ALTER TABLE audit_log DISABLE TRIGGER audit_trigger;\n\
@@ -665,11 +662,11 @@ fn test_mixed_medium_multi_all_analyzed() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  Negative tests: normal ALTER TABLE should NOT trigger trigger signals
+//  Negative tests: normal ALTER TABLE should NOT trigger trigger findings
 // ═════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_normal_alter_table_no_trigger_signal() {
+fn test_normal_alter_table_no_trigger_finding() {
     // Normal ALTER TABLE ADD COLUMN should NOT fire PG-TRIG-OFF or INFO-PG-TRIG-ON
     let report = pg_analyze("ALTER TABLE my_table ADD COLUMN new_col INT;");
     assert!(
@@ -683,7 +680,7 @@ fn test_normal_alter_table_no_trigger_signal() {
 }
 
 #[test]
-fn test_normal_drop_table_no_view_signal() {
+fn test_normal_drop_table_no_view_finding() {
     // DROP TABLE should NOT fire VIEW-DROP (view dropped)
     let report = pg_analyze("DROP TABLE my_table;");
     assert!(

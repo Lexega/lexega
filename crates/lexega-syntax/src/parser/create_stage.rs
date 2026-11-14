@@ -28,13 +28,15 @@
 //! ```
 
 use crate::ast::{
-    AstCreateStage, AstStageCredentialOption, AstStageCredentialOptionValue,
+    AstCreateStage, AstObjectRef, AstStageCredentialOption, AstStageCredentialOptionValue,
     AstStageCredentialsClause, AstStageCredentialsKind, AstStageFileFormatClause,
     AstStageFileFormatSpec, AstStageType, AstStageUrlClause, AstStmt,
 };
 use crate::ast::{AstUnknownClause, UnknownKind};
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, LiteralKind, Operator, Punctuation, Span, TokenKind};
+use crate::lexer::{
+    decode_string_literal, Keyword, LiteralKind, Operator, Punctuation, Span, TokenKind,
+};
 use crate::parser::core::Parser;
 
 /// Parse CREATE STAGE statement with comprehensive support for all Snowflake options.
@@ -148,10 +150,9 @@ pub(crate) fn try_parse_create_stage_stmt_with_parser(p: &mut Parser<'_>) -> Par
     }
 
     // Stage name (required)
-    let name_tok = p
-        .peek_non_trivia()
+    p.peek_non_trivia()
         .ok_or_eof(span, vec!["stage_name".to_string()])?;
-    let name_span = parse_stage_name(p, name_tok.span)?;
+    let name_span = p.parse_object_name_span()?;
     span.end = name_span.end;
 
     // Now parse optional clauses in any order (Snowflake allows flexible ordering)
@@ -164,6 +165,7 @@ pub(crate) fn try_parse_create_stage_stmt_with_parser(p: &mut Parser<'_>) -> Par
     let mut comment_span: Option<Span> = None;
     let mut tag_clause: Option<Span> = None;
     let mut clone_clause: Option<Span> = None;
+    let mut clone_source: Option<AstObjectRef> = None;
     let mut extras: Vec<AstUnknownClause> = Vec::new();
 
     // Parse clauses until we hit semicolon or EOF
@@ -178,16 +180,8 @@ pub(crate) fn try_parse_create_stage_stmt_with_parser(p: &mut Parser<'_>) -> Par
             break;
         }
 
-        // Check for next statement keyword (end of this statement)
-        if matches!(
-            tok.kind,
-            TokenKind::Keyword(Keyword::Create)
-                | TokenKind::Keyword(Keyword::Select)
-                | TokenKind::Keyword(Keyword::Insert)
-                | TokenKind::Keyword(Keyword::Update)
-                | TokenKind::Keyword(Keyword::Delete)
-                | TokenKind::Keyword(Keyword::Drop)
-        ) {
+        // A statement starting ends this one.
+        if p.is_statement_keyword(tok) {
             break;
         }
 
@@ -235,9 +229,10 @@ pub(crate) fn try_parse_create_stage_stmt_with_parser(p: &mut Parser<'_>) -> Par
             span.end = clause_span.end;
             tag_clause = Some(clause_span);
         } else if tok.lexeme(p.source).eq_ignore_ascii_case("CLONE") {
-            let clause_span = parse_clone_clause(p)?;
+            let (clause_span, source) = parse_clone_clause(p)?;
             span.end = clause_span.end;
             clone_clause = Some(clause_span);
+            clone_source = Some(source);
         } else {
             // Unknown clause - capture it instead of failing (defensive design)
             let unknown_start = tok.span.start;
@@ -317,39 +312,9 @@ pub(crate) fn try_parse_create_stage_stmt_with_parser(p: &mut Parser<'_>) -> Par
         comment_span,
         tag_clause,
         clone_clause,
+        clone_source,
         extras, // Unknown properties captured here
     })))
-}
-
-/// Parse stage name (may be qualified: schema.stage_name or db.schema.stage_name)
-fn parse_stage_name(p: &mut Parser<'_>, start: Span) -> ParseResult<Span> {
-    let name_tok = p
-        .advance()
-        .ok_or_eof(start, vec!["stage_name".to_string()])?;
-    let mut span = name_tok.span;
-
-    // Check for dot (qualified name)
-    while let Some(tok) = p.peek_non_trivia() {
-        if matches!(
-            tok.kind,
-            TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-        ) {
-            let dot = p
-                .advance()
-                .expect_invariant("DOT punctuation should be available after peek");
-            span.end = dot.span.end;
-
-            // Expect identifier after dot
-            let part = p
-                .advance()
-                .ok_or_eof(span, vec!["identifier".to_string()])?;
-            span.end = part.span.end;
-        } else {
-            break;
-        }
-    }
-
-    Ok(span)
 }
 
 /// Parse URL clause: URL = 'protocol://bucket/path'
@@ -398,7 +363,9 @@ fn parse_url_clause(p: &mut Parser<'_>) -> ParseResult<AstStageUrlClause> {
         .expect_invariant("URL string literal should be available after peek");
     let url_value_span = url_value.span;
     span.end = url_value_span.end;
-    let url_text = unquote_sql_string(url_value.lexeme(p.source));
+    let written = url_value.lexeme(p.source);
+    let url_text =
+        decode_string_literal(written, p.dialect).map_or_else(|| written.to_string(), |d| d.value);
 
     Ok(AstStageUrlClause {
         node_id: p.id_gen.next(),
@@ -432,13 +399,9 @@ fn parse_storage_integration_clause(p: &mut Parser<'_>) -> ParseResult<AstStageC
     let _ = p.advance();
 
     // Expect integration name
-    let _name_tok = p
-        .peek_non_trivia()
+    p.peek_non_trivia()
         .ok_or_eof(span, vec!["integration_name".to_string()])?;
-    let name = p
-        .advance()
-        .expect_invariant("integration name identifier should be available after peek");
-    let integration_name_span = name.span;
+    let integration_name_span = p.parse_object_name_span()?;
     span.end = integration_name_span.end;
 
     Ok(AstStageCredentialsClause {
@@ -589,7 +552,9 @@ pub(crate) fn try_parse_credential_option(p: &mut Parser<'_>) -> Option<AstStage
                     value: AstStageCredentialOptionValue::Other { span: value_span },
                 });
             }
-            let text = unquote_sql_string(v.lexeme(p.source));
+            let written = v.lexeme(p.source);
+            let text = decode_string_literal(written, p.dialect)
+                .map_or_else(|| written.to_string(), |d| d.value);
             Some(AstStageCredentialOption {
                 node_id: p.id_gen.next(),
                 span,
@@ -605,10 +570,13 @@ pub(crate) fn try_parse_credential_option(p: &mut Parser<'_>) -> Option<AstStage
             None
         }
         _ => {
+            // A literal written over more than this token (`X'…'`, `$$ … $$`).
+            let literal = p.secret_value_at(p.idx);
             let v = p.advance()?;
             let value_span = v.span;
             span.end = value_span.end;
             p.redaction_spans.push(value_span);
+            p.redaction_spans.extend(literal);
             Some(AstStageCredentialOption {
                 node_id: p.id_gen.next(),
                 span,
@@ -617,23 +585,6 @@ pub(crate) fn try_parse_credential_option(p: &mut Parser<'_>) -> Option<AstStage
             })
         }
     }
-}
-
-/// Strip surrounding `'…'` or `"…"` quotes and fold `''` escapes. Returns
-/// the original input if it isn't recognizable as a quoted literal —
-/// downstream content predicates simply see no match in that case.
-///
-/// Shared with [`crate::parser::alter_stage`] for symmetric URL / credential
-/// literal extraction across CREATE STAGE and ALTER STAGE.
-pub(crate) fn unquote_sql_string(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        return trimmed[1..trimmed.len() - 1].replace("''", "'");
-    }
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        return trimmed[1..trimmed.len() - 1].to_string();
-    }
-    trimmed.to_string()
 }
 
 /// Parse ENCRYPTION clause: ENCRYPTION = ( ... )
@@ -846,6 +797,7 @@ fn parse_file_format_clause(p: &mut Parser<'_>) -> ParseResult<AstStageFileForma
         ));
     }
     let _ = p.advance();
+    let file_format_name = p.format_name_in(p.idx.saturating_sub(1));
 
     // Peek inside to determine FORMAT_NAME vs TYPE
     let format_spec = if let Some(tok) = p.peek_non_trivia() {
@@ -870,6 +822,7 @@ fn parse_file_format_clause(p: &mut Parser<'_>) -> ParseResult<AstStageFileForma
         span,
         keyword_span,
         format_spec,
+        file_format_name,
     })
 }
 
@@ -975,26 +928,26 @@ fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
     Ok(span)
 }
 
-/// Parse CLONE clause: CLONE source_stage
-fn parse_clone_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+/// Parse CLONE clause: CLONE source_stage. The clause's span and the stage.
+fn parse_clone_clause(p: &mut Parser<'_>) -> ParseResult<(Span, AstObjectRef)> {
     let clone_kw = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["CLONE".to_string()])?;
     let mut span = clone_kw.span;
 
     // Expect source stage name
-    let source_tok = p
-        .peek_non_trivia()
+    p.peek_non_trivia()
         .ok_or_eof(span, vec!["source_stage_name".to_string()])?;
-    let source_span = parse_stage_name(p, source_tok.span)?;
-    span.end = source_span.end;
+    let source = p.parse_required_object_ref()?;
+    span.end = source.span.end;
 
-    Ok(span)
+    Ok((span, source))
 }
 
 /// Helper: Parse content within parentheses until closing paren.
 /// Returns the span of the closing paren.
 fn parse_parenthesized_content(p: &mut Parser<'_>, start_span: Span) -> ParseResult<Span> {
+    let from = p.idx;
     let mut depth = 1;
     let mut last_span = start_span;
 
@@ -1019,6 +972,8 @@ fn parse_parenthesized_content(p: &mut Parser<'_>, start_span: Span) -> ParseRes
         let _ = p.advance();
     }
 
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     Ok(last_span)
 }
 

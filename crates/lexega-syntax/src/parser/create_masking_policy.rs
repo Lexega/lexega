@@ -75,7 +75,7 @@ impl<'a> Parser<'a> {
         let exists_token_id = if_not_exists.exists_token_id;
 
         // Policy name
-        let policy_name_span = self.parse_policy_name_masking()?;
+        let policy_name_span = self.parse_object_name_span()?;
 
         // AS keyword (REQUIRED for MASKING POLICY)
         let as_tok = self
@@ -302,60 +302,6 @@ impl<'a> Parser<'a> {
             if_token_id: None,
             not_token_id: None,
             exists_token_id: None,
-        })
-    }
-
-    fn parse_policy_name_masking(&mut self) -> ParseResult<Span> {
-        // Parse identifier (possibly qualified: db.schema.policy)
-        let first_tok = if let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Identifier { .. }) {
-                self.advance()
-                    .expect_invariant("policy name identifier available after peek")
-            } else {
-                return Err(ParseError::new(
-                    tok.span,
-                    ParseErrorKind::UnexpectedToken {
-                        expected: vec!["identifier".to_string()],
-                        found: tok.lexeme(self.source).to_string(),
-                    },
-                ));
-            }
-        } else {
-            return Err(ParseError::new(
-                self.current_span(),
-                ParseErrorKind::InvalidStatement {
-                    message: "Expected policy name".to_string(),
-                },
-            ));
-        };
-
-        let start_pos = first_tok.span.start;
-        let mut end_pos = first_tok.span.end;
-
-        // Consume optional dot-separated parts
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                if let Some(id_tok) = self.peek_non_trivia() {
-                    if matches!(id_tok.kind, TokenKind::Identifier { .. }) {
-                        let t = self.advance().expect_invariant(
-                            "qualified policy name identifier available after peek",
-                        );
-                        end_pos = t.span.end;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span {
-            start: start_pos,
-            end: end_pos,
         })
     }
 

@@ -73,6 +73,11 @@ pub struct StatementFacts {
     /// look up the original fragment AST node, and the span
     /// of the entire Jinja block for diagnostics.
     pub jinja_fragments: Vec<JinjaFragmentRef>,
+
+    /// The names of temporary tables and table variables the statement
+    /// reads or writes, as written (T-SQL `#t`, `##t`, `@t`): the session
+    /// holds them.
+    pub session_tables: Vec<Span>,
 }
 
 impl StatementFacts {
@@ -97,6 +102,7 @@ impl StatementFacts {
             pre_limit_extensions,
             post_locking_extensions,
             jinja_fragments,
+            session_tables,
         } = self;
         for_update.is_empty()
             && output_format.is_none()
@@ -106,6 +112,7 @@ impl StatementFacts {
             && pre_limit_extensions.is_empty()
             && post_locking_extensions.is_empty()
             && jinja_fragments.is_empty()
+            && session_tables.is_empty()
     }
 }
 

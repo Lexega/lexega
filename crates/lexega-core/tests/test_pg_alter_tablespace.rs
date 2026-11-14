@@ -3,7 +3,7 @@
 
 //! Tests for ALTER TABLESPACE (PostgreSQL storage management).
 //!
-//! Verifies: parsing, formatting, semantic analysis, governance signal (PG-TBLSPC-CHG).
+//! Verifies: parsing, formatting, semantic analysis, governance finding (PG-TBLSPC-CHG).
 
 use lexega_core::{
     analyzer::{AnalysisConfig, RuleMatch},
@@ -24,7 +24,7 @@ fn pg_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| match s {
+    report.findings.iter().any(|s| match s {
         RuleMatch::Analysis(g) => g.matched_rule == rule_id,
     })
 }
@@ -76,9 +76,9 @@ fn test_alter_tablespace_fires_pg_c041() {
 
     assert!(
         has_rule(&report, "PG-TBLSPC-CHG"),
-        "Should fire PG-TBLSPC-CHG for ALTER TABLESPACE. Signals: {:?}",
+        "Should fire PG-TBLSPC-CHG for ALTER TABLESPACE. Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
             .map(|s| match s {
                 RuleMatch::Analysis(g) => g.matched_rule.as_str(),
@@ -129,7 +129,7 @@ fn test_alter_tablespace_multi_statement() {
 
     // Count total evidence for PG-TBLSPC-CHG
     let evidence_count: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "PG-TBLSPC-CHG"))
         .map(|s| match s {

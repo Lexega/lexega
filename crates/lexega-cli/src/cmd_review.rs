@@ -9,27 +9,21 @@ use std::process;
 
 use super::cmd_analyze::{run, Scope};
 use super::extension::Extension;
+use super::git::CommitRange;
 use super::usage::print_review_usage;
 
 pub fn handle_review_command(args: &[String], ext: &dyn Extension) {
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        print_review_usage(&args[0]);
+        print_review_usage(&args[0], ext);
         return;
     }
     let Some(range) = args.get(2) else {
-        print_review_usage(&args[0]);
+        print_review_usage(&args[0], ext);
         process::exit(1);
     };
-    let Some((base, head)) = range.split_once("..") else {
-        eprintln!("Error: commit range must be in format 'base..head' (e.g., main..HEAD)");
+    let range = CommitRange::resolve(range).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
         process::exit(1);
-    };
-    run(
-        args,
-        ext,
-        Scope::Change {
-            base: base.to_string(),
-            head: head.to_string(),
-        },
-    );
+    });
+    run(args, ext, Scope::Change(range));
 }

@@ -56,7 +56,7 @@ fn parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -834,4 +834,176 @@ END;
 $$;
 "#;
     format_and_verify(sql.trim());
+}
+
+#[test]
+fn a_plpgsql_select_into_assigns_variables_and_reads_its_table() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    use lexega_core::dialect;
+
+    let shapes = [
+        ("postgres", "DO $$ DECLARE n int; v int; BEGIN {} END $$;"),
+        (
+            "postgres",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ DECLARE n int; v int; BEGIN {} RETURN v; END $$;",
+        ),
+        (
+            "postgres",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ DECLARE n int; v int; BEGIN {} END $$;",
+        ),
+        (
+            "redshift",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ DECLARE n int; v int; BEGIN {} END $$;",
+        ),
+    ];
+    let bodies = [
+        "SELECT c INTO STRICT v FROM zz_src WHERE id = 1;",
+        "SELECT c, d INTO n, v FROM zz_src;",
+        "SELECT c INTO v FROM zz_src;",
+    ];
+    for (name, shape) in shapes {
+        for body in bodies {
+            let sql = shape.replace("{}", body);
+            let cfg = AnalysisConfig {
+                dialect: dialect::dialect_from_name(name),
+                trace_mode: true,
+                ..Default::default()
+            };
+            let report = analyze_risk_with_policy_config(&sql, &cfg).expect("should analyze");
+            let json = serde_json::to_value(&report).expect("report serializes");
+            assert_eq!(
+                json["summary"]["statements_skipped"], 0,
+                "a statement skipped in {sql}"
+            );
+            let statements = json["statement_traces"]
+                .as_array()
+                .expect("statement facts");
+            let kinds: Vec<&str> = statements
+                .iter()
+                .filter_map(|s| s["facts"]["kind"].as_str())
+                .collect();
+            assert!(
+                !kinds.contains(&"create_table"),
+                "no table is created in {sql}: {kinds:?}"
+            );
+            let reads_src = statements.iter().any(|s| {
+                s["facts"]["query"]["reads_table"]
+                    .as_array()
+                    .is_some_and(|reads| {
+                        reads
+                            .iter()
+                            .any(|r| r["table"]["name"]["raw"].as_str() == Some("zz_src"))
+                    })
+            });
+            assert!(reads_src, "the read of zz_src is published in {sql}");
+        }
+    }
+}
+
+/// Each path at which `a` and `b` differ, with both values shortened. A
+/// statement's preview is left out: it folds the source's whitespace.
+fn differing_paths(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    path: String,
+    out: &mut Vec<String>,
+) {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let keys = x.keys().chain(y.keys().filter(|k| !x.contains_key(*k)));
+            for key in keys.filter(|k| k.as_str() != "statement_preview") {
+                let (p, q) = (x.get(key), y.get(key));
+                differing_paths(
+                    p.unwrap_or(&Value::Null),
+                    q.unwrap_or(&Value::Null),
+                    format!("{path}.{key}"),
+                    out,
+                );
+            }
+        }
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                differing_paths(p, q, format!("{path}[{i}]"), out);
+            }
+        }
+        _ if a != b => {
+            let short = |v: &Value| v.to_string().chars().take(160).collect::<String>();
+            out.push(format!("{path}: {} | {}", short(a), short(b)));
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn perform_reports_what_the_same_select_reports() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    use lexega_core::dialect;
+
+    // `PERFORM q` and `SELECT  q` are the same length, so every offset in
+    // the two reports is the same.
+    let shapes = [
+        "DO $$ BEGIN {} END $$;",
+        "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN IF true THEN {} END IF; END $$;",
+        "CREATE PROCEDURE p(n int) LANGUAGE plpgsql AS $b$ DECLARE v int; BEGIN {} RETURN; END $b$;",
+    ];
+    let queries = [
+        "zz_f(1, 'x');",
+        "* FROM users;",
+        "id FROM users WHERE name = NULL;",
+        "count(*) FROM orders o, users u;",
+        "id FROM users ORDER BY random() LIMIT 1;",
+        "DISTINCT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 10;",
+        "pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'zz';",
+        "set_config('search_path', 'public', false);",
+    ];
+    let report = |sql: &str| {
+        let cfg = AnalysisConfig {
+            dialect: dialect::dialect_from_name("postgres"),
+            trace_mode: true,
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(sql, &cfg).expect("should analyze");
+        let mut json = serde_json::to_value(&report).expect("report serializes");
+        json["timestamp"] = serde_json::Value::Null;
+        json
+    };
+    let mut differ = Vec::new();
+    for shape in shapes {
+        for query in queries {
+            let perform = shape.replace("{}", &format!("PERFORM {query}"));
+            let select = shape.replace("{}", &format!("SELECT  {query}"));
+            let performed = report(&perform);
+            let selected = report(&select);
+            assert_eq!(
+                performed["summary"]["statements_skipped"], 0,
+                "a statement skipped in {perform}"
+            );
+            let performed: serde_json::Value = serde_json::from_str(
+                &serde_json::to_string(&performed)
+                    .expect("report serializes")
+                    .replace("PERFORM", "SELECT "),
+            )
+            .expect("report parses");
+            let mut paths = Vec::new();
+            differing_paths(&performed, &selected, String::new(), &mut paths);
+            if !paths.is_empty() {
+                let count = paths.len();
+                paths.truncate(6);
+                differ.push(format!(
+                    "{perform}\n  ({count} paths)\n  {}",
+                    paths.join("\n  ")
+                ));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
+
+    // A set operation after the query is read with it.
+    let sql = "DO $$ BEGIN PERFORM id FROM users UNION SELECT id FROM archive; END $$;";
+    let summary = &report(sql)["summary"];
+    assert_eq!(summary["statements_skipped"], 0, "{sql}");
+    assert_eq!(summary["tables_read"], 2, "{sql}");
 }

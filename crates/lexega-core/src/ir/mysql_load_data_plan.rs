@@ -18,7 +18,7 @@ use crate::lexer::token::Span;
 pub struct MysqlLoadDataPlan {
     /// `LOCAL` modifier present — read from the client host (not the server).
     pub local: bool,
-    /// Dequoted `INFILE` path literal.
+    /// The `INFILE` path literal's value.
     pub infile_path: Option<String>,
     /// Target table name (verbatim source text), if recognized.
     pub target_table: Option<String>,
@@ -33,21 +33,11 @@ fn span_text(source: &str, span: Span) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn dequote(raw: &str) -> String {
-    let t = raw.trim();
-    if t.len() >= 2 {
-        let b = t.as_bytes();
-        if (b[0] == b'\'' && b[t.len() - 1] == b'\'') || (b[0] == b'"' && b[t.len() - 1] == b'"') {
-            return t[1..t.len() - 1].to_string();
-        }
-    }
-    t.to_string()
-}
-
 pub fn lower_mysql_load_data_to_plan(s: &AstMysqlLoadData, source: &str) -> MysqlLoadDataPlan {
     MysqlLoadDataPlan {
         local: s.local,
-        infile_path: span_text(source, s.infile_path_span).map(|p| dequote(&p)),
+        infile_path: span_text(source, s.infile_path_span)
+            .map(|p| super::span_extract::literal_value_or_name(&p)),
         target_table: s.target_table_span.and_then(|sp| span_text(source, sp)),
         target_table_span: s.target_table_span,
         node_id: s.node_id,

@@ -19,6 +19,8 @@
 //!   by.
 //! - [`detect_tautologies_in_scope`] — always-true OR-branch patterns,
 //!   reported as [`TautologyFinding`]s.
+//! - [`literal_equality`] — whether two literal values are equal in the
+//!   dialect in force.
 
 use std::collections::BTreeMap;
 
@@ -101,6 +103,11 @@ pub struct IrColumnConstraints {
     /// IS NOT NULL constraint.
     #[serde(default)]
     pub is_not_null: bool,
+    /// The rows these are said of hold none: a filter contradicted what
+    /// its input held of the column. What the summary says is that
+    /// filter's claim; no row holds a value a reader could contradict.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub holds_no_row: bool,
 }
 
 impl IrColumnConstraints {
@@ -116,7 +123,7 @@ impl IrColumnConstraints {
 /// Constraints for all columns visible at a CTE / derived-table / model
 /// boundary. Wire-shape for `CteColumnSchema.constraint_set` /
 /// `DerivedTableSchema.constraint_set` / `ResolvedModel.constraint_set` /
-/// `ModelEntry.constraint_set`. Produced exclusively by IR folds.
+/// `ModelEntry.constraint_set`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IrConstraintSet {
     /// Per-column constraints (AND-connected within same OR branch).
@@ -176,53 +183,39 @@ impl IrConstraintSet {
 /// All three layers normalize via [`normalize_identifier`] so the
 /// resulting [`IdentKey`] is the case-folded canonical form; every
 /// consumer that buckets predicates by column uses this one key.
+///
+/// An atom over a field of a column keys by the column id followed by
+/// its path, so it shares a bucket with neither the bare column nor
+/// another path.
 pub fn pred_to_col_key(pred: &PredicateFact, bindings: &BindingTable) -> IdentKey {
-    column_id_to_col_key(pred.column_id, bindings)
-        .unwrap_or_else(|| IdentKey::new(&pred_column_identity(&pred.column)))
+    // A variable's atom is keyed by the variable, apart from every column.
+    if let Some(variable) = &pred.variable {
+        return IdentKey::from_normalized(format!("var:{}", variable.as_str()));
+    }
+    match column_id_to_col_key(pred.column_id, bindings) {
+        Some(key) if pred.field_path.is_empty() => key,
+        Some(key) => {
+            IdentKey::from_normalized(format!("{}{}", key.as_str(), pred.field_path.suffix_text()))
+        }
+        None => IdentKey::new(&pred_column_identity(&pred.column)),
+    }
 }
 
-/// Canonicalize a `ColumnId` to a `BindingTable`-stable bucket key.
+/// Canonicalize a `ColumnId` to a bucket key.
 ///
-/// Two references to the same scan column may carry distinct
-/// `ColumnId`s (the IR allocates fresh ids per `ScalarExpr::Column`
-/// occurrence in post-join contexts), but their bindings share the
-/// same `ColumnOrigin::Table { table_node, column_name, .. }`.
-/// Keying by `(table_node, column_name)` folds those into one
-/// bucket while still distinguishing multi-alias self-joins
-/// (`t AS a` and `t AS b` are separate AST nodes with distinct
-/// `NodeId`s, so their bindings get distinct table_nodes).
+/// The id is the identity: every reference to a column of a source
+/// carries the source's one id for it, and a computed, set-operation,
+/// outer or recursive id each represents a distinct synthesized value.
+/// Two aliases of one table (`t AS a`, `t AS b`) are distinct sources
+/// with distinct ids.
 ///
-/// For non-Table origins (computed expressions, set-op unifications,
-/// outer/recursive refs) the `ColumnId` itself is the canonical
-/// identity — each represents a distinct synthesized value.
-///
-/// Returns `None` when the id is absent or unresolvable; callers
-/// can fall back to a text-based identity for those edge paths.
+/// Returns `None` when there is no id; callers fall back to a
+/// text-based identity for those edge paths.
 pub fn column_id_to_col_key(
     column_id: Option<crate::ir::column::ColumnId>,
-    bindings: &BindingTable,
+    _bindings: &BindingTable,
 ) -> Option<IdentKey> {
-    let cid = column_id?;
-    if let Some(binding) = bindings.get(cid) {
-        match &binding.origin {
-            crate::ir::column::ColumnOrigin::Table {
-                table_node,
-                column_name,
-                ..
-            } => {
-                return Some(IdentKey::new(&format!(
-                    "tbl:{}:{}",
-                    table_node.as_u32(),
-                    normalize_identifier(column_name)
-                )));
-            }
-            crate::ir::column::ColumnOrigin::Computed { .. }
-            | crate::ir::column::ColumnOrigin::SetOp { .. }
-            | crate::ir::column::ColumnOrigin::OuterRef { .. }
-            | crate::ir::column::ColumnOrigin::RecursiveRef { .. } => {}
-        }
-    }
-    Some(IdentKey::new(&format!("cid:{}", cid.as_u32())))
+    column_id.map(|cid| IdentKey::new(&format!("cid:{}", cid.as_u32())))
 }
 
 /// User-visible column display string. `T.col` when the column
@@ -286,6 +279,14 @@ fn witness_span(a: Span, b: Span) -> Span {
     }
 }
 
+/// What [`detect_tautologies_in_scope`] buckets atoms by: a column's
+/// key, or the variable a reflexive variable atom reads.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum AtomKey {
+    Column(String),
+    Variable(IdentKey),
+}
+
 /// Detect tautological predicate patterns across OR branches, among the
 /// predicates of one scope.
 ///
@@ -305,21 +306,31 @@ pub fn detect_tautologies_in_scope(
 ) -> Vec<TautologyFinding> {
     let mut findings = Vec::new();
 
-    let mut by_column: BTreeMap<String, Vec<&PredicateFact>> = BTreeMap::new();
+    let mut by_column: BTreeMap<AtomKey, Vec<&PredicateFact>> = BTreeMap::new();
     for pred in predicates {
         if pred.scope_id != target_scope_id || pred.join_scope_id != target_join_scope_id {
             continue;
         }
         // Bucket by the binding-aware column key, so tautology
         // detection across multi-alias self-joins doesn't conflate
-        // predicates that sit on separate scans.
-        let col_key = pred_to_col_key(pred, bindings).as_str().to_string();
-        by_column.entry(col_key).or_default().push(pred);
+        // predicates that sit on separate scans; a variable's atom by
+        // the variable.
+        let key = match &pred.variable {
+            Some(variable) => AtomKey::Variable(variable.clone()),
+            None => AtomKey::Column(pred_to_col_key(pred, bindings).as_str().to_string()),
+        };
+        by_column.entry(key).or_default().push(pred);
     }
 
     use crate::context::node_metadata::PredicateOp;
     use crate::ir::scalar::ComparisonOp;
-    for (col, preds) in &by_column {
+    for (key, preds) in &by_column {
+        // A column's findings carry its bucket key; a variable's its name
+        // as written.
+        let col = match key {
+            AtomKey::Column(col) => col.as_str(),
+            AtomKey::Variable(_) => preds.first().map_or("", |p| p.column.name.as_str()),
+        };
         // All predicates in this bucket are equivalent under
         // `pred_to_col_key`'s BindingTable-driven canonicalization;
         // pick any predicate's `column_id` to stamp on emitted
@@ -346,13 +357,13 @@ pub fn detect_tautologies_in_scope(
             for neq in &neq_preds {
                 if eq.or_branch_id != neq.or_branch_id {
                     if let (Some(ref ev), Some(ref nv)) = (&eq.literal_value, &neq.literal_value) {
-                        if ev.eq_ignore_ascii_case(nv) {
+                        if literal_equality(ev, nv) == LiteralEquality::Equal {
                             findings.push(TautologyFinding {
                                 message: format!(
                                     "{} = '{}' OR {} <> '{}' is always true (tautology)",
                                     col, ev, col, nv
                                 ),
-                                column: col.clone(),
+                                column: col.to_string(),
                                 column_id: col_id,
                                 span: witness_span(eq.span, neq.span),
                             });
@@ -381,7 +392,7 @@ pub fn detect_tautologies_in_scope(
                                 "{} IS NULL OR {} IS NOT NULL is always true (tautology)",
                                 col, col
                             ),
-                            column: col.clone(),
+                            column: col.to_string(),
                             column_id: col_id,
                             span: witness_span(null_p.span, not_null_p.span),
                         });
@@ -450,7 +461,7 @@ pub fn detect_tautologies_in_scope(
                             if lo_incl { ">=" } else { ">" },
                             b_val
                         ),
-                        column: col.clone(),
+                        column: col.to_string(),
                         column_id: col_id,
                         span: witness_span(up.span, lo.span),
                     });
@@ -477,11 +488,12 @@ pub fn detect_tautologies_in_scope(
             .filter(|p| matches!(p.operator, PredicateOp::NotIn) && p.in_list_values.is_some())
             .collect();
 
-        let as_set = |vals: &[String]| -> Vec<String> {
-            let mut v: Vec<String> = vals.iter().map(|s| s.to_ascii_lowercase()).collect();
-            v.sort();
-            v.dedup();
-            v
+        // Every value of each set equal to a value of the other.
+        let covers = |of: &[String], by: &[String]| {
+            of.iter().all(|value| {
+                by.iter()
+                    .any(|other| literal_equality(value, other) == LiteralEquality::Equal)
+            })
         };
         'in_complement: for inp in &in_preds {
             for notinp in &not_in_preds {
@@ -491,13 +503,13 @@ pub fn detect_tautologies_in_scope(
                 let (Some(iv), Some(nv)) = (&inp.in_list_values, &notinp.in_list_values) else {
                     continue;
                 };
-                if as_set(iv) == as_set(nv) {
+                if covers(iv, nv) && covers(nv, iv) {
                     findings.push(TautologyFinding {
                         message: format!(
                             "{} IN (...) OR {} NOT IN (...) over the same set is always true (tautology)",
                             col, col
                         ),
-                        column: col.clone(),
+                        column: col.to_string(),
                         column_id: col_id,
                         span: witness_span(inp.span, notinp.span),
                     });
@@ -533,7 +545,7 @@ pub fn detect_tautologies_in_scope(
                     "{} compared to itself is always true for non-NULL rows (tautology)",
                     col
                 ),
-                column: col.clone(),
+                column: col.to_string(),
                 column_id: col_id,
                 span: rp.span,
             });
@@ -594,7 +606,7 @@ pub fn detect_tautologies_in_scope(
                         "{} BETWEEN {} AND {} OR {} NOT BETWEEN {} AND {} is always true (tautology)",
                         col, b.low, b.high, col, b.low, b.high
                     ),
-                    column: col.clone(),
+                    column: col.to_string(),
                     column_id: col_id,
                     span: nb.span,
                 });
@@ -642,7 +654,7 @@ pub fn detect_tautologies_in_scope(
                                 "{} = TRUE OR {} = FALSE OR {} IS NULL is always true (tautology)",
                                 col, col, col
                             ),
-                            column: col.clone(),
+                            column: col.to_string(),
                             column_id: col_id,
                             span: leftmost,
                         });
@@ -660,13 +672,293 @@ pub fn detect_tautologies_in_scope(
 // Literal comparison
 // ────────────────────────────────────────────────────────────────────────
 
-/// Compare two values, trying numeric first, falling back to string.
+/// Whether two literal values one operand is compared with are equal, as
+/// the dialect in force compares them by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteralEquality {
+    /// Equal under every collation the dialect may compare them by.
+    Equal,
+    /// Different under every such collation.
+    Distinct,
+    /// Not decided: literals of different kinds, which the operand reads
+    /// through a cast, or strings the dialect's default collation may
+    /// compare equal.
+    Undecided,
+}
+
+/// Whether the literal values `a` and `b`, as an atom carries them, are
+/// equal: numbers by value, strings by the dialect's default collation.
+pub fn literal_equality(a: &str, b: &str) -> LiteralEquality {
+    let equal_if = |same: bool| {
+        if same {
+            LiteralEquality::Equal
+        } else {
+            LiteralEquality::Distinct
+        }
+    };
+    match (LiteralValue::of(a), LiteralValue::of(b)) {
+        (LiteralValue::Str(a), LiteralValue::Str(b)) => string_equality(&a, &b),
+        (LiteralValue::Number(a), LiteralValue::Number(b)) => equal_if(a == b),
+        (LiteralValue::Bool(a), LiteralValue::Bool(b)) => equal_if(a == b),
+        (LiteralValue::Other(a), LiteralValue::Other(b)) if a == b => LiteralEquality::Equal,
+        (
+            LiteralValue::Str(_)
+            | LiteralValue::Number(_)
+            | LiteralValue::Bool(_)
+            | LiteralValue::Other(_),
+            _,
+        ) => LiteralEquality::Undecided,
+    }
+}
+
+/// A literal value as an atom carries it, by kind.
+enum LiteralValue<'a> {
+    /// A string literal's value.
+    Str(String),
+    Number(Decimal),
+    Bool(bool),
+    /// Any other literal, as written.
+    Other(&'a str),
+}
+
+impl<'a> LiteralValue<'a> {
+    fn of(text: &'a str) -> Self {
+        if let Some(value) = super::span_extract::string_literal_value(text) {
+            return Self::Str(value);
+        }
+        let text = text.trim();
+        if let Some(number) = Decimal::parse(text) {
+            Self::Number(number)
+        } else if text.eq_ignore_ascii_case("true") {
+            Self::Bool(true)
+        } else if text.eq_ignore_ascii_case("false") {
+            Self::Bool(false)
+        } else {
+            Self::Other(text)
+        }
+    }
+}
+
+/// A decimal number written in digits, exactly: `0.digits × 10^exponent`,
+/// `digits` without leading or trailing zeros; zero has no digits.
+#[derive(PartialEq, Eq)]
+struct Decimal {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+impl Decimal {
+    /// `[+-]digits[.digits][(e|E)[+-]digits]`.
+    fn parse(text: &str) -> Option<Self> {
+        let (negative, unsigned) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        };
+        let (mantissa, scale) = match unsigned.find(['e', 'E']) {
+            Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i64>().ok()?),
+            None => (unsigned, 0),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let is_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+        if (whole.is_empty() && fraction.is_empty()) || !is_digits(whole) || !is_digits(fraction) {
+            return None;
+        }
+        let all = format!("{whole}{fraction}");
+        let significant = all.trim_start_matches('0');
+        let leading = all.len() - significant.len();
+        let digits = significant.trim_end_matches('0');
+        if digits.is_empty() {
+            return Some(Self {
+                negative: false,
+                digits: String::new(),
+                exponent: 0,
+            });
+        }
+        let exponent = i64::try_from(whole.len())
+            .ok()?
+            .checked_sub(i64::try_from(leading).ok()?)?
+            .checked_add(scale)?;
+        Some(Self {
+            negative,
+            digits: digits.to_string(),
+            exponent,
+        })
+    }
+}
+
+/// Whether two string values are equal under the dialect in force's
+/// default collation. Where it may ignore case, strings equal but for case
+/// are undecided, as are strings with other than ASCII characters, which
+/// such a collation may fold as well; where it ignores trailing spaces
+/// (PAD SPACE), strings equal but for those are undecided.
+fn string_equality(a: &str, b: &str) -> LiteralEquality {
+    use crate::ir::CatalogDialect as D;
+    if a == b {
+        return LiteralEquality::Equal;
+    }
+    let (case, trailing_spaces) =
+        match D::from_dialect_name(crate::ir::normalize::dialect_in_force().name()) {
+            D::PostgreSql | D::Snowflake | D::BigQuery | D::Databricks => (false, false),
+            D::Redshift => (false, true),
+            D::MySql | D::MsSql | D::Default => (true, true),
+        };
+    if case && (!a.is_ascii() || !b.is_ascii()) {
+        return LiteralEquality::Undecided;
+    }
+    let (a, b) = if trailing_spaces {
+        (a.trim_end_matches(' '), b.trim_end_matches(' '))
+    } else {
+        (a, b)
+    };
+    if a == b || (case && a.eq_ignore_ascii_case(b)) {
+        LiteralEquality::Undecided
+    } else {
+        LiteralEquality::Distinct
+    }
+}
+
+/// Compare two values, trying numeric first, falling back to string; a
+/// string literal compares by its value.
 pub fn compare_values(a: &str, b: &str) -> std::cmp::Ordering {
-    let a_clean = a.trim_matches('\'').trim_matches('"');
-    let b_clean = b.trim_matches('\'').trim_matches('"');
+    let a_clean = super::span_extract::literal_value_or_name(a);
+    let b_clean = super::span_extract::literal_value_or_name(b);
 
     match (a_clean.parse::<f64>(), b_clean.parse::<f64>()) {
         (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
-        _ => a_clean.cmp(b_clean),
+        _ => a_clean.cmp(&b_clean),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::node_metadata::{ColumnRef, PredicateContext, PredicateOp};
+    use crate::ir::normalize::NameKind;
+    use crate::ir::scalar::ComparisonOp;
+
+    /// An atom on a column `name` the plan gave no id, in OR branch
+    /// `branch`.
+    fn atom(name: &str, operator: PredicateOp, branch: u32) -> PredicateFact {
+        PredicateFact {
+            column: ColumnRef::new(name.to_string()),
+            operator,
+            literal_value: None,
+            rhs_text: None,
+            has_temporal: false,
+            has_subquery: false,
+            subquery_column: None,
+            subquery_table: None,
+            function_calls: Vec::new(),
+            context: PredicateContext::Where,
+            logical_operator: None,
+            or_branch_id: branch,
+            not_isolation_id: 0,
+            scope_id: 0,
+            join_scope_id: 0,
+            in_list_values: None,
+            between_bounds: None,
+            is_negated: false,
+            is_reflexive: false,
+            span: Span::default(),
+            column_id: None,
+            variable: None,
+            field_path: crate::ir::scalar::FieldPath::empty(),
+        }
+    }
+
+    #[test]
+    fn a_field_path_keys_apart_from_its_column_and_other_paths() {
+        use crate::ir::column::ColumnId;
+        use crate::ir::scalar::{FieldPath, FieldStep};
+        let _folding = crate::ir::normalize::default_folding();
+        let on = |path: &[&str]| PredicateFact {
+            column_id: Some(ColumnId::new(3)),
+            field_path: FieldPath::from_field_steps(
+                &path
+                    .iter()
+                    .map(|field| FieldStep::Field((*field).to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            ..atom("addr", PredicateOp::IsNull, 0)
+        };
+        let bindings = BindingTable::default();
+        let key = |path: &[&str]| pred_to_col_key(&on(path), &bindings);
+        assert_eq!(
+            key(&[]),
+            column_id_to_col_key(Some(ColumnId::new(3)), &bindings).expect("an id keys")
+        );
+        assert_eq!(key(&["zip"]), key(&["ZIP"]));
+        assert_ne!(key(&["zip"]), key(&[]));
+        assert_ne!(key(&["zip"]), key(&["city"]));
+        assert_ne!(key(&["zip"]), key(&["zip", "code"]));
+    }
+
+    #[test]
+    fn literal_values_compare_by_value_kind_and_the_dialects_collation() {
+        use LiteralEquality::{Distinct, Equal, Undecided};
+        let rows: &[(&str, &str, &str, LiteralEquality)] = &[
+            ("snowflake", "1", "1.0", Equal),
+            ("snowflake", "1.50", "1.5", Equal),
+            ("snowflake", "10", "1e1", Equal),
+            ("snowflake", "0.05", "5E-2", Equal),
+            ("snowflake", "0", "0.000", Equal),
+            ("snowflake", "1", "2", Distinct),
+            (
+                "snowflake",
+                "12345678901234567890",
+                "12345678901234567891",
+                Distinct,
+            ),
+            ("snowflake", "'1.0'", "1", Undecided),
+            ("snowflake", "true", "'true'", Undecided),
+            ("snowflake", "true", "TRUE", Equal),
+            ("postgresql", "'a'", "'A'", Distinct),
+            ("postgresql", "'a'", "'a '", Distinct),
+            ("snowflake", "'a'", "'A'", Distinct),
+            ("bigquery", "'a'", "'A'", Distinct),
+            ("databricks", "'a'", "'A'", Distinct),
+            ("redshift", "'a'", "'A'", Distinct),
+            ("snowflake", "'é'", "'e'", Distinct),
+            ("snowflake", "'a'", "'a '", Distinct),
+            ("redshift", "'a'", "'a '", Undecided),
+            ("mysql", "'a'", "'a '", Undecided),
+            ("mssql", "'A'", "'a  '", Undecided),
+            ("mysql", "'é'", "'e'", Undecided),
+            ("postgresql", "'é'", "'e'", Distinct),
+            ("mysql", "'active'", "'inactive'", Distinct),
+            ("mysql", "'a'", "'a'", Equal),
+        ];
+        for (dialect, a, b, expected) in rows {
+            let _dialect = crate::ir::normalize::set_normalization_dialect(dialect);
+            assert_eq!(literal_equality(a, b), *expected, "[{dialect}] {a} and {b}");
+        }
+    }
+
+    #[test]
+    fn a_variable_compared_with_itself_is_kept_apart_from_a_column_of_its_name() {
+        let _folding = crate::ir::normalize::default_folding();
+        let variable = PredicateFact {
+            is_reflexive: true,
+            variable: Some(IdentKey::new_as("id", NameKind::Column)),
+            ..atom("id", PredicateOp::Compare(ComparisonOp::Eq), 0)
+        };
+        let predicates = [
+            variable,
+            atom("id", PredicateOp::IsNull, 1),
+            atom("id", PredicateOp::IsNotNull, 2),
+        ];
+        let findings = detect_tautologies_in_scope(&predicates, &BindingTable::default(), 0, 0);
+        let mut columns: Vec<&str> = findings.iter().map(|f| f.column.as_str()).collect();
+        columns.sort_unstable();
+        assert_eq!(columns, vec!["ID", "id"], "{findings:#?}");
+        // A column atom compared with itself is not the variable's.
+        let column = PredicateFact {
+            is_reflexive: true,
+            ..atom("id", PredicateOp::Compare(ComparisonOp::Eq), 0)
+        };
+        let findings = detect_tautologies_in_scope(&[column], &BindingTable::default(), 0, 0);
+        let columns: Vec<&str> = findings.iter().map(|f| f.column.as_str()).collect();
+        assert_eq!(columns, vec!["ID"], "{findings:#?}");
     }
 }

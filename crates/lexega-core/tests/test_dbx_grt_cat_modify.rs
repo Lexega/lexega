@@ -4,7 +4,7 @@
 /// Tests for DBX-GRT-CAT-MODIFY — Grant MODIFY on Catalog
 ///
 /// Rule ID: DBX-GRT-CAT-MODIFY
-/// Risk: Critical
+/// Risk: High
 /// YAML detail pattern: privilege=MODIFY,object_type=CATALOG (exact, no globs)
 ///
 /// Pipeline under test:
@@ -17,18 +17,18 @@ use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-CAT-MODIFY";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -38,7 +38,7 @@ fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
 
 // ─── Core Detection ───
 
-/// End-to-end: GRANT text → signal emission → YAML match → Critical signal.
+/// End-to-end: GRANT text → finding emission → YAML match → High finding.
 #[test]
 fn test_basic_detection() {
     let rules = analyze_and_get_rules("GRANT MODIFY ON CATALOG main TO admin_role;");
@@ -48,18 +48,18 @@ fn test_basic_detection() {
     );
 }
 
-/// Critical severity — regression here would misclassify sweeping DML grant.
+/// High severity — regression here would misclassify sweeping DML grant.
 #[test]
-fn test_risk_level_is_critical() {
+fn test_risk_level_is_high() {
     let report =
         analyze_risk("GRANT MODIFY ON CATALOG main TO admin_role;").expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
-    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::Critical);
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
+    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
 }
 
 // ─── Object Type Boundary (detail pattern specificity) ───
@@ -107,7 +107,7 @@ fn test_select_on_catalog_does_not_trigger() {
 // ─── Multi-Privilege Extraction ───
 
 /// extract_privileges() must split comma-separated privileges and emit separate
-/// per-privilege signals. MODIFY should trigger even combined with SELECT.
+/// per-privilege findings. MODIFY should trigger even combined with SELECT.
 #[test]
 fn test_multi_privilege_single_grant_still_fires() {
     let rules = analyze_and_get_rules("GRANT SELECT, MODIFY ON CATALOG main TO admin_role;");
@@ -119,7 +119,7 @@ fn test_multi_privilege_single_grant_still_fires() {
 
 // ─── ALL PRIVILEGES Boundary ───
 
-/// ALL PRIVILEGES emits AllPrivileges signal, NOT individual SpecificPrivilege signals.
+/// ALL PRIVILEGES emits AllPrivileges finding, NOT individual SpecificPrivilege findings.
 /// CAT-MODIFY should NOT fire — it requires specific MODIFY detail string.
 #[test]
 fn test_all_privileges_does_not_trigger() {
@@ -142,11 +142,11 @@ fn test_revoke_does_not_trigger() {
     );
 }
 
-// ─── Mixed Script (signal survival) ───
+// ─── Mixed Script (finding survival) ───
 
-/// Grant signals must survive alongside DDL statements in the same script.
+/// Grant findings must survive alongside DDL statements in the same script.
 #[test]
-fn test_grant_signal_survives_in_mixed_script() {
+fn test_grant_finding_survives_in_mixed_script() {
     let sql = r#"
         CREATE TABLE staging.events (id INT, ts TIMESTAMP);
         GRANT MODIFY ON CATALOG main TO etl_role;
@@ -155,13 +155,13 @@ fn test_grant_signal_survives_in_mixed_script() {
     let rules = analyze_and_get_rules(sql);
     assert!(
         rules.contains(RULE_ID),
-        "CAT-MODIFY signal must survive mixed DDL context — got: {rules:?}"
+        "CAT-MODIFY finding must survive mixed DDL context — got: {rules:?}"
     );
 }
 
 // ─── Evidence Deduplication ───
 
-/// Multiple identical-rule signals get deduplicated; evidence_count accumulates.
+/// Multiple identical-rule findings get deduplicated; evidence_count accumulates.
 #[test]
 fn test_multiple_grants_produce_correct_evidence_count() {
     let sql = r#"
@@ -171,7 +171,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {
@@ -199,7 +199,7 @@ fn test_grant_to_public_fires_privilege_rule() {
     let report = analyze_risk(sql).expect("should succeed");
     // PUBLIC grant is always Critical
     assert!(
-        report.summary.critical_count >= 2,
-        "Should have critical signals from both MODIFY and PUBLIC rules"
+        report.summary.high_count >= 1 && report.summary.critical_count >= 1,
+        "Should have high from MODIFY and critical from PUBLIC rules"
     );
 }

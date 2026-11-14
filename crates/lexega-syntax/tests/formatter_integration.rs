@@ -153,3 +153,20 @@ fn test_format_select_star() {
     assert!(result.contains("SELECT *"));
     assert!(result.contains("\nFROM"));
 }
+
+#[test]
+fn a_run_of_operators_formats_byte_exact_however_long() {
+    // Formatted SQL formats to itself: every operand and operator kept in
+    // place, three operands or sixty-four thousand.
+    for ops in [&["+"][..], &["-"], &["*"], &["/"], &["||"], &["+", "-"]] {
+        for n in [3, 64_000] {
+            let mut run = String::from("c0");
+            for i in 1..n {
+                run.push_str(&format!(" {} c{i}", ops[(i - 1) % ops.len()]));
+            }
+            let sql = format!("SELECT {run} AS x\nFROM t\nWHERE\n    y = {run};");
+            let formatted = format_sql(&sql).expect("format failed");
+            assert!(formatted == sql, "{ops:?}, {n} operands: {formatted:.200}");
+        }
+    }
+}

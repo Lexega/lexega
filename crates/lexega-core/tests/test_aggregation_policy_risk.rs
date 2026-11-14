@@ -11,21 +11,21 @@ fn test_aggregation_policy_no_constraint_critical() {
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should generate signals
+    // Should generate findings
     assert!(
-        report.summary.total_reported_signals > 0,
-        "Should generate signals for NO_AGGREGATION_CONSTRAINT"
+        report.summary.total_reported_findings > 0,
+        "Should generate findings for NO_AGGREGATION_CONSTRAINT"
     );
 
-    // Should have critical signal for NO_AGGREGATION_CONSTRAINT
+    // Should have critical finding for NO_AGGREGATION_CONSTRAINT
     assert!(
         report.summary.critical_count >= 1,
-        "Should have at least one critical signal"
+        "Should have at least one critical finding"
     );
 
     // Should find SNW-AGGPOL-NOCONST violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-NOCONST"
         }),
@@ -34,20 +34,20 @@ fn test_aggregation_policy_no_constraint_critical() {
 }
 
 #[test]
-fn test_aggregation_policy_low_group_size_critical() {
+fn test_aggregation_policy_low_group_size_high() {
     let sql = "CREATE AGGREGATION POLICY test_policy AS () RETURNS AGGREGATION_CONSTRAINT -> AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 2);";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal for dangerously low MIN_GROUP_SIZE
+    // Should have high finding for dangerously low MIN_GROUP_SIZE
     assert!(
-        report.summary.critical_count >= 1,
-        "Should have critical signal for MIN_GROUP_SIZE < 3"
+        report.summary.high_count >= 1,
+        "Should have critical finding for MIN_GROUP_SIZE < 3"
     );
 
     // Should find SNW-AGGPOL-GRPSZ-CRIT violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-GRPSZ-CRIT"
         }),
@@ -61,15 +61,15 @@ fn test_aggregation_policy_strong_group_size_positive() {
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have positive signal for strong MIN_GROUP_SIZE
+    // Should have positive context entry for strong MIN_GROUP_SIZE
     assert!(
-        report.summary.low_count >= 1,
-        "Should have low-level signal for strong MIN_GROUP_SIZE"
+        report.summary.info_count >= 1,
+        "Should have info-level context for strong MIN_GROUP_SIZE"
     );
 
-    // Should find SNW-AGGPOL-GRPSZ-STRONG (positive signal)
+    // Should find SNW-AGGPOL-GRPSZ-STRONG (positive context entry)
     assert!(
-        report.signals.iter().any(|f| {
+        report.context.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-GRPSZ-STRONG"
         }),
@@ -83,15 +83,15 @@ fn test_alter_aggregation_policy_protection_removed() {
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal for protection removal
+    // Should have critical finding for protection removal
     assert!(
         report.summary.critical_count >= 1,
-        "Should have critical signal for protection removal"
+        "Should have critical finding for protection removal"
     );
 
     // Should find SNW-AGGPOL-NOCONST-CHG violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-NOCONST-CHG"
         }),
@@ -100,20 +100,20 @@ fn test_alter_aggregation_policy_protection_removed() {
 }
 
 #[test]
-fn test_drop_aggregation_policy_critical() {
+fn test_drop_aggregation_policy_medium() {
     let sql = "DROP AGGREGATION POLICY test_policy;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal for dropping policy
+    // Should have medium finding for dropping policy
     assert!(
-        report.summary.critical_count >= 1,
-        "Should have critical signal for dropping policy"
+        report.summary.medium_count >= 1,
+        "Should have medium finding for dropping policy"
     );
 
     // Should find SNW-AGGPOL-DROP violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-DROP"
         }),
@@ -134,27 +134,89 @@ fn test_aggregation_policy_conditional_logic() {
 
     // Should detect both conditional logic and NO_AGGREGATION_CONSTRAINT
     assert!(
-        report.summary.total_reported_signals >= 2,
-        "Should detect multiple governance signals"
+        report.entries().count() >= 2,
+        "Should detect multiple governance findings"
     );
 
     // Should find SNW-AGGPOL-COND (conditional policy)
     assert!(
-        report.signals.iter().any(|f| {
+        report.context.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-COND"
         }),
         "Should find SNW-AGGPOL-COND (conditional aggregation policy)"
     );
 
-    // Should also find SNW-AGGPOL-NOCONST (NO_AGGREGATION_CONSTRAINT in CASE branch)
+    // The ELSE is what every other role gets, and it is unconstrained.
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "SNW-AGGPOL-NOCONST"
         }),
-        "Should find SNW-AGGPOL-NOCONST (NO_AGGREGATION_CONSTRAINT in policy body)"
+        "Should find SNW-AGGPOL-NOCONST (the default path is unconstrained)"
     );
+}
+
+fn aggpol_findings(sql: &str) -> Vec<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    report
+        .findings
+        .iter()
+        .map(|f| {
+            let RuleMatch::Analysis(ref p) = f;
+            p.matched_rule.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn test_aggregation_policy_exempted_role_is_not_no_constraint() {
+    // The documented pattern: one authorised role is exempt, everyone else is constrained.
+    let create = "CREATE AGGREGATION POLICY p AS () RETURNS AGGREGATION_CONSTRAINT ->
+  CASE
+    WHEN CURRENT_ROLE() = 'ADMIN' THEN NO_AGGREGATION_CONSTRAINT()
+    ELSE AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 5)
+  END;";
+    let alter = "ALTER AGGREGATION POLICY p SET BODY ->
+  CASE
+    WHEN CURRENT_ROLE() = 'ADMIN' THEN NO_AGGREGATION_CONSTRAINT()
+    ELSE AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 5)
+  END;";
+    assert!(!aggpol_findings(create).contains(&"SNW-AGGPOL-NOCONST".to_string()));
+    assert!(!aggpol_findings(alter).contains(&"SNW-AGGPOL-NOCONST-CHG".to_string()));
+}
+
+#[test]
+fn test_aggregation_policy_unconstrained_default_is_no_constraint() {
+    // A constrained WHEN does not matter: the ELSE is unconstrained, or absent
+    // (the default is NULL, undecided).
+    for body in [
+        "CASE WHEN CURRENT_ROLE() = 'ANALYST' THEN AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 5) ELSE NO_AGGREGATION_CONSTRAINT() END",
+        "CASE WHEN CURRENT_ROLE() = 'ANALYST' THEN AGGREGATION_CONSTRAINT(MIN_GROUP_SIZE => 5) END",
+    ] {
+        let create = format!(
+            "CREATE AGGREGATION POLICY p AS () RETURNS AGGREGATION_CONSTRAINT -> {body};"
+        );
+        let alter = format!("ALTER AGGREGATION POLICY p SET BODY -> {body};");
+        assert!(aggpol_findings(&create).contains(&"SNW-AGGPOL-NOCONST".to_string()), "{create}");
+        assert!(aggpol_findings(&alter).contains(&"SNW-AGGPOL-NOCONST-CHG".to_string()), "{alter}");
+    }
+}
+
+#[test]
+fn test_aggregation_policy_every_branch_unconstrained_is_no_constraint() {
+    let create = "CREATE AGGREGATION POLICY p AS () RETURNS AGGREGATION_CONSTRAINT ->
+  CASE
+    WHEN CURRENT_ROLE() = 'ADMIN' THEN NO_AGGREGATION_CONSTRAINT()
+    ELSE NO_AGGREGATION_CONSTRAINT()
+  END;";
+    let alter = "ALTER AGGREGATION POLICY p SET BODY ->
+  CASE
+    WHEN CURRENT_ROLE() = 'ADMIN' THEN NO_AGGREGATION_CONSTRAINT()
+    ELSE NO_AGGREGATION_CONSTRAINT()
+  END;";
+    assert!(aggpol_findings(create).contains(&"SNW-AGGPOL-NOCONST".to_string()));
+    assert!(aggpol_findings(alter).contains(&"SNW-AGGPOL-NOCONST-CHG".to_string()));
 }
 
 #[test]
@@ -165,7 +227,7 @@ fn test_table_set_aggregation_policy_fires_attach_rule() {
     let report = analyze_risk(sql).expect("should analyze successfully");
 
     assert!(
-        report.signals.iter().any(|f| {
+        report.context.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "TBL-AGGPOL-SET"
         }),
@@ -182,14 +244,14 @@ fn test_table_unset_aggregation_policy_unchanged() {
     let report = analyze_risk(sql).expect("should analyze successfully");
 
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "TBL-AGGPOL-RMV"
         }),
         "Should find TBL-AGGPOL-RMV (aggregation policy removed)"
     );
     assert!(
-        !report.signals.iter().any(|f| {
+        !report.entries().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "TBL-AGGPOL-SET"
         }),

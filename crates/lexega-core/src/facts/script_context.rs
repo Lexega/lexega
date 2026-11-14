@@ -29,9 +29,13 @@ pub struct ScriptContext {
     /// Total number of statements in the script.
     pub total_statements: u32,
 
-    /// What's enclosing this statement, if any (procedure body, function
-    /// body, trigger body, control-flow block).
-    pub enclosing: Option<EnclosingKind>,
+    /// The bodies that hold this statement, outermost first: the routine,
+    /// trigger, event, task or rule whose body it is in, and the blocks,
+    /// handlers and control-flow bodies around it. Empty for a statement
+    /// no body holds. A statement in a procedure's `IF` lists the
+    /// procedure, then its block, then the `IF`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enclosing: Vec<EnclosingKind>,
 
     /// DDL actions that have already executed in this script before
     /// this statement. Useful for rules like "fire when this statement
@@ -62,24 +66,32 @@ pub struct SessionContextFacts {
     pub active_role: Option<IdentName>,
 }
 
+/// A body that holds a statement ([`ScriptContext::enclosing`]). Each
+/// routine-like body carries the name its statement gives it, as written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EnclosingKind {
-    Procedure {
-        name: IdentName,
-    },
-    Function {
-        name: IdentName,
-    },
-    Trigger {
-        name: IdentName,
-    },
+    /// The body of a stored procedure.
+    Procedure { name: IdentName },
+    /// The body of a function.
+    Function { name: IdentName },
+    /// The body of a trigger.
+    Trigger { name: IdentName },
+    /// The body of a scheduled event (MySQL `CREATE EVENT … DO`).
+    Event { name: IdentName },
+    /// The statement a task runs (Snowflake `CREATE TASK … AS`).
+    Task { name: IdentName },
+    /// The commands of a rewrite rule (PostgreSQL `CREATE RULE … DO`).
+    Rule { name: IdentName },
+    /// A `BEGIN … END` block, a routine's or an anonymous one (a
+    /// PostgreSQL `DO` body is one), with its declarations and exception
+    /// handlers.
     Block,
-    /// Nested control-flow body (IF / WHILE / FOR / LOOP / TRY-CATCH).
-    ControlFlow {
-        flow_kind: ControlFlowKind,
-    },
+    /// The statement a `DECLARE … HANDLER` runs.
+    Handler,
+    /// A control-flow body: a branch, a loop, a `TRY` or `CATCH`.
+    ControlFlow { flow_kind: ControlFlowKind },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

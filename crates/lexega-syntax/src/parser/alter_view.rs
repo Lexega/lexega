@@ -27,6 +27,7 @@
 //
 // PostgreSQL:
 //   ALTER VIEW [IF EXISTS] name RENAME TO new_name
+//   ALTER VIEW [IF EXISTS] name RENAME [COLUMN] col TO new_col
 //   ALTER VIEW [IF EXISTS] name SET (option = value, ...)
 //   ALTER VIEW [IF EXISTS] name OWNER TO new_owner
 //   ALTER VIEW [IF EXISTS] name ALTER COLUMN col SET DEFAULT expr
@@ -42,12 +43,108 @@
 
 use crate::ast::types::{
     AstAlterMaterializedView, AstAlterMaterializedViewAction, AstAlterMaterializedViewActionKind,
-    AstAlterView, AstAlterViewAction, AstAlterViewActionKind,
+    AstAlterView, AstAlterViewAction, AstAlterViewActionKind, AstColumnPolicyUnset,
 };
-use crate::ast::AstStmt;
+use crate::ast::{AstStmt, AstTagRef};
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::create_table::PolicyClause;
+use crate::parser::tag::TagListShape;
+
+/// An `AlterColumn` action whose column and policies are not read: the
+/// action without a column, or one the parser keeps as a span.
+fn alter_column_unread(action_span: Span) -> AstAlterViewActionKind {
+    AstAlterViewActionKind::AlterColumn {
+        action_span,
+        column: None,
+        masking_policy: None,
+        masking_policy_using: Vec::new(),
+        projection_policy: None,
+        tags: Vec::new(),
+        policy_unset: None,
+    }
+}
+
+/// The `ALTER MATERIALIZED VIEW` action an `ALTER VIEW` action reads as: the
+/// actions a materialized view has keep their shape, every other action is
+/// kept as written.
+fn materialized_action_of(action: AstAlterViewAction) -> AstAlterMaterializedViewAction {
+    use AstAlterMaterializedViewActionKind as M;
+    use AstAlterViewActionKind as V;
+    let span = action.span;
+    let kind = match action.kind {
+        V::AddRowAccessPolicy {
+            action_span,
+            policy,
+            columns,
+        } => M::AddRowAccessPolicy {
+            action_span,
+            policy,
+            columns,
+        },
+        V::DropRowAccessPolicy {
+            action_span,
+            policy,
+        } => M::DropRowAccessPolicy {
+            action_span,
+            policy,
+        },
+        V::DropAllRowAccessPolicies { action_span } => M::DropAllRowAccessPolicies { action_span },
+        V::RenameColumn {
+            action_span,
+            old_name_span,
+            new_name_span,
+        } => M::RenameColumn {
+            action_span,
+            old_name_span,
+            new_name_span,
+        },
+        V::AlterColumn {
+            action_span,
+            column,
+            masking_policy,
+            masking_policy_using: _,
+            projection_policy,
+            tags: _,
+            policy_unset,
+        } => M::AlterColumn {
+            action_span,
+            column,
+            masking_policy,
+            projection_policy,
+            policy_unset,
+        },
+        V::SetOptions {
+            set_span,
+            options_span,
+            options_list_span,
+        } => M::SetOptions {
+            set_span,
+            options_span,
+            options_list_span,
+        },
+        V::RenameTo { action_span } => M::RenameTo { action_span },
+        V::SetSecure { action_span } => M::SetSecure { action_span },
+        V::UnsetSecure { action_span } => M::UnsetSecure { action_span },
+        V::SetComment { action_span } => M::SetComment { action_span },
+        V::UnsetComment { action_span } => M::UnsetComment { action_span },
+        V::SetTag { action_span, tags } => M::SetTag { action_span, tags },
+        V::UnsetTag { action_span, tags } => M::UnsetTag { action_span, tags },
+        V::AlterColumnSetOptions { .. }
+        | V::SetChangeTracking { .. }
+        | V::SetAggregationPolicy { .. }
+        | V::UnsetAggregationPolicy { .. }
+        | V::SetJoinPolicy { .. }
+        | V::UnsetJoinPolicy { .. }
+        | V::AddColumn { .. }
+        | V::DataMetricFunction { .. }
+        | V::OpaqueRemainder { .. } => M::OpaqueRemainder {
+            remainder_span: span,
+        },
+    };
+    AstAlterMaterializedViewAction { span, kind }
+}
 
 impl<'a> Parser<'a> {
     // ========================================================================
@@ -73,7 +170,7 @@ impl<'a> Parser<'a> {
         let if_exists_span = self.parse_alter_view_if_exists()?;
 
         // View name (dot-separated qualified name)
-        let name_span = self.parse_alter_view_name()?;
+        let name_span = self.parse_object_name_span()?;
 
         // Parse action
         let action = self.parse_alter_view_action()?;
@@ -125,7 +222,7 @@ impl<'a> Parser<'a> {
         let if_exists_span = self.parse_alter_view_if_exists()?;
 
         // MV name (dot-separated qualified name)
-        let name_span = self.parse_alter_view_name()?;
+        let name_span = self.parse_object_name_span()?;
 
         // Parse action
         let action = self.parse_alter_materialized_view_action()?;
@@ -180,33 +277,6 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    /// Parse a dot-separated qualified name for ALTER VIEW / ALTER MATERIALIZED VIEW.
-    /// Uses the safe dot-separated pattern: first ident, then dot+ident pairs only.
-    fn parse_alter_view_name(&mut self) -> ParseResult<Span> {
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["view name".to_string()])?;
-        let start = first.span.start;
-        let mut end = first.span.end;
-
-        // Consume dot-separated parts only
-        loop {
-            if let Some(dot_tok) = self.peek_non_trivia() {
-                if matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                    self.advance(); // consume dot
-                    let part = self
-                        .advance()
-                        .ok_or_eof(self.current_span(), vec!["name part after dot".to_string()])?;
-                    end = part.span.end;
-                    continue;
-                }
-            }
-            break;
-        }
-
-        Ok(Span { start, end })
-    }
-
     // ========================================================================
     // ALTER VIEW action parsing
     // ========================================================================
@@ -250,16 +320,98 @@ impl<'a> Parser<'a> {
             }
         }
 
+        if let Some(action) = self.parse_alter_view_definition() {
+            return Ok(action);
+        }
+
         // Opaque remainder — for actions we don't explicitly handle
         self.parse_alter_view_as_opaque()
     }
 
-    /// Parse RENAME TO <new_name>
+    /// `[(columns)] [WITH attribute [, …]] AS [(] query [)] [WITH [CASCADED |
+    /// LOCAL] CHECK OPTION]`: a new definition of the view, kept as written.
+    /// It ends where its query does, as `CREATE VIEW`'s does.
+    fn parse_alter_view_definition(&mut self) -> Option<AstAlterViewAction> {
+        let start_idx = self.idx;
+        let mut i = self.parens_end(start_idx).unwrap_or(start_idx);
+        let attributes = self.words_end(i, &["WITH"]).and_then(|k| {
+            self.comma_list_end(k, |j| {
+                self.any_words_end(
+                    j,
+                    &[&["ENCRYPTION"], &["SCHEMABINDING"], &["VIEW_METADATA"]],
+                )
+            })
+        });
+        if let Some(end) = attributes {
+            i = end;
+        }
+        if !self.word_at(i, "AS") {
+            return None;
+        }
+        let start = self.tokens[start_idx].span.start;
+        let mut end = self.tokens[i].span.end;
+        self.idx = i + 1;
+        let has_paren = self
+            .peek_non_trivia()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)));
+        if has_paren {
+            end = self.advance().expect_invariant("`(` after peek").span.end;
+        }
+        let query_idx = self.idx;
+        match self.parse_statement() {
+            Ok(query) => {
+                end = query.span().end;
+                if has_paren
+                    && self.peek_non_trivia().is_some_and(|t| {
+                        matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen))
+                    })
+                {
+                    end = self.advance().expect_invariant("`)` after peek").span.end;
+                }
+                let check_option = self.words_end(self.idx, &["WITH"]).and_then(|k| {
+                    let k = self
+                        .any_words_end(k, &[&["CASCADED"], &["LOCAL"]])
+                        .unwrap_or(k);
+                    self.words_end(k, &["CHECK", "OPTION"])
+                });
+                if let Some(past) = check_option {
+                    end = self.tokens[past - 1].span.end;
+                    self.idx = past;
+                }
+            }
+            Err(_) => {
+                self.idx = query_idx;
+                while let Some(tok) = self.peek_non_trivia() {
+                    if self.should_stop_scan_at_statement_start(tok)
+                        || matches!(
+                            tok.kind,
+                            TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+                        )
+                    {
+                        break;
+                    }
+                    end = self.advance().expect_invariant("token after peek").span.end;
+                }
+            }
+        }
+        let span = Span { start, end };
+        Some(AstAlterViewAction {
+            span,
+            kind: AstAlterViewActionKind::OpaqueRemainder {
+                remainder_span: span,
+            },
+        })
+    }
+
+    /// Parse RENAME TO <new_name>, or RENAME [COLUMN] <col> TO <new_col>.
     fn parse_alter_view_rename_to(&mut self) -> ParseResult<AstAlterViewAction> {
         let rename_tok = self
             .advance()
             .expect_invariant("RENAME consumed after peek");
         let start = rename_tok.span.start;
+        if !self.word_at(self.idx, "TO") {
+            return self.parse_alter_view_rename_column(start);
+        }
 
         // TO keyword
         let _to_tok = self
@@ -267,7 +419,7 @@ impl<'a> Parser<'a> {
             .ok_or_eof(self.current_span(), vec!["TO".to_string()])?;
 
         // New name (dot-separated)
-        let name_span = self.parse_alter_view_name()?;
+        let name_span = self.parse_object_name_span()?;
 
         let action_span = Span {
             start,
@@ -276,6 +428,43 @@ impl<'a> Parser<'a> {
         Ok(AstAlterViewAction {
             span: action_span,
             kind: AstAlterViewActionKind::RenameTo { action_span },
+        })
+    }
+
+    /// `[COLUMN] <col> TO <new_col>` after the `RENAME` at `start`.
+    fn parse_alter_view_rename_column(&mut self, start: u32) -> ParseResult<AstAlterViewAction> {
+        if self.word_at(self.idx, "COLUMN") {
+            self.advance().expect_invariant("COLUMN after peek");
+        }
+        let old_name_span = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["column name".to_string()])?
+            .span;
+        let to_tok = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["TO".to_string()])?;
+        if !to_tok.lexeme(self.source).eq_ignore_ascii_case("TO") {
+            return Err(ParseError::unexpected_token(
+                to_tok.span,
+                vec!["TO".to_string()],
+                Parser::token_description(to_tok, self.source),
+            ));
+        }
+        let new_name_span = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["new column name".to_string()])?
+            .span;
+        let action_span = Span {
+            start,
+            end: new_name_span.end,
+        };
+        Ok(AstAlterViewAction {
+            span: action_span,
+            kind: AstAlterViewActionKind::RenameColumn {
+                action_span,
+                old_name_span,
+                new_name_span,
+            },
         })
     }
 
@@ -293,6 +482,7 @@ impl<'a> Parser<'a> {
             if lexeme.eq_ignore_ascii_case("OPTIONS") {
                 let options_tok = self.advance().expect_invariant("OPTIONS consumed");
                 let options_span = Some(options_tok.span);
+                self.record_option_list_secrets(self.idx);
                 let list_start = self.current_span().start;
                 let end = self.consume_alter_view_balanced()?;
                 let action_span = Span { start, end };
@@ -344,11 +534,15 @@ impl<'a> Parser<'a> {
 
             // SET TAG ... — Snowflake
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Tag)) {
-                let end = self.consume_alter_view_until_semi(start);
-                let action_span = Span { start, end };
+                self.advance().expect_invariant("TAG keyword after peek");
+                let (list_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
+                let action_span = Span {
+                    start,
+                    end: list_span.end,
+                };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::SetTag { action_span },
+                    kind: AstAlterViewActionKind::SetTag { action_span, tags },
                 });
             }
 
@@ -382,8 +576,14 @@ impl<'a> Parser<'a> {
                 });
             }
 
+            // SET TBLPROPERTIES (…) — Databricks; kept as the remainder below.
+            if lexeme.eq_ignore_ascii_case("TBLPROPERTIES") {
+                self.record_option_list_secrets(self.idx + 1);
+            }
+
             // SET ( option = value, ... ) — PostgreSQL
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                self.record_option_list_secrets(self.idx);
                 let end = self.consume_alter_view_balanced()?;
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
@@ -417,7 +617,7 @@ impl<'a> Parser<'a> {
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: alter_column_unread(action_span),
                 });
             }
 
@@ -427,7 +627,7 @@ impl<'a> Parser<'a> {
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: alter_column_unread(action_span),
                 });
             }
         }
@@ -476,11 +676,15 @@ impl<'a> Parser<'a> {
 
             // UNSET TAG — Snowflake
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Tag)) {
-                let end = self.consume_alter_view_until_semi(start);
-                let action_span = Span { start, end };
+                self.advance().expect_invariant("TAG keyword after peek");
+                let (list_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                let action_span = Span {
+                    start,
+                    end: list_span.end,
+                };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::UnsetTag { action_span },
+                    kind: AstAlterViewActionKind::UnsetTag { action_span, tags },
                 });
             }
 
@@ -520,7 +724,7 @@ impl<'a> Parser<'a> {
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: alter_column_unread(action_span),
                 });
             }
 
@@ -530,7 +734,7 @@ impl<'a> Parser<'a> {
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: alter_column_unread(action_span),
                 });
             }
         }
@@ -554,11 +758,17 @@ impl<'a> Parser<'a> {
         if let Some(tok) = self.peek_non_trivia() {
             // ADD ROW ACCESS POLICY
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Row)) {
-                let end = self.consume_alter_view_until_semi(start);
+                let (clause, name_end) = self.take_row_access_policy(start)?;
+                let end = self.consume_alter_view_until_semi(name_end);
                 let action_span = Span { start, end };
+                let (policy, columns) = PolicyClause::parts(clause);
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AddRowAccessPolicy { action_span },
+                    kind: AstAlterViewActionKind::AddRowAccessPolicy {
+                        action_span,
+                        policy,
+                        columns,
+                    },
                 });
             }
 
@@ -603,11 +813,15 @@ impl<'a> Parser<'a> {
         if let Some(tok) = self.peek_non_trivia() {
             // DROP ROW ACCESS POLICY <name>
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Row)) {
-                let end = self.consume_alter_view_until_semi(start);
+                let (clause, name_end) = self.take_row_access_policy(start)?;
+                let end = self.consume_alter_view_until_semi(name_end);
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::DropRowAccessPolicy { action_span },
+                    kind: AstAlterViewActionKind::DropRowAccessPolicy {
+                        action_span,
+                        policy: PolicyClause::parts(clause).0,
+                    },
                 });
             }
 
@@ -637,7 +851,7 @@ impl<'a> Parser<'a> {
                 let action_span = Span { start, end };
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: alter_column_unread(action_span),
                 });
             }
         }
@@ -690,6 +904,7 @@ impl<'a> Parser<'a> {
                     if next_lexeme.eq_ignore_ascii_case("OPTIONS") {
                         // BigQuery: ALTER COLUMN col SET OPTIONS (...)
                         let options_tok = self.advance().expect_invariant("OPTIONS consumed");
+                        self.record_option_list_secrets(self.idx);
                         let list_start = self.current_span().start;
                         let end = self.consume_alter_view_balanced()?;
                         let action_span = Span {
@@ -715,19 +930,52 @@ impl<'a> Parser<'a> {
                 }
 
                 // Snowflake: ALTER/MODIFY COLUMN col SET MASKING POLICY / TAG / etc.
-                let end = self.consume_alter_view_until_semi(action_start);
+                self.skip_trivia();
+                let masking = self.masking_policy_at(self.idx);
+                let projection = self.projection_policy_at(self.idx);
+                let tag_at = self.words_end(self.idx, &["TAG"]);
+                let tags = self.column_tags_at(tag_at, TagListShape::Assignments);
+                let name_end = match masking
+                    .as_ref()
+                    .or(projection.as_ref())
+                    .map(|clause| clause.next)
+                    .or(tag_at)
+                {
+                    Some(read_to) => {
+                        self.idx = read_to;
+                        self.tokens[read_to - 1].span.end
+                    }
+                    None => action_start,
+                };
+                let end = self.consume_alter_view_until_semi(name_end);
                 let action_span = Span {
                     start: action_start,
                     end,
                 };
+                let (masking_policy, masking_policy_using) = PolicyClause::parts(masking);
+                let (projection_policy, _) = PolicyClause::parts(projection);
                 return Ok(AstAlterViewAction {
                     span: action_span,
-                    kind: AstAlterViewActionKind::AlterColumn { action_span },
+                    kind: AstAlterViewActionKind::AlterColumn {
+                        action_span,
+                        column: Some(column_name_tok.span),
+                        masking_policy,
+                        masking_policy_using,
+                        projection_policy,
+                        tags,
+                        policy_unset: None,
+                    },
                 });
             }
         }
 
         // Snowflake: ALTER/MODIFY COLUMN col UNSET/DROP DEFAULT/etc.
+        self.skip_trivia();
+        let tags = self.column_tags_at(
+            self.words_end(self.idx, &["UNSET", "TAG"]),
+            TagListShape::Names,
+        );
+        let policy_unset = self.column_policy_unset_at(self.idx);
         let end = self.consume_alter_view_until_semi(action_start);
         let action_span = Span {
             start: action_start,
@@ -735,8 +983,40 @@ impl<'a> Parser<'a> {
         };
         Ok(AstAlterViewAction {
             span: action_span,
-            kind: AstAlterViewActionKind::AlterColumn { action_span },
+            kind: AstAlterViewActionKind::AlterColumn {
+                action_span,
+                column: Some(column_name_tok.span),
+                masking_policy: None,
+                masking_policy_using: Vec::new(),
+                projection_policy: None,
+                tags,
+                policy_unset,
+            },
         })
+    }
+
+    /// The `UNSET MASKING POLICY` / `UNSET PROJECTION POLICY` written at
+    /// token `i`. Nothing is consumed.
+    fn column_policy_unset_at(&self, i: usize) -> Option<AstColumnPolicyUnset> {
+        let span_to = |end: usize| Span {
+            start: self.tokens[i].span.start,
+            end: self.tokens[end - 1].span.end,
+        };
+        if let Some(end) = self.words_end(i, &["UNSET", "MASKING", "POLICY"]) {
+            return Some(AstColumnPolicyUnset::Masking { span: span_to(end) });
+        }
+        self.words_end(i, &["UNSET", "PROJECTION", "POLICY"])
+            .map(|end| AstColumnPolicyUnset::Projection { span: span_to(end) })
+    }
+
+    /// The tags of the list written at `list_at`, the index past the `TAG`
+    /// word that opens it; none where it is not read as a tag list. Nothing
+    /// is consumed.
+    fn column_tags_at(&self, list_at: Option<usize>, shape: TagListShape) -> Vec<AstTagRef> {
+        list_at
+            .and_then(|at| self.tag_list_at(at, shape))
+            .map(|(_, tags)| tags)
+            .unwrap_or_default()
     }
 
     /// Parse opaque remainder for actions we don't explicitly handle.
@@ -769,51 +1049,28 @@ impl<'a> Parser<'a> {
         &mut self,
     ) -> ParseResult<AstAlterMaterializedViewAction> {
         if let Some(tok) = self.peek_non_trivia() {
-            // SET OPTIONS (...)
-            if matches!(tok.kind, TokenKind::Keyword(Keyword::Set)) {
-                let set_tok = self.advance().expect_invariant("SET consumed after peek");
-                let set_span = Some(set_tok.span);
-
-                if let Some(opt_tok) = self.peek_non_trivia() {
-                    if opt_tok.lexeme(self.source).eq_ignore_ascii_case("OPTIONS") {
-                        let options_tok = self.advance().expect_invariant("OPTIONS consumed");
-                        let options_span = Some(options_tok.span);
-
-                        let list_start = self.current_span().start;
-                        let end = self.consume_alter_view_balanced()?;
-
-                        let action_span = Span {
-                            start: set_tok.span.start,
-                            end,
-                        };
-
-                        return Ok(AstAlterMaterializedViewAction {
-                            span: action_span,
-                            kind: AstAlterMaterializedViewActionKind::SetOptions {
-                                set_span,
-                                options_span,
-                                options_list_span: Span {
-                                    start: list_start,
-                                    end,
-                                },
-                            },
-                        });
-                    }
-                }
-
-                // SET without OPTIONS — opaque
-                let remainder_start = set_tok.span.start;
-                let end = self.consume_alter_view_until_semi(remainder_start);
-                let action_span = Span {
-                    start: remainder_start,
-                    end,
-                };
-                return Ok(AstAlterMaterializedViewAction {
-                    span: action_span,
-                    kind: AstAlterMaterializedViewActionKind::OpaqueRemainder {
-                        remainder_span: action_span,
-                    },
-                });
+            let lexeme = tok.lexeme(self.source);
+            // The actions a materialized view shares with a view read as the
+            // ALTER VIEW forms are.
+            let shared = if lexeme.eq_ignore_ascii_case("ADD") {
+                Some(self.parse_alter_view_add_action()?)
+            } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Drop)) {
+                Some(self.parse_alter_view_drop_action()?)
+            } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Alter))
+                || lexeme.eq_ignore_ascii_case("MODIFY")
+            {
+                Some(self.parse_alter_view_alter_column_action()?)
+            } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Set)) {
+                Some(self.parse_alter_view_set_action()?)
+            } else if lexeme.eq_ignore_ascii_case("UNSET") {
+                Some(self.parse_alter_view_unset_action()?)
+            } else if lexeme.eq_ignore_ascii_case("RENAME") {
+                Some(self.parse_alter_view_rename_to()?)
+            } else {
+                None
+            };
+            if let Some(action) = shared {
+                return Ok(materialized_action_of(action));
             }
         }
 
@@ -841,6 +1098,7 @@ impl<'a> Parser<'a> {
     /// Consume a balanced parenthesized group including the opening and closing parens.
     /// Returns the end position (after closing paren).
     fn consume_alter_view_balanced(&mut self) -> ParseResult<u32> {
+        let from = self.idx;
         let mut end = self.current_span().start;
         let mut depth: i32 = 0;
         let mut started = false;
@@ -879,11 +1137,32 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(end)
+    }
+
+    /// Consumes the `ROW ACCESS POLICY name [ON (…)]` written at the current
+    /// token ([`Self::row_access_policy_at`]), returning it and where it
+    /// ends; `from` and no clause where the words are not written. Where
+    /// no name follows them, the name reader's error.
+    fn take_row_access_policy(&mut self, from: u32) -> ParseResult<(Option<PolicyClause>, u32)> {
+        self.skip_trivia();
+        let Some(words) = self.words_end(self.idx, &["ROW", "ACCESS", "POLICY"]) else {
+            return Ok((None, from));
+        };
+        let Some(clause) = self.row_access_policy_at(self.idx) else {
+            self.idx = words;
+            return Ok((None, self.parse_object_name_span()?.end));
+        };
+        self.idx = clause.next;
+        let end = self.tokens[clause.next - 1].span.end;
+        Ok((Some(clause), end))
     }
 
     /// Consume all tokens until semicolon or EOF. Returns the end position.
     fn consume_alter_view_until_semi(&mut self, start: u32) -> u32 {
+        let from = self.idx;
         let mut end = start;
         while let Some(tok) = self.peek_non_trivia() {
             if matches!(
@@ -898,6 +1177,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         end
     }
 }

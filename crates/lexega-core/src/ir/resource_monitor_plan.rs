@@ -127,8 +127,9 @@ pub fn lower_drop_resource_monitor_to_resource_monitor_plan(
     ResourceMonitorPlan {
         action: ResourceMonitorAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: ResourceMonitorOptions {
             or_replace: false,
             if_not_exists: false,
@@ -160,7 +161,8 @@ fn lower_triggers(
         .collect()
 }
 
-/// Split a parenthesized list (`(a, b)`) into unquoted trimmed entries.
+/// Split a parenthesized list (`(a, b)`) into its entries, a string
+/// literal's by its value.
 fn split_paren_list(source: &str, span: Span) -> Vec<String> {
     slice_span(source, span)
         .unwrap_or("")
@@ -168,9 +170,8 @@ fn split_paren_list(source: &str, span: Span) -> Vec<String> {
         .trim_start_matches('(')
         .trim_end_matches(')')
         .split(',')
-        .map(|s| s.trim().trim_matches('\''))
+        .map(crate::ir::span_extract::literal_value_or_text)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect()
 }
 

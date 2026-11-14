@@ -830,6 +830,9 @@ pub struct SyntaxSubquery {
     pub r_paren: TokenId,
     /// Span covering the entire subquery including parens
     pub span: Span,
+    /// The parentheses written directly inside these around the same query
+    /// (`((SELECT 1))`), where there are more.
+    pub inner: Option<SyntaxSubqueryId>,
 }
 
 /// Statement with optional trailing semicolon
@@ -1047,14 +1050,14 @@ pub struct SyntaxReturning {
     pub span: Span,
 }
 
-/// COLLATE expression: expr COLLATE 'spec'
+/// COLLATE expression: expr COLLATE spec
 ///
-/// Example: `name COLLATE 'en-ci'`, `COLLATE(col1, 'de')`
+/// Example: `name COLLATE 'en-ci'`, `name COLLATE Latin1_General_CI_AS`
 #[derive(Debug, Clone, Copy)]
 pub struct SyntaxCollate {
     /// COLLATE keyword token
     pub collate_keyword: TokenId,
-    /// Collation specification string literal token
+    /// Collation specification token: a string literal or a name
     pub spec_literal: TokenId,
     /// Span covering the entire COLLATE expression
     pub span: Span,

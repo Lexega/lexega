@@ -40,7 +40,7 @@ fn extract_first_expr(sql: &str, dialect: &dyn Dialect) -> AstExpr {
 fn top_operator(sql: &str, dialect: &dyn Dialect) -> BinaryOperator {
     let expr = extract_first_expr(sql, dialect);
     match &expr {
-        AstExpr::BinaryOp { operator, .. } => operator.clone(),
+        AstExpr::BinaryOp { operator, .. } => *operator,
         other => panic!(
             "expected BinaryOp at top level, got {:?}",
             std::mem::discriminant(other)
@@ -171,26 +171,19 @@ fn test_snowflake_concat_in_arithmetic_context() {
     // In Snowflake: a || b || c  chains as concat
     let expr = first_projection_expr("SELECT a || b || c", &*snowflake());
     match &expr {
-        AstExpr::BinaryOp {
-            operator: BinaryOperator::Concat,
-            left,
+        AstExpr::OperatorChain {
+            operands,
+            operators,
             ..
         } => {
-            match left.as_ref() {
-                AstExpr::BinaryOp {
-                    operator: BinaryOperator::Concat,
-                    ..
-                } => {
-                    // Correct: left-associative concat chain
-                }
-                other => panic!(
-                    "Expected nested Concat, got {:?}",
-                    std::mem::discriminant(other)
-                ),
-            }
+            // Correct: one left-associative run of concatenations
+            assert_eq!(operands.len(), 3);
+            assert!(operators
+                .iter()
+                .all(|op| op.operator == BinaryOperator::Concat));
         }
         other => panic!(
-            "Expected Concat at top, got {:?}",
+            "Expected a run of Concat, got {:?}",
             std::mem::discriminant(other)
         ),
     }
@@ -334,8 +327,10 @@ fn test_postgres_concat_in_select() {
 // ============================================================================
 
 fn format_and_verify_dialect(sql: &str, dialect: lexega_syntax::dialect::DialectRef) {
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = dialect.clone();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: dialect.clone(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .unwrap_or_else(|e| panic!("Format failed for {}: {}", dialect.name(), e));
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, dialect.as_ref())

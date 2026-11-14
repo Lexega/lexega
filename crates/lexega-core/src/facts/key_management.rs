@@ -14,10 +14,10 @@
 //! top level of `StatementFacts` rather than under `ddl`.
 //!
 //! Three recognition primitives are surfaced: the verb, the key kind, and
-//! whether an inline password decrypts the key. Which combination is dangerous
+//! each inline password that decrypts the key. Which combination is dangerous
 //! is a YAML verdict (e.g. opening a key with a hardcoded password is a
-//! credential leak), never baked into Rust. The password VALUE is redacted at
-//! parse time and never appears here.
+//! credential leak), never baked into Rust. Each password's value is in the
+//! facts and is masked in every report.
 //!
 //! Predicate example:
 //! ```yaml
@@ -66,6 +66,22 @@ pub struct MssqlKeyManagementFacts {
     /// Which key the statement targets.
     pub key_kind: KeyManagementKind,
     /// True when an inline `PASSWORD = '…'` decrypts/opens the key — a
-    /// hardcoded credential in the source. The value itself is redacted.
+    /// hardcoded credential in the source.
     pub password_present: bool,
+    /// Each password literal written, decoded: doubled quotes undone and any
+    /// `N` prefix dropped. A value the engine rendered from a template or
+    /// substituted for a deploy variable is not listed. The value is masked
+    /// in every report; a custom rule message that interpolates it shows it
+    /// unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub password_literals: Vec<PasswordLiteral>,
+}
+
+/// A password written as a literal: in a T-SQL key statement, or as the
+/// password of a URL's user information (`scheme://user:password@host`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+pub struct PasswordLiteral {
+    /// The password's value. Masked in every report.
+    pub value: String,
 }

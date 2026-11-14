@@ -5,7 +5,7 @@
 //! over one column, as a [`PredicateFact`].
 
 use super::column::{BindingTable, ColumnId, ColumnOrigin};
-use super::scalar::{Lit, ScalarExpr, UnaryOpKind};
+use super::scalar::{FieldPath, Lit, ScalarExpr, UnaryOpKind};
 use crate::context::node_metadata::{
     ColumnRef, ColumnSourceType, LogicalOperator, PredicateContext, PredicateFact, PredicateOp,
 };
@@ -17,10 +17,12 @@ pub fn column_ref_for(bindings: &BindingTable, id: ColumnId, span: Span) -> Colu
         Some(binding) => {
             let mut col_ref = ColumnRef::new(binding.display_name.clone()).with_span(span);
             match &binding.origin {
-                ColumnOrigin::Table { .. } => {
+                // An unattributed column is a column of a table that is
+                // not known.
+                ColumnOrigin::Table { .. } | ColumnOrigin::Unattributed { .. } => {
                     col_ref = col_ref.with_source_type(ColumnSourceType::BaseTable);
                 }
-                ColumnOrigin::Computed { .. } => {
+                ColumnOrigin::Computed { .. } | ColumnOrigin::Merged { .. } => {
                     col_ref = col_ref.with_source_type(ColumnSourceType::Unknown);
                 }
                 ColumnOrigin::SetOp { .. }
@@ -90,6 +92,8 @@ pub fn expr_to_simple_fact(
                             between_bounds: None,
                             is_negated,
                             is_reflexive: true,
+                            variable: None,
+                            field_path: FieldPath::empty(),
                             span: *span,
                             column_id: Some(*lc),
                         },
@@ -135,6 +139,8 @@ pub fn expr_to_simple_fact(
                     in_list_values: None,
                     is_negated,
                     is_reflexive: false,
+                    variable: None,
+                    field_path: FieldPath::empty(),
                     between_bounds: None,
                     span: *span,
                     column_id: Some(col_id),
@@ -163,7 +169,12 @@ pub fn expr_to_simple_fact(
                 | UnaryOpKind::AtLocal
                 | UnaryOpKind::Collate
                 | UnaryOpKind::Prior
-                | UnaryOpKind::Spread => return None,
+                | UnaryOpKind::Spread
+                | UnaryOpKind::BitwiseNot
+                | UnaryOpKind::SquareRoot
+                | UnaryOpKind::AbsoluteValue
+                | UnaryOpKind::Is(_)
+                | UnaryOpKind::IsNot(_) => return None,
             };
             Some((
                 col_id,
@@ -186,6 +197,8 @@ pub fn expr_to_simple_fact(
                     in_list_values: None,
                     is_negated,
                     is_reflexive: false,
+                    variable: None,
+                    field_path: FieldPath::empty(),
                     between_bounds: None,
                     span: *span,
                     column_id: Some(col_id),
@@ -250,6 +263,8 @@ pub fn expr_to_simple_fact(
                     between_bounds: None,
                     is_negated,
                     is_reflexive: false,
+                    variable: None,
+                    field_path: FieldPath::empty(),
                     span: *span,
                     column_id: Some(col_id),
                 },
@@ -316,6 +331,8 @@ pub fn expr_to_simple_fact(
                     between_bounds: Some(bounds),
                     is_negated,
                     is_reflexive: false,
+                    variable: None,
+                    field_path: FieldPath::empty(),
                     span: *span,
                     column_id: Some(col_id),
                 },
@@ -325,6 +342,8 @@ pub fn expr_to_simple_fact(
         ScalarExpr::Lit { .. }
         | ScalarExpr::Column { .. }
         | ScalarExpr::OuterRef { .. }
+        // A run of operators compares nothing.
+        | ScalarExpr::OperatorChain { .. }
         // A chain is boolean structure, not an atom — callers descend
         // it before reaching here.
         | ScalarExpr::LogicalChain { .. }
@@ -336,6 +355,7 @@ pub fn expr_to_simple_fact(
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::FieldAccess { .. }
         | ScalarExpr::Lambda { .. }
@@ -370,14 +390,14 @@ pub fn swap_comparison_operator(
     }
 }
 
-/// A literal's value text; `None` for `NULL`.
+/// A literal's value text; `None` for `NULL`, and for a bind parameter or
+/// a variable, whose value the statement does not know.
 pub fn lit_to_value(lit: &Lit) -> Option<String> {
     match lit {
         Lit::Null => None,
         Lit::Bool(b) => Some(b.to_string()),
         Lit::Integer(s) | Lit::Float(s) | Lit::Str(s) => Some(s.clone()),
-        Lit::Bytes { value, .. } | Lit::Typed { value, .. } | Lit::Variant(value) => {
-            Some(value.clone())
-        }
+        Lit::Bytes { value, .. } | Lit::Typed { value, .. } => Some(value.clone()),
+        Lit::Variant(_) | Lit::Variable { .. } => None,
     }
 }

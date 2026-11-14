@@ -26,6 +26,7 @@ use crate::cst::TokenId;
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterExternalAccessIntegration, SyntaxAlterExternalAccessIntegrationAction,
     SyntaxCreateExternalAccessIntegration, SyntaxDropExternalAccessIntegration,
@@ -167,6 +168,9 @@ impl<'a> Parser<'a> {
         let mut allowed_network_rules_span: Option<Span> = None;
         let mut allowed_api_authentication_integrations_span: Option<Span> = None;
         let mut allowed_authentication_secrets_span: Option<Span> = None;
+        let mut allowed_network_rules = Vec::new();
+        let mut allowed_api_authentication_integrations = Vec::new();
+        let mut allowed_authentication_secrets = Vec::new();
         let mut enabled_span: Option<Span> = None;
         let mut comment_span: Option<Span> = None;
         let mut extras: Vec<AstUnknownClause> = Vec::new();
@@ -193,6 +197,8 @@ impl<'a> Parser<'a> {
                                 .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
 
                             // Parse list: (rule1, rule2, ...)
+                            self.skip_trivia();
+                            allowed_network_rules = self.object_ref_list_at(self.idx);
                             if let Some(lparen_tok) = self.peek_non_trivia() {
                                 if matches!(
                                     &lparen_tok.kind,
@@ -232,6 +238,9 @@ impl<'a> Parser<'a> {
                                 .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
 
                             // Parse list: (name, ...) | (none)
+                            self.skip_trivia();
+                            allowed_api_authentication_integrations =
+                                self.object_ref_list_at(self.idx);
                             if let Some(lparen_tok) = self.peek_non_trivia() {
                                 if matches!(
                                     &lparen_tok.kind,
@@ -271,6 +280,8 @@ impl<'a> Parser<'a> {
                                 .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
 
                             // Parse list: (name, ...) | (all) | (none)
+                            self.skip_trivia();
+                            allowed_authentication_secrets = self.object_ref_list_at(self.idx);
                             if let Some(lparen_tok) = self.peek_non_trivia() {
                                 if matches!(
                                     &lparen_tok.kind,
@@ -426,8 +437,11 @@ impl<'a> Parser<'a> {
             integration_span,
             integration_name_span,
             allowed_network_rules_span,
+            allowed_network_rules,
             allowed_api_authentication_integrations_span,
+            allowed_api_authentication_integrations,
             allowed_authentication_secrets_span,
+            allowed_authentication_secrets,
             enabled_span,
             comment_span,
             extras,
@@ -540,40 +554,8 @@ impl<'a> Parser<'a> {
 
                     // Parse tag assignments: tag_name = 'value' [, ...]
                     let tags_start = self.current_span().start;
-                    let mut tags_end;
-
-                    loop {
-                        // tag_name (possibly qualified: db.schema.tag_name)
-                        let tag_name_span = self.parse_qualified_name_span()?;
-                        tags_end = tag_name_span.end;
-
-                        // =
-                        let Some(eq) = self.peek_non_trivia() else {
-                            break;
-                        };
-                        if matches!(eq.kind, TokenKind::Operator(Operator::Eq)) {
-                            self.advance();
-                            tags_end = self.current_span().end;
-                        } else {
-                            break;
-                        }
-
-                        // 'value'
-                        let Some(val) = self.advance() else {
-                            break;
-                        };
-                        tags_end = val.span.end;
-
-                        // Check for comma
-                        let Some(comma) = self.peek_non_trivia() else {
-                            break;
-                        };
-                        if matches!(comma.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
+                    let (list_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
+                    let tags_end = list_span.end;
 
                     end = tags_end;
                     let tags_span = Span {
@@ -599,6 +581,7 @@ impl<'a> Parser<'a> {
                             set_span,
                             tag_span,
                             tags_span,
+                            tags,
                         },
                     });
                 } else {
@@ -626,23 +609,8 @@ impl<'a> Parser<'a> {
 
                     // Parse tag names: tag_name [, tag_name, ...]
                     let tags_start = self.current_span().start;
-                    let mut tags_end;
-
-                    loop {
-                        // tag_name (possibly qualified: db.schema.tag_name)
-                        let tag_name_span = self.parse_qualified_name_span()?;
-                        tags_end = tag_name_span.end;
-
-                        // Check for comma
-                        let Some(comma) = self.peek_non_trivia() else {
-                            break;
-                        };
-                        if matches!(comma.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                            self.advance();
-                        } else {
-                            break;
-                        }
-                    }
+                    let (list_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                    let tags_end = list_span.end;
 
                     end = tags_end;
                     let tags_span = Span {
@@ -668,6 +636,7 @@ impl<'a> Parser<'a> {
                             unset_span,
                             tag_span,
                             tags_span,
+                            tags,
                         },
                     });
                 } else {
@@ -794,9 +763,11 @@ impl<'a> Parser<'a> {
                     // Parse value
                     let value_start = self.current_span().start;
                     let mut value_end = value_start;
+                    let mut names = Vec::new();
 
                     if let Some(next) = self.peek_non_trivia() {
                         if matches!(&next.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                            names = self.object_ref_list_at(self.idx);
                             self.advance();
                             let mut paren_depth = 1;
                             while paren_depth > 0 {
@@ -843,6 +814,7 @@ impl<'a> Parser<'a> {
                                 property_span,
                                 eq_span,
                                 value_span,
+                                rules: names,
                             }
                         }
                         "ALLOWED_API_AUTHENTICATION_INTEGRATIONS" => {
@@ -851,6 +823,7 @@ impl<'a> Parser<'a> {
                                 property_span,
                                 eq_span,
                                 value_span,
+                                integrations: names,
                             }
                         }
                         "ALLOWED_AUTHENTICATION_SECRETS" => {
@@ -859,6 +832,7 @@ impl<'a> Parser<'a> {
                                 property_span,
                                 eq_span,
                                 value_span,
+                                secrets: names,
                             }
                         }
                         "ENABLED" => {

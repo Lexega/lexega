@@ -69,19 +69,6 @@ pub(crate) fn span_text(source: &str, span: Span) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn dequote(raw: &str) -> String {
-    let t = raw.trim();
-    let b = t.as_bytes();
-    if t.len() >= 2
-        && ((b[0] == b'\'' && b[t.len() - 1] == b'\'')
-            || (b[0] == b'"' && b[t.len() - 1] == b'"')
-            || (b[0] == b'`' && b[t.len() - 1] == b'`'))
-    {
-        return t[1..t.len() - 1].to_string();
-    }
-    t.to_string()
-}
-
 pub(crate) fn lower_definer(definer: &AstDefiner, source: &str) -> DefinerLowered {
     match &definer.principal {
         AstDefinerPrincipal::CurrentUser => DefinerLowered {
@@ -94,7 +81,8 @@ pub(crate) fn lower_definer(definer: &AstDefiner, source: &str) -> DefinerLowere
             host_span,
         } => DefinerLowered {
             explicit: true,
-            user: span_text(source, *user_span).map(|u| dequote(&u)),
+            user: span_text(source, *user_span)
+                .map(|u| super::span_extract::literal_value_or_name(&u)),
             host: host_span.and_then(|h| span_text(source, h)),
         },
     }

@@ -46,9 +46,8 @@ impl StrictMode {
 ///
 /// This enum is **closed** alongside `RelPlan` and `ScalarExpr`. The
 /// same discipline applies to the nested sub-enums below
-/// (`SelectClauseFeature`, `WindowContextCategory`,
-/// `AggregateContextCategory`, `DmlShapeCategory`,
-/// `GroupByOrdinalCategory`): they are the secondary granularity, and
+/// (`WindowContextCategory`, `AggregateContextCategory`,
+/// `DmlShapeCategory`, `GroupByOrdinalCategory`): they are the secondary granularity, and
 /// a new lowering site must pick the variant whose meaning matches —
 /// never widen a variant's meaning to accommodate a new site.
 #[derive(Debug, Clone)]
@@ -82,6 +81,8 @@ pub enum OpaqueReason {
     /// A top-level statement that isn't query-bearing. The IR is
     /// not invoked on these; the variant exists for harness
     /// bookkeeping when the dispatcher is asked to lower one anyway.
+    /// Also the source of a T-SQL `INSERT … EXEC`: the rows a
+    /// statement that is no query returns, their columns unknown.
     NonSelectTopLevel,
     /// An expression nested deeper than the analyzer walks.
     /// The input is valid SQL — this bounds the fixed stack shared by
@@ -94,6 +95,21 @@ pub enum OpaqueReason {
     /// them flat. It is the non-associative chains (`a - b - c …`,
     /// `a / b / c …`), which cannot be re-associated, that can.
     ExpressionTooDeep { depth: usize },
+    /// An expression whose lowered size, counting the nodes that writing
+    /// out the SELECT-list aliases it reads adds, exceeds the statement's
+    /// budget. The input is valid SQL — this bounds the time and memory
+    /// a chain of aliases that each read the one before more than once
+    /// would take, so it is a coverage limit, and permanent. `nodes` is
+    /// the count of added nodes at which lowering stopped.
+    ExpressionTooLarge { nodes: usize },
+    /// A statement body, or a query nested in a statement, nested in
+    /// others deeper than the analyzer walks: a body's statements are not
+    /// lowered, and one statement spanning them stands in their place; a
+    /// query's statement is opaque. The input is valid SQL — this bounds
+    /// the fixed stack the walks over nested statements share, so it is a
+    /// coverage limit, and permanent. `depth` is the number of guarded
+    /// frames in flight where lowering stopped.
+    NestingTooDeep { depth: usize },
     /// A lookup the current analysis needs from the attached
     /// [`crate::ir::CatalogContext`] could not be satisfied.
     ///
@@ -256,6 +272,8 @@ impl OpaqueReason {
             OpaqueReason::NonSelectTopLevel => "non_select_top_level",
             OpaqueReason::CatalogMissing { .. } => "catalog_missing",
             OpaqueReason::ExpressionTooDeep { .. } => "expression_too_deep",
+            OpaqueReason::ExpressionTooLarge { .. } => "expression_too_large",
+            OpaqueReason::NestingTooDeep { .. } => "nesting_too_deep",
         }
     }
 
@@ -301,6 +319,12 @@ impl OpaqueReason {
             // statement's plan collapses and every finding in it is
             // lost.
             OpaqueReason::ExpressionTooDeep { .. } => true,
+            // Valid SQL past the size budget: as above, the plan
+            // collapses and every finding in the statement is lost.
+            OpaqueReason::ExpressionTooLarge { .. } => true,
+            // A valid body we declined to walk: every finding in it is
+            // lost.
+            OpaqueReason::NestingTooDeep { .. } => true,
         }
     }
 }
@@ -339,6 +363,8 @@ mod lost_analysis_tests {
         // Valid SQL we declined to walk: the plan collapses and every
         // finding in the statement is lost.
         assert!(OpaqueReason::ExpressionTooDeep { depth: 500 }.indicates_lost_analysis());
+        assert!(OpaqueReason::ExpressionTooLarge { nodes: 65_537 }.indicates_lost_analysis());
+        assert!(OpaqueReason::NestingTooDeep { depth: 200 }.indicates_lost_analysis());
     }
 }
 

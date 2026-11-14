@@ -71,20 +71,7 @@ fn is_acceptable_normalization(orig_tokens: &[String], fmt_tokens: &[String]) ->
         return true;
     }
 
-    // Normalization 3: UNPIVOT(...) -> UNPIVOT EXCLUDE NULLS (...)
-    // (Snowflake default: UNPIVOT excludes nulls by default)
-    if orig_str.to_uppercase().contains("UNPIVOT (")
-        && fmt_str.to_uppercase().contains("UNPIVOT EXCLUDE NULLS (")
-    {
-        let normalized = orig_str
-            .to_uppercase()
-            .replace("UNPIVOT (", "UNPIVOT EXCLUDE NULLS (");
-        if normalized == fmt_str.to_uppercase() {
-            return true;
-        }
-    }
-
-    // Normalization 4: Set operation precedence: UNION has lower precedence than INTERSECT
+    // Normalization 3: Set operation precedence: UNION has lower precedence than INTERSECT
     // So "A UNION B INTERSECT C" should be "A UNION (B INTERSECT C)" but formatter does
     // "(A UNION B) INTERSECT C" - this is a grouping preference
     // For now, allow parentheses additions around set operations
@@ -108,26 +95,25 @@ fn is_acceptable_normalization(orig_tokens: &[String], fmt_tokens: &[String]) ->
             // Check all other significant keywords are present
             for token in orig_tokens {
                 let token_upper = token.to_uppercase();
-                if token_upper == "SELECT"
+                if (token_upper == "SELECT"
                     || token_upper == "FROM"
                     || token_upper == "UNION"
                     || token_upper == "INTERSECT"
                     || token_upper == "EXCEPT"
-                    || token_upper == "ALL"
+                    || token_upper == "ALL")
+                    && !fmt_tokens.iter().any(|t| t.eq_ignore_ascii_case(token))
                 {
-                    if !fmt_tokens.iter().any(|t| t.eq_ignore_ascii_case(token)) {
-                        return false;
-                    }
+                    return false;
                 }
             }
             return true;
         }
     }
 
-    // Normalization 5: Adding explicit AS keyword before aliases
+    // Normalization 4: Adding explicit AS keyword before aliases
     // Original: ) t1  ->  Formatted: ) AS t1
     // This is adding the optional AS keyword which is semantically equivalent
-    if orig_tokens.len() + 1 <= fmt_tokens.len() {
+    if orig_tokens.len() < fmt_tokens.len() {
         // Count how many AS keywords differ
         let orig_as_count = orig_tokens
             .iter()
@@ -2623,4 +2609,235 @@ fn test_no_data_loss_star_qualified_with_schema() {
     EXCLUDE ( /* lparen */ internal_col /* col */ ) /* rparen */
 FROM schema_name.table_name;"#;
     assert_preserves_tokens(sql, "Star qualified with schema and trivia");
+}
+
+#[test]
+fn formatted_text_that_reads_differently_fails_verification() {
+    use lexega_syntax::dialect::{mssql, mysql, postgres, snowflake};
+    use lexega_syntax::verify_formatting_safe_with_dialect;
+
+    let refused = [
+        // A number and the word written against it set apart.
+        (mssql(), "SELECT 0x41 FROM t;", "SELECT 0 x41 FROM t;"),
+        (
+            mssql(),
+            "UPDATE t SET c = 0x4142 WHERE id = 1;",
+            "UPDATE t\nSET c = 0\nx4142 WHERE id = 1;",
+        ),
+        (postgres(), "SELECT 1_000 FROM t;", "SELECT 1 _000 FROM t;"),
+        // A prefix and the string it prefixes set apart.
+        (mysql(), "SELECT X'41' FROM t;", "SELECT X\n'41' FROM t;"),
+        (
+            mysql(),
+            "SELECT _utf8mb4'x' FROM t;",
+            "SELECT _utf8mb4 'x' FROM t;",
+        ),
+        // A template expression and the name written against it set apart.
+        (
+            snowflake(),
+            "SELECT * FROM {{ s }}_t;",
+            "SELECT *\nFROM {{ s }} _t;",
+        ),
+        (
+            snowflake(),
+            "SELECT * FROM t_{{ s }};",
+            "SELECT *\nFROM t_\n\n{{ s }};",
+        ),
+        (
+            snowflake(),
+            "SELECT a{% if x %}_b{% endif %} FROM t;",
+            "SELECT a {% if x %}_b{% endif %} FROM t;",
+        ),
+        // A split token where the formatter also inserted a keyword.
+        (
+            mssql(),
+            "SELECT 0x41 FROM a JOIN b ON a.id = b.id;",
+            "SELECT 0 x41 FROM a INNER JOIN b ON a.id = b.id;",
+        ),
+        (
+            mssql(),
+            "SELECT ab FROM a JOIN b ON a.id = b.id;",
+            "SELECT a b FROM a INNER JOIN b ON a.id = b.id;",
+        ),
+        // A string or a quoted name whose case changed.
+        (snowflake(), "SELECT 'abc' FROM t;", "SELECT 'ABC' FROM t;"),
+        (
+            snowflake(),
+            "SELECT \"MyCol\" FROM t;",
+            "SELECT \"MYCOL\" FROM t;",
+        ),
+    ];
+    for (dialect, original, formatted) in refused {
+        assert!(
+            verify_formatting_safe_with_dialect(original, formatted, dialect.as_ref()).is_err(),
+            "verification passed {formatted:?} for {original:?}"
+        );
+    }
+
+    let accepted = [
+        (snowflake(), "select a from t", "SELECT a FROM t"),
+        (snowflake(), "SELECT a b FROM t", "SELECT a AS b FROM t;"),
+        (
+            snowflake(),
+            "SELECT * FROM a JOIN b ON a.id = b.id",
+            "SELECT * FROM a INNER JOIN b ON a.id = b.id",
+        ),
+        (
+            snowflake(),
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id",
+            "SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id",
+        ),
+        (snowflake(), "SELECT\"a\"FROM t", "SELECT \"a\" FROM t"),
+        (
+            snowflake(),
+            "SELECT a,b FROM t WHERE a=1",
+            "SELECT a, b FROM t WHERE a = 1",
+        ),
+        (
+            snowflake(),
+            "SELECT * FROM {{ s }}_t;",
+            "SELECT *\nFROM {{ s }}_t;",
+        ),
+        (
+            snowflake(),
+            "SELECT CONCAT(\n{% if p %}\n'P_',\n{% endif %}name) FROM t;",
+            "SELECT CONCAT(\n{% if p %}\n'P_',\n{% endif %} name) FROM t;",
+        ),
+        (mssql(), "SELECT N'x' FROM t;", "SELECT N'x'\nFROM t;"),
+    ];
+    for (dialect, original, formatted) in accepted {
+        let verdict = verify_formatting_safe_with_dialect(original, formatted, dialect.as_ref());
+        assert!(
+            verdict.is_ok(),
+            "{original:?} -> {formatted:?}: {verdict:?}"
+        );
+    }
+}
+
+// A routine body the formatter copies as written is verified byte for byte:
+// a function's, and a procedure's in a language other than SQL. A body
+// written as SQL statements is formatted, so its text may change.
+#[test]
+fn a_changed_byte_of_a_copied_span_fails_verification() {
+    use lexega_syntax::context::RenderContext;
+    use lexega_syntax::dialect::{bigquery, postgres, snowflake};
+    use lexega_syntax::{parse_sql_with_dialect, verify_copied_spans, CopiedSpan, Formatter};
+
+    // The formatted text and the spans copied as written.
+    let format = |config: FormatterConfig, source: &str| -> (String, Vec<CopiedSpan>) {
+        let script = parse_sql_with_dialect(source, config.dialect.as_ref())
+            .unwrap_or_else(|e| panic!("{source:?}: {e}"));
+        let rendered = Formatter::with_config(config)
+            .format_script(RenderContext::from_source(source), &script)
+            .unwrap_or_else(|e| panic!("{source:?}: {e}"));
+        let formatted = rendered.formatted().expect("formatted");
+        (
+            formatted.formatted_sql().to_string(),
+            formatted.copied_spans().to_vec(),
+        )
+    };
+
+    let js_body = "$$\n  var x = 1;\n    return x;   \n  $$";
+    let recovered = format!(
+        "select  a frm t where;\ncreate or replace procedure p() returns string language javascript as {js_body};\nselect  1;\n"
+    );
+    let in_block = format!(
+        "begin\n  create or replace procedure p() returns string language javascript as {js_body};\n  return 1;\nend;\n"
+    );
+    let plpgsql_body = "$$\nbegin\n    return 1;\nend\n$$";
+    let plpgsql = format!("create function f() returns int as {plpgsql_body} language plpgsql;\n");
+    let py_body = "$$\ndef run_sql(s):\n    if True:\n        return 'a'\n$$";
+    let py = format!(
+        "create procedure p() returns string language python runtime_version='3.11' handler='run_sql' as {py_body};\n"
+    );
+    for (dialect, source, body) in [
+        (snowflake(), recovered.as_str(), js_body),
+        (snowflake(), in_block.as_str(), js_body),
+        (postgres(), plpgsql.as_str(), plpgsql_body),
+        (snowflake(), py.as_str(), py_body),
+    ] {
+        let config = FormatterConfig {
+            dialect,
+            ..Default::default()
+        };
+        let (formatted, copied) = format(config, source);
+        // A procedure's body is copied from after its opening delimiter.
+        let inside = &body[2..];
+        let holds_body = copied.iter().any(|span| {
+            source[span.source.start as usize..span.source.end as usize].contains(inside)
+        });
+        assert!(holds_body, "{source:?}: {copied:?}");
+        verify_copied_spans(source, &formatted, &copied)
+            .unwrap_or_else(|e| panic!("{source:?} -> {formatted:?}: {e}"));
+        // A line break appended to the text, as a file gets, moves no span.
+        verify_copied_spans(source, &format!("{formatted}\n"), &copied)
+            .unwrap_or_else(|e| panic!("{source:?}: {e}"));
+
+        // One byte of the body changed.
+        let at = formatted.find(body).expect("body") + body.find("return").expect("return");
+        let mut changed = formatted.clone();
+        changed.replace_range(at..at + 1, "R");
+        assert!(
+            verify_copied_spans(source, &changed, &copied).is_err(),
+            "{changed:?}"
+        );
+        // The body's line breaks rewritten.
+        let rebroken = formatted.replacen(body, &body.replace('\n', "\r\n"), 1);
+        assert!(
+            verify_copied_spans(source, &rebroken, &copied).is_err(),
+            "{rebroken:?}"
+        );
+        // Text inserted before the body, so that every span after it moves.
+        let moved = format!(" {formatted}");
+        assert!(
+            verify_copied_spans(source, &moved, &copied).is_err(),
+            "{moved:?}"
+        );
+    }
+
+    // Alias alignment inserts padding before a span copied as written (a
+    // type written as read); the span's record moves with the text.
+    let config = FormatterConfig {
+        dialect: bigquery(),
+        align_select_aliases: true,
+        ..Default::default()
+    };
+    let source = "select a as x, cast(b as array<string>) as yy, c as z from t;\n";
+    let (formatted, copied) = format(config, source);
+    assert!(
+        copied.iter().any(
+            |span| &source[span.source.start as usize..span.source.end as usize] == "array<string>"
+        ),
+        "{copied:?}"
+    );
+    verify_copied_spans(source, &formatted, &copied)
+        .unwrap_or_else(|e| panic!("{source:?} -> {formatted:?}: {e}"));
+}
+
+#[test]
+fn a_semicolon_before_the_first_statement_is_kept() {
+    use lexega_syntax::dialect::{mysql, snowflake};
+    use lexega_syntax::verify_formatting_safe_with_dialect;
+
+    for (dialect, sql) in [
+        (snowflake(), ";\nSELECT 1;\n"),
+        (snowflake(), ";;\n-- c\nSELECT 1;\n"),
+        (
+            mysql(),
+            "/*!40101 SET NAMES utf8 */;\n/*!40103 SET x=1 */;\nDROP TABLE t;\n",
+        ),
+        (
+            mysql(),
+            "-- dump\n--\n/*!40101 SET NAMES utf8 */;\n\nDROP TABLE IF EXISTS `t`;\n",
+        ),
+    ] {
+        let config = FormatterConfig {
+            dialect,
+            ..Default::default()
+        };
+        let formatted =
+            format_sql_with_config(sql, &config).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+        verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
+            .unwrap_or_else(|e| panic!("{sql:?} -> {formatted:?}: {e}"));
+    }
 }

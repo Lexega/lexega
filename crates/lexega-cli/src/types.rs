@@ -3,6 +3,8 @@
 
 //! Option types shared by the command drivers.
 
+use std::collections::BTreeMap;
+
 use super::artifacts::{DecisionArtifactFormat, ReportArtifactFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,7 +35,7 @@ impl RenderDiagnosticsLevel {
 /// like `handle_risk_batch` and `format_batch`. Created once from CLI args,
 /// then passed to batch handlers.
 #[derive(Clone)]
-pub struct BatchProcessingConfig<'a> {
+pub(crate) struct BatchProcessingConfig<'a> {
     // Output options
     pub output_format: &'a str,
     pub report_artifact_format: ReportArtifactFormat,
@@ -61,11 +63,18 @@ pub struct BatchProcessingConfig<'a> {
     // Analysis options
     pub catalog_path: Option<&'a str>,
     pub catalog_provider: Option<&'a str>,
+    /// Where a table named without a database or schema is looked for
+    /// ([`crate::io::resolve_default_schema`]).
+    pub default_schema: Option<&'a lexega_core::ir::SessionContext>,
     pub custom_rules: Option<Vec<lexega_core::rules::Rule>>,
+    /// The masking policy the custom rule file states; empty by default.
+    pub masking: std::sync::Arc<lexega_core::rules::MaskingPolicy>,
 
     // dbt options
     pub load_macros: bool,
     pub dbt_project_path: Option<&'a str>,
+    /// The profile `--dbt-profile` names, read in place of the project's.
+    pub dbt_profile: Option<&'a str>,
     pub fail_on_missing_packages: bool,
 
     // Variable context — rendered before analysis, same as single-file mode.
@@ -80,7 +89,7 @@ pub struct BatchProcessingConfig<'a> {
     // Filtering options
     pub min_severity: Option<lexega_core::analyzer::RiskLevel>,
 
-    // Detail mode - show per-file signals in batch output
+    // Detail mode - show per-file findings in batch output
     pub detail_mode: bool,
 
     // Dialect
@@ -105,13 +114,81 @@ pub struct BatchProcessingConfig<'a> {
     /// for a caller that posts it.
     pub capture_markdown: bool,
 
-    /// Read each file as of this commit instead of from the working tree.
-    pub source_commit: Option<&'a str>,
+    /// The files named outright on the command line, by the path each is
+    /// reported by: one of these that cannot be read fails the run.
+    pub named_files: &'a [String],
+
+    /// The run's reading of the working tree's dbt projects.
+    pub projects: &'a lexega_core::template::ProjectsOnDisk,
 }
 
 impl<'a> BatchProcessingConfig<'a> {
     /// Check if policy enforcement is enabled
     pub fn policy_enabled(&self) -> bool {
         self.policy_path.is_some()
+    }
+
+    /// Whether the run writes something a program reads: a report in a
+    /// machine-readable format on stdout, a `--report-out` file, or a
+    /// policy's decisions.
+    pub fn writes_records(&self) -> bool {
+        writes_records(self.output_format, self.report_out, self.policy_path)
+    }
+}
+
+/// Whether a run with `output_format`, `report_out` and `policy_path`
+/// writes something a program reads: a report in a machine-readable format
+/// on stdout, a `--report-out` file, or a policy's decisions.
+pub fn writes_records(
+    output_format: &str,
+    report_out: Option<&str>,
+    policy_path: Option<&str>,
+) -> bool {
+    !matches!(output_format, "text" | "markdown") || report_out.is_some() || policy_path.is_some()
+}
+
+/// An option given twice with different values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedOption {
+    pub option: String,
+    pub first: String,
+    pub second: String,
+}
+
+impl std::fmt::Display for RepeatedOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is given twice, as '{}' and as '{}'; give it once",
+            self.option, self.first, self.second
+        )
+    }
+}
+
+impl std::error::Error for RepeatedOption {}
+
+/// The value each single-valued option of a command line was first given,
+/// so that a second, different one is refused rather than replacing the
+/// first: a gate must not drop the policy it was given.
+#[derive(Debug, Default)]
+pub struct GivenOptions {
+    values: BTreeMap<String, String>,
+}
+
+impl GivenOptions {
+    /// Note `option` given as `value`. The same value again is accepted.
+    pub fn record(&mut self, option: &str, value: &str) -> Result<(), RepeatedOption> {
+        match self.values.get(option) {
+            Some(first) if first != value => Err(RepeatedOption {
+                option: option.to_string(),
+                first: first.clone(),
+                second: value.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                self.values.insert(option.to_string(), value.to_string());
+                Ok(())
+            }
+        }
     }
 }

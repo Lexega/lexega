@@ -4,7 +4,7 @@
 /// Tests for unknown syntax governance integration
 ///
 /// Verifies that unknown Snowflake syntax detected by the defensive design pattern
-/// is properly surfaced to the governance layer and generates appropriate risk signals.
+/// is properly surfaced to the governance layer and generates appropriate risk findings.
 use lexega_core::analyzer::{AnalysisReport, RiskLevel};
 use lexega_core::api::analyze_risk;
 use lexega_core::{format_sql_with_config, FormatterConfig};
@@ -18,20 +18,20 @@ fn analyze_sql(sql: &str) -> AnalysisReport {
     analyze_risk(sql).expect("Risk analysis should succeed")
 }
 
-/// Check if report contains a signal with specific rule code
-fn has_signal_with_rule(report: &AnalysisReport, rule_code: &str) -> bool {
-    report.signals.iter().any(|f| {
+/// Check if report contains a finding with specific rule code
+fn has_finding_with_rule(report: &AnalysisReport, rule_code: &str) -> bool {
+    report.findings.iter().any(|f| {
         let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
         p.matched_rule == rule_code
     })
 }
 
-/// Get signal by rule code
-fn get_signal_by_rule<'a>(
+/// Get finding by rule code
+fn get_finding_by_rule<'a>(
     report: &'a AnalysisReport,
     rule_code: &str,
-) -> Option<&'a lexega_core::analyzer::AnalysisSignal> {
-    report.signals.iter().find_map(|f| {
+) -> Option<&'a lexega_core::analyzer::AnalysisFinding> {
+    report.findings.iter().find_map(|f| {
         let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
         if p.matched_rule == rule_code {
             Some(p)
@@ -41,10 +41,10 @@ fn get_signal_by_rule<'a>(
     })
 }
 
-/// Count signals with specific rule code
-fn count_signals_with_rule(report: &AnalysisReport, rule_code: &str) -> usize {
+/// Count findings with specific rule code
+fn count_findings_with_rule(report: &AnalysisReport, rule_code: &str) -> usize {
     report
-        .signals
+        .findings
         .iter()
         .filter(|f| {
             let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
@@ -63,36 +63,36 @@ fn test_alter_stage_unknown_property_generates_snw_unknown() {
 
     let report = analyze_sql(sql);
 
-    // Should have SNW-UNKNOWN signal for unknown syntax
+    // Should have SNW-UNKNOWN finding for unknown syntax
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
-        "Should generate SNW-UNKNOWN signal for unknown ALTER STAGE property"
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
+        "Should generate SNW-UNKNOWN finding for unknown ALTER STAGE property"
     );
 
-    // Verify signal details
-    let signal = get_signal_by_rule(&report, "SNW-UNKNOWN").unwrap();
-    assert_eq!(signal.risk_level, RiskLevel::High);
+    // Verify finding details
+    let finding = get_finding_by_rule(&report, "SNW-UNKNOWN").unwrap();
+    assert_eq!(finding.risk_level, RiskLevel::Medium);
     assert!(
-        signal
+        finding
             .message
             .to_lowercase()
             .contains("cannot verify compliance")
-            || signal
+            || finding
                 .message
                 .to_lowercase()
                 .contains("cannot verify compliance"),
         "Message should explain compliance gap. Got: {}",
-        signal.message
+        finding.message
     );
     assert!(
-        signal.message.to_lowercase().contains("unknown"),
+        finding.message.to_lowercase().contains("unknown"),
         "Message should mention unknown syntax. Got: {}",
-        signal.message
+        finding.message
     );
 }
 
 #[test]
-fn test_alter_stage_multiple_unknowns_single_signal() {
+fn test_alter_stage_multiple_unknowns_single_finding() {
     let sql = "
         ALTER STAGE my_stage 
         SET UNKNOWN_PROP1 = 'val1' 
@@ -101,19 +101,19 @@ fn test_alter_stage_multiple_unknowns_single_signal() {
 
     let report = analyze_sql(sql);
 
-    // Should have exactly one SNW-UNKNOWN signal (count embedded in message)
+    // Should have exactly one SNW-UNKNOWN finding (count embedded in message)
     assert_eq!(
-        count_signals_with_rule(&report, "SNW-UNKNOWN"),
+        count_findings_with_rule(&report, "SNW-UNKNOWN"),
         1,
-        "Should generate single signal with count for multiple unknowns in same statement"
+        "Should generate single finding with count for multiple unknowns in same statement"
     );
 
-    let signal = get_signal_by_rule(&report, "SNW-UNKNOWN").unwrap();
+    let finding = get_finding_by_rule(&report, "SNW-UNKNOWN").unwrap();
     assert!(
-        signal.message.to_lowercase().contains("unknown")
-            || signal.message.to_lowercase().contains("unrecognized"),
+        finding.message.to_lowercase().contains("unknown")
+            || finding.message.to_lowercase().contains("unrecognized"),
         "Message should indicate multiple unknowns. Got: {}",
-        signal.message
+        finding.message
     );
 }
 
@@ -127,9 +127,9 @@ fn test_alter_stage_known_properties_no_snw_unknown() {
 
     let report = analyze_sql(sql);
 
-    // Should NOT have SNW-UNKNOWN signal (all properties known)
+    // Should NOT have SNW-UNKNOWN finding (all properties known)
     assert!(
-        !has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        !has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should not generate SNW-UNKNOWN for known properties"
     );
 }
@@ -146,13 +146,13 @@ fn test_alter_stage_mixed_known_unknown() {
 
     // Should have SNW-UNKNOWN for unknown property
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should generate SNW-UNKNOWN for unknown property"
     );
 
-    // Should also have encryption signal (known property analysis still works)
+    // Should also have encryption finding (known property analysis still works)
     assert!(
-        report.signals.iter().any(|f| {
+        report.context.iter().any(|f| {
             let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
             p.message.to_lowercase().contains("encryption")
         }),
@@ -171,17 +171,13 @@ fn test_alter_stage_multi_property_known_analyzes_non_primary_property() {
     let report = analyze_sql(sql);
 
     assert!(
-        !has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        !has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should not generate SNW-UNKNOWN for known multi-property ALTER STAGE SET"
     );
 
     assert!(
-        report.signals.iter().any(|f| {
-            let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
-            p.message.to_lowercase().contains("encryption")
-                && p.message.to_lowercase().contains("disabled")
-        }),
-        "Should detect encryption disabled even when ENCRYPTION is not the first SET property"
+        has_finding_with_rule(&report, "SNW-STG-ENC-OFF"),
+        "Should detect ENCRYPTION = (TYPE = 'NONE') even when ENCRYPTION is not the first SET property"
     );
 }
 
@@ -199,22 +195,22 @@ fn test_create_stage_unknown_clause_generates_snw_unknown() {
 
     let report = analyze_sql(sql);
 
-    // Should have SNW-UNKNOWN signal
+    // Should have SNW-UNKNOWN finding
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
-        "Should generate SNW-UNKNOWN signal for unknown CREATE STAGE clause"
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
+        "Should generate SNW-UNKNOWN finding for unknown CREATE STAGE clause"
     );
 
-    let signal = get_signal_by_rule(&report, "SNW-UNKNOWN").unwrap();
-    assert_eq!(signal.risk_level, RiskLevel::High);
+    let finding = get_finding_by_rule(&report, "SNW-UNKNOWN").unwrap();
+    assert_eq!(finding.risk_level, RiskLevel::Medium);
     assert!(
-        signal
+        finding
             .message
             .to_lowercase()
             .contains("cannot verify compliance")
-            || signal.message.to_lowercase().contains("unknown"),
+            || finding.message.to_lowercase().contains("unknown"),
         "Message should explain compliance gap. Got: {}",
-        signal.message
+        finding.message
     );
 }
 
@@ -229,16 +225,19 @@ fn test_create_stage_multiple_unknowns() {
 
     let report = analyze_sql(sql);
 
-    // Should have one SNW-UNKNOWN signal with count
-    let count = count_signals_with_rule(&report, "SNW-UNKNOWN");
-    assert_eq!(count, 1, "Should have single SNW-UNKNOWN signal with count");
+    // Should have one SNW-UNKNOWN finding with count
+    let count = count_findings_with_rule(&report, "SNW-UNKNOWN");
+    assert_eq!(
+        count, 1,
+        "Should have single SNW-UNKNOWN finding with count"
+    );
 
-    let signal = get_signal_by_rule(&report, "SNW-UNKNOWN").unwrap();
+    let finding = get_finding_by_rule(&report, "SNW-UNKNOWN").unwrap();
     assert!(
-        signal.message.to_lowercase().contains("unknown")
-            || signal.message.to_lowercase().contains("unrecognized"),
+        finding.message.to_lowercase().contains("unknown")
+            || finding.message.to_lowercase().contains("unrecognized"),
         "Message should indicate multiple unknowns. Got: {}",
-        signal.message
+        finding.message
     );
 }
 
@@ -255,7 +254,7 @@ fn test_create_stage_known_clauses_no_snw_unknown() {
 
     // Should NOT have SNW-UNKNOWN (all clauses known)
     assert!(
-        !has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        !has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should not generate SNW-UNKNOWN for known clauses"
     );
 }
@@ -274,8 +273,8 @@ fn test_multi_statement_each_unknown_detected() {
 
     let report = analyze_sql(sql);
 
-    // Should have 3 SNW-UNKNOWN signals (one per statement)
-    let count = count_signals_with_rule(&report, "SNW-UNKNOWN");
+    // Should have 3 SNW-UNKNOWN findings (one per statement)
+    let count = count_findings_with_rule(&report, "SNW-UNKNOWN");
     assert_eq!(
         count, 3,
         "Should detect unknown syntax in all 3 statements (not just last one - verify get_stmt_node_id updated)"
@@ -287,20 +286,20 @@ fn test_multi_statement_mixed_known_unknown() {
     let sql = "
         ALTER STAGE stage1 SET ENCRYPTION = (TYPE = 'NONE');  -- Known (should trigger C050)
         ALTER STAGE stage2 SET UNKNOWN_PROP = 'value';        -- Unknown (should trigger SNW-UNKNOWN)
-        ALTER STAGE stage3 SET TAG owner = 'team';            -- Known (no critical signal)
+        ALTER STAGE stage3 SET TAG owner = 'team';            -- Known (no critical finding)
     ";
 
     let report = analyze_sql(sql);
 
-    // Should have both SNW-UNKNOWN (unknown) and known-property signals
+    // Should have both SNW-UNKNOWN (unknown) and known-property findings
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should detect unknown property in statement 2"
     );
 
-    // Should also have signals from known properties (encryption disabled)
+    // Should also have findings from known properties (encryption disabled)
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let lexega_core::analyzer::RuleMatch::Analysis(p) = f;
             p.message.to_lowercase().contains("encryption")
         }),
@@ -309,8 +308,8 @@ fn test_multi_statement_mixed_known_unknown() {
 
     // Verify all statements were analyzed (not just last)
     assert!(
-        report.signals.len() >= 2,
-        "Should have signals from multiple statements"
+        report.findings.len() >= 2,
+        "Should have findings from multiple statements"
     );
 }
 
@@ -334,8 +333,8 @@ fn test_format_preserves_unknown_syntax() {
     // Should still parse and analyze after formatting
     let report = analyze_sql(&formatted);
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
-        "SNW-UNKNOWN signal should persist after formatting"
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
+        "SNW-UNKNOWN finding should persist after formatting"
     );
 }
 
@@ -352,22 +351,22 @@ fn test_format_round_trip_with_unknowns() {
     let formatted2 = format_sql_with_config(&formatted1, &FormatterConfig::default())
         .expect("Should format again");
 
-    // Both should generate same SNW-UNKNOWN signal
+    // Both should generate same SNW-UNKNOWN finding
     let report1 = analyze_sql(&formatted1);
     let report2 = analyze_sql(&formatted2);
 
     assert!(
-        has_signal_with_rule(&report1, "SNW-UNKNOWN"),
+        has_finding_with_rule(&report1, "SNW-UNKNOWN"),
         "First formatting should detect unknown syntax"
     );
     assert!(
-        has_signal_with_rule(&report2, "SNW-UNKNOWN"),
+        has_finding_with_rule(&report2, "SNW-UNKNOWN"),
         "Round-trip formatting should preserve unknown syntax detection"
     );
 
-    // Signal details should be consistent
-    let f1 = get_signal_by_rule(&report1, "SNW-UNKNOWN").unwrap();
-    let f2 = get_signal_by_rule(&report2, "SNW-UNKNOWN").unwrap();
+    // Finding details should be consistent
+    let f1 = get_finding_by_rule(&report1, "SNW-UNKNOWN").unwrap();
+    let f2 = get_finding_by_rule(&report2, "SNW-UNKNOWN").unwrap();
     assert_eq!(
         f1.risk_level, f2.risk_level,
         "Risk level should be consistent across round-trip"
@@ -379,19 +378,19 @@ fn test_format_round_trip_with_unknowns() {
 // ============================================================================
 
 #[test]
-fn test_unknown_syntax_risk_level_is_high() {
+fn test_unknown_syntax_risk_level_is_medium() {
     let sql = "ALTER STAGE my_stage SET UNKNOWN_PROP = 'value';";
 
     let report = analyze_sql(sql);
 
-    let signal = get_signal_by_rule(&report, "SNW-UNKNOWN").unwrap();
+    let finding = get_finding_by_rule(&report, "SNW-UNKNOWN").unwrap();
 
-    // Risk level should be HIGH (not CRITICAL)
+    // Risk level should be MEDIUM
     // Rationale: Cannot verify compliance, but might be legitimate new feature
     assert_eq!(
-        signal.risk_level,
-        RiskLevel::High,
-        "Unknown syntax should be HIGH risk (might be legitimate new feature)"
+        finding.risk_level,
+        RiskLevel::Medium,
+        "Unknown syntax should be MEDIUM risk (might be legitimate new feature)"
     );
 }
 
@@ -403,13 +402,13 @@ fn test_unknown_syntax_appears_in_summary() {
 
     // Should appear in summary counts
     assert!(
-        report.summary.high_count >= 1,
-        "Should increment high-risk count"
+        report.summary.medium_count >= 1,
+        "Should increment medium-risk count"
     );
 
     assert!(
-        report.summary.total_reported_signals >= 1,
-        "Should increment total signal count"
+        report.summary.total_reported_findings >= 1,
+        "Should increment total finding count"
     );
 }
 
@@ -423,7 +422,7 @@ fn test_empty_script_no_snw_unknown() {
 
     match analyze_risk(sql) {
         Ok(report) => {
-            assert!(!has_signal_with_rule(&report, "SNW-UNKNOWN"));
+            assert!(!has_finding_with_rule(&report, "SNW-UNKNOWN"));
         }
         Err(_) => {
             // Empty script might not parse, that's okay
@@ -437,7 +436,7 @@ fn test_comment_only_no_snw_unknown() {
 
     match analyze_risk(sql) {
         Ok(report) => {
-            assert!(!has_signal_with_rule(&report, "SNW-UNKNOWN"));
+            assert!(!has_finding_with_rule(&report, "SNW-UNKNOWN"));
         }
         Err(_) => {
             // Comment-only might not parse as statement, that's okay
@@ -453,17 +452,17 @@ fn test_only_select_no_snw_unknown() {
 
     // SELECT statements don't have extras field, should not generate SNW-UNKNOWN
     assert!(
-        !has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        !has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Non-STAGE statements should not generate SNW-UNKNOWN"
     );
 }
 
 // ============================================================================
-// INTEGRATION WITH OTHER signals
+// INTEGRATION WITH OTHER findings
 // ============================================================================
 
 #[test]
-fn test_unknown_syntax_does_not_suppress_other_signals() {
+fn test_unknown_syntax_does_not_suppress_other_findings() {
     let sql = "
         ALTER STAGE stage1 SET ENCRYPTION = (TYPE = 'NONE');
         ALTER STAGE stage2 SET UNKNOWN_PROP = 'value';
@@ -471,30 +470,30 @@ fn test_unknown_syntax_does_not_suppress_other_signals() {
 
     let report = analyze_sql(sql);
 
-    // Should have both SNW-UNKNOWN and encryption signals
+    // Should have both SNW-UNKNOWN and encryption findings
     assert!(
-        has_signal_with_rule(&report, "SNW-UNKNOWN"),
+        has_finding_with_rule(&report, "SNW-UNKNOWN"),
         "Should have SNW-UNKNOWN"
     );
 
-    // Should also have encryption disabled signal (if that rule is active)
+    // Should also have encryption disabled finding (if that rule is active)
     // This verifies unknown syntax doesn't break normal analysis
     assert!(
-        report.signals.len() >= 2,
-        "Should have signals from both statements"
+        report.findings.len() >= 2,
+        "Should have findings from both statements"
     );
 }
 
 #[test]
-fn test_high_risk_summary_includes_unknown() {
+fn test_medium_risk_summary_includes_unknown() {
     let sql = "ALTER STAGE my_stage SET UNKNOWN_PROP = 'value';";
 
     let report = analyze_sql(sql);
 
-    // Summary should reflect HIGH risk signal
+    // Summary should reflect MEDIUM risk finding
     assert!(
-        report.summary.high_count >= 1,
-        "Summary high_count should include unknown syntax signals"
+        report.summary.medium_count >= 1,
+        "Summary medium_count should include unknown syntax findings"
     );
 }
 
@@ -509,7 +508,7 @@ fn test_high_risk_summary_includes_unknown() {
 
 /// `ALTER RESOURCE MONITOR ... SET ...` is now parsed and analyzed (gap
 /// closed). It is a typed statement that fires the resource-monitor
-/// credit-quota governance signal rather than degrading to a skipped
+/// credit-quota governance finding rather than degrading to a skipped
 /// opaque statement.
 #[test]
 fn test_alter_resource_monitor_analyzed() {
@@ -526,9 +525,9 @@ fn test_alter_resource_monitor_analyzed() {
         report.summary.statements_skipped, 0,
         "ALTER RESOURCE MONITOR should no longer be skipped"
     );
-    // Raising the spend cap surfaces the credit-quota change signal.
+    // Raising the spend cap surfaces the credit-quota change finding.
     assert!(
-        has_signal_with_rule(&report, "SNW-RESMON-QUOTA-CHG"),
+        has_finding_with_rule(&report, "SNW-RESMON-QUOTA-CHG"),
         "ALTER RESOURCE MONITOR SET CREDIT_QUOTA should fire SNW-RESMON-QUOTA-CHG"
     );
 }
@@ -582,9 +581,10 @@ fn test_recognized_rls_toggle_is_not_partial() {
     let report = lexega_core::api::analyze_risk_with_policy_config(
         "ALTER TABLE t DISABLE ROW LEVEL SECURITY;",
         &{
-            let mut c = lexega_core::analyzer::AnalysisConfig::default();
-            c.dialect = Some(std::sync::Arc::new(lexega_core::PostgresDialect));
-            c
+            lexega_core::analyzer::AnalysisConfig {
+                dialect: Some(std::sync::Arc::new(lexega_core::PostgresDialect)),
+                ..Default::default()
+            }
         },
     )
     .expect("analysis ok");

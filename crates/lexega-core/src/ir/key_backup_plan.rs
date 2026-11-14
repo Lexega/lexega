@@ -9,29 +9,31 @@
 //! `StatementFacts.mssql_key_backup` carrier.
 //!
 //! The lowering carries the governance-bearing primitives: the verb, the key
-//! object, and whether an inline password protects/unlocks the material. Which
+//! object, and each inline password that protects/unlocks the material. Which
 //! combination is dangerous (exporting a root key, re-keying from a file, a
 //! hardcoded password) is a YAML verdict.
 
 use crate::ast::types::{AstMssqlKeyBackup, BackupKeyObject, KeyBackupAction};
 use crate::ast::NodeId;
+use crate::ir::span_extract::string_literal_values;
 use crate::lexer::token::Span;
 
 #[derive(Debug, Clone)]
 pub struct MssqlKeyBackupPlan {
     pub action: KeyBackupAction,
     pub key_object: BackupKeyObject,
-    pub password_present: bool,
+    /// Each inline `PASSWORD = '…'` that protects/unlocks the material, decoded.
+    pub password_literals: Vec<String>,
     pub node_id: NodeId,
     pub span: Span,
 }
 
 /// Lower a typed [`AstMssqlKeyBackup`] into a [`MssqlKeyBackupPlan`].
-pub fn lower_key_backup_to_plan(s: &AstMssqlKeyBackup) -> MssqlKeyBackupPlan {
+pub fn lower_key_backup_to_plan(s: &AstMssqlKeyBackup, source: &str) -> MssqlKeyBackupPlan {
     MssqlKeyBackupPlan {
         action: s.action,
         key_object: s.key_object,
-        password_present: s.password_present,
+        password_literals: string_literal_values(&s.password_literal_spans, source),
         node_id: s.node_id,
         span: s.span,
     }

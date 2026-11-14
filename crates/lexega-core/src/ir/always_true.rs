@@ -17,18 +17,40 @@
 use super::column::{BindingTable, ColumnId, ColumnOrigin};
 use super::plan::{FilterKind, ProjectItem, RelPlan};
 use super::queries::for_each_immediate;
-use super::scalar::{BinOpKind, ComparisonOp, Lit, QuantifiedRhs, ScalarExpr};
+use super::scalar::{
+    BinOpKind, ComparisonOp, FieldPath, FieldStep, Lit, QuantifiedRhs, ScalarExpr, SqlType,
+};
 use crate::ast::{AstExpr, NodeId};
 use crate::context::node_metadata::{IdentKey, TableRef};
+use crate::facts::catalog::Nullability;
+use crate::facts::reasoning::{QueryReasoning, ReadAt, ReadSite};
+use crate::ir::normalize::NameKind;
 use crate::lexer::Span;
 
-/// Proof that a column holds no NULLs.
+/// Proof that a column holds no NULLs where one predicate reads it.
 pub trait NonNullProof {
-    /// Whether `col` is proven non-null. `target` is the statement's DML
-    /// target, when it has one: a reference to one of its columns may
-    /// carry an id of its own, and is then resolved against the target
-    /// by name.
-    fn proven_not_null(&self, col: ColumnId, target: Option<&TableRef>) -> bool;
+    /// Whether `col` is proven non-null at the predicate's site.
+    fn proven_not_null(&self, col: ColumnId) -> bool;
+}
+
+/// The proof at one predicate's node: a column the catalog declares
+/// NOT NULL where the node's predicate reads it. Nothing else proves.
+struct DeclaredAt<'r> {
+    reasoning: &'r dyn QueryReasoning,
+    node: &'r RelPlan,
+}
+
+impl NonNullProof for DeclaredAt<'_> {
+    fn proven_not_null(&self, col: ColumnId) -> bool {
+        let site = ReadSite {
+            node: self.node,
+            at: ReadAt::Context,
+        };
+        matches!(
+            self.reasoning.nullability(site, col),
+            Nullability::CatalogNonNullable
+        )
+    }
 }
 
 /// Whether the statement's outer-scope WHERE / ON predicate holds for every row.
@@ -48,23 +70,32 @@ pub trait NonNullProof {
 ///
 /// `Explain` and `WithScope` wrappers transparently delegate to
 /// their inner body.
+///
+/// `reasoning` answers whether a column is never NULL where a
+/// predicate reads it: at the predicate's `Filter`, or at the node of
+/// the statement that writes. Without it nothing is proven non-null.
 pub fn has_tautology_where(
     plan: &RelPlan,
     source: &str,
     bindings: &BindingTable,
-    proof: Option<&dyn NonNullProof>,
+    reasoning: Option<&dyn QueryReasoning>,
 ) -> bool {
+    let judged = |pred: &ScalarExpr, target: Option<&TableRef>, node: &RelPlan| {
+        let proof = reasoning.map(|reasoning| DeclaredAt { reasoning, node });
+        let proof = proof.as_ref().map(|proof| proof as &dyn NonNullProof);
+        is_always_true(pred, source, target, bindings, proof)
+    };
     match plan {
         RelPlan::Update {
             target,
             predicate: Some(pred),
             ..
-        } => is_always_true(pred, source, Some(target), bindings, proof),
-        RelPlan::Delete {
+        }
+        | RelPlan::Delete {
             target,
             predicate: Some(pred),
             ..
-        } => is_always_true(pred, source, Some(target), bindings, proof),
+        } => judged(pred, Some(target), plan),
         // MERGE passes `target: None`: the ON predicate's
         // every-row judgment must NOT enable the IN-subquery
         // self-reference branch (which keys on the DML target), and the
@@ -72,9 +103,10 @@ pub fn has_tautology_where(
         // exhaustion) is caught via the constant / coverage paths that
         // need no target. Reflexive `t.col = t.col` over an aliased
         // MERGE target is an obscure shape left as a sound under-call.
-        RelPlan::Merge { on, .. } => is_always_true(on, source, None, bindings, proof),
-        RelPlan::Explain { body, .. } => has_tautology_where(body, source, bindings, proof),
-        RelPlan::WithScope { body, .. } => has_tautology_where(body, source, bindings, proof),
+        RelPlan::Merge { on, .. } => judged(on, None, plan),
+        RelPlan::Explain { body, .. } | RelPlan::WithScope { body, .. } => {
+            has_tautology_where(body, source, bindings, reasoning)
+        }
 
         RelPlan::Update {
             predicate: None, ..
@@ -122,9 +154,7 @@ pub fn has_tautology_where(
                     ..
                 } = p
                 {
-                    if is_always_true(predicate, source, None, bindings, proof) {
-                        found = true;
-                    }
+                    found = judged(predicate, None, p);
                 }
             });
             found
@@ -190,6 +220,7 @@ fn collect_or_leaves<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a ScalarExpr>) {
         | ScalarExpr::OuterRef { .. }
         | ScalarExpr::Lit { .. }
         | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
         | ScalarExpr::BinOp { .. }
         | ScalarExpr::UnaryOp { .. }
         | ScalarExpr::FuncCall { .. }
@@ -201,6 +232,7 @@ fn collect_or_leaves<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a ScalarExpr>) {
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::FieldAccess { .. }
         | ScalarExpr::Lambda { .. }
@@ -228,7 +260,6 @@ fn collect_or_leaves<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a ScalarExpr>) {
 fn or_chain_domain_exhaustion(
     or_expr: &ScalarExpr,
     bindings: &BindingTable,
-    target: Option<&TableRef>,
     proof: Option<&dyn NonNullProof>,
 ) -> bool {
     use super::constraint_types::{detect_tautologies_in_scope, pred_to_col_key};
@@ -269,8 +300,7 @@ fn or_chain_domain_exhaustion(
         match proof {
             Some(p) => facts.iter().any(|f| {
                 pred_to_col_key(f, bindings).as_str() == finding.column
-                    && f.column_id
-                        .is_some_and(|cid| p.proven_not_null(cid, target))
+                    && f.column_id.is_some_and(|cid| p.proven_not_null(cid))
             }),
             None => false,
         }
@@ -291,7 +321,8 @@ fn or_chain_domain_exhaustion(
 /// - `IS NOT NULL` over any non-NULL literal or any column.
 /// - `IS NULL` over a NULL literal.
 /// - `AND` of always-true expressions; `OR` with at least one
-///   always-true operand.
+///   always-true operand; `XOR` of an always-true and an always-false
+///   operand.
 /// - `CASE WHEN … THEN …` with every branch — including `ELSE`
 ///   — provably always-true.
 /// - `EXISTS (SELECT … no FROM)`: synthetic Bare-SELECT shape.
@@ -328,36 +359,74 @@ pub fn is_always_true(
     bindings: &BindingTable,
     proof: Option<&dyn NonNullProof>,
 ) -> bool {
+    constant_truth(predicate, source, target, bindings, proof) == Some(true)
+}
+
+/// Whether `predicate` is true on every row (`Some(true)`), false on
+/// every row (`Some(false)`), or neither is proven (`None`).
+///
+/// The always-false side is bounded to what `NOT <expr>` and a side of
+/// `XOR` need: a `FALSE` literal, `col IS NULL` over a column proven
+/// non-null, a constant comparison or `IN` list that folds to false, and
+/// the connectives over those.
+///
+/// Each operand of a connective is judged once, whichever answer the
+/// caller is after, so the cost is linear in the size of the predicate.
+/// The depth of the recursion is the depth of the expression, which
+/// lowering bounds; a long `AND` / `OR` is one N-ary chain node.
+///
+/// Closed-enum exhaustive over [`ScalarExpr`].
+fn constant_truth(
+    predicate: &ScalarExpr,
+    source: &str,
+    target: Option<&TableRef>,
+    bindings: &BindingTable,
+    proof: Option<&dyn NonNullProof>,
+) -> Option<bool> {
+    let truth = |operand: &ScalarExpr| constant_truth(operand, source, target, bindings, proof);
     match predicate {
         ScalarExpr::Lit { value, span } => match value {
-            Lit::Bool(true) => {
-                let text = span_text(source, *span).to_ascii_uppercase();
-                text == "TRUE"
-            }
-            Lit::Bool(false) => false,
+            Lit::Bool(true) => span_text(source, *span)
+                .eq_ignore_ascii_case("TRUE")
+                .then_some(true),
+            Lit::Bool(false) => span_text(source, *span)
+                .eq_ignore_ascii_case("FALSE")
+                .then_some(false),
             Lit::Null
             | Lit::Integer(_)
             | Lit::Float(_)
             | Lit::Str(_)
             | Lit::Bytes { .. }
             | Lit::Typed { .. }
-            | Lit::Variant(_) => false,
+            | Lit::Variant(_)
+            | Lit::Variable { .. } => None,
         },
 
         ScalarExpr::BinOp {
             op, left, right, ..
         } => {
             if matches!(op, BinOpKind::And) {
-                is_always_true(left, source, target, bindings, proof)
-                    && is_always_true(right, source, target, bindings, proof)
+                conjunction_truth([left.as_ref(), right.as_ref()], truth)
             } else if matches!(op, BinOpKind::Or) {
-                is_always_true(left, source, target, bindings, proof)
-                    || is_always_true(right, source, target, bindings, proof)
-                    || or_chain_domain_exhaustion(predicate, bindings, target, proof)
+                disjunction_truth([left.as_ref(), right.as_ref()], truth, || {
+                    or_chain_domain_exhaustion(predicate, bindings, proof)
+                })
+            } else if matches!(op, BinOpKind::Xor) {
+                // True where exactly one side is.
+                match (truth(left), truth(right)) {
+                    (Some(left), Some(right)) => Some(left != right),
+                    (None, _) | (_, None) => None,
+                }
             } else if let BinOpKind::Cmp(cmp) = op {
-                comparison_is_always_true(*cmp, left, right, source, target, proof)
+                if comparison_is_always_true(*cmp, left, right, source, proof) {
+                    Some(true)
+                } else if literal_comparison(*cmp, left, right, source) == Some(false) {
+                    Some(false)
+                } else {
+                    None
+                }
             } else {
-                false
+                None
             }
         }
 
@@ -366,34 +435,48 @@ pub fn is_always_true(
         // `a OR b OR 1=1` stays every-row; `collect_or_leaves`
         // descends the chain to supply its disjuncts.
         ScalarExpr::LogicalChain { op, operands, .. } => match op {
-            crate::ir::scalar::LogicalOp::And => operands
-                .iter()
-                .all(|o| is_always_true(o, source, target, bindings, proof)),
-            crate::ir::scalar::LogicalOp::Or => {
-                operands
-                    .iter()
-                    .any(|o| is_always_true(o, source, target, bindings, proof))
-                    || or_chain_domain_exhaustion(predicate, bindings, target, proof)
-            }
+            crate::ir::scalar::LogicalOp::And => conjunction_truth(operands, truth),
+            crate::ir::scalar::LogicalOp::Or => disjunction_truth(operands, truth, || {
+                or_chain_domain_exhaustion(predicate, bindings, proof)
+            }),
         },
+
+        // The left fold of the `Xor` arm above; a run of any other
+        // operator has no truth.
+        ScalarExpr::OperatorChain {
+            operands,
+            operators,
+            ..
+        } => {
+            if operators.iter().any(|op| *op != BinOpKind::Xor) {
+                return None;
+            }
+            ScalarExpr::fold_chain(operands, operators, truth, |folded, _, operand| {
+                folded
+                    .zip(truth(operand))
+                    .map(|(left, right)| left != right)
+            })
+            .flatten()
+        }
 
         ScalarExpr::UnaryOp { op, arg, .. } => match op {
             crate::ir::scalar::UnaryOpKind::IsNotNull => match arg.as_ref() {
                 ScalarExpr::Lit {
                     value: Lit::Null, ..
-                } => false,
-                ScalarExpr::Lit { .. } => true,
+                } => None,
+                ScalarExpr::Lit { .. } => Some(true),
                 // `col IS NOT NULL` filters out the rows where `col` is
                 // NULL, so it is every-row only when `col` is *proven*
                 // non-null: with a proof it escalates to every-row (no
                 // NULL rows to spare), without one it stays bounded
                 // (`DELETE FROM t WHERE deleted_at IS NOT NULL` keeps
                 // the rows that were never deleted).
-                ScalarExpr::Column { column, .. } => {
-                    proof.is_some_and(|p| p.proven_not_null(*column, target))
-                }
+                ScalarExpr::Column { column, .. } => proof
+                    .is_some_and(|p| p.proven_not_null(*column))
+                    .then_some(true),
                 ScalarExpr::OuterRef { .. }
                 | ScalarExpr::LogicalChain { .. }
+                | ScalarExpr::OperatorChain { .. }
                 | ScalarExpr::BinOp { .. }
                 | ScalarExpr::UnaryOp { .. }
                 | ScalarExpr::FuncCall { .. }
@@ -405,59 +488,83 @@ pub fn is_always_true(
                 | ScalarExpr::Exists { .. }
                 | ScalarExpr::ScalarSubquery { .. }
                 | ScalarExpr::QuantifiedCmp { .. }
+                | ScalarExpr::RowCmp { .. }
                 | ScalarExpr::WindowFn { .. }
                 | ScalarExpr::FieldAccess { .. }
                 | ScalarExpr::Lambda { .. }
                 | ScalarExpr::PatternVarRef { .. }
-                | ScalarExpr::Opaque { .. } => false,
+                | ScalarExpr::Opaque { .. } => None,
             },
-            crate::ir::scalar::UnaryOpKind::IsNull => matches!(
-                arg.as_ref(),
+            crate::ir::scalar::UnaryOpKind::IsNull => match arg.as_ref() {
                 ScalarExpr::Lit {
-                    value: Lit::Null,
-                    ..
-                }
-            ),
-            // `NOT <always-false>` is always true (`NOT FALSE`, `NOT (1 = 2)`).
-            crate::ir::scalar::UnaryOpKind::Not => {
-                is_always_false(arg, source, target, bindings, proof)
-            }
+                    value: Lit::Null, ..
+                } => Some(true),
+                // `col IS NULL` is always FALSE when `col` is proven
+                // non-null, so `NOT (col IS NULL)` is every-row on a
+                // catalog-NOT-NULL column. Symmetric with the
+                // `IS NOT NULL` arm.
+                ScalarExpr::Column { column, .. } => proof
+                    .is_some_and(|p| p.proven_not_null(*column))
+                    .then_some(false),
+                ScalarExpr::Lit { .. }
+                | ScalarExpr::OuterRef { .. }
+                | ScalarExpr::LogicalChain { .. }
+                | ScalarExpr::OperatorChain { .. }
+                | ScalarExpr::BinOp { .. }
+                | ScalarExpr::UnaryOp { .. }
+                | ScalarExpr::FuncCall { .. }
+                | ScalarExpr::Case { .. }
+                | ScalarExpr::Cast { .. }
+                | ScalarExpr::InList { .. }
+                | ScalarExpr::Between { .. }
+                | ScalarExpr::Like { .. }
+                | ScalarExpr::Exists { .. }
+                | ScalarExpr::ScalarSubquery { .. }
+                | ScalarExpr::QuantifiedCmp { .. }
+                | ScalarExpr::RowCmp { .. }
+                | ScalarExpr::WindowFn { .. }
+                | ScalarExpr::FieldAccess { .. }
+                | ScalarExpr::Lambda { .. }
+                | ScalarExpr::PatternVarRef { .. }
+                | ScalarExpr::Opaque { .. } => None,
+            },
+            // `NOT FALSE`, `NOT (1 = 2)`; and `NOT TRUE` is always false.
+            crate::ir::scalar::UnaryOpKind::Not => truth(arg).map(|always| !always),
             crate::ir::scalar::UnaryOpKind::Neg
             | crate::ir::scalar::UnaryOpKind::Plus
             | crate::ir::scalar::UnaryOpKind::AtLocal
             | crate::ir::scalar::UnaryOpKind::Collate
             | crate::ir::scalar::UnaryOpKind::Prior
-            | crate::ir::scalar::UnaryOpKind::Spread => false,
+            | crate::ir::scalar::UnaryOpKind::Spread
+            | crate::ir::scalar::UnaryOpKind::BitwiseNot
+            | crate::ir::scalar::UnaryOpKind::SquareRoot
+            | crate::ir::scalar::UnaryOpKind::AbsoluteValue
+            | crate::ir::scalar::UnaryOpKind::Is(_)
+            | crate::ir::scalar::UnaryOpKind::IsNot(_) => None,
         },
 
         ScalarExpr::Case {
             branches, else_, ..
         } => {
             if branches.is_empty() {
-                return false;
+                return None;
             }
             let all_branches_true = branches
                 .iter()
-                .all(|(_, result)| is_always_true(result, source, target, bindings, proof));
+                .all(|(_, result)| truth(result) == Some(true));
             let else_true = match else_ {
                 None => false,
-                Some(e) => is_always_true(e, source, target, bindings, proof),
+                Some(e) => truth(e) == Some(true),
             };
-            all_branches_true && else_true
+            (all_branches_true && else_true).then_some(true)
         }
 
         // A pattern match is never statically always-true.
-        ScalarExpr::Like { .. } => false,
+        ScalarExpr::Like { .. } => None,
 
         ScalarExpr::Exists {
             subquery, negated, ..
-        } => {
-            if *negated {
-                false
-            } else {
-                exists_subquery_is_always_true(subquery)
-            }
-        }
+        } => (!*negated && exists_subquery_is_always_true(subquery)).then_some(true),
 
         ScalarExpr::QuantifiedCmp {
             op,
@@ -471,18 +578,18 @@ pub fn is_always_true(
             // Any other shape (NOT IN, <> ALL, <, etc.) isn't covered by
             // this self-referential identity check.
             if !matches!(op, crate::ir::scalar::ComparisonOp::Eq) {
-                return false;
+                return None;
             }
             if !matches!(quantifier, super::scalar::Quantifier::Any) {
-                return false;
+                return None;
             }
             if *negated {
-                return false;
+                return None;
             }
             let QuantifiedRhs::Subquery(plan, _) = right else {
-                return false;
+                return None;
             };
-            in_subquery_is_self_referential(left, plan, target, bindings)
+            in_subquery_is_self_referential(left, plan, target, bindings).then_some(true)
         }
 
         // `COALESCE(<always-true>, …)` / `NVL` / `IFNULL`: the first argument
@@ -491,11 +598,11 @@ pub fn is_always_true(
             let name = span_text(source, func.span()).to_ascii_uppercase();
             if name == "COALESCE" || name == "NVL" || name == "IFNULL" {
                 match args.first() {
-                    Some(first) => is_always_true(first, source, target, bindings, proof),
-                    None => false,
+                    Some(first) => (truth(first) == Some(true)).then_some(true),
+                    None => None,
                 }
             } else {
-                false
+                None
             }
         }
 
@@ -505,18 +612,59 @@ pub fn is_always_true(
             list,
             negated,
             ..
-        } => in_list_static_truth(expr, list, *negated, source) == Some(true),
+        } => in_list_static_truth(expr, list, *negated, source),
 
         ScalarExpr::Column { .. }
         | ScalarExpr::OuterRef { .. }
         | ScalarExpr::Cast { .. }
         | ScalarExpr::Between { .. }
         | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::FieldAccess { .. }
         | ScalarExpr::Lambda { .. }
         | ScalarExpr::PatternVarRef { .. }
-        | ScalarExpr::Opaque { .. } => false,
+        | ScalarExpr::Opaque { .. } => None,
+    }
+}
+
+/// `AND` of `operands`, each judged once: always false where one is,
+/// always true where all are.
+fn conjunction_truth<'a>(
+    operands: impl IntoIterator<Item = &'a ScalarExpr>,
+    truth: impl Fn(&'a ScalarExpr) -> Option<bool>,
+) -> Option<bool> {
+    let mut all_true = true;
+    for operand in operands {
+        match truth(operand) {
+            Some(false) => return Some(false),
+            Some(true) => {}
+            None => all_true = false,
+        }
+    }
+    all_true.then_some(true)
+}
+
+/// `OR` of `operands`, each judged once: always true where one is, or
+/// where `exhausts_the_domain` says the disjuncts cover every row;
+/// always false where all are.
+fn disjunction_truth<'a>(
+    operands: impl IntoIterator<Item = &'a ScalarExpr>,
+    truth: impl Fn(&'a ScalarExpr) -> Option<bool>,
+    exhausts_the_domain: impl FnOnce() -> bool,
+) -> Option<bool> {
+    let mut all_false = true;
+    for operand in operands {
+        match truth(operand) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => all_false = false,
+        }
+    }
+    if exhausts_the_domain() {
+        Some(true)
+    } else {
+        all_false.then_some(false)
     }
 }
 
@@ -524,7 +672,6 @@ fn equality_is_always_true(
     left: &ScalarExpr,
     right: &ScalarExpr,
     source: &str,
-    target: Option<&TableRef>,
     proof: Option<&dyn NonNullProof>,
 ) -> bool {
     if is_null_lit(left) && is_null_lit(right) {
@@ -563,7 +710,7 @@ fn equality_is_always_true(
         (left, right)
     {
         if lcol == rcol {
-            return proof.is_some_and(|p| p.proven_not_null(*lcol, target));
+            return proof.is_some_and(|p| p.proven_not_null(*lcol));
         }
     }
 
@@ -590,7 +737,11 @@ fn literals_equal(l: &Lit, l_span: Span, r: &Lit, r_span: Span, source: &str) ->
         Lit::Integer(_) => matches!(r, Lit::Integer(_)) && same_text(),
         Lit::Float(_) => matches!(r, Lit::Float(_)) && same_text(),
         Lit::Str(_) => matches!(r, Lit::Str(_)) && same_text(),
-        Lit::Null | Lit::Bytes { .. } | Lit::Typed { .. } | Lit::Variant(_) => false,
+        Lit::Null
+        | Lit::Bytes { .. }
+        | Lit::Typed { .. }
+        | Lit::Variant(_)
+        | Lit::Variable { .. } => false,
     }
 }
 
@@ -629,88 +780,6 @@ fn coalesce_equality_always_true(expr: &ScalarExpr, other: &ScalarExpr, source: 
         return false;
     };
     literals_equal(first_val, *first_span, other_val, *other_span, source)
-}
-
-/// Dual of [`is_always_true`], bounded to the shapes needed to resolve
-/// `NOT <expr>`: a `FALSE` literal, the De Morgan duals of `AND`/`OR`,
-/// `NOT <always-true>`, and a constant comparison that folds to false.
-/// Anything else is not provably false (so `NOT` over it is not a tautology).
-fn is_always_false(
-    predicate: &ScalarExpr,
-    source: &str,
-    target: Option<&TableRef>,
-    bindings: &BindingTable,
-    proof: Option<&dyn NonNullProof>,
-) -> bool {
-    if let ScalarExpr::Lit {
-        value: Lit::Bool(false),
-        span,
-    } = predicate
-    {
-        return span_text(source, *span).eq_ignore_ascii_case("FALSE");
-    }
-    // `col IS NULL` is always FALSE when `col` is proven non-null, so
-    // `NOT (col IS NULL)` (≡ `col IS NOT NULL`) is every-row on a
-    // catalog-NOT-NULL column. Symmetric with the `IS NOT NULL` arm of
-    // `is_always_true`.
-    if let ScalarExpr::UnaryOp {
-        op: crate::ir::scalar::UnaryOpKind::IsNull,
-        arg,
-        ..
-    } = predicate
-    {
-        if let ScalarExpr::Column { column, .. } = arg.as_ref() {
-            return proof.is_some_and(|p| p.proven_not_null(*column, target));
-        }
-    }
-    if let ScalarExpr::UnaryOp {
-        op: crate::ir::scalar::UnaryOpKind::Not,
-        arg,
-        ..
-    } = predicate
-    {
-        return is_always_true(arg, source, target, bindings, proof);
-    }
-    // N-ary spelling of the `And` / `Or` cases below. This is an
-    // `if let` chain, not an exhaustive match, so nothing forces this
-    // arm — without it a chained predicate silently answers `false`.
-    if let ScalarExpr::LogicalChain { op, operands, .. } = predicate {
-        return match op {
-            crate::ir::scalar::LogicalOp::And => operands
-                .iter()
-                .any(|o| is_always_false(o, source, target, bindings, proof)),
-            crate::ir::scalar::LogicalOp::Or => operands
-                .iter()
-                .all(|o| is_always_false(o, source, target, bindings, proof)),
-        };
-    }
-    if let ScalarExpr::BinOp {
-        op, left, right, ..
-    } = predicate
-    {
-        if matches!(op, BinOpKind::And) {
-            return is_always_false(left, source, target, bindings, proof)
-                || is_always_false(right, source, target, bindings, proof);
-        }
-        if matches!(op, BinOpKind::Or) {
-            return is_always_false(left, source, target, bindings, proof)
-                && is_always_false(right, source, target, bindings, proof);
-        }
-        if let BinOpKind::Cmp(cmp) = op {
-            return literal_comparison(*cmp, left, right, source) == Some(false);
-        }
-        return false;
-    }
-    if let ScalarExpr::InList {
-        expr,
-        list,
-        negated,
-        ..
-    } = predicate
-    {
-        return in_list_static_truth(expr, list, *negated, source) == Some(false);
-    }
-    false
 }
 
 /// Static truth of `<lit> [NOT] IN (<lit>, …)` when the needle and every list
@@ -772,11 +841,10 @@ fn comparison_is_always_true(
     left: &ScalarExpr,
     right: &ScalarExpr,
     source: &str,
-    target: Option<&TableRef>,
     proof: Option<&dyn NonNullProof>,
 ) -> bool {
     match op {
-        ComparisonOp::Eq => equality_is_always_true(left, right, source, target, proof),
+        ComparisonOp::Eq => equality_is_always_true(left, right, source, proof),
         ComparisonOp::NotEq
         | ComparisonOp::Lt
         | ComparisonOp::LtEq
@@ -848,7 +916,8 @@ fn numeric_lit_f64(v: &Lit, span: Span, source: &str) -> Option<f64> {
         | Lit::Str(_)
         | Lit::Bytes { .. }
         | Lit::Typed { .. }
-        | Lit::Variant(_) => None,
+        | Lit::Variant(_)
+        | Lit::Variable { .. } => None,
     }
 }
 
@@ -893,6 +962,84 @@ fn exists_subquery_is_always_true(plan: &RelPlan) -> bool {
     }
 }
 
+/// The name a column read from a table is compared under: a table
+/// column's name, and an unattributed column's qualifier, segment by
+/// segment, and name, so one written through a qualifier equals no bare
+/// column. `None` for any other column.
+fn compared_name(origin: &ColumnOrigin) -> Option<(Vec<IdentKey>, IdentKey)> {
+    match origin {
+        ColumnOrigin::Table { column_name, .. } => {
+            Some((Vec::new(), IdentKey::new_as(column_name, NameKind::Column)))
+        }
+        ColumnOrigin::Unattributed {
+            qualifier, name, ..
+        } => Some(super::lower::unattributed_key(qualifier.as_deref(), name)),
+        ColumnOrigin::Computed { .. }
+        | ColumnOrigin::Merged { .. }
+        | ColumnOrigin::SetOp { .. }
+        | ColumnOrigin::OuterRef { .. }
+        | ColumnOrigin::RecursiveRef { .. } => None,
+    }
+}
+
+/// What an operand of a self-referential `IN` reads.
+#[derive(PartialEq)]
+pub(crate) struct ComparedOperand {
+    /// The column's [`compared_name`].
+    name: (Vec<IdentKey>, IdentKey),
+    /// The field path a field access reads below the column; empty for
+    /// the column itself.
+    path: FieldPath,
+    /// The cast of that field access.
+    cast: Option<SqlType>,
+}
+
+/// What an operand of a self-referential `IN` reads: the compared name
+/// of a column, with the field path and cast of a field access over
+/// it. `None` for any other operand, and for a path with a computed
+/// index, which names no one field.
+fn compared_operand(expr: &ScalarExpr, bindings: &BindingTable) -> Option<ComparedOperand> {
+    let (column, path, cast) = match expr {
+        ScalarExpr::Column { column, .. } => (*column, FieldPath::empty(), None),
+        ScalarExpr::FieldAccess {
+            base, path, cast, ..
+        } => {
+            let ScalarExpr::Column { column, .. } = base.as_ref() else {
+                return None;
+            };
+            if path
+                .iter()
+                .any(|step| matches!(step, FieldStep::IndexExpr(_)))
+            {
+                return None;
+            }
+            (*column, FieldPath::from_field_steps(path), cast.clone())
+        }
+        ScalarExpr::OuterRef { .. }
+        | ScalarExpr::Lit { .. }
+        | ScalarExpr::BinOp { .. }
+        | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
+        | ScalarExpr::UnaryOp { .. }
+        | ScalarExpr::FuncCall { .. }
+        | ScalarExpr::Case { .. }
+        | ScalarExpr::Cast { .. }
+        | ScalarExpr::InList { .. }
+        | ScalarExpr::Between { .. }
+        | ScalarExpr::Like { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
+        | ScalarExpr::WindowFn { .. }
+        | ScalarExpr::Lambda { .. }
+        | ScalarExpr::PatternVarRef { .. }
+        | ScalarExpr::Opaque { .. } => return None,
+    };
+    let name = compared_name(&bindings.get(column)?.origin)?;
+    Some(ComparedOperand { name, path, cast })
+}
+
 fn in_subquery_is_self_referential(
     outer: &ScalarExpr,
     plan: &RelPlan,
@@ -902,23 +1049,9 @@ fn in_subquery_is_self_referential(
     let Some(target) = target else {
         return false;
     };
-    let ScalarExpr::Column {
-        column: outer_col, ..
-    } = outer
-    else {
+    let Some(outer_name) = compared_operand(outer, bindings) else {
         return false;
     };
-    let Some(outer_binding) = bindings.get(*outer_col) else {
-        return false;
-    };
-    let outer_name = match &outer_binding.origin {
-        ColumnOrigin::Table { column_name, .. } => column_name.clone(),
-        ColumnOrigin::Computed { .. }
-        | ColumnOrigin::SetOp { .. }
-        | ColumnOrigin::OuterRef { .. }
-        | ColumnOrigin::RecursiveRef { .. } => return false,
-    };
-    let outer_name_norm = normalize_ident(&outer_name);
 
     let mut current = plan;
     let mut project_items: Option<&Vec<ProjectItem>> = None;
@@ -953,23 +1086,8 @@ fn in_subquery_is_self_referential(
                 let ProjectItem::Expr(inner_proj) = &items[0] else {
                     return false;
                 };
-                let ScalarExpr::Column {
-                    column: inner_col, ..
-                } = &inner_proj.expr
-                else {
-                    return false;
-                };
-                let Some(inner_binding) = bindings.get(*inner_col) else {
-                    return false;
-                };
-                let inner_name = match &inner_binding.origin {
-                    ColumnOrigin::Table { column_name, .. } => column_name.clone(),
-                    ColumnOrigin::Computed { .. }
-                    | ColumnOrigin::SetOp { .. }
-                    | ColumnOrigin::OuterRef { .. }
-                    | ColumnOrigin::RecursiveRef { .. } => return false,
-                };
-                return normalize_ident(&inner_name) == outer_name_norm;
+                return compared_operand(&inner_proj.expr, bindings)
+                    .is_some_and(|inner| inner == outer_name);
             }
             RelPlan::Filter { .. }
             | RelPlan::Limit { .. }
@@ -1014,7 +1132,114 @@ fn span_text(source: &str, span: Span) -> &str {
     }
 }
 
-#[inline]
-fn normalize_ident(s: &str) -> String {
-    crate::ir::normalize_identifier(s)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{
+        lower_query_full_with_bindings, CatalogDialect, FunctionCatalog, SessionContext, StrictMode,
+    };
+    use crate::lexer::{tokenize, tokenize_with_dialect};
+    use crate::parser::{parse_script, try_parse_script_with_dialect};
+
+    /// Whether the `WHERE` of the one statement `src` is always true.
+    fn tautology(src: &str) -> bool {
+        let tokens = tokenize(src);
+        let script = parse_script(src, &tokens.tokens).expect("parse");
+        tautology_of(src, &script)
+    }
+
+    /// As [`tautology`], with `src` read as MySQL.
+    fn mysql_tautology(src: &str) -> bool {
+        let mysql = crate::dialect::mysql();
+        let tokens = tokenize_with_dialect(src, mysql.as_ref());
+        let script =
+            try_parse_script_with_dialect(src, &tokens.tokens, mysql.as_ref()).expect("parse");
+        assert_eq!(script.stmts.len(), 1, "{src}");
+        tautology_of(src, &script)
+    }
+
+    fn tautology_of(src: &str, script: &crate::ast::AstScript) -> bool {
+        let (plan, _catalog_ctx, bindings, _facts) = lower_query_full_with_bindings(
+            &script.stmts[0],
+            src,
+            StrictMode::Permissive,
+            &FunctionCatalog::for_dialect(CatalogDialect::Default),
+            &SessionContext::default(),
+            None,
+        )
+        .expect("lower");
+        has_tautology_where(&plan, src, &bindings, None)
+    }
+
+    #[test]
+    fn an_exclusive_or_of_a_true_side_and_a_false_side_is_always_true() {
+        let _folding = crate::ir::normalize::default_folding();
+        for every_row in [
+            "DELETE FROM t WHERE 1 = 1 XOR 1 = 2",
+            "DELETE FROM t WHERE 1 = 2 XOR 1 = 1",
+            "DELETE FROM t WHERE TRUE XOR FALSE",
+            "DELETE FROM t WHERE FALSE XOR TRUE",
+            "DELETE FROM t WHERE NOT (1 = 1) XOR TRUE",
+            // `AND` binds tighter, and is false whatever `c` is.
+            "DELETE FROM t WHERE 1 = 1 XOR 1 = 2 AND c > 0",
+            "UPDATE t SET a = 1 WHERE (1 = 1 XOR 1 = 1) XOR TRUE",
+        ] {
+            assert!(mysql_tautology(every_row), "{every_row}");
+        }
+        for bounded in [
+            // A side that depends on the row.
+            "DELETE FROM t WHERE 1 = 1 XOR c > 0",
+            "DELETE FROM t WHERE c > 0 XOR 1 = 2",
+            // Always false: both sides true, or both false.
+            "DELETE FROM t WHERE 1 = 1 XOR 1 = 1",
+            "DELETE FROM t WHERE FALSE XOR 1 = 2",
+            "DELETE FROM t WHERE NOT (1 = 1 XOR 1 = 2)",
+        ] {
+            assert!(!mysql_tautology(bounded), "{bounded}");
+        }
+        // And its negation where it is always false.
+        assert!(mysql_tautology("DELETE FROM t WHERE NOT (1 = 1 XOR 1 = 1)"));
+    }
+
+    #[test]
+    fn a_long_xor_chain_is_judged_in_linear_time() {
+        let _folding = crate::ir::normalize::default_folding();
+        // Each operand depends on its row: not every row matches. Lowering
+        // keeps the chain no deeper than it keeps any expression.
+        let operands: Vec<String> = (0..2_000).map(|i| format!("c{i} > 0")).collect();
+        assert!(!mysql_tautology(&format!(
+            "DELETE FROM t WHERE {}",
+            operands.join(" XOR ")
+        )));
+        // A run of operands that are each always true is always true
+        // where their number is odd, and always false where it is even.
+        let run = |operands: usize| vec!["1 = 1"; operands].join(" XOR ");
+        assert!(mysql_tautology(&format!("DELETE FROM t WHERE {}", run(51))));
+        assert!(!mysql_tautology(&format!(
+            "DELETE FROM t WHERE {}",
+            run(50)
+        )));
+        assert!(mysql_tautology(&format!(
+            "DELETE FROM t WHERE NOT ({})",
+            run(50)
+        )));
+    }
+
+    #[test]
+    fn a_self_referential_in_compares_a_qualifier_segment_by_segment() {
+        let _folding = crate::ir::normalize::default_folding();
+        assert!(tautology(
+            "DELETE FROM t WHERE zz.s.id IN (SELECT zz.s.id FROM t)"
+        ));
+        // A quoted segment is the unquoted one it normalizes to.
+        assert!(tautology(
+            "DELETE FROM t WHERE \"ZZ\".s.id IN (SELECT zz.s.id FROM t)"
+        ));
+        assert!(!tautology(
+            "DELETE FROM t WHERE \"zz\".s.id IN (SELECT zz.s.id FROM t)"
+        ));
+        assert!(!tautology(
+            "DELETE FROM t WHERE yy.s.id IN (SELECT zz.s.id FROM t)"
+        ));
+    }
 }

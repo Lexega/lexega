@@ -19,14 +19,48 @@ use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, Par
 use crate::lexer::{Keyword, Span, Token, TokenKind};
 use crate::parser::core::{track_depth, Parser};
 
+/// How far a string a template writes into runs
+/// ([`Parser::templated_string_after`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TemplatedString {
+    /// The index past its last token.
+    pub(crate) past: usize,
+    /// Whether a fragment closes it.
+    pub(crate) closed: bool,
+}
+
+/// Where a call is read: in an expression, or as a table-valued function
+/// called in `FROM`, whose arguments may be written in another grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallSite {
+    Expression,
+    TableFunction,
+}
+
+/// Whether `token` is a word written bare: a keyword or an unquoted
+/// identifier.
+fn is_unquoted_word(token: &Token) -> bool {
+    matches!(
+        token.kind,
+        TokenKind::Keyword(_)
+            | TokenKind::Identifier {
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
+            }
+    )
+}
+
 impl<'a> Parser<'a> {
     /// Parse a function call starting from after the function name.
     /// Handles empty args, COUNT(*), regular args, and OVER clause for window functions.
-    /// Returns the parsed expression (either FunctionCall or WindowFn).
+    /// Returns the parsed expression (either FunctionCall or WindowFn). At
+    /// [`CallSite::TableFunction`] an argument the expression reader cannot
+    /// read is an [`crate::ast::AstFunctionArg::Unparsed`].
     pub(crate) fn parse_function_call_from_lparen(
         &mut self,
         func_name_span: Span,
         approximate: Option<(crate::cst::TokenId, Span)>,
+        site: CallSite,
     ) -> ParseResult<AstExpr> {
         let _guard = track_depth("parse_function_call_from_lparen", func_name_span)?;
 
@@ -35,6 +69,28 @@ impl<'a> Parser<'a> {
         // syntax node so the formatter emits it byte-exact, and the semantic
         // flag is set on the resulting node — parallel to the DISTINCT/ALL
         // quantifier. The caller extends the node span to cover `APPROXIMATE`.
+        // T-SQL's `OPENROWSET` / `OPENDATASOURCE` carry a connection's
+        // credentials in their arguments.
+        let opens_connection = self
+            .source
+            .get(func_name_span.start as usize..func_name_span.end as usize)
+            .map(str::trim)
+            .is_some_and(|n| {
+                n.eq_ignore_ascii_case("OPENROWSET") || n.eq_ignore_ascii_case("OPENDATASOURCE")
+            });
+        if opens_connection {
+            self.record_connection_call_secrets(self.idx);
+        }
+        // dblink's functions take a libpq connection string; `set_config`
+        // gives a setting its value.
+        if let Some(called) = self
+            .source
+            .get(func_name_span.start as usize..func_name_span.end as usize)
+        {
+            self.record_libpq_call_secrets(called, self.idx);
+        }
+        self.record_set_config_secrets(self.idx);
+
         let approximate_keyword: Option<crate::cst::TokenId> = approximate.map(|(tok, _)| tok);
         let approximate_span: Option<Span> = approximate.map(|(_, span)| span);
 
@@ -115,6 +171,40 @@ impl<'a> Parser<'a> {
             .map(|n| n.trim().eq_ignore_ascii_case("OPENROWSET"))
             .unwrap_or(false);
 
+        // The arguments the dialect reads as no values (`CONVERT(INT, x)`,
+        // `DATEADD(day, 1, d)`); directly inside an ODBC `{fn …}` escape,
+        // those of ODBC's own grammar. A row that holds for a number of
+        // arguments is kept where the call has that number.
+        let odbc = self.odbc_call == Some(func_name_span.start);
+        let non_values: &[crate::dialect::NonValueArgument] = match site {
+            CallSite::Expression => self
+                .source
+                .get(func_name_span.start as usize..func_name_span.end as usize)
+                .map(|name| {
+                    if odbc {
+                        crate::dialect::odbc_non_value_arguments(name)
+                    } else {
+                        self.dialect.non_value_arguments(name)
+                    }
+                })
+                .unwrap_or_default(),
+            CallSite::TableFunction => &[],
+        };
+        let argument_count = non_values
+            .iter()
+            .any(|row| row.arity.is_some())
+            .then(|| self.call_argument_count());
+        // The arguments a keyword introduces (`OVERLAY(s PLACING r FROM 2)`);
+        // none inside an ODBC escape, whose grammar separates by commas.
+        let introduced: &[crate::dialect::IntroducedArgument] = match site {
+            CallSite::Expression if !odbc => self
+                .source
+                .get(func_name_span.start as usize..func_name_span.end as usize)
+                .map(|name| self.dialect.introduced_arguments(name))
+                .unwrap_or_default(),
+            CallSite::Expression | CallSite::TableFunction => &[],
+        };
+
         // Check for empty argument list: func() or func(DISTINCT) without args (invalid but handle gracefully)
         if let Some(rp) = self.peek() {
             if matches!(
@@ -154,6 +244,8 @@ impl<'a> Parser<'a> {
                                     func_name: AstIdentifier {
                                         node_id: self.id_gen.next(),
                                         span: func_name_span,
+                                        kind: crate::ast::AstIdentifierKind::Name,
+                                        templated: None,
                                     },
                                     approximate: approximate_span,
                                     lparen_span: lparen.span,
@@ -207,11 +299,13 @@ impl<'a> Parser<'a> {
                     func_name: AstIdentifier {
                         node_id: self.id_gen.next(),
                         span: func_name_span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
                     },
                     quantifier,
                     args,
                     approximate: approximate_keyword.is_some(),
-                    odbc_fn: false,
+                    odbc_fn: None,
                     order_by_span: None,
                     inline_order_by: None,
                     separator_span: None,
@@ -287,6 +381,8 @@ impl<'a> Parser<'a> {
                                                 func_name: AstIdentifier {
                                                     node_id: self.id_gen.next(),
                                                     span: func_name_span,
+                                                    kind: crate::ast::AstIdentifierKind::Name,
+                                                    templated: None,
                                                 },
                                                 approximate: approximate_span,
                                                 lparen_span: lparen.span,
@@ -330,11 +426,13 @@ impl<'a> Parser<'a> {
                                 func_name: AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: func_name_span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 },
                                 quantifier,
                                 args,
                                 approximate: approximate_keyword.is_some(),
-                                odbc_fn: false,
+                                odbc_fn: None,
                                 order_by_span: None,
                                 inline_order_by: None,
                                 separator_span: None,
@@ -353,215 +451,95 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Parse regular expression argument, named argument, or lambda expression
-            // Note: quantifier was already parsed at the top of this function
-            // Check for:
-            // - Named argument: identifier => value
-            // - Lambda: identifier -> expr OR (ident, ident) -> expr
-            let arg = if let Some(tok) = self.peek() {
-                // T-SQL OPENROWSET(BULK '<file>', …): `BULK` identifier prefix
-                // directly followed by the file-path literal (no comma). Captured
-                // as a single BulkArg so the file literal stays attached to the
-                // OPENROWSET call and the form is recognizable as a file read.
-                if is_openrowset
-                    && matches!(tok.kind, TokenKind::Identifier { .. })
-                    && tok.lexeme(self.source).eq_ignore_ascii_case("BULK")
-                    && self.peek_ahead(1).is_some_and(|t| {
-                        matches!(
-                            t.kind,
-                            TokenKind::Literal(crate::lexer::LiteralKind::String)
-                        )
-                    })
-                {
-                    let bulk_tok = self
-                        .advance()
-                        .ok_or_eof(self.current_span(), vec!["BULK".to_string()])?;
-                    let value = self.parse_expr_with_recovery()?;
-                    crate::ast::AstFunctionArg::BulkArg {
-                        bulk_span: bulk_tok.span,
-                        value: Box::new(value),
-                    }
-                } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Execute)) {
-                    // EXECUTE IMMEDIATE as function argument → statement-form
-                    // subquery, e.g. Snowflake `RETURN TABLE(EXECUTE IMMEDIATE :q)`.
-                    // Same SubqueryArg shape as ARRAY(SELECT ...): parens belong to
-                    // the call; downstream walkers reach the EXECUTE IMMEDIATE
-                    // through the expression tree.
-                    // Checked before the identifier branch — EXECUTE is unreserved
-                    // in most dialects and would otherwise be consumed as a name.
-                    // Speculative parse with rollback, mirroring the parenthesized
-                    // `(EXECUTE IMMEDIATE ...)` form in expr.rs.
-                    let ei_start = tok.span.start;
-                    let saved_idx = self.idx;
-                    match crate::parser::scripting::try_parse_execute_immediate_stmt(self) {
-                        Ok(ei_stmt) => {
-                            let span = Span {
-                                start: ei_start,
-                                end: ei_stmt.span().end,
-                            };
-                            crate::ast::AstFunctionArg::Positional(Box::new(AstExpr::SubqueryArg {
-                                node_id: self.id_gen.next(),
-                                subquery: Box::new(ei_stmt),
-                                span,
-                            }))
-                        }
-                        Err(err) => {
-                            if err.kind.is_resource_exhaustion() {
-                                return Err(err);
-                            }
-                            // Restore and fall back to plain expression parsing
-                            // (EXECUTE used as an ordinary identifier argument).
-                            self.idx = saved_idx;
-                            let expr = self.parse_expr_with_recovery()?;
-                            crate::ast::AstFunctionArg::Positional(Box::new(expr))
-                        }
-                    }
-                } else if self.can_be_identifier_token(tok) {
-                    let next = self.peek_ahead(1);
-                    let is_named_arrow = next.is_some_and(|t| {
-                        matches!(t.kind, TokenKind::Operator(crate::lexer::Operator::EqGt))
-                    });
-                    let is_lambda_arrow = next.is_some_and(|t| {
-                        matches!(
-                            t.kind,
-                            TokenKind::Operator(crate::lexer::Operator::RightArrow)
-                        )
-                    });
-
-                    if is_named_arrow {
-                        // This is a named argument: name => value
-                        let name_tok = self
-                            .advance()
-                            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                        let arrow_tok = self
-                            .advance()
-                            .ok_or_eof(self.current_span(), vec!["=>".to_string()])?;
-                        // Use error recovery for the value expression
-                        let value = self.parse_expr_with_recovery()?;
-
-                        crate::ast::AstFunctionArg::Named {
-                            name: crate::ast::AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: name_tok.span,
-                            },
-                            arrow_span: arrow_tok.span,
-                            value: Box::new(value),
-                        }
-                    } else if is_lambda_arrow {
-                        // This is a lambda expression: x -> expr
-                        let param_tok = self
-                            .advance()
-                            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                        let param_start = param_tok.span.start;
-                        let arrow_tok = self
-                            .advance()
-                            .ok_or_eof(self.current_span(), vec!["->".to_string()])?;
-                        // Parse lambda body expression
-                        let body = self.parse_expr_with_recovery()?;
-                        let body_end = body.span().end;
-
-                        crate::ast::AstFunctionArg::Lambda {
-                            params: vec![crate::ast::AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: param_tok.span,
-                            }],
-                            arrow_span: arrow_tok.span,
-                            body: Box::new(body),
-                            span: Span {
-                                start: param_start,
-                                end: body_end,
-                            },
-                        }
-                    } else {
-                        // Regular positional argument - use error recovery
-                        let expr = self.parse_expr_with_recovery()?;
-                        crate::ast::AstFunctionArg::Positional(Box::new(expr))
-                    }
-                } else if matches!(
-                    tok.kind,
-                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                ) {
-                    // Could be a lambda with multiple params: (x, y) -> expr
-                    // Or just a parenthesized expression
-                    // Peek ahead to find -> after the closing paren
-                    let is_lambda = self.is_lambda_params();
-                    if is_lambda {
-                        self.parse_lambda_arg()?
-                    } else {
-                        // Regular positional argument - use error recovery
-                        let expr = self.parse_expr_with_recovery()?;
-                        crate::ast::AstFunctionArg::Positional(Box::new(expr))
-                    }
-                } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Select)) {
-                    // SELECT keyword as function argument → subquery argument
-                    // e.g., ARRAY(SELECT AS STRUCT id, name FROM users)
-                    // Use SubqueryArg (not ScalarSubquery) because the parens belong
-                    // to the function call, not the subquery itself.
-                    let select_start = tok.span.start;
-                    let subquery = self.try_parse_set_or_select_stmt().map_err(|_| {
-                        ParseError::invalid_expression(
-                            self.current_span(),
-                            "Expected SELECT subquery as function argument".to_string(),
-                        )
-                    })?;
-                    let subquery_span = subquery.span();
-                    let span = Span {
-                        start: select_start,
-                        end: subquery_span.end,
-                    };
-                    crate::ast::AstFunctionArg::Positional(Box::new(AstExpr::SubqueryArg {
-                        node_id: self.id_gen.next(),
-                        subquery: Box::new(subquery),
-                        span,
-                    }))
-                } else {
-                    // Not an identifier, must be a positional expression - use error recovery
-                    let expr = self.parse_expr_with_recovery()?;
-                    crate::ast::AstFunctionArg::Positional(Box::new(expr))
-                }
+            // A table function's argument the expression reader cannot read
+            // is kept as its text.
+            let arg_from = self.idx;
+            let errors_before = self.recovery_errors.len();
+            let row = non_values.iter().find(|row| {
+                row.position == args.len()
+                    && row.arity.is_none_or(|count| argument_count == Some(count))
+            });
+            let arg = if let Some(kind) = self.introduced_value_at(introduced) {
+                self.parse_introduced_argument(kind)?
             } else {
-                return Err(ParseError::new(
-                    lparen.span,
-                    ParseErrorKind::UnexpectedEof {
-                        expected: vec!["expression".to_string(), ")".to_string()],
-                    },
-                )); // Unexpected EOF
+                match (site, row) {
+                    (CallSite::Expression, Some(row)) => {
+                        self.parse_non_value_argument(row.kind, odbc, is_openrowset, lparen.span)?
+                    }
+                    (CallSite::Expression, None) => {
+                        self.parse_function_arg(is_openrowset, lparen.span)?
+                    }
+                    (CallSite::TableFunction, Some(_) | None) => {
+                        match self.table_argument(errors_before)? {
+                            Some(arg) => arg,
+                            None => match self.columns_argument(arg_from)? {
+                                Some(arg) => arg,
+                                None => match self.parse_function_arg(is_openrowset, lparen.span) {
+                                    Ok(arg)
+                                        if self.recovery_errors.len() == errors_before
+                                            && self.at_call_argument_end() =>
+                                    {
+                                        arg
+                                    }
+                                    Err(e) if e.kind.is_resource_exhaustion() => return Err(e),
+                                    Ok(_) | Err(_) => {
+                                        self.unparsed_call_argument(arg_from, errors_before)?
+                                    }
+                                },
+                            },
+                        }
+                    }
+                }
             };
 
             // Check for trailing AS alias (BigQuery STRUCT constructor syntax)
             // e.g., STRUCT(1 AS x, 'hello' AS y)
             // Only promote Positional args — Named and Lambda already have their own semantics.
-            let arg = if matches!(arg, crate::ast::AstFunctionArg::Positional(_)) {
-                if let Some(next) = self.peek() {
-                    if matches!(next.kind, TokenKind::Keyword(Keyword::As)) {
-                        let as_tok = self.advance().unwrap(); // consume AS
-                        if let Some(alias_tok) = self.advance() {
-                            if let crate::ast::AstFunctionArg::Positional(value) = arg {
-                                crate::ast::AstFunctionArg::AliasedArg {
-                                    value,
-                                    as_span: as_tok.span,
-                                    alias: crate::ast::AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: alias_tok.span,
-                                    },
-                                }
-                            } else {
-                                unreachable!() // guarded by outer match
-                            }
-                        } else {
-                            arg // EOF after AS — leave as-is, let downstream handle
-                        }
-                    } else {
-                        arg
-                    }
-                } else {
-                    arg
+            let arg = match arg {
+                crate::ast::AstFunctionArg::Positional(value)
+                    if self.introduced_value_at(introduced).is_some() =>
+                {
+                    crate::ast::AstFunctionArg::Positional(value)
                 }
-            } else {
-                arg
+                crate::ast::AstFunctionArg::Positional(value) => self.aliased_argument(value),
+                other @ (crate::ast::AstFunctionArg::Named { .. }
+                | crate::ast::AstFunctionArg::Lambda { .. }
+                | crate::ast::AstFunctionArg::AliasedArg { .. }
+                | crate::ast::AstFunctionArg::BulkArg { .. }
+                | crate::ast::AstFunctionArg::Unparsed { .. }
+                | crate::ast::AstFunctionArg::Table { .. }
+                | crate::ast::AstFunctionArg::DataType { .. }
+                | crate::ast::AstFunctionArg::NonValue { .. }
+                | crate::ast::AstFunctionArg::Introduced { .. }) => other,
             };
 
+            // `OPENROWSET(BULK 'file', name = value, …)`: an option of the
+            // bulk read.
+            if let (Some(first), crate::ast::AstFunctionArg::Positional(option)) =
+                (args.first(), &arg)
+            {
+                if let (
+                    crate::ast::AstFunctionArg::BulkArg { .. },
+                    AstExpr::BinaryOp {
+                        left,
+                        operator: crate::ast::BinaryOperator::Equal,
+                        right,
+                        ..
+                    },
+                ) = (first.as_ref(), option.as_ref())
+                {
+                    self.bulk_options.push(crate::ast::BulkOption {
+                        name: left.span(),
+                        value: right.span(),
+                    });
+                }
+            }
             args.push(Box::new(arg));
+
+            // An argument a keyword introduces follows with no comma.
+            if self.introduced_value_at(introduced).is_some() {
+                continue;
+            }
 
             // MySQL GROUP_CONCAT `SEPARATOR 'str'` directly after the last
             // argument (no in-args ORDER BY): GROUP_CONCAT(name SEPARATOR ', ').
@@ -570,7 +548,8 @@ impl<'a> Parser<'a> {
                     if matches!(
                         sep_tok.kind,
                         TokenKind::Identifier {
-                            kind: crate::lexer::IdentifierKind::Unquoted
+                            kind: crate::lexer::IdentifierKind::Unquoted,
+                            ..
                         }
                     ) && sep_tok
                         .lexeme(self.source)
@@ -610,20 +589,20 @@ impl<'a> Parser<'a> {
                         let order_by_start = order_tok.span.start;
 
                         // Expect BY
-                        let by_tok = self.advance();
-                        if by_tok.is_none()
-                            || !matches!(by_tok.unwrap().kind, TokenKind::Keyword(Keyword::By))
-                        {
+                        let Some(by_tok) = self
+                            .advance()
+                            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::By)))
+                        else {
                             return Err(ParseError::new(
                                 order_tok.span,
                                 ParseErrorKind::InvalidSyntax {
                                     message: "Expected BY after ORDER".to_string(),
                                 },
                             ));
-                        }
+                        };
 
                         // Parse order items until we hit RParen
-                        let mut order_by_end = by_tok.unwrap().span.end;
+                        let mut order_by_end = by_tok.span.end;
                         let mut order_items: Vec<Box<crate::ast::AstOrderItem>> = Vec::new();
                         while let Some(item) = self.parse_order_by_item()? {
                             order_by_end = item.span.end;
@@ -692,7 +671,8 @@ impl<'a> Parser<'a> {
                                 if matches!(
                                     sep_tok.kind,
                                     TokenKind::Identifier {
-                                        kind: crate::lexer::IdentifierKind::Unquoted
+                                        kind: crate::lexer::IdentifierKind::Unquoted,
+                                        ..
                                     }
                                 ) && sep_tok
                                     .lexeme(self.source)
@@ -786,6 +766,8 @@ impl<'a> Parser<'a> {
                                             func_name: AstIdentifier {
                                                 node_id: self.id_gen.next(),
                                                 span: func_name_span,
+                                                kind: crate::ast::AstIdentifierKind::Name,
+                                                templated: None,
                                             },
                                             approximate: approximate_span,
                                             lparen_span: lparen.span,
@@ -826,11 +808,13 @@ impl<'a> Parser<'a> {
                             func_name: AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: func_name_span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             },
                             quantifier,
                             args,
                             approximate: approximate_keyword.is_some(),
-                            odbc_fn: false,
+                            odbc_fn: None,
                             order_by_span,
                             inline_order_by: if order_items.is_empty() {
                                 None
@@ -892,6 +876,8 @@ impl<'a> Parser<'a> {
                                             func_name: AstIdentifier {
                                                 node_id: self.id_gen.next(),
                                                 span: func_name_span,
+                                                kind: crate::ast::AstIdentifierKind::Name,
+                                                templated: None,
                                             },
                                             approximate: approximate_span,
                                             lparen_span: lparen.span,
@@ -935,11 +921,13 @@ impl<'a> Parser<'a> {
                             func_name: AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: func_name_span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             },
                             quantifier,
                             args,
                             approximate: approximate_keyword.is_some(),
-                            odbc_fn: false,
+                            odbc_fn: None,
                             order_by_span: None,
                             inline_order_by: None,
                             separator_span,
@@ -952,15 +940,43 @@ impl<'a> Parser<'a> {
                         // Check if previous argument contained Jinja - if so, comma may be conditional
                         // This handles dbt patterns like: CONCAT({% if cond %}'val',{% endif %}name)
                         // When cond is false, there's no comma between empty block and next arg
-                        let prev_arg_has_jinja = args.last().is_some_and(|arg| {
-                            Self::expr_contains_jinja(match arg.as_ref() {
-                                crate::ast::AstFunctionArg::Positional(e) => e,
-                                crate::ast::AstFunctionArg::Named { value, .. } => value,
-                                crate::ast::AstFunctionArg::Lambda { body, .. } => body,
-                                crate::ast::AstFunctionArg::AliasedArg { value, .. } => value,
-                                crate::ast::AstFunctionArg::BulkArg { value, .. } => value,
-                            })
-                        });
+                        let prev_arg_has_jinja =
+                            args.last().is_some_and(|arg| match arg.as_ref() {
+                                crate::ast::AstFunctionArg::Positional(e) => {
+                                    Self::expr_contains_jinja(e)
+                                }
+                                crate::ast::AstFunctionArg::Named { value, .. }
+                                | crate::ast::AstFunctionArg::AliasedArg { value, .. }
+                                | crate::ast::AstFunctionArg::BulkArg { value, .. } => {
+                                    Self::expr_contains_jinja(value)
+                                }
+                                crate::ast::AstFunctionArg::Lambda { body, .. } => {
+                                    Self::expr_contains_jinja(body)
+                                }
+                                crate::ast::AstFunctionArg::Introduced {
+                                    value: crate::ast::AstIntroducedValue::Expr(value),
+                                    ..
+                                } => Self::expr_contains_jinja(value),
+                                crate::ast::AstFunctionArg::Unparsed { .. }
+                                | crate::ast::AstFunctionArg::DataType { .. }
+                                | crate::ast::AstFunctionArg::NonValue { .. }
+                                | crate::ast::AstFunctionArg::Introduced {
+                                    value:
+                                        crate::ast::AstIntroducedValue::DataType { .. }
+                                        | crate::ast::AstIntroducedValue::Name(_),
+                                    ..
+                                } => false,
+                                crate::ast::AstFunctionArg::Table {
+                                    partition_by,
+                                    order_by,
+                                    ..
+                                } => {
+                                    partition_by.iter().any(Self::expr_contains_jinja)
+                                        || order_by
+                                            .iter()
+                                            .any(|item| Self::expr_contains_jinja(&item.expr))
+                                }
+                            });
 
                         if prev_arg_has_jinja && self.is_likely_function_arg_start(next) {
                             // Tolerate missing comma after Jinja block
@@ -985,6 +1001,753 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One argument of a call, at the current token: a positional,
+    /// named or lambda argument, a `SELECT` or `EXECUTE IMMEDIATE`
+    /// subquery, or T-SQL `OPENROWSET`'s `BULK '<file>'`.
+    fn parse_function_arg(
+        &mut self,
+        is_openrowset: bool,
+        lparen_span: Span,
+    ) -> ParseResult<crate::ast::AstFunctionArg> {
+        let Some(tok) = self.peek() else {
+            return Err(ParseError::new(
+                lparen_span,
+                ParseErrorKind::UnexpectedEof {
+                    expected: vec!["expression".to_string(), ")".to_string()],
+                },
+            ));
+        };
+        if is_openrowset {
+            if let Some(run) = self.openrowset_login_run() {
+                return Ok(run);
+            }
+        }
+        Ok(
+            // T-SQL OPENROWSET(BULK '<file>', …): `BULK` identifier prefix
+            // directly followed by the file-path literal (no comma). Captured
+            // as a single BulkArg so the file literal stays attached to the
+            // OPENROWSET call and the form is recognizable as a file read.
+            if is_openrowset
+                && matches!(tok.kind, TokenKind::Identifier { .. })
+                && tok.lexeme(self.source).eq_ignore_ascii_case("BULK")
+                && self.peek_ahead(1).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Literal(crate::lexer::LiteralKind::String)
+                    )
+                })
+            {
+                let bulk_tok = self
+                    .advance()
+                    .ok_or_eof(self.current_span(), vec!["BULK".to_string()])?;
+                let value = self.parse_expr_with_recovery()?;
+                crate::ast::AstFunctionArg::BulkArg {
+                    bulk_span: bulk_tok.span,
+                    value: Box::new(value),
+                }
+            } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Execute)) {
+                // EXECUTE IMMEDIATE as function argument → statement-form
+                // subquery, e.g. Snowflake `RETURN TABLE(EXECUTE IMMEDIATE :q)`.
+                // Same SubqueryArg shape as ARRAY(SELECT ...): parens belong to
+                // the call; downstream walkers reach the EXECUTE IMMEDIATE
+                // through the expression tree.
+                // Checked before the identifier branch — EXECUTE is unreserved
+                // in most dialects and would otherwise be consumed as a name.
+                // Speculative parse with rollback, mirroring the parenthesized
+                // `(EXECUTE IMMEDIATE ...)` form in expr.rs.
+                let ei_start = tok.span.start;
+                let saved_idx = self.idx;
+                match crate::parser::scripting::try_parse_execute_immediate_stmt(self) {
+                    Ok(ei_stmt) => {
+                        let span = Span {
+                            start: ei_start,
+                            end: ei_stmt.span().end,
+                        };
+                        crate::ast::AstFunctionArg::Positional(Box::new(AstExpr::SubqueryArg {
+                            node_id: self.id_gen.next(),
+                            subquery: Box::new(ei_stmt),
+                            span,
+                        }))
+                    }
+                    Err(err) => {
+                        if err.kind.is_resource_exhaustion() {
+                            return Err(err);
+                        }
+                        // Restore and fall back to plain expression parsing
+                        // (EXECUTE used as an ordinary identifier argument).
+                        self.idx = saved_idx;
+                        let expr = self.parse_expr_with_recovery()?;
+                        crate::ast::AstFunctionArg::Positional(Box::new(expr))
+                    }
+                }
+            } else if self.can_be_identifier_token(tok) {
+                let next = self.peek_ahead(1);
+                let is_named_arrow = next.is_some_and(|t| {
+                    matches!(t.kind, TokenKind::Operator(crate::lexer::Operator::EqGt))
+                });
+                let is_lambda_arrow = next.is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Operator(crate::lexer::Operator::RightArrow)
+                    )
+                });
+
+                if is_named_arrow {
+                    // This is a named argument: name => value
+                    let name_tok = self
+                        .advance()
+                        .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
+                    let arrow_tok = self
+                        .advance()
+                        .ok_or_eof(self.current_span(), vec!["=>".to_string()])?;
+                    // A literal given to a name that names a secret
+                    // (`password => '…'`) is one.
+                    if crate::secrets::is_secret_name(name_tok.lexeme(self.source)) {
+                        if let Some(secret) = self.secret_value_at(self.idx) {
+                            self.redaction_spans.push(secret);
+                        }
+                    }
+                    // Use error recovery for the value expression
+                    let value = self.parse_expr_with_recovery()?;
+
+                    crate::ast::AstFunctionArg::Named {
+                        name: crate::ast::AstIdentifier {
+                            node_id: self.id_gen.next(),
+                            span: name_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
+                        },
+                        arrow_span: arrow_tok.span,
+                        value: Box::new(value),
+                    }
+                } else if is_lambda_arrow {
+                    // This is a lambda expression: x -> expr
+                    let param_tok = self
+                        .advance()
+                        .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
+                    let param_start = param_tok.span.start;
+                    let arrow_tok = self
+                        .advance()
+                        .ok_or_eof(self.current_span(), vec!["->".to_string()])?;
+                    // Parse lambda body expression
+                    let body = self.parse_expr_with_recovery()?;
+                    let body_end = body.span().end;
+
+                    crate::ast::AstFunctionArg::Lambda {
+                        params: vec![crate::ast::AstIdentifier {
+                            node_id: self.id_gen.next(),
+                            span: param_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
+                        }],
+                        arrow_span: arrow_tok.span,
+                        body: Box::new(body),
+                        span: Span {
+                            start: param_start,
+                            end: body_end,
+                        },
+                    }
+                } else {
+                    // Regular positional argument - use error recovery
+                    let expr = self.parse_expr_with_recovery()?;
+                    crate::ast::AstFunctionArg::Positional(Box::new(expr))
+                }
+            } else if matches!(
+                tok.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+            ) {
+                // Could be a lambda with multiple params: (x, y) -> expr
+                // Or just a parenthesized expression
+                // Peek ahead to find -> after the closing paren
+                let is_lambda = self.is_lambda_params();
+                if is_lambda {
+                    self.parse_lambda_arg()?
+                } else {
+                    // Regular positional argument - use error recovery
+                    let expr = self.parse_expr_with_recovery()?;
+                    crate::ast::AstFunctionArg::Positional(Box::new(expr))
+                }
+            } else if matches!(tok.kind, TokenKind::Keyword(Keyword::Select)) {
+                // SELECT keyword as function argument → subquery argument
+                // e.g., ARRAY(SELECT AS STRUCT id, name FROM users)
+                // Use SubqueryArg (not ScalarSubquery) because the parens belong
+                // to the function call, not the subquery itself.
+                let select_start = tok.span.start;
+                let subquery = self.try_parse_set_or_select_stmt().map_err(|_| {
+                    ParseError::invalid_expression(
+                        self.current_span(),
+                        "Expected SELECT subquery as function argument".to_string(),
+                    )
+                })?;
+                let subquery_span = subquery.span();
+                let span = Span {
+                    start: select_start,
+                    end: subquery_span.end,
+                };
+                crate::ast::AstFunctionArg::Positional(Box::new(AstExpr::SubqueryArg {
+                    node_id: self.id_gen.next(),
+                    subquery: Box::new(subquery),
+                    span,
+                }))
+            } else {
+                // Not an identifier, must be a positional expression - use error recovery
+                let expr = self.parse_expr_with_recovery()?;
+                crate::ast::AstFunctionArg::Positional(Box::new(expr))
+            },
+        )
+    }
+
+    /// An argument the dialect says is no value
+    /// ([`crate::dialect::Dialect::non_value_arguments`]): a data type, a
+    /// date or time part, or a normalization form, written whole up to the
+    /// next `,` or `)`. Any other argument there (a string, an expression,
+    /// a word the dialect gives no such meaning) is read as
+    /// [`Self::parse_function_arg`] reads it. `odbc` reads a part as ODBC's
+    /// `SQL_TSI_<unit>`.
+    fn parse_non_value_argument(
+        &mut self,
+        kind: crate::dialect::NonValueKind,
+        odbc: bool,
+        is_openrowset: bool,
+        lparen_span: Span,
+    ) -> ParseResult<crate::ast::AstFunctionArg> {
+        use crate::dialect::NonValueKind;
+        match kind {
+            NonValueKind::DataType => self.parse_type_argument(is_openrowset, lparen_span),
+            NonValueKind::DatePart | NonValueKind::NormalForm => {
+                match self.non_value_word(kind, odbc) {
+                    Some((value, span)) => Ok(crate::ast::AstFunctionArg::NonValue { value, span }),
+                    None => self.parse_function_arg(is_openrowset, lparen_span),
+                }
+            }
+        }
+    }
+
+    /// The date part (`day`, BigQuery's `WEEK(MONDAY)`) or normalization
+    /// form written at the current token and ending at `,` or `)`, read;
+    /// `None`, with nothing read, where none is.
+    fn non_value_word(
+        &mut self,
+        kind: crate::dialect::NonValueKind,
+        odbc: bool,
+    ) -> Option<(crate::ast::AstNonValue, Span)> {
+        use crate::ast::{ArgKeyword, AstNonValue, DatePart, NormalForm};
+        use crate::dialect::NonValueKind;
+        use crate::lexer::Punctuation;
+        let first = self.peek().filter(|t| is_unquoted_word(t))?;
+        let word = first.lexeme(self.source);
+        let value = match kind {
+            NonValueKind::DatePart if odbc => {
+                AstNonValue::Unit(DatePart::from_odbc_interval(word)?)
+            }
+            NonValueKind::DatePart => AstNonValue::Unit(self.dialect.date_part(word)?),
+            NonValueKind::NormalForm => {
+                AstNonValue::Keyword(ArgKeyword::NormalForm(NormalForm::from_name(word)?))
+            }
+            NonValueKind::DataType => return None,
+        };
+        let from = self.idx;
+        let mut end = self.advance()?.span.end;
+        let is_punctuation = |t: Option<&Token>, p: Punctuation| {
+            t.is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(q) if q == p))
+        };
+        // BigQuery's week starting on a day: `WEEK(MONDAY)`.
+        let value = match value {
+            AstNonValue::Unit(DatePart::Week)
+                if is_punctuation(self.peek(), Punctuation::LParen) =>
+            {
+                let Some((day, rparen_end)) = self.weekday_in_parentheses() else {
+                    self.idx = from;
+                    return None;
+                };
+                end = rparen_end;
+                AstNonValue::Unit(DatePart::WeekStarting(day))
+            }
+            other => other,
+        };
+        if is_punctuation(self.peek(), Punctuation::Comma)
+            || is_punctuation(self.peek(), Punctuation::RParen)
+        {
+            Some((
+                value,
+                Span {
+                    start: first.span.start,
+                    end,
+                },
+            ))
+        } else {
+            self.idx = from;
+            None
+        }
+    }
+
+    /// `( <weekday> )` at the current token, read: the day and where the
+    /// `)` ends. `None` where it is not written so (the caller restores
+    /// the position).
+    pub(crate) fn weekday_in_parentheses(&mut self) -> Option<(crate::ast::Weekday, u32)> {
+        use crate::lexer::Punctuation;
+        self.advance();
+        let day = self.advance().filter(|t| is_unquoted_word(t))?;
+        let day = crate::ast::Weekday::from_name(day.lexeme(self.source))?;
+        let rparen = self
+            .advance()
+            .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)))?;
+        Some((day, rparen.span.end))
+    }
+
+    /// The number of arguments of the call whose `(` was just read: the
+    /// commas outside any parenthesis before its `)`, and one.
+    fn call_argument_count(&self) -> usize {
+        use crate::lexer::Punctuation;
+        let mut depth = 0usize;
+        let mut commas = 0usize;
+        let mut written = false;
+        for token in self.tokens.get(self.idx..).unwrap_or_default() {
+            let is = |p: Punctuation| matches!(token.kind, TokenKind::Punctuation(q) if q == p);
+            if matches!(token.kind, TokenKind::Eof) || (depth == 0 && is(Punctuation::RParen)) {
+                break;
+            }
+            if is(Punctuation::LParen) {
+                depth += 1;
+            } else if is(Punctuation::RParen) {
+                depth -= 1;
+            } else if depth == 0 && is(Punctuation::Comma) {
+                commas += 1;
+            }
+            written = true;
+        }
+        if written {
+            commas + 1
+        } else {
+            0
+        }
+    }
+
+    /// The argument of a call the dialect says names a data type
+    /// ([`crate::dialect::Dialect::non_value_arguments`]): a data type
+    /// written by name up to the next `,` or `)`. Any other argument there
+    /// is read as [`Self::parse_function_arg`] reads it.
+    fn parse_type_argument(
+        &mut self,
+        is_openrowset: bool,
+        lparen_span: Span,
+    ) -> ParseResult<crate::ast::AstFunctionArg> {
+        use crate::lexer::{IdentifierKind, Punctuation};
+        let from = self.idx;
+        let name = self.peek().filter(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Keyword(_)
+                    | TokenKind::Identifier {
+                        kind: IdentifierKind::Unquoted | IdentifierKind::Quoted,
+                        ..
+                    }
+            )
+        });
+        if let Some(start) = name.map(|t| t.span.start) {
+            let read = self.parse_data_type();
+            let ends = self.peek().is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen)
+                )
+            });
+            match (read, self.consumed_end()) {
+                (Some(Ok(data_type)), Some(end)) if ends => {
+                    return Ok(crate::ast::AstFunctionArg::DataType {
+                        data_type,
+                        span: Span { start, end },
+                    });
+                }
+                (Some(Err(e)), _) if e.kind.is_resource_exhaustion() => return Err(e),
+                (Some(Ok(_) | Err(_)) | None, _) => self.idx = from,
+            }
+        }
+        self.parse_function_arg(is_openrowset, lparen_span)
+    }
+
+    /// What follows the keyword at the current token, where it is one of
+    /// `introduced` ([`crate::dialect::Dialect::introduced_arguments`]) and
+    /// something other than `,` or `)` follows it; `None` otherwise.
+    fn introduced_value_at(
+        &self,
+        introduced: &[crate::dialect::IntroducedArgument],
+    ) -> Option<crate::dialect::IntroducedValue> {
+        use crate::lexer::Punctuation;
+        let keyword = self.peek().filter(|t| is_unquoted_word(t))?;
+        let word = keyword.lexeme(self.source);
+        let row = introduced
+            .iter()
+            .find(|row| row.keyword.eq_ignore_ascii_case(word))?;
+        self.peek_ahead(1)
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Eof
+                        | TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen)
+                )
+            })
+            .map(|_| row.value)
+    }
+
+    /// The argument a keyword introduces at the current token, `kind` as
+    /// [`Self::introduced_value_at`] gives it: the keyword, then an
+    /// expression, a data type, or a name.
+    fn parse_introduced_argument(
+        &mut self,
+        kind: crate::dialect::IntroducedValue,
+    ) -> ParseResult<crate::ast::AstFunctionArg> {
+        use crate::ast::AstIntroducedValue;
+        use crate::dialect::IntroducedValue;
+        let keyword_span = self.advance().expect_invariant("keyword after peek").span;
+        let value = match kind {
+            IntroducedValue::Expr => AstIntroducedValue::Expr(Box::new(self.parse_expr()?)),
+            IntroducedValue::DataType => {
+                let start = self.current_span().start;
+                let data_type = match self.parse_data_type() {
+                    Some(read) => read?,
+                    None => {
+                        return Err(ParseError::unexpected_eof(
+                            self.current_span(),
+                            vec!["data type".to_string()],
+                        ))
+                    }
+                };
+                let end = self.consumed_end().unwrap_or(start);
+                AstIntroducedValue::DataType {
+                    data_type,
+                    span: Span { start, end },
+                }
+            }
+            IntroducedValue::Name => {
+                let name = self
+                    .advance()
+                    .expect_invariant("a token after the keyword, as peeked");
+                AstIntroducedValue::Name(crate::ast::AstIdentifier {
+                    node_id: self.id_gen.next(),
+                    span: name.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
+                })
+            }
+        };
+        Ok(crate::ast::AstFunctionArg::Introduced {
+            keyword_span,
+            value,
+        })
+    }
+
+    /// The positional argument `value`, with a trailing `AS alias` (BigQuery
+    /// `STRUCT(1 AS x)`) read where one is written.
+    fn aliased_argument(&mut self, value: Box<AstExpr>) -> crate::ast::AstFunctionArg {
+        if !self
+            .peek()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::As)))
+        {
+            return crate::ast::AstFunctionArg::Positional(value);
+        }
+        let as_span = self.advance().expect_invariant("AS after peek").span;
+        // Input ending after `AS` leaves the argument as it is.
+        let Some(alias_tok) = self.advance() else {
+            return crate::ast::AstFunctionArg::Positional(value);
+        };
+        crate::ast::AstFunctionArg::AliasedArg {
+            value,
+            as_span,
+            alias: crate::ast::AstIdentifier {
+                node_id: self.id_gen.next(),
+                span: alias_tok.span,
+                kind: crate::ast::AstIdentifierKind::Name,
+                templated: None,
+            },
+        }
+    }
+
+    /// Whether the current token ends a call's argument: `,`, `)`, or the
+    /// `AS` of an aliased argument.
+    fn at_call_argument_end(&self) -> bool {
+        use crate::lexer::Punctuation;
+        self.peek().is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen)
+                    | TokenKind::Keyword(Keyword::As)
+            )
+        })
+    }
+
+    /// A table function's argument that is a table, at the current token
+    /// ([`crate::ast::AstFunctionArg::Table`]): `TABLE name` or `TABLE (
+    /// name )`, the name read by the object-name reader, then `PARTITION BY
+    /// …` and `ORDER BY …` read by the window's readers, up to the call's
+    /// next `,` or `)`. `None`, consuming and recording nothing, for any
+    /// other argument (`TABLE ( query )` included).
+    fn table_argument(
+        &mut self,
+        errors_before: usize,
+    ) -> ParseResult<Option<crate::ast::AstFunctionArg>> {
+        use crate::lexer::Punctuation;
+        let Some(table_keyword) = self
+            .peek()
+            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Table)))
+            .map(|t| t.span)
+        else {
+            return Ok(None);
+        };
+        let from = self.idx;
+        let give_back = |parser: &mut Self| {
+            parser.idx = from;
+            parser.recovery_errors.truncate(errors_before);
+            Ok(None)
+        };
+        self.advance();
+        let is = |parser: &Self, p: Punctuation| {
+            parser
+                .peek()
+                .is_some_and(|t| t.kind == TokenKind::Punctuation(p))
+        };
+        let parenthesized = is(self, Punctuation::LParen);
+        if parenthesized {
+            self.advance();
+        }
+        let node_id = self.id_gen.next();
+        let Some((next, name)) = self.object_ref_at(self.idx, node_id) else {
+            return give_back(self);
+        };
+        self.idx = next;
+        if parenthesized {
+            if !is(self, Punctuation::RParen) {
+                return give_back(self);
+            }
+            self.advance();
+        }
+        let by_follows = |parser: &Self| {
+            parser
+                .peek_ahead(1)
+                .is_some_and(|t| t.lexeme(parser.source).eq_ignore_ascii_case("BY"))
+        };
+        let mut partition_by = Vec::new();
+        if self
+            .peek()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Partition)))
+            && by_follows(self)
+        {
+            self.advance();
+            self.advance();
+            match self.parse_partition_by_list() {
+                Ok(exprs) => partition_by = exprs,
+                Err(e) if e.kind.is_resource_exhaustion() => return Err(e),
+                Err(_) => return give_back(self),
+            }
+        }
+        let mut order_by = Vec::new();
+        if self
+            .peek()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Order)))
+            && by_follows(self)
+        {
+            self.advance();
+            self.advance();
+            match self.parse_order_by_list() {
+                Ok(items) => order_by = items,
+                Err(e) if e.kind.is_resource_exhaustion() => return Err(e),
+                Err(_) => return give_back(self),
+            }
+        }
+        let ends = is(self, Punctuation::Comma) || is(self, Punctuation::RParen);
+        if !ends || self.recovery_errors.len() != errors_before {
+            return give_back(self);
+        }
+        let end = self.tokens[self.idx - 1].span.end;
+        Ok(Some(crate::ast::AstFunctionArg::Table {
+            table_keyword: Some(table_keyword),
+            name: Box::new(name),
+            partition_by,
+            order_by,
+            span: Span {
+                start: table_keyword.start,
+                end,
+            },
+        }))
+    }
+
+    /// The argument from token `from` to the next `,` or `)` of the call,
+    /// read as text ([`crate::ast::AstFunctionArg::Unparsed`]): what a
+    /// failed reading of it consumed or recorded is dropped, and the
+    /// secrets written in it are recorded as in other unparsed text.
+    fn unparsed_call_argument(
+        &mut self,
+        from: usize,
+        errors_before: usize,
+    ) -> ParseResult<crate::ast::AstFunctionArg> {
+        self.idx = from;
+        self.recovery_errors.truncate(errors_before);
+        self.pass_call_argument_rest(from)
+    }
+
+    /// A `JSON_TABLE` argument `path [AS name] COLUMNS ( column [, …] )` at
+    /// the current token, read once: an
+    /// [`crate::ast::AstFunctionArg::Unparsed`] holding its text, the
+    /// columns it declares kept by its span for the table reference. Text
+    /// written after the list makes it an unparsed argument declaring
+    /// nothing. `None` where the argument is not one.
+    fn columns_argument(&mut self, from: usize) -> ParseResult<Option<crate::ast::AstFunctionArg>> {
+        use crate::lexer::{LiteralKind, Punctuation};
+        if !self
+            .peek()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)))
+        {
+            return Ok(None);
+        }
+        let named = self
+            .peek_ahead(1)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::As)))
+            && self
+                .peek_ahead(2)
+                .is_some_and(|name| self.can_be_identifier_token(name));
+        let columns_at = if named { 3 } else { 1 };
+        if !self.is_word(self.peek_ahead(columns_at), "COLUMNS")
+            || !self
+                .peek_ahead(columns_at + 1)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))
+        {
+            return Ok(None);
+        }
+        for _ in 0..=columns_at {
+            self.advance();
+        }
+        let columns = self
+            .read_column_list()
+            .and_then(crate::parser::table_ref::ColumnList::declared);
+        let ends = self.peek().is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen)
+            )
+        });
+        let arg = self.pass_call_argument_rest(from)?;
+        if !ends {
+            return Ok(Some(arg));
+        }
+        if let (crate::ast::AstFunctionArg::Unparsed { span }, Some(columns)) = (&arg, columns) {
+            self.declared_columns.insert(*span, columns);
+        }
+        Ok(Some(arg))
+    }
+
+    /// T-SQL `OPENROWSET`'s `'data source';'user';'password'` argument at
+    /// the current token, consumed: the string literals of a run separated
+    /// by `;`, kept as its text ([`crate::ast::AstFunctionArg::Unparsed`]).
+    /// `None`, consuming nothing, where a string followed by `;` does not
+    /// start the argument.
+    fn openrowset_login_run(&mut self) -> Option<crate::ast::AstFunctionArg> {
+        use crate::lexer::{LiteralKind, Punctuation};
+        let is_string = |t: Option<&Token>| {
+            t.is_some_and(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)))
+        };
+        let is_semi = |t: Option<&Token>| {
+            t.is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)))
+        };
+        if !is_string(self.peek()) || !is_semi(self.peek_ahead(1)) {
+            return None;
+        }
+        let first = self.advance()?.span;
+        let (start, mut end) = (first.start, first.end);
+        while is_semi(self.peek()) && is_string(self.peek_ahead(1)) {
+            self.advance();
+            end = self.advance()?.span.end;
+        }
+        Some(crate::ast::AstFunctionArg::Unparsed {
+            span: Span { start, end },
+        })
+    }
+
+    /// The argument from token `from` to the next `,` or `)` of the call,
+    /// read as text from the current token on.
+    fn pass_call_argument_rest(&mut self, from: usize) -> ParseResult<crate::ast::AstFunctionArg> {
+        use crate::lexer::Punctuation;
+        let mut depth = 0usize;
+        let mut end = self.consumed_end().filter(|_| self.idx > from);
+        while let Some(t) = self.peek() {
+            match t.kind {
+                TokenKind::Punctuation(Punctuation::Comma | Punctuation::RParen) if depth == 0 => {
+                    break;
+                }
+                TokenKind::Punctuation(Punctuation::LParen) => depth += 1,
+                TokenKind::Punctuation(Punctuation::RParen) => depth -= 1,
+                TokenKind::Eof => break,
+                TokenKind::Punctuation(
+                    Punctuation::Comma
+                    | Punctuation::LBracket
+                    | Punctuation::RBracket
+                    | Punctuation::LCurly
+                    | Punctuation::RCurly
+                    | Punctuation::Semi
+                    | Punctuation::Dot
+                    | Punctuation::Colon,
+                )
+                | TokenKind::Keyword(_)
+                | TokenKind::Identifier { .. }
+                | TokenKind::Literal(_)
+                | TokenKind::Operator(_)
+                | TokenKind::LineComment
+                | TokenKind::BlockComment
+                | TokenKind::JinjaComment
+                | TokenKind::JinjaExprOpen
+                | TokenKind::JinjaExprClose
+                | TokenKind::JinjaStmtOpen
+                | TokenKind::JinjaStmtClose
+                | TokenKind::JinjaPipe
+                | TokenKind::JinjaTilde
+                | TokenKind::JinjaDoubleStar
+                | TokenKind::JinjaDoubleSlash
+                | TokenKind::JinjaDoubleEq
+                | TokenKind::JinjaAnd
+                | TokenKind::JinjaOr
+                | TokenKind::JinjaNot
+                | TokenKind::JinjaIn
+                | TokenKind::JinjaIs
+                | TokenKind::JinjaTrue
+                | TokenKind::JinjaFalse
+                | TokenKind::JinjaNull
+                | TokenKind::JinjaIf
+                | TokenKind::JinjaElif
+                | TokenKind::JinjaElse
+                | TokenKind::JinjaEndIf
+                | TokenKind::JinjaFor
+                | TokenKind::JinjaEndFor
+                | TokenKind::JinjaSet
+                | TokenKind::JinjaEndSet
+                | TokenKind::JinjaDocs
+                | TokenKind::JinjaEndDocs
+                | TokenKind::JinjaFilter
+                | TokenKind::JinjaEndFilter
+                | TokenKind::JinjaCall
+                | TokenKind::JinjaEndCall
+                | TokenKind::Placeholder
+                | TokenKind::Unknown => {}
+            }
+            end = Some(t.span.end);
+            self.advance();
+        }
+        let (Some(first), Some(end)) = (self.tokens.get(from), end) else {
+            return Err(ParseError::unexpected_token(
+                self.current_span(),
+                vec!["argument".to_string()],
+                self.peek()
+                    .map(|t| Parser::token_description(t, self.source))
+                    .unwrap_or_default(),
+            ));
+        };
+        self.record_unparsed_secrets(from, self.idx);
+        Ok(crate::ast::AstFunctionArg::Unparsed {
+            span: Span {
+                start: first.span.start,
+                end,
+            },
+        })
+    }
+
     /// Check if an expression contains any Jinja constructs
     fn expr_contains_jinja(expr: &AstExpr) -> bool {
         match expr {
@@ -992,6 +1755,9 @@ impl<'a> Parser<'a> {
             AstExpr::BinaryOp { left, right, .. } => {
                 Self::expr_contains_jinja(left) || Self::expr_contains_jinja(right)
             }
+            AstExpr::OperatorChain { operands, .. } => operands
+                .iter()
+                .any(|operand| Self::expr_contains_jinja(operand)),
             AstExpr::Parenthesized { expr, .. } => Self::expr_contains_jinja(expr),
             AstExpr::FunctionCall { args, .. } | AstExpr::WindowFn { args, .. } => {
                 args.iter().any(|arg| match arg.as_ref() {
@@ -1007,6 +1773,29 @@ impl<'a> Parser<'a> {
                     }
                     crate::ast::AstFunctionArg::BulkArg { value, .. } => {
                         Self::expr_contains_jinja(value)
+                    }
+                    crate::ast::AstFunctionArg::Introduced {
+                        value: crate::ast::AstIntroducedValue::Expr(value),
+                        ..
+                    } => Self::expr_contains_jinja(value),
+                    crate::ast::AstFunctionArg::Unparsed { .. }
+                    | crate::ast::AstFunctionArg::DataType { .. }
+                    | crate::ast::AstFunctionArg::NonValue { .. }
+                    | crate::ast::AstFunctionArg::Introduced {
+                        value:
+                            crate::ast::AstIntroducedValue::DataType { .. }
+                            | crate::ast::AstIntroducedValue::Name(_),
+                        ..
+                    } => false,
+                    crate::ast::AstFunctionArg::Table {
+                        partition_by,
+                        order_by,
+                        ..
+                    } => {
+                        partition_by.iter().any(Self::expr_contains_jinja)
+                            || order_by
+                                .iter()
+                                .any(|item| Self::expr_contains_jinja(&item.expr))
                     }
                 })
             }
@@ -1435,17 +2224,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Helper to extract string value from a string literal token
+    /// The value of a string literal token.
     fn extract_string_literal(&self, tok: &Token) -> ParseResult<String> {
         match &tok.kind {
             TokenKind::Literal(crate::lexer::LiteralKind::String) => {
-                // Remove surrounding quotes
-                let s = &tok.lexeme(self.source);
-                if s.len() >= 2 && (s.starts_with('\'') || s.starts_with('"')) {
-                    Ok(s[1..s.len() - 1].to_string())
-                } else {
-                    Ok(s.to_string())
-                }
+                let s = tok.lexeme(self.source);
+                Ok(crate::lexer::decode_string_literal(s, self.dialect)
+                    .map_or_else(|| s.to_string(), |decoded| decoded.value))
             }
             _ => Err(ParseError::unexpected_token(
                 tok.span,
@@ -1464,92 +2249,72 @@ impl<'a> Parser<'a> {
             ParseError::unexpected_eof(self.current_span(), vec!["string fragment".to_string()])
         })?;
         let start = first_tok.span.start;
-        let mut end = first_tok.span.end;
-
-        // Continue consuming tokens until we find a StringFragment that ends with a quote
-        // (indicating the string is complete)
-        loop {
-            let next = self.peek();
-            match next {
-                Some(tok) if matches!(tok.kind, TokenKind::JinjaComment) => {
-                    let tok = self
-                        .advance()
-                        .expect_invariant("JinjaComment token available after peek");
-                    end = tok.span.end;
-                }
-                Some(tok) if matches!(tok.kind, TokenKind::JinjaExprOpen) => {
-                    // Consume the entire Jinja expression: {{ ... }}
-                    let tok = self
-                        .advance()
-                        .expect_invariant("JinjaExprOpen token available after peek");
-                    end = tok.span.end;
-                    // Skip tokens until we find the closing }}
-                    while let Some(inner_tok) = self.peek() {
-                        if matches!(inner_tok.kind, TokenKind::JinjaExprClose) {
-                            let close = self
-                                .advance()
-                                .expect_invariant("JinjaExprClose token available after peek");
-                            end = close.span.end;
-                            break;
-                        } else {
-                            let inner = self.advance().expect_invariant(
-                                "Jinja expression inner token available after peek",
-                            );
-                            end = inner.span.end;
-                        }
-                    }
-                }
-                Some(tok) if matches!(tok.kind, TokenKind::JinjaStmtOpen) => {
-                    // Consume the entire Jinja statement block: {% ... %}
-                    let tok = self
-                        .advance()
-                        .expect_invariant("JinjaStmtOpen token available after peek");
-                    end = tok.span.end;
-                    // Skip tokens until we find the closing %}
-                    while let Some(inner_tok) = self.peek() {
-                        if matches!(inner_tok.kind, TokenKind::JinjaStmtClose) {
-                            let close = self
-                                .advance()
-                                .expect_invariant("JinjaStmtClose token available after peek");
-                            end = close.span.end;
-                            break;
-                        } else {
-                            let inner = self.advance().expect_invariant(
-                                "Jinja statement inner token available after peek",
-                            );
-                            end = inner.span.end;
-                        }
-                    }
-                }
-                Some(tok)
-                    if matches!(
-                        tok.kind,
-                        TokenKind::Literal(crate::lexer::LiteralKind::StringFragment)
-                    ) =>
-                {
-                    let tok = self
-                        .advance()
-                        .expect_invariant("StringFragment token available after peek");
-                    end = tok.span.end;
-                    // Check if this fragment ends the string (contains closing quote)
-                    if tok.lexeme(self.source).ends_with('\'') {
-                        break;
-                    }
-                }
-                _ => {
-                    // Unexpected token or EOF - the string wasn't properly closed
-                    // This is an error case, but for robustness we'll just stop here
-                    break;
-                }
-            }
-        }
-
+        let read = self.templated_string_after(self.idx - 1);
+        self.idx = read.past;
         Ok(AstExpr::Literal {
             node_id: self.id_gen.next(),
             literal: AstLiteral::StringWithJinja {
-                span: Span { start, end },
+                span: Span {
+                    start,
+                    end: self.tokens[read.past - 1].span.end,
+                },
             },
         })
+    }
+
+    /// The rest of the string a template writes into whose opening fragment
+    /// is token `first` (`'a`, then `{{ … }}`, `{% … %}`, `{# … #}` and
+    /// fragments): read up to the fragment that closes it, or, unclosed, up
+    /// to the first other token or the end of the text.
+    pub(crate) fn templated_string_after(&self, first: usize) -> TemplatedString {
+        let token_at = |j: usize| {
+            self.tokens
+                .get(j..)?
+                .iter()
+                .position(|t| !matches!(t.kind, TokenKind::Eof))
+                .map(|k| (j + k, &self.tokens[j + k]))
+        };
+        let mut past = first + 1;
+        while let Some((at, tok)) = token_at(past) {
+            if matches!(tok.kind, TokenKind::JinjaComment) {
+                past = at + 1;
+            } else if matches!(
+                tok.kind,
+                TokenKind::JinjaExprOpen | TokenKind::JinjaStmtOpen
+            ) {
+                let expr = matches!(tok.kind, TokenKind::JinjaExprOpen);
+                past = at + 1;
+                while let Some((inner, inner_tok)) = token_at(past) {
+                    past = inner + 1;
+                    let closes = if expr {
+                        matches!(inner_tok.kind, TokenKind::JinjaExprClose)
+                    } else {
+                        matches!(inner_tok.kind, TokenKind::JinjaStmtClose)
+                    };
+                    if closes {
+                        break;
+                    }
+                }
+            } else if matches!(
+                tok.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::StringFragment)
+            ) {
+                past = at + 1;
+                // A fragment written after a template closes the string with
+                // a quote not doubled: its trailing run of quotes is odd.
+                let lexeme = tok.lexeme(self.source);
+                let quotes = lexeme.len() - lexeme.trim_end_matches('\'').len();
+                if quotes % 2 == 1 {
+                    return TemplatedString { past, closed: true };
+                }
+            } else {
+                break;
+            }
+        }
+        TemplatedString {
+            past,
+            closed: false,
+        }
     }
 
     /// Check if the current position starts a lambda parameter list: (x, y) ->
@@ -1627,6 +2392,8 @@ impl<'a> Parser<'a> {
                 params.push(crate::ast::AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: param_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 });
 
                 // Check for comma or rparen
@@ -1982,6 +2749,44 @@ impl<'a> Parser<'a> {
     /// Returns (over_span, window_spec) where over_span covers from OVER to closing )
     ///
     /// null_handling_tokens: Optional (ignore_respect_token_id, nulls_token_id) from caller
+    /// The expressions of a `PARTITION BY` list, the cursor past `BY`.
+    pub(crate) fn parse_partition_by_list(&mut self) -> ParseResult<Vec<AstExpr>> {
+        let mut exprs = Vec::new();
+        loop {
+            exprs.push(self.parse_expr()?);
+            if self.peek().is_some_and(|comma| {
+                matches!(
+                    comma.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                )
+            }) {
+                self.advance();
+                continue;
+            }
+            return Ok(exprs);
+        }
+    }
+
+    /// The items of an `ORDER BY` list ([`Self::parse_order_by_item`]),
+    /// the cursor past `BY`.
+    pub(crate) fn parse_order_by_list(&mut self) -> ParseResult<Vec<AstOrderItem>> {
+        let mut items = Vec::new();
+        while let Some(item) = self.parse_order_by_item()? {
+            items.push(item);
+            if self.peek().is_some_and(|comma| {
+                matches!(
+                    comma.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                )
+            }) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(items)
+    }
+
     pub(crate) fn parse_window_spec_opt(
         &mut self,
         null_handling_tokens: Option<(crate::cst::TokenId, crate::cst::TokenId)>,
@@ -2130,22 +2935,9 @@ impl<'a> Parser<'a> {
                             by_tok.lexeme(self.source).to_string(),
                         )));
                     }
-                    loop {
-                        let expr = match self.parse_expr() {
-                            Ok(e) => e,
-                            Err(e) => return Some(Err(e)),
-                        };
-                        partition_by.push(expr);
-                        if let Some(comma) = self.peek() {
-                            if matches!(
-                                comma.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                            ) {
-                                let _ = self.advance();
-                                continue;
-                            }
-                        }
-                        break;
+                    match self.parse_partition_by_list() {
+                        Ok(exprs) => partition_by.extend(exprs),
+                        Err(e) => return Some(Err(e)),
                     }
                 }
                 TokenKind::Keyword(Keyword::Order) => {
@@ -2162,25 +2954,9 @@ impl<'a> Parser<'a> {
                             by_tok.lexeme(self.source).to_string(),
                         )));
                     }
-                    loop {
-                        // Use shared helper with ExprMode::Sql for window functions
-                        let item = match self.parse_order_by_item() {
-                            Ok(Some(item)) => item,
-                            Ok(None) => break,
-                            Err(e) => return Some(Err(e)),
-                        };
-                        order_items.push(item);
-
-                        if let Some(comma) = self.peek() {
-                            if matches!(
-                                comma.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                            ) {
-                                let _ = self.advance();
-                                continue;
-                            }
-                        }
-                        break;
+                    match self.parse_order_by_list() {
+                        Ok(items) => order_items.extend(items),
+                        Err(e) => return Some(Err(e)),
                     }
                 }
                 TokenKind::Keyword(Keyword::Rows) => {

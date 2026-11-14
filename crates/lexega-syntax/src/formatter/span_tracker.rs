@@ -502,6 +502,125 @@ impl std::fmt::Display for SpanTrackerError {
 
 impl std::error::Error for SpanTrackerError {}
 
+/// Validate gaps in token-level mappings to prevent data loss
+///
+/// Token tracking only tracks significant tokens (identifiers, literals, Jinja).
+/// Gaps are allowed but must contain ONLY:
+/// - Whitespace (spaces, tabs, newlines)
+/// - SQL keywords (SELECT, FROM, WHERE, etc.)
+/// - Operators and punctuation (*, =, etc.)
+///
+/// This prevents accidentally skipping user-provided content.
+fn validate_token_gaps(
+    mappings: &[SpanMapping],
+    source: &str,
+    source_len: usize,
+) -> Result<(), SpanTrackerError> {
+    if mappings.is_empty() {
+        return Ok(());
+    }
+
+    let mut pos = 0;
+
+    for mapping in mappings.iter() {
+        let gap_start = pos;
+        let gap_end = mapping.source.start as usize;
+
+        if gap_start < gap_end {
+            let gap_text = &source[gap_start..gap_end];
+
+            // Validate gap contains only safe-to-skip content
+            // For now, use simple heuristic: no quoted strings or complex identifiers
+            if contains_user_content(gap_text) {
+                // For now, just warn rather than error - we'll refine this
+            }
+        }
+
+        pos = mapping.source.end as usize;
+    }
+
+    // Check trailing gap
+    if pos < source_len {
+        let gap_text = &source[pos..source_len];
+
+        if contains_user_content(gap_text) {
+            // Warning: trailing gap may contain user content
+        }
+    }
+
+    Ok(())
+}
+
+/// Simple heuristic: check if text contains quoted strings or looks like identifiers
+/// This is conservative - better to warn unnecessarily than skip user content
+fn contains_user_content(text: &str) -> bool {
+    // Check for quoted strings (user literals)
+    if text.contains('\'') || text.contains('"') {
+        // But allow common SQL like 'active' in gaps if it's a keyword context
+        // This is a simplified check
+        return true;
+    }
+
+    // Check for consecutive alphanumeric (likely identifiers)
+    // Skip if it's just keywords like SELECT, FROM, WHERE
+    let words: Vec<&str> = text.split_whitespace().collect();
+    for word in words {
+        // Strip punctuation
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+
+        if clean.is_empty() {
+            continue;
+        }
+
+        // Check if it's a known SQL keyword (safe to skip)
+        let upper = clean.to_uppercase();
+        if is_sql_keyword(&upper) {
+            continue;
+        }
+
+        // If it has alphanumeric content and isn't a keyword, might be user content
+        if clean.chars().any(|c| c.is_alphanumeric()) {
+            return false; // Actually safe - keywords are OK in gaps
+        }
+    }
+
+    false
+}
+
+/// Check if token is a common SQL keyword
+fn is_sql_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "SELECT"
+            | "FROM"
+            | "WHERE"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "AS"
+            | "ON"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "GROUP"
+            | "BY"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "ALL"
+            | "DISTINCT"
+            | "TOP"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,123 +765,4 @@ mod tests {
 
         assert_eq!(expected_pos, source.len());
     }
-}
-
-/// Validate gaps in token-level mappings to prevent data loss
-///
-/// Token tracking only tracks significant tokens (identifiers, literals, Jinja).
-/// Gaps are allowed but must contain ONLY:
-/// - Whitespace (spaces, tabs, newlines)
-/// - SQL keywords (SELECT, FROM, WHERE, etc.)
-/// - Operators and punctuation (*, =, etc.)
-///
-/// This prevents accidentally skipping user-provided content.
-fn validate_token_gaps(
-    mappings: &[SpanMapping],
-    source: &str,
-    source_len: usize,
-) -> Result<(), SpanTrackerError> {
-    if mappings.is_empty() {
-        return Ok(());
-    }
-
-    let mut pos = 0;
-
-    for mapping in mappings.iter() {
-        let gap_start = pos;
-        let gap_end = mapping.source.start as usize;
-
-        if gap_start < gap_end {
-            let gap_text = &source[gap_start..gap_end];
-
-            // Validate gap contains only safe-to-skip content
-            // For now, use simple heuristic: no quoted strings or complex identifiers
-            if contains_user_content(gap_text) {
-                // For now, just warn rather than error - we'll refine this
-            }
-        }
-
-        pos = mapping.source.end as usize;
-    }
-
-    // Check trailing gap
-    if pos < source_len {
-        let gap_text = &source[pos..source_len];
-
-        if contains_user_content(gap_text) {
-            // Warning: trailing gap may contain user content
-        }
-    }
-
-    Ok(())
-}
-
-/// Simple heuristic: check if text contains quoted strings or looks like identifiers
-/// This is conservative - better to warn unnecessarily than skip user content
-fn contains_user_content(text: &str) -> bool {
-    // Check for quoted strings (user literals)
-    if text.contains('\'') || text.contains('"') {
-        // But allow common SQL like 'active' in gaps if it's a keyword context
-        // This is a simplified check
-        return true;
-    }
-
-    // Check for consecutive alphanumeric (likely identifiers)
-    // Skip if it's just keywords like SELECT, FROM, WHERE
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for word in words {
-        // Strip punctuation
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
-
-        if clean.is_empty() {
-            continue;
-        }
-
-        // Check if it's a known SQL keyword (safe to skip)
-        let upper = clean.to_uppercase();
-        if is_sql_keyword(&upper) {
-            continue;
-        }
-
-        // If it has alphanumeric content and isn't a keyword, might be user content
-        if clean.chars().any(|c| c.is_alphanumeric()) {
-            return false; // Actually safe - keywords are OK in gaps
-        }
-    }
-
-    false
-}
-
-/// Check if token is a common SQL keyword
-fn is_sql_keyword(s: &str) -> bool {
-    matches!(
-        s,
-        "SELECT"
-            | "FROM"
-            | "WHERE"
-            | "AND"
-            | "OR"
-            | "NOT"
-            | "AS"
-            | "ON"
-            | "JOIN"
-            | "INNER"
-            | "LEFT"
-            | "RIGHT"
-            | "OUTER"
-            | "CROSS"
-            | "NATURAL"
-            | "GROUP"
-            | "BY"
-            | "ORDER"
-            | "HAVING"
-            | "LIMIT"
-            | "OFFSET"
-            | "UNION"
-            | "INTERSECT"
-            | "EXCEPT"
-            | "ALL"
-            | "DISTINCT"
-            | "TOP"
-    )
 }

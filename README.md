@@ -32,7 +32,7 @@ ARM64, at <https://github.com/Lexega/lexega/releases/latest>:
 `lexega-darwin-arm64`, `lexega-windows-x64.exe`, `lexega-windows-arm64.exe`.
 `CHECKSUMS.sha256` covers each file, and each binary has an SBOM beside it.
 
-To build it from this repository, with Rust 1.91 or later:
+To build it from this repository, with Rust 1.99 or later:
 
 ```sh
 cargo build --release --bin lexega
@@ -47,7 +47,9 @@ with `go build` in its directory.
 `lexega` analyzes each statement with the facts its own structure determines.
 Rules that predicate on facts needing analysis across scopes, statements or
 scripts stay silent or report less precisely, and every report says how many
-rules that affects. Jinja and dbt templates are analyzed as written. Options
+rules that affects. Jinja and dbt templates, a dbt project's models among
+them, are analyzed as written, and every report says how many files were not
+rendered. Options
 that need a capability this build does not have (a policy gate, template
 rendering, cross-script analysis) are refused by name.
 [`crates/lexega-cli`](crates/lexega-cli#depth) has the details, and

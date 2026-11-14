@@ -800,7 +800,7 @@ pub fn lower_drop_security_integration_to_integration_plan(s: &AstDrop) -> Integ
     IntegrationPlan {
         action: IntegrationAction::Drop,
         integration_kind: IntegrationKindIr::Security,
-        name_span: s.target_name_span.unwrap_or(s.span),
+        name_span: s.target_name.as_ref().map_or(s.span, |name| name.span),
         renamed_to_name_span: None,
         if_not_exists: false,
         if_exists: s.if_exists_span.is_some(),

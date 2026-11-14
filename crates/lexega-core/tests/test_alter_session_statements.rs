@@ -15,18 +15,18 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(report.entries())
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -77,7 +77,7 @@ fn test_alter_session_multi_statement() {
 // ───────────────────────── governance rules ─────────────────────────
 
 #[test]
-fn test_alter_session_set_info_signal() {
+fn test_alter_session_set_info_finding() {
     let rules = analyze_and_get_rules("ALTER SESSION SET TIMEZONE = 'UTC';");
     assert!(
         rules.contains("INFO-SNW-SESSION-PARAM-SET"),
@@ -86,7 +86,7 @@ fn test_alter_session_set_info_signal() {
 }
 
 #[test]
-fn test_alter_session_unset_info_signal() {
+fn test_alter_session_unset_info_finding() {
     let rules = analyze_and_get_rules("ALTER SESSION UNSET QUERY_TAG, TIMEZONE;");
     assert!(
         rules.contains("INFO-SNW-SESSION-PARAM-UNSET"),
@@ -115,7 +115,7 @@ fn test_alter_session_stmt_timeout_nonzero_negative() {
     );
     assert!(
         rules.contains("INFO-SNW-SESSION-PARAM-SET"),
-        "non-zero timeout SET should still fire the info signal, got {rules:?}"
+        "non-zero timeout SET should still fire the info finding, got {rules:?}"
     );
 }
 
@@ -190,7 +190,7 @@ fn test_alter_session_set_does_not_fire_session_policy_rules() {
     );
     assert!(
         rules.contains("INFO-SNW-SESSION-PARAM-SET"),
-        "ALTER SESSION SET should still fire its own info signal, got {rules:?}"
+        "ALTER SESSION SET should still fire its own info finding, got {rules:?}"
     );
 }
 

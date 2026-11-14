@@ -13,6 +13,7 @@
 //! - Jinja template integration in projections
 
 use crate::ast::*;
+use crate::dialect::LabelPosition;
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Span, Token, TokenKind};
 use crate::parser::core::Parser;
@@ -26,9 +27,19 @@ struct SelectHead {
     select_as_qualifier: Option<Span>,
     set_quantifier: Option<Box<crate::ast::AstSetQuantifier>>,
     set_quantifier_span: Option<Span>,
+    select_options: Vec<Span>,
     top: Option<crate::ast::AstTop>,
     projection: crate::ast::AstProjection,
     into_target: Option<Box<crate::ast::AstSelectIntoTarget>>,
+}
+
+/// The word a select list follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectLead {
+    /// `SELECT`.
+    Select,
+    /// PL/pgSQL's `PERFORM`, written for `SELECT`.
+    Perform,
 }
 
 /// Check if a lexeme matches a clause keyword that terminates SELECT list parsing.
@@ -491,7 +502,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Reached end of tokens without signal closing - not a valid comma wrapper
+        // Reached end of tokens without finding closing - not a valid comma wrapper
         false
     }
 
@@ -753,6 +764,7 @@ impl<'a> Parser<'a> {
                     if content.is_none() {
                         let dummy_span = tok.span;
                         let dummy_name = crate::ast::AstObjectRef {
+                            name_kind: crate::ast::AstTableNameKind::Catalog,
                             node_id: self.id_gen.next(),
                             span: dummy_span,
                             // Synthetic placeholder for error-recovery
@@ -776,13 +788,18 @@ impl<'a> Parser<'a> {
                             values: None,
                             lateral_keyword_span: None,
                             only_span: None,
+                            stream_span: None,
                             time_travel: None,
                             syntax_id: None,
                             sample: None,
                             changes: None,
                             stage_options: None,
+                            stage: None,
                             table_function: None,
                             tvf_schema_span: None,
+                            table_function_columns: None,
+                            column_definitions_span: None,
+                            with_ordinality_span: None,
                             with_offset: None,
                             pivot: None,
                             unpivot: None,
@@ -2125,16 +2142,19 @@ impl<'a> Parser<'a> {
                 if matches!(tok.kind, TokenKind::Keyword(Keyword::As)) {
                     let as_tok = self.advance().expect_invariant("AS keyword after peek"); // consume AS
                     agg_as_span = Some(as_tok.span);
-                    if let Some(alias_tok) = self.peek() {
-                        if self.can_be_identifier_token(alias_tok) {
-                            let alias_tok = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                            agg_alias = Some(crate::ast::AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_tok.span,
-                            });
-                        }
+                    if self.peek().is_some()
+                        && self
+                            .can_be_label(self.idx, LabelPosition::ColumnLabel { after_as: true })
+                    {
+                        let alias_tok = self
+                            .advance()
+                            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
+                        agg_alias = Some(crate::ast::AstIdentifier {
+                            node_id: self.id_gen.next(),
+                            span: alias_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
+                        });
                     }
                 }
             }
@@ -2273,17 +2293,22 @@ impl<'a> Parser<'a> {
                                 let as_tok =
                                     self.advance().expect_invariant("AS keyword after peek");
                                 value_as_span = Some(as_tok.span);
-                                if let Some(alias_tok) = self.peek() {
-                                    if self.can_be_identifier_token(alias_tok) {
-                                        let alias_tok = self.advance().ok_or_eof(
-                                            self.current_span(),
-                                            vec!["identifier".to_string()],
-                                        )?;
-                                        value_alias = Some(crate::ast::AstIdentifier {
-                                            node_id: self.id_gen.next(),
-                                            span: alias_tok.span,
-                                        });
-                                    }
+                                if self.peek().is_some()
+                                    && self.can_be_label(
+                                        self.idx,
+                                        LabelPosition::ColumnLabel { after_as: true },
+                                    )
+                                {
+                                    let alias_tok = self.advance().ok_or_eof(
+                                        self.current_span(),
+                                        vec!["identifier".to_string()],
+                                    )?;
+                                    value_alias = Some(crate::ast::AstIdentifier {
+                                        node_id: self.id_gen.next(),
+                                        span: alias_tok.span,
+                                        kind: crate::ast::AstIdentifierKind::Name,
+                                        templated: None,
+                                    });
                                 }
                             }
                         }
@@ -2532,6 +2557,8 @@ impl<'a> Parser<'a> {
                     cols.push(crate::ast::AstIdentifier {
                         node_id: self.id_gen.next(),
                         span: col_tok.span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
                     });
                     // Check for comma
                     if let Some(comma) = self.peek() {
@@ -2569,6 +2596,8 @@ impl<'a> Parser<'a> {
                 vec![crate::ast::AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: col_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 }]
             } else {
                 return Err(ParseError::unexpected_token(
@@ -2615,6 +2644,8 @@ impl<'a> Parser<'a> {
         let name_column = crate::ast::AstIdentifier {
             node_id: self.id_gen.next(),
             span: name_col_tok.span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: None,
         };
 
         // Expect IN keyword
@@ -2677,6 +2708,8 @@ impl<'a> Parser<'a> {
                     tuple_cols.push(crate::ast::AstIdentifier {
                         node_id: self.id_gen.next(),
                         span: inner_tok.span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
                     });
                     if let Some(comma) = self.peek() {
                         if matches!(
@@ -2712,6 +2745,8 @@ impl<'a> Parser<'a> {
                 vec![crate::ast::AstIdentifier {
                     node_id: self.id_gen.next(),
                     span: col_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
                 }]
             } else {
                 break;
@@ -2726,7 +2761,8 @@ impl<'a> Parser<'a> {
                     col_as_span = Some(as_tok.span);
                     if let Some(alias_tok) = self.peek() {
                         // Accept identifiers, keywords, and string literals as aliases
-                        if self.can_be_identifier_token(alias_tok)
+                        if self
+                            .can_be_label(self.idx, LabelPosition::ColumnLabel { after_as: true })
                             || matches!(
                                 alias_tok.kind,
                                 TokenKind::Literal(crate::lexer::LiteralKind::String)
@@ -2738,6 +2774,8 @@ impl<'a> Parser<'a> {
                             col_alias = Some(crate::ast::AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: alias_tok.span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             });
                         }
                     }
@@ -2826,11 +2864,23 @@ impl<'a> Parser<'a> {
         let values_keyword_id = self.last_token_id();
 
         let mut rows: Vec<Vec<AstExpr>> = Vec::new();
+        let mut row_keywords: Vec<Option<Span>> = Vec::new();
         let mut row_lparens: Vec<crate::cst::TokenId> = Vec::new();
         let mut row_rparens: Vec<crate::cst::TokenId> = Vec::new();
         let mut end_span = start_span;
 
         loop {
+            // MySQL's `ROW` before a row.
+            let row_keyword = match self.is_word(self.peek(), "ROW")
+                && self.peek_ahead(1).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                    )
+                }) {
+                true => self.advance().map(|row| row.span),
+                false => None,
+            };
             // Expect '(' for each row
             let lparen = self.peek()?;
             if !matches!(
@@ -2882,6 +2932,7 @@ impl<'a> Parser<'a> {
 
             if !row_exprs.is_empty() {
                 rows.push(row_exprs);
+                row_keywords.push(row_keyword);
             }
 
             // Check for comma (more rows) or end
@@ -2915,6 +2966,7 @@ impl<'a> Parser<'a> {
             Some(crate::ast::AstValues {
                 node_id: self.id_gen.next(),
                 rows,
+                row_keywords,
                 span: Span {
                     start: start_span,
                     end: end_span,
@@ -2937,22 +2989,39 @@ impl<'a> Parser<'a> {
         // Recursion guard to prevent stack overflow on deeply nested SELECTs
         let _depth = self.track_depth("select")?;
 
-        self.try_parse_select_in_mode_impl_boxed()
+        self.try_parse_select_in_mode_impl_boxed(SelectLead::Select)
     }
 
-    fn try_parse_select_in_mode_impl_boxed(&mut self) -> crate::error::ParseResult<Box<AstSelect>> {
+    /// Parse the query of a PL/pgSQL `PERFORM`: a SELECT whose `SELECT` is
+    /// the word `PERFORM` at the cursor.
+    pub(crate) fn try_parse_perform_query_boxed(
+        &mut self,
+    ) -> crate::error::ParseResult<Box<AstSelect>> {
+        let _depth = self.track_depth("select")?;
+
+        self.try_parse_select_in_mode_impl_boxed(SelectLead::Perform)
+    }
+
+    fn try_parse_select_in_mode_impl_boxed(
+        &mut self,
+        lead: SelectLead,
+    ) -> crate::error::ParseResult<Box<AstSelect>> {
         // Split around the recursive FROM-clause descent: the prelude and the
         // clause-assembly tail live in child frames (parse_select_head /
         // finish_select), so only this slim frame is held across the recursion.
-        let head = self.parse_select_head()?;
-        let from = self.parse_select_from_clause(head.select_span)?;
-        self.finish_select(head, from)
+        let mut head = self.parse_select_head(lead)?;
+        let select_options = std::mem::take(&mut head.select_options);
+        let mut select = self
+            .parse_select_from_clause(head.select_span)
+            .and_then(|from| self.finish_select(head, from))?;
+        select.select_options = select_options;
+        Ok(select)
     }
 
     /// Parse a SELECT up to (not including) its FROM clause: leading Jinja
     /// comments, SELECT keyword, BigQuery AS STRUCT/VALUE qualifier, set
     /// quantifier (incl. DISTINCT ON), TOP, projection, and optional INTO.
-    fn parse_select_head(&mut self) -> crate::error::ParseResult<SelectHead> {
+    fn parse_select_head(&mut self, lead: SelectLead) -> crate::error::ParseResult<SelectHead> {
         use crate::error::{ExpectInvariant, ParseError, ParseResultExt};
 
         // Skip any leading Jinja comments {# ... #} before SELECT
@@ -2965,20 +3034,30 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Parse SELECT keyword
+        // Parse SELECT keyword (or the word written for it)
+        let lead_word = match lead {
+            SelectLead::Select => "SELECT",
+            SelectLead::Perform => "PERFORM",
+        };
         let select_tok = self
             .advance()
-            .ok_or_eof(self.current_span(), vec!["SELECT".to_string()])?;
+            .ok_or_eof(self.current_span(), vec![lead_word.to_string()])?;
 
-        match select_tok.kind {
-            TokenKind::Keyword(Keyword::Select) => {}
-            _ => {
-                return Err(ParseError::unexpected_token(
-                    select_tok.span,
-                    vec!["SELECT".to_string()],
-                    Self::token_description(select_tok, self.source),
-                ));
+        let led = match lead {
+            SelectLead::Select => matches!(select_tok.kind, TokenKind::Keyword(Keyword::Select)),
+            SelectLead::Perform => {
+                matches!(select_tok.kind, TokenKind::Identifier { .. })
+                    && select_tok
+                        .lexeme(self.source)
+                        .eq_ignore_ascii_case(lead_word)
             }
+        };
+        if !led {
+            return Err(ParseError::unexpected_token(
+                select_tok.span,
+                vec![lead_word.to_string()],
+                Self::token_description(select_tok, self.source),
+            ));
         }
         let select_span = select_tok.span;
 
@@ -3141,6 +3220,78 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // MySQL's select options, in any order with ALL / DISTINCT /
+        // DISTINCTROW. A word a `,`, FROM, AS or `)` follows, or the first
+        // part of a qualified name, is a column.
+        let mut select_options = Vec::new();
+        if self.dialect.select_options() {
+            const OPTIONS: [&str; 7] = [
+                "HIGH_PRIORITY",
+                "STRAIGHT_JOIN",
+                "SQL_SMALL_RESULT",
+                "SQL_BIG_RESULT",
+                "SQL_BUFFER_RESULT",
+                "SQL_NO_CACHE",
+                "SQL_CALC_FOUND_ROWS",
+            ];
+            while let Some(tok) = self.peek() {
+                let qualified = self
+                    .object_name_end(self.idx)
+                    .is_some_and(|end| end > self.idx + 1);
+                let names_an_item = qualified
+                    || self.peek_ahead(1).is_none_or(|next| {
+                        matches!(
+                            next.kind,
+                            TokenKind::Punctuation(
+                                crate::lexer::Punctuation::Comma
+                                    | crate::lexer::Punctuation::RParen
+                                    | crate::lexer::Punctuation::Semi
+                            ) | TokenKind::Keyword(Keyword::From | Keyword::As)
+                                | TokenKind::Eof
+                        )
+                    });
+                if names_an_item {
+                    break;
+                }
+                let word = tok.lexeme(self.source);
+                let distinct = matches!(tok.kind, TokenKind::Keyword(Keyword::Distinct))
+                    || word.eq_ignore_ascii_case("DISTINCTROW");
+                if set_quantifier.is_none() && distinct {
+                    set_quantifier_span = Some(tok.span);
+                    set_quantifier = Some(Box::new(
+                        crate::parser::sql_stmt::build_set_quantifier_distinct(),
+                    ));
+                } else if set_quantifier.is_none()
+                    && matches!(tok.kind, TokenKind::Keyword(Keyword::All))
+                {
+                    set_quantifier_span = Some(tok.span);
+                    set_quantifier =
+                        Some(Box::new(crate::parser::sql_stmt::build_set_quantifier_all()));
+                } else if OPTIONS
+                    .iter()
+                    .any(|option| word.eq_ignore_ascii_case(option))
+                {
+                    select_options.push(tok.span);
+                } else {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        // PL/pgSQL `SELECT INTO [STRICT] v, … expr, … FROM …`: the targets may
+        // come before the select list.
+        let leading_into = match self.peek() {
+            Some(tok)
+                if self.reads_plpgsql_into()
+                    && matches!(tok.kind, TokenKind::Keyword(Keyword::Into)) =>
+            {
+                self.advance();
+                self.parse_into_variable_target()
+            }
+            Some(_) | None => None,
+        };
+
         // Parse [TOP <number|expr> [PERCENT] [WITH TIES]]
         let top = self.try_parse_top_clause()?;
 
@@ -3155,16 +3306,18 @@ impl<'a> Parser<'a> {
             )
         })?;
 
-        // Parse optional INTO clause. Two mutually-exclusive shapes, dialect-driven:
-        //   1. Scripting form: `SELECT col INTO :var, :var2 FROM …`
-        //      (Snowflake Scripting / MySQL / Oracle PL/SQL).
+        // Parse optional INTO clause. Two mutually-exclusive shapes:
+        //   1. Scripting form: `SELECT col INTO [STRICT] :var, :var2 FROM …`
+        //      (Snowflake Scripting / MySQL / Oracle PL/SQL / PL/pgSQL).
         //   2. NewTable form: `SELECT col INTO [TEMP|TEMPORARY|UNLOGGED] new_tbl
         //      [ON filegroup] FROM …` (MSSQL / PostgreSQL legacy CTAS).
-        // Disambiguation is dialect-only — PL/pgSQL bodies live inside dollar-
-        // quoted string literals and do not reach this parser, so PG `INTO`
-        // here is always the CTAS form.
-        let mut into_target: Option<Box<crate::ast::AstSelectIntoTarget>> = None;
-        if let Some(tok) = self.peek() {
+        // Where `INTO` creates a table, a block read inside a dollar-quoted
+        // body (PL/pgSQL) still takes the scripting form.
+        if leading_into.is_some() {
+            self.record_into_target_secrets(leading_into.as_deref(), &projection);
+        }
+        let mut into_target: Option<Box<crate::ast::AstSelectIntoTarget>> = leading_into;
+        if let Some(tok) = self.peek().filter(|_| into_target.is_none()) {
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Into)) {
                 let into_kw = self
                     .advance()
@@ -3178,11 +3331,15 @@ impl<'a> Parser<'a> {
                     matches!(
                         t.kind,
                         TokenKind::Identifier {
-                            kind: crate::lexer::IdentifierKind::AtVariable
+                            kind: crate::lexer::IdentifierKind::AtVariable,
+                            ..
                         }
                     )
                 });
-                if self.dialect.select_into_creates_table() && !next_is_at_variable {
+                if self.dialect.select_into_creates_table()
+                    && !self.reads_plpgsql_into()
+                    && !next_is_at_variable
+                {
                     // Parse the NewTable form.
                     use crate::ast::{
                         AstSelectIntoFilegroup, AstSelectIntoNewTable, AstSelectIntoTarget,
@@ -3222,7 +3379,8 @@ impl<'a> Parser<'a> {
                             if matches!(
                                 name_tok.kind,
                                 TokenKind::Identifier {
-                                    kind: IdentifierKind::TempTable
+                                    kind: IdentifierKind::TempTable,
+                                    ..
                                 }
                             ) {
                                 let lex = name_tok.lexeme(self.source);
@@ -3237,12 +3395,19 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    let name_span = self.parse_qualified_name_span()?;
-                    let name = crate::ast::AstObjectRef {
-                        node_id: self.id_gen.next(),
-                        span: name_span,
-                        parts: None,
-                        identifier_arg: None,
+                    // A name a template writes some of: `#t_{{ s }}`.
+                    let name = match self.parse_templated_object_ref() {
+                        Some(name) => name,
+                        None => {
+                            let name_span = self.parse_qualified_name_span()?;
+                            crate::ast::AstObjectRef {
+                                name_kind: crate::ast::AstTableNameKind::Catalog,
+                                node_id: self.id_gen.next(),
+                                span: name_span,
+                                parts: None,
+                                identifier_arg: None,
+                            }
+                        }
                     };
 
                     // MSSQL: optional `ON [PRIMARY]` filegroup clause.
@@ -3288,12 +3453,10 @@ impl<'a> Parser<'a> {
                     // MySQL INTO OUTFILE / DUMPFILE (dialect-gated inside).
                     into_target = Some(Box::new(crate::ast::AstSelectIntoTarget::OutFile(outfile)));
                 } else {
-                    // Scripting variable list (Snowflake / MySQL / Oracle PL/SQL).
-                    use crate::ast::AstSelectIntoTarget;
-                    let vars = self.parse_into_scripting_vars();
-                    if !vars.is_empty() {
-                        into_target = Some(Box::new(AstSelectIntoTarget::ScriptingVars(vars)));
-                    }
+                    // Scripting variable list (Snowflake / MySQL / Oracle PL/SQL
+                    // / PL/pgSQL).
+                    into_target = self.parse_into_variable_target();
+                    self.record_into_target_secrets(into_target.as_deref(), &projection);
                 }
             }
         }
@@ -3303,6 +3466,7 @@ impl<'a> Parser<'a> {
             select_as_qualifier,
             set_quantifier,
             set_quantifier_span,
+            select_options,
             top,
             projection,
             into_target,
@@ -3325,6 +3489,8 @@ impl<'a> Parser<'a> {
             select_as_qualifier,
             set_quantifier,
             set_quantifier_span,
+            // Set on the SELECT by the caller.
+            select_options: _,
             top,
             projection,
             mut into_target,
@@ -3591,6 +3757,10 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // The hierarchical clause, `[START WITH …] CONNECT BY …`, where
+        // Oracle and Snowflake write it: after WHERE, before GROUP BY.
+        let connect_by_before_grouping = self.parse_connect_by()?.map(Box::new);
+
         // Parse GROUP BY clause
         let group_by = self.parse_select_group_by()?;
 
@@ -3628,8 +3798,12 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // Parse CONNECT BY clause (hierarchical queries - Oracle/Snowflake)
-        let connect_by = self.parse_connect_by()?.map(Box::new);
+        // Parse CONNECT BY clause (hierarchical queries - Oracle/Snowflake),
+        // written after QUALIFY where not before GROUP BY.
+        let connect_by = match connect_by_before_grouping {
+            Some(connect_by) => Some(connect_by),
+            None => self.parse_connect_by()?.map(Box::new),
+        };
 
         // Parse WINDOW clause (named window definitions; PostgreSQL and Databricks)
         // Syntax: WINDOW w AS (...) [, w2 AS (...)]
@@ -3686,12 +3860,8 @@ impl<'a> Parser<'a> {
                         into_target =
                             Some(Box::new(crate::ast::AstSelectIntoTarget::OutFile(outfile)));
                     } else {
-                        let vars = self.parse_into_scripting_vars();
-                        if !vars.is_empty() {
-                            into_target = Some(Box::new(
-                                crate::ast::AstSelectIntoTarget::ScriptingVars(vars),
-                            ));
-                        }
+                        into_target = self.parse_into_variable_target();
+                        self.record_into_target_secrets(into_target.as_deref(), &projection);
                     }
                 }
             }
@@ -3724,7 +3894,7 @@ impl<'a> Parser<'a> {
                         .is_some_and(|t| *end > t.span.start)
             });
         let last_span_end = if let Some(last_ext) = post_locking_extension_clauses.last() {
-            last_ext.end
+            last_ext.span.end
         } else if let Some(ref fjx) = for_json_xml {
             fjx.end
         } else if let Some(last_lock) = for_locking.last() {
@@ -3910,57 +4080,146 @@ impl<'a> Parser<'a> {
         select.post_locking_extension_clauses = Box::new(post_locking_extension_clauses);
         select.for_json_xml = for_json_xml;
         select.limit_offset_comma_span = limit_offset.limit_comma_span;
+        select.fetch_with_ties_span = limit_offset.fetch_with_ties_span;
 
         Ok(Box::new(select))
     }
 
+    /// Records the secret each item of `projection` assigns to the variable
+    /// in its place among the `INTO` targets (`SELECT '…' INTO v, w`)
+    /// ([`Self::record_assigned_secret`]).
+    fn record_into_target_secrets(
+        &mut self,
+        into_target: Option<&crate::ast::AstSelectIntoTarget>,
+        projection: &crate::ast::AstProjection,
+    ) {
+        let (
+            Some(crate::ast::AstSelectIntoTarget::ScriptingVars { vars, .. }),
+            crate::ast::AstProjectionKind::Columns(items),
+        ) = (into_target, &projection.kind)
+        else {
+            return;
+        };
+        if vars.len() != items.len() {
+            return;
+        }
+        for (var, item) in vars.iter().zip(items) {
+            if let crate::ast::ProjectionItemKind::SelectItem(si) = &item.kind {
+                self.record_assigned_secret(*var, &si.expr);
+            }
+        }
+    }
+
+    /// Whether `SELECT … INTO` here takes PL/pgSQL's variable targets: a
+    /// block read inside a dollar-quoted body where `INTO` would otherwise
+    /// name a new table.
+    fn reads_plpgsql_into(&self) -> bool {
+        self.dialect.select_into_creates_table() && self.dollar_body_block_depth > 0
+    }
+
+    /// Parse the variable target after INTO: `[STRICT] targets` (`STRICT`
+    /// where [`Self::reads_plpgsql_into`] holds and a target follows it).
+    /// `None` when no target follows.
+    fn parse_into_variable_target(&mut self) -> Option<Box<crate::ast::AstSelectIntoTarget>> {
+        let strict_span = match self.peek() {
+            Some(tok)
+                if self.reads_plpgsql_into()
+                    && matches!(
+                        tok.kind,
+                        TokenKind::Identifier {
+                            kind: crate::lexer::IdentifierKind::Unquoted,
+                            ..
+                        }
+                    )
+                    && tok.lexeme(self.source).eq_ignore_ascii_case("STRICT")
+                    && self
+                        .peek_ahead(1)
+                        .is_some_and(|target| self.can_be_identifier_token(target)) =>
+            {
+                Some(
+                    self.advance()
+                        .expect_invariant("STRICT confirmed by peek")
+                        .span,
+                )
+            }
+            _ => None,
+        };
+        let vars = self.parse_into_scripting_vars();
+        if vars.is_empty() {
+            return None;
+        }
+        Some(Box::new(crate::ast::AstSelectIntoTarget::ScriptingVars {
+            vars,
+            strict_span,
+        }))
+    }
+
     /// Parse the scripting-variable list after INTO: `:v, :v2` or `v, v2`
-    /// or `@v, @v2`. Returns collected spans (empty = nothing consumed).
+    /// or `@v, @v2`; a target may be a record field (`rec.field`). Returns
+    /// collected spans (empty = nothing consumed).
     fn parse_into_scripting_vars(&mut self) -> Vec<Span> {
         let mut vars: Vec<Span> = Vec::new();
         while let Some(next) = self.peek() {
-            match &next.kind {
-                TokenKind::Punctuation(crate::lexer::Punctuation::Colon) => {
-                    let colon_tok = self
-                        .advance()
-                        .expect_invariant("Colon confirmed by peek for INTO variable");
-                    if let Some(id_tok) = self.advance() {
-                        if self.can_be_identifier_token(id_tok) {
-                            let var_span = crate::parser::sql_stmt::build_into_var_span(
-                                colon_tok.span,
-                                id_tok.span,
-                            );
-                            vars.push(var_span);
-                            if let Some(comma) = self.peek() {
-                                if matches!(
-                                    comma.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                                ) {
-                                    self.advance();
-                                    continue;
-                                }
+            if matches!(
+                next.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::Colon)
+            ) {
+                let colon_tok = self
+                    .advance()
+                    .expect_invariant("Colon confirmed by peek for INTO variable");
+                if let Some(id_tok) = self.advance() {
+                    if self.can_be_identifier_token(id_tok) {
+                        let var_span = crate::parser::sql_stmt::build_into_var_span(
+                            colon_tok.span,
+                            id_tok.span,
+                        );
+                        vars.push(var_span);
+                        if let Some(comma) = self.peek() {
+                            if matches!(
+                                comma.kind,
+                                TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                            ) {
+                                self.advance();
+                                continue;
                             }
                         }
                     }
-                    break;
                 }
-                TokenKind::Identifier { .. } => {
-                    let id_tok = self
+                break;
+            } else if self.can_be_identifier_token(next) {
+                let id_tok = self
+                    .advance()
+                    .expect_invariant("Identifier confirmed by peek for INTO variable");
+                let mut var_span = id_tok.span;
+                // A record field target: `rec.field`.
+                while self.peek().is_some_and(|dot| {
+                    matches!(
+                        dot.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
+                    )
+                }) && self
+                    .peek_ahead(1)
+                    .is_some_and(|part| self.can_be_identifier_after_dot_token(part))
+                {
+                    self.advance();
+                    let part = self
                         .advance()
-                        .expect_invariant("Identifier confirmed by peek for INTO variable");
-                    vars.push(id_tok.span);
-                    if let Some(comma) = self.peek() {
-                        if matches!(
-                            comma.kind,
-                            TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                        ) {
-                            self.advance();
-                            continue;
-                        }
-                    }
-                    break;
+                        .expect_invariant("field name confirmed by peek for INTO variable");
+                    var_span.end = part.span.end;
                 }
-                _ => break,
+                vars.push(var_span);
+                if let Some(comma) = self.peek() {
+                    if matches!(
+                        comma.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                    ) {
+                        self.advance();
+                        continue;
+                    }
+                }
+                break;
+            } else {
+                break;
             }
         }
         vars
@@ -3985,7 +4244,8 @@ impl<'a> Parser<'a> {
         if !matches!(
             kind_tok.kind,
             TokenKind::Identifier {
-                kind: crate::lexer::IdentifierKind::Unquoted
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
             }
         ) {
             return Ok(None);
@@ -4032,6 +4292,7 @@ impl<'a> Parser<'a> {
                     TokenKind::Literal(crate::lexer::LiteralKind::String) => true,
                     TokenKind::Identifier {
                         kind: crate::lexer::IdentifierKind::Unquoted,
+                        ..
                     } => {
                         let lex = tok.lexeme(self.source);
                         if after_character_set {
@@ -4165,7 +4426,9 @@ impl<'a> Parser<'a> {
         Ok(spans)
     }
 
-    fn parse_post_locking_extension_clauses(&mut self) -> crate::error::ParseResult<Vec<Span>> {
+    pub(crate) fn parse_post_locking_extension_clauses(
+        &mut self,
+    ) -> crate::error::ParseResult<Vec<crate::ast::AstQueryOptions>> {
         let mut spans = Vec::new();
         if !self.dialect.supports_query_option_clause() {
             return Ok(spans);
@@ -4197,12 +4460,28 @@ impl<'a> Parser<'a> {
             self.advance(); // consume '('
             let mut end = lparen_span.end;
             let mut depth: usize = 1;
+            let mut hints = Vec::new();
+            // The tokens of the hint being read, each list item one hint.
+            let mut hint: Vec<&Token> = Vec::new();
 
             while self.peek().is_some() {
                 let consumed = self
                     .advance()
                     .expect_invariant("OPTION(...) token after peek");
                 end = consumed.span.end;
+                let closes = depth == 1
+                    && matches!(
+                        consumed.kind,
+                        TokenKind::Punctuation(
+                            crate::lexer::Punctuation::RParen | crate::lexer::Punctuation::Comma
+                        )
+                    );
+                if closes {
+                    hints.extend(self.query_hint(&hint));
+                    hint.clear();
+                } else {
+                    hint.push(consumed);
+                }
                 match consumed.kind {
                     TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
                     TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
@@ -4224,13 +4503,43 @@ impl<'a> Parser<'a> {
                 ));
             }
 
-            spans.push(Span {
-                start: head_tok.span.start,
-                end,
+            spans.push(crate::ast::AstQueryOptions {
+                span: Span {
+                    start: head_tok.span.start,
+                    end,
+                },
+                hints,
             });
         }
 
         Ok(spans)
+    }
+
+    /// The query hint the tokens `hint` of one `OPTION (…)` list item
+    /// write; `None` for an empty item.
+    fn query_hint(&self, hint: &[&Token]) -> Option<crate::ast::AstQueryHint> {
+        use crate::ast::{AstJoinHintKind, AstQueryHintKind};
+        let (first, last) = (hint.first()?, hint.last()?);
+        let kind = match hint {
+            [word, join] if matches!(join.kind, TokenKind::Keyword(Keyword::Join)) => {
+                match self.join_hint_kind(word) {
+                    Some(
+                        kind @ (AstJoinHintKind::Loop
+                        | AstJoinHintKind::Hash
+                        | AstJoinHintKind::Merge),
+                    ) => AstQueryHintKind::Join(kind),
+                    Some(AstJoinHintKind::Remote) | None => AstQueryHintKind::Other,
+                }
+            }
+            _ => AstQueryHintKind::Other,
+        };
+        Some(crate::ast::AstQueryHint {
+            kind,
+            span: Span {
+                start: first.span.start,
+                end: last.span.end,
+            },
+        })
     }
 
     /// Parse FOR locking clauses (FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE).
@@ -4255,7 +4564,8 @@ impl<'a> Parser<'a> {
                     if matches!(
                         lock_tok.kind,
                         TokenKind::Identifier {
-                            kind: crate::lexer::IdentifierKind::Unquoted
+                            kind: crate::lexer::IdentifierKind::Unquoted,
+                            ..
                         }
                     ) && lock_tok.lexeme(self.source).eq_ignore_ascii_case("LOCK")
                         && self
@@ -4430,42 +4740,8 @@ impl<'a> Parser<'a> {
 
                     // Parse comma-separated table names (possibly qualified: schema.table)
                     loop {
-                        // Consume first identifier token
-                        let first_tok = self.advance().ok_or_else(|| {
-                            crate::error::ParseError::new(
-                                of_tok.span,
-                                crate::error::ParseErrorKind::InvalidStatement {
-                                    message: "Expected table name after OF".to_string(),
-                                },
-                            )
-                        })?;
-                        let mut tbl_end = first_tok.span.end;
-
-                        // Consume optional dot-separated qualifiers (schema.table)
-                        while let Some(dot_tok) = self.peek_non_trivia() {
-                            if matches!(
-                                dot_tok.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-                            ) {
-                                self.advance(); // consume dot
-                                let next_part = self.advance().ok_or_else(|| {
-                                    crate::error::ParseError::new(
-                                        first_tok.span,
-                                        crate::error::ParseErrorKind::InvalidStatement {
-                                            message: "Expected identifier after '.'".to_string(),
-                                        },
-                                    )
-                                })?;
-                                tbl_end = next_part.span.end;
-                            } else {
-                                break;
-                            }
-                        }
-
-                        of_tables.push(crate::lexer::Span {
-                            start: first_tok.span.start,
-                            end: tbl_end,
-                        });
+                        // A table's name, possibly qualified (schema.table)
+                        of_tables.push(self.parse_object_name_span()?);
 
                         // Check for comma
                         if let Some(next) = self.peek_non_trivia() {

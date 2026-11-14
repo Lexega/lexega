@@ -36,9 +36,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -226,22 +226,22 @@ fn test_unset_tblproperties_if_exists_multiple_format_roundtrip() {
 }
 
 // ============================================================================
-// Risk analysis tests — signals
+// Risk analysis tests — findings
 // ============================================================================
 
 #[test]
-fn test_set_tblproperties_signal_dbx_tbl_props_chg() {
+fn test_set_tblproperties_finding_dbx_tbl_props_chg() {
     let report =
         dbx_analyze("ALTER TABLE my_table SET TBLPROPERTIES ('delta.appendOnly' = 'true');");
     assert!(
-        has_signal(&report, "DBX-TBL-PROPS-CHG"),
-        "Should find DBX-TBL-PROPS-CHG (Table Properties Modified). Signals: {:?}",
+        has_finding(&report, "DBX-TBL-PROPS-CHG"),
+        "Should find DBX-TBL-PROPS-CHG (Table Properties Modified). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
-            .filter_map(|s| {
+            .map(|s| {
                 let RuleMatch::Analysis(g) = s;
-                Some(&g.matched_rule)
+                &g.matched_rule
             })
             .collect::<Vec<_>>()
     );
@@ -252,32 +252,32 @@ fn test_set_tblproperties_signal_dbx_tbl_props_chg() {
 }
 
 #[test]
-fn test_unset_tblproperties_signal_dbx_c040() {
+fn test_unset_tblproperties_finding_dbx_c040() {
     let report = dbx_analyze("ALTER TABLE my_table UNSET TBLPROPERTIES ('delta.appendOnly');");
     assert!(
-        has_signal(&report, "DBX-TBL-PROPS-RMV"),
-        "Should find DBX-TBL-PROPS-RMV (Table Properties Removed). Signals: {:?}",
+        has_finding(&report, "DBX-TBL-PROPS-RMV"),
+        "Should find DBX-TBL-PROPS-RMV (Table Properties Removed). Findings: {:?}",
         report
-            .signals
+            .findings
             .iter()
-            .filter_map(|s| {
+            .map(|s| {
                 let RuleMatch::Analysis(g) = s;
-                Some(&g.matched_rule)
+                &g.matched_rule
             })
             .collect::<Vec<_>>()
     );
     assert!(
-        report.summary.high_count >= 1,
-        "UNSET TBLPROPERTIES should be High severity"
+        report.summary.medium_count >= 1,
+        "UNSET TBLPROPERTIES should be Medium severity"
     );
 }
 
 #[test]
-fn test_unset_tblproperties_if_exists_signal() {
+fn test_unset_tblproperties_if_exists_finding() {
     let report =
         dbx_analyze("ALTER TABLE my_table UNSET TBLPROPERTIES IF EXISTS ('delta.appendOnly');");
     assert!(
-        has_signal(&report, "DBX-TBL-PROPS-RMV"),
+        has_finding(&report, "DBX-TBL-PROPS-RMV"),
         "UNSET TBLPROPERTIES IF EXISTS should also emit DBX-TBL-PROPS-RMV"
     );
 }
@@ -295,19 +295,19 @@ fn test_multi_statement_tblproperties() {
     "#;
     let report = dbx_analyze(sql);
 
-    // Should have both SET and UNSET signals
+    // Should have both SET and UNSET findings
     assert!(
-        has_signal(&report, "DBX-TBL-PROPS-CHG"),
+        has_finding(&report, "DBX-TBL-PROPS-CHG"),
         "Should find DBX-TBL-PROPS-CHG for SET TBLPROPERTIES"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-PROPS-RMV"),
+        has_finding(&report, "DBX-TBL-PROPS-RMV"),
         "Should find DBX-TBL-PROPS-RMV for UNSET TBLPROPERTIES"
     );
 
-    // Count total evidence for SET signals
+    // Count total evidence for SET findings
     let set_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-PROPS-CHG"))
         .map(|s| {
@@ -327,25 +327,25 @@ fn test_multi_statement_tblproperties() {
 // ============================================================================
 
 #[test]
-fn test_regular_alter_table_no_tblproperties_signal() {
+fn test_regular_alter_table_no_tblproperties_finding() {
     // Regular ALTER TABLE SET (Snowflake parameter) should NOT trigger DBX-TBL-PROPS-CHG
     let report = dbx_analyze("ALTER TABLE t SET DATA_RETENTION_TIME_IN_DAYS = 90;");
     assert!(
-        !has_signal(&report, "DBX-TBL-PROPS-CHG"),
+        !has_finding(&report, "DBX-TBL-PROPS-CHG"),
         "Regular SET should not trigger DBX-TBL-PROPS-CHG"
     );
     assert!(
-        !has_signal(&report, "DBX-TBL-PROPS-RMV"),
+        !has_finding(&report, "DBX-TBL-PROPS-RMV"),
         "Regular SET should not trigger DBX-TBL-PROPS-RMV"
     );
 }
 
 #[test]
-fn test_alter_table_set_tag_no_tblproperties_signal() {
-    // SET TAG should NOT trigger TBLPROPERTIES signals
+fn test_alter_table_set_tag_no_tblproperties_finding() {
+    // SET TAG should NOT trigger TBLPROPERTIES findings
     let report = dbx_analyze("ALTER TABLE t SET TAG owner = 'team';");
     assert!(
-        !has_signal(&report, "DBX-TBL-PROPS-CHG"),
+        !has_finding(&report, "DBX-TBL-PROPS-CHG"),
         "SET TAG should not trigger DBX-TBL-PROPS-CHG"
     );
 }

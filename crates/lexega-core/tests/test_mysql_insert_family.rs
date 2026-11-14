@@ -19,9 +19,10 @@ use lexega_core::{format_sql_with_config, parse_sql_with_dialect, FormatterConfi
 // ============================================================================
 
 fn mysql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mysql();
-    config
+    FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) {
@@ -49,9 +50,10 @@ fn single_stmt(sql: &str) -> AstStmt {
 }
 
 fn mysql_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mysql());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mysql()),
+        ..Default::default()
+    }
 }
 
 // ============================================================================
@@ -241,7 +243,7 @@ fn test_mysql_insert_optional_into_ast() {
     match single_stmt("INSERT t (a) VALUES (1);") {
         AstStmt::Insert(ins) => {
             assert!(ins.into_span.is_none());
-            assert!(ins.target_table_span.is_some());
+            assert!(ins.target_table.is_some());
         }
         other => panic!("expected Insert, got {:?}", stmt_name(&other)),
     }
@@ -252,7 +254,7 @@ fn test_mysql_replace_values_ast() {
     match single_stmt("REPLACE INTO t (a, b) VALUES (1, 2);") {
         AstStmt::ReplaceInto(rep) => {
             assert!(rep.into_span.is_some());
-            assert!(rep.target_table_span.is_some());
+            assert!(rep.target_table.is_some());
             assert!(matches!(rep.source_kind, AstInsertSourceKind::Values));
             assert_eq!(rep.values_rows.len(), 1);
         }

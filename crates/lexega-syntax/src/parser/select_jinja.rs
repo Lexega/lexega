@@ -12,11 +12,10 @@
 //! These constructs are common in dbt models where SQL is dynamically
 //! generated based on configuration or macros.
 
-use crate::ast::{AstExpr, AstObjectRef, AstTableRef, JinjaBlockKind};
+use crate::ast::{AstExpr, AstTableRef, JinjaBlockKind};
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult};
 use crate::lexer::{Keyword, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::select::is_clause_keyword_lexeme;
 
 impl<'a> Parser<'a> {
     /// Parse Jinja statements (like {% set %}) that appear before projection items
@@ -864,24 +863,19 @@ impl<'a> Parser<'a> {
         _select_span: Span,
         _lateral: bool,
     ) -> ParseResult<Option<AstTableRef>> {
-        // Determine the opening block kind
-        let jinja_table_name =
-            match self.parse_jinja_table_name_block(crate::ast::JinjaBlockKind::If)? {
+        // The block begins the name the one reader reads.
+        let open = self.idx;
+        let name_end = self.object_name_end(open);
+        let (jinja_table_name, name_end) =
+            match self.parse_jinja_table_name_block(crate::ast::JinjaBlockKind::If, name_end)? {
                 Some(b) => b,
                 None => return Ok(None),
             };
 
-        // For backward compatibility, we need to return AstTableRef
-        // But the proper structure is now in JinjaTableNameBlock
-        // Create a minimal AstTableRef that spans the entire construct
-        let name = AstObjectRef {
-            node_id: self.id_gen.next(),
-            span: jinja_table_name.span,
-            // Span covers a Jinja table-name block (`{{ ref(...) }}`).
-            // Lowering opaques out via `is_jinja_templated_span`.
-            parts: None,
-            identifier_arg: None,
-        };
+        // A block writes the name, whatever its parts read.
+        let node_id = self.id_gen.next();
+        let mut name = self.object_ref_of_range(open, name_end, node_id);
+        name.name_kind = crate::ast::AstTableNameKind::Templated;
 
         // Extract alias and AS token
         let (alias, as_token) = if let Some(ref alias_with_as) = jinja_table_name.alias {
@@ -892,7 +886,7 @@ impl<'a> Parser<'a> {
                     .iter()
                     .position(|t| t.span.start == as_sp.start)
                     .unwrap_or(0);
-                crate::cst::TokenId(idx as u32)
+                self.token_id_at(idx)
             });
             (Some(alias_with_as.ident.clone()), as_tok)
         } else {
@@ -946,10 +940,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a Jinja control block that produces a table name fragment.
     /// Proper recursive descent - parses each branch's content separately.
+    /// `name_end` is the index where the one reader ends the name the block
+    /// begins; returned with the block, the index just past that name.
     fn parse_jinja_table_name_block(
         &mut self,
         opening_kind: crate::ast::JinjaBlockKind,
-    ) -> ParseResult<Option<crate::ast::JinjaTableNameBlock>> {
+        name_end: Option<usize>,
+    ) -> ParseResult<Option<(crate::ast::JinjaTableNameBlock, usize)>> {
         use crate::ast::{JinjaTableNameBlock, JinjaTableNameElifBranch, JinjaTableNameElseBranch};
 
         // Determine closing kind
@@ -1128,7 +1125,8 @@ impl<'a> Parser<'a> {
         );
 
         // 6. Parse optional continuation after {% endif %} (e.g., ".orders" or ".schema.table")
-        let continuation = self.parse_table_name_continuation();
+        let continuation = self.parse_table_name_continuation(name_end);
+        let name_end = self.idx;
 
         // Calculate span end before parsing alias
         let mut span_end = continuation.map(|c| c.end).unwrap_or(closing.span.end);
@@ -1139,20 +1137,23 @@ impl<'a> Parser<'a> {
             span_end = a.ident.span.end;
         }
 
-        Ok(Some(JinjaTableNameBlock {
-            node_id: self.id_gen.next(),
-            opening,
-            then_content,
-            elif_branches,
-            else_branch,
-            closing,
-            continuation,
-            alias,
-            span: Span {
-                start: block_start,
-                end: span_end,
+        Ok(Some((
+            JinjaTableNameBlock {
+                node_id: self.id_gen.next(),
+                opening,
+                then_content,
+                elif_branches,
+                else_branch,
+                closing,
+                continuation,
+                alias,
+                span: Span {
+                    start: block_start,
+                    end: span_end,
+                },
             },
-        }))
+            name_end,
+        )))
     }
 
     /// Parse table name fragment content inside a Jinja branch.
@@ -1185,171 +1186,17 @@ impl<'a> Parser<'a> {
         Some(Span { start, end })
     }
 
-    /// Parse optional continuation after a Jinja block closing delimiter.
-    /// Returns the span covering table name parts like ".schema.table", ".table",
-    /// another Jinja block `{% if %}...{% endif %}orders`, or just `orders`.
-    fn parse_table_name_continuation(&mut self) -> Option<Span> {
-        let tok = self.peek()?;
-        let start = tok.span.start;
-        let mut end = start;
-        let mut consumed_any = false;
-
-        // Loop to handle sequential Jinja blocks, identifiers, dots, expressions
-        while let Some(tok) = self.peek() {
-            match &tok.kind {
-                TokenKind::Identifier { .. } => {
-                    let t = self.advance()?;
-                    end = t.span.end;
-                    consumed_any = true;
-                }
-                TokenKind::Punctuation(crate::lexer::Punctuation::Dot) => {
-                    let t = self.advance()?;
-                    end = t.span.end;
-                    consumed_any = true;
-                }
-                TokenKind::JinjaExprOpen => {
-                    // Jinja expression: {{ table_name }}
-                    self.advance(); // consume {{
-                    let _ = self.parse_jinja_expr().ok();
-
-                    if let Some(close) = self.peek() {
-                        if matches!(close.kind, TokenKind::JinjaExprClose) {
-                            let close_tok = self.advance()?;
-                            end = close_tok.span.end;
-                            consumed_any = true;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                TokenKind::JinjaStmtOpen => {
-                    // Another Jinja block: {% if %}...{% endif %}
-                    if let Some(kind) = self.peek_jinja_block_kind() {
-                        if matches!(kind, JinjaBlockKind::If | JinjaBlockKind::For) {
-                            // Recursively parse the nested Jinja block as span
-                            if let Some(nested_span) = self.parse_jinja_block_as_continuation_span()
-                            {
-                                end = nested_span.end;
-                                consumed_any = true;
-                                // Continue loop to parse any content after this nested block
-                                continue;
-                            }
-                        }
-                    }
-                    break;
-                }
-                TokenKind::Keyword(_) if self.can_be_identifier_token(tok) => {
-                    // Check for clause keywords that end the continuation
-                    let lexeme = tok.lexeme(self.source);
-                    if is_clause_keyword_lexeme(lexeme)
-                        || self.dialect.is_clause_boundary_keyword(lexeme)
-                    {
-                        break;
-                    }
-                    let t = self.advance()?;
-                    end = t.span.end;
-                    consumed_any = true;
-                }
-                _ => break,
-            }
-        }
-
-        if consumed_any {
-            Some(Span { start, end })
-        } else {
-            None
-        }
-    }
-
-    /// Parse a Jinja block ({% if %}...{% endif %} or {% for %}...{% endfor %}) and return its span.
-    /// Used within table name continuation for chained Jinja blocks.
-    fn parse_jinja_block_as_continuation_span(&mut self) -> Option<Span> {
-        let opening_kind = self.peek_jinja_block_kind()?;
-        let closing_kind = match opening_kind {
-            JinjaBlockKind::If => JinjaBlockKind::EndIf,
-            JinjaBlockKind::For => JinjaBlockKind::EndFor,
-            _ => return None,
+    /// What the name a block begins holds after the block's closing
+    /// delimiter (`.orders`, `_orders`, another block), consumed up to
+    /// `name_end`, the index where the one reader ends the name; `None`
+    /// where the name ends at the block.
+    fn parse_table_name_continuation(&mut self, name_end: Option<usize>) -> Option<Span> {
+        let end = name_end.filter(|end| *end > self.idx)?;
+        let span = Span {
+            start: self.tokens[self.idx].span.start,
+            end: self.tokens[end - 1].span.end,
         };
-
-        // Record start position
-        let start_tok = self.peek()?;
-        let start = start_tok.span.start;
-        let mut end = start;
-
-        // Consume opening delimiter ({% if condition %})
-        self.advance(); // {%
-        self.advance(); // if/for
-        let _ = self.parse_jinja_expr().ok(); // condition
-        if let Some(close) = self.peek() {
-            if matches!(close.kind, TokenKind::JinjaStmtClose) {
-                let close_tok = self.advance()?;
-                end = close_tok.span.end;
-            }
-        }
-
-        // Consume content until we hit a delimiter (elif/else/endif/endfor)
-        // We also need to handle nested Jinja blocks at depth 1
-        let mut depth = 1;
-        while depth > 0 {
-            let tok = self.peek()?;
-
-            match &tok.kind {
-                TokenKind::JinjaStmtOpen => {
-                    if let Some(kind) = self.peek_jinja_block_kind() {
-                        match kind {
-                            JinjaBlockKind::If | JinjaBlockKind::For => {
-                                // Nested opening - increase depth
-                                depth += 1;
-                            }
-                            JinjaBlockKind::EndIf | JinjaBlockKind::EndFor => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    // This is our closing delimiter
-                                    break;
-                                }
-                            }
-                            JinjaBlockKind::Elif | JinjaBlockKind::Else => {
-                                // Branch at depth 1 - just consume
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Consume the block delimiter tokens
-                    self.advance(); // {%
-                    self.advance(); // keyword
-                    let _ = self.parse_jinja_expr().ok(); // optional condition
-                    if let Some(close) = self.peek() {
-                        if matches!(close.kind, TokenKind::JinjaStmtClose) {
-                            let close_tok = self.advance()?;
-                            end = close_tok.span.end;
-                        }
-                    }
-                }
-                TokenKind::Eof => break,
-                _ => {
-                    // Regular content token - consume
-                    let t = self.advance()?;
-                    end = t.span.end;
-                }
-            }
-        }
-
-        // Consume the closing delimiter ({% endif %} or {% endfor %})
-        if let Some(kind) = self.peek_jinja_block_kind() {
-            if kind == closing_kind {
-                self.advance(); // {%
-                self.advance(); // endif/endfor
-                if let Some(close) = self.peek() {
-                    if matches!(close.kind, TokenKind::JinjaStmtClose) {
-                        let close_tok = self.advance()?;
-                        end = close_tok.span.end;
-                    }
-                }
-            }
-        }
-
-        Some(Span { start, end })
+        self.idx = end;
+        Some(span)
     }
 }

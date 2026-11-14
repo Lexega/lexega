@@ -24,9 +24,8 @@
 //! - **Multi-principal** — `TO p1, p2, p3`. Each principal becomes one
 //!   entry in `body.grantees`.
 //!
-//! The `AS <principal>` ownership-delegation clause is consumed and
-//! discarded. Promote to a typed field on `AstPrivilegeGrantBody` when the
-//! first consumer needs it.
+//! The `AS <principal>` ownership-delegation clause is kept on
+//! `AstPrivilegeGrantBody` as [`AstDenyAs`].
 //!
 //! ## Failure semantics
 //!
@@ -36,10 +35,10 @@
 //! statement level due to a malformed GRANT.
 
 use crate::ast::{
-    AstGrant, AstGrantObject, AstGrantShape, AstGrantee, AstObjectKind, AstPrivilegeGrantBody,
-    AstStmt,
+    AstDenyAs, AstGrant, AstGrantObject, AstGrantShape, AstGrantee, AstObjectKind,
+    AstPrivilegeGrantBody, AstStmt,
 };
-use crate::error::{ExpectInvariant, ParseResult};
+use crate::error::{ExpectInvariant, ParseResult, ParseResultExt};
 use crate::lexer::token::{Span, TokenKind};
 use crate::lexer::{Keyword, Operator, Punctuation};
 use crate::parser::core::Parser;
@@ -114,17 +113,26 @@ fn try_parse_privilege_body(p: &mut Parser<'_>) -> ParseResult<AstPrivilegeGrant
 
     let with_grant_option = consume_with_grant_option(p);
 
-    // Optional trailing `AS <principal>`, consumed and discarded.
-    if peek_token_kind(p, TokenKind::Keyword(Keyword::As)) {
-        let _ = p.advance(); // AS
-        let _ = p.parse_qualified_name_span()?;
-    }
+    // Optional trailing `AS <principal>`.
+    let as_principal = if peek_token_kind(p, TokenKind::Keyword(Keyword::As)) {
+        let as_tok = p
+            .advance()
+            .ok_or_eof(p.current_span(), vec!["AS".to_string()])?;
+        let principal_name_span = p.parse_qualified_name_span()?;
+        Some(AstDenyAs {
+            keyword_span: as_tok.span,
+            principal_name_span,
+        })
+    } else {
+        None
+    };
 
     Ok(AstPrivilegeGrantBody {
         privileges,
         objects,
         grantees,
         with_grant_option,
+        as_principal,
     })
 }
 

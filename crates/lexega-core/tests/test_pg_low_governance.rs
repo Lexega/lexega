@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Tests for PostgreSQL governance signals: indexes, sequences, types,
+//! Tests for PostgreSQL governance findings: indexes, sequences, types,
 //! comments, maintenance, notifications, tablespaces.
 //!
 //!   INFO-PG-IDX-NEW  – Index Created              (Info)
@@ -50,7 +50,7 @@ fn pg_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| match s {
+    report.entries().any(|s| match s {
         RuleMatch::Analysis(g) => g.matched_rule == rule_id,
     })
 }
@@ -65,10 +65,9 @@ fn pg_format(sql: &str) -> String {
 
 fn rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> Vec<&str> {
     report
-        .signals
-        .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.as_str()),
+        .entries()
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => g.matched_rule.as_str(),
         })
         .collect()
 }
@@ -85,7 +84,7 @@ fn test_create_index_format_roundtrip() {
 }
 
 #[test]
-fn test_create_index_signal() {
+fn test_create_index_finding() {
     let sql = "CREATE INDEX idx_users_email ON users (email);";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-PG-IDX-NEW"), "rules: {:?}", rule_ids(&r));
@@ -93,7 +92,7 @@ fn test_create_index_signal() {
 }
 
 #[test]
-fn test_create_unique_index_signal() {
+fn test_create_unique_index_finding() {
     let sql = "CREATE UNIQUE INDEX idx_pk ON orders (id);";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-PG-IDX-NEW"), "rules: {:?}", rule_ids(&r));
@@ -118,7 +117,7 @@ fn test_drop_index_format_roundtrip() {
 }
 
 #[test]
-fn test_drop_index_signal() {
+fn test_drop_index_finding() {
     let sql = "DROP INDEX idx_users_email;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-IDX-DROP"), "rules: {:?}", rule_ids(&r));
@@ -126,7 +125,7 @@ fn test_drop_index_signal() {
 }
 
 #[test]
-fn test_drop_index_cascade_signal() {
+fn test_drop_index_cascade_finding() {
     let sql = "DROP INDEX idx_users_email CASCADE;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-IDX-DROP"), "rules: {:?}", rule_ids(&r));
@@ -156,7 +155,7 @@ fn test_create_sequence_format_roundtrip() {
 }
 
 #[test]
-fn test_create_sequence_signal() {
+fn test_create_sequence_finding() {
     let sql = "CREATE SEQUENCE user_id_seq;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-SEQ-NEW"), "rules: {:?}", rule_ids(&r));
@@ -175,7 +174,7 @@ fn test_alter_sequence_format_roundtrip() {
 }
 
 #[test]
-fn test_alter_sequence_signal() {
+fn test_alter_sequence_finding() {
     let sql = "ALTER SEQUENCE user_id_seq RESTART WITH 100;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-SEQ-CHG"), "rules: {:?}", rule_ids(&r));
@@ -200,7 +199,7 @@ fn test_drop_sequence_format_roundtrip() {
 }
 
 #[test]
-fn test_drop_sequence_signal() {
+fn test_drop_sequence_finding() {
     let sql = "DROP SEQUENCE user_id_seq;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "SEQ-DROP"), "rules: {:?}", rule_ids(&r));
@@ -208,7 +207,7 @@ fn test_drop_sequence_signal() {
 }
 
 #[test]
-fn test_drop_sequence_cascade_signal() {
+fn test_drop_sequence_cascade_finding() {
     let sql = "DROP SEQUENCE user_id_seq CASCADE;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "SEQ-DROP"), "rules: {:?}", rule_ids(&r));
@@ -231,7 +230,7 @@ fn test_create_type_enum_format_roundtrip() {
 }
 
 #[test]
-fn test_create_type_signal() {
+fn test_create_type_finding() {
     let sql = "CREATE TYPE mood AS ENUM ('happy', 'sad');";
     let r = pg_analyze(sql);
     assert!(
@@ -265,7 +264,7 @@ fn test_alter_type_format_roundtrip() {
 }
 
 #[test]
-fn test_alter_type_signal() {
+fn test_alter_type_finding() {
     let sql = "ALTER TYPE mood ADD VALUE 'anxious';";
     let r = pg_analyze(sql);
     assert!(
@@ -298,7 +297,7 @@ fn test_drop_type_format_roundtrip() {
 }
 
 #[test]
-fn test_drop_type_signal() {
+fn test_drop_type_finding() {
     let sql = "DROP TYPE mood;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-TYPE-DROP"), "rules: {:?}", rule_ids(&r));
@@ -306,7 +305,7 @@ fn test_drop_type_signal() {
 }
 
 #[test]
-fn test_drop_type_cascade_signal() {
+fn test_drop_type_cascade_finding() {
     let sql = "DROP TYPE mood CASCADE;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-TYPE-DROP"), "rules: {:?}", rule_ids(&r));
@@ -336,7 +335,7 @@ fn test_comment_on_table_format_roundtrip() {
 }
 
 #[test]
-fn test_comment_on_signal() {
+fn test_comment_on_finding() {
     let sql = "COMMENT ON TABLE users IS 'Main users table';";
     let r = pg_analyze(sql);
     assert!(
@@ -381,7 +380,7 @@ fn test_vacuum_format_roundtrip() {
 }
 
 #[test]
-fn test_vacuum_signal() {
+fn test_vacuum_finding() {
     let sql = "VACUUM users;";
     let r = pg_analyze(sql);
     assert!(
@@ -426,7 +425,7 @@ fn test_analyze_format_roundtrip() {
 }
 
 #[test]
-fn test_analyze_signal() {
+fn test_analyze_finding() {
     let sql = "ANALYZE users;";
     let r = pg_analyze(sql);
     assert!(
@@ -460,7 +459,7 @@ fn test_cluster_format_roundtrip() {
 }
 
 #[test]
-fn test_cluster_signal() {
+fn test_cluster_finding() {
     let sql = "CLUSTER users USING idx_users_email;";
     let r = pg_analyze(sql);
     assert!(
@@ -494,7 +493,7 @@ fn test_listen_format_roundtrip() {
 }
 
 #[test]
-fn test_listen_signal() {
+fn test_listen_finding() {
     let sql = "LISTEN my_channel;";
     let r = pg_analyze(sql);
     assert!(
@@ -517,7 +516,7 @@ fn test_notify_format_roundtrip() {
 }
 
 #[test]
-fn test_notify_signal() {
+fn test_notify_finding() {
     let sql = "NOTIFY my_channel;";
     let r = pg_analyze(sql);
     assert!(
@@ -551,7 +550,7 @@ fn test_unlisten_format_roundtrip() {
 }
 
 #[test]
-fn test_unlisten_signal() {
+fn test_unlisten_finding() {
     let sql = "UNLISTEN my_channel;";
     let r = pg_analyze(sql);
     assert!(
@@ -585,7 +584,7 @@ fn test_create_aggregate_format_roundtrip() {
 }
 
 #[test]
-fn test_create_aggregate_signal() {
+fn test_create_aggregate_finding() {
     let sql = "CREATE AGGREGATE my_avg (float8) (sfunc = float8_accum, stype = float8[]);";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-PG-AGG-NEW"), "rules: {:?}", rule_ids(&r));
@@ -604,7 +603,7 @@ fn test_create_operator_format_roundtrip() {
 }
 
 #[test]
-fn test_create_operator_signal() {
+fn test_create_operator_finding() {
     let sql = "CREATE OPERATOR === (leftarg = text, rightarg = text, procedure = my_eq);";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "INFO-PG-OP-NEW"), "rules: {:?}", rule_ids(&r));
@@ -623,7 +622,7 @@ fn test_create_tablespace_format_roundtrip() {
 }
 
 #[test]
-fn test_create_tablespace_signal() {
+fn test_create_tablespace_finding() {
     let sql = "CREATE TABLESPACE fast_disk LOCATION '/ssd/pgdata';";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-TBLSPC-NEW"), "rules: {:?}", rule_ids(&r));
@@ -649,7 +648,7 @@ fn test_drop_tablespace_format_roundtrip() {
 }
 
 #[test]
-fn test_drop_tablespace_signal() {
+fn test_drop_tablespace_finding() {
     let sql = "DROP TABLESPACE fast_disk;";
     let r = pg_analyze(sql);
     assert!(has_rule(&r, "PG-TBLSPC-DROP"), "rules: {:?}", rule_ids(&r));
@@ -732,7 +731,7 @@ fn test_multi_cascade_drops() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_create_index_no_drop_signal() {
+fn test_create_index_no_drop_finding() {
     let sql = "CREATE INDEX idx_ok ON t (a);";
     let r = pg_analyze(sql);
     assert!(
@@ -746,7 +745,7 @@ fn test_create_index_no_drop_signal() {
 }
 
 #[test]
-fn test_vacuum_no_type_signal() {
+fn test_vacuum_no_type_finding() {
     let sql = "VACUUM users;";
     let r = pg_analyze(sql);
     assert!(

@@ -97,7 +97,7 @@ fn test_pivot_any_with_order_by() {
         ast::AstPivotInValues::Any(order_by) => {
             assert!(order_by.is_some(), "Expected ORDER BY clause");
             assert!(
-                order_by.as_ref().unwrap().len() > 0,
+                !order_by.as_ref().unwrap().is_empty(),
                 "Expected ORDER BY items"
             );
         }

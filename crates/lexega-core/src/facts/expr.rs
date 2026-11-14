@@ -36,7 +36,14 @@ pub enum Expr {
     Column { column: ColumnRef },
 
     /// Literal value.
-    Literal { literal: LiteralValue },
+    #[serde(serialize_with = "serialize_literal")]
+    #[cfg_attr(feature = "schema", schemars(with = "LiteralFields"))]
+    Literal {
+        literal: LiteralValue,
+        /// Where the source writes the literal.
+        #[serde(default)]
+        origin: super::identity::TextOrigin,
+    },
 
     /// Function call (scalar, table-valued, aggregate-as-expression, …).
     FuncCall { func_call: FuncCallExpr },
@@ -46,6 +53,10 @@ pub enum Expr {
 
     /// A run of two or more operands joined by the same `AND` / `OR`.
     LogicalChain { logical_chain: LogicalChainExpr },
+
+    /// A run of three or more operands joined by arithmetic,
+    /// concatenation or bitwise operators of one precedence level.
+    OperatorChain { operator_chain: OperatorChainExpr },
 
     /// Unary operator: NOT, -, +, IS NULL, IS NOT NULL.
     UnaryOp { unary_op: UnaryOpExpr },
@@ -108,6 +119,10 @@ pub struct FuncCallExpr {
     pub name: IdentName,
     pub schema: Option<IdentName>,
     pub args: Vec<Expr>,
+    /// Arguments given by name (`format => 'csv'`), and the fields of a
+    /// `STRUCT` named with `AS` (`STRUCT(1 AS x)`), in the order written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_args: Vec<NamedArgument>,
     /// Catalog-flagged: `CURRENT_DATE`, `NOW`, `GETDATE`, etc.
     pub is_temporal: bool,
     pub is_deterministic: bool,
@@ -116,6 +131,19 @@ pub struct FuncCallExpr {
     /// `true` when the function name resolves to a catalog entry.
     pub catalog_resolved: bool,
     pub source_span: Option<Span>,
+}
+
+/// An argument given by name (`name => value`), or a `STRUCT` field
+/// (`value AS name`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct NamedArgument {
+    /// The name as the dialect folds it. Its `raw` is that folded name
+    /// too, not the name as written (Snowflake `input =>` and `"INPUT" =>`
+    /// are both `INPUT`).
+    pub name: IdentName,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +165,21 @@ pub struct LogicalChainExpr {
     pub op: LogicalChainOp,
     /// Operands in source order; always two or more.
     pub operands: Vec<Expr>,
+}
+
+/// A run of three or more operands joined by operators of one precedence
+/// level: `a + b - c`, `x || y || z`, `a * b / c`. It is computed from the
+/// left, `((a + b) - c)`: `operators[0]` joins the first two operands, and
+/// each later operator joins the value so far with the next operand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct OperatorChainExpr {
+    /// Operands in source order; always three or more.
+    pub operands: Vec<Expr>,
+    /// The operator between each two operands, in source order; one
+    /// fewer than the operands.
+    pub operators: Vec<BinaryOp>,
 }
 
 /// The connective joining a [`LogicalChainExpr`]'s operands.
@@ -470,13 +513,29 @@ pub struct IndexAccessExpr {
     pub index: Box<Expr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct OpaqueExpr {
     pub reason: OpaqueExprReason,
     /// Display only; never participates in predicate matching.
     pub rendered: String,
+    /// Where the source writes the expression `rendered` is the text of.
+    #[serde(skip)]
+    pub(crate) origin: super::identity::TextOrigin,
+}
+
+impl Serialize for OpaqueExpr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("OpaqueExpr", 2)?;
+        out.serialize_field("reason", &self.reason)?;
+        match self.origin.masked_in_print() {
+            true => out.serialize_field("rendered", super::MASKED_VALUE)?,
+            false => out.serialize_field("rendered", &self.rendered)?,
+        }
+        out.end()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -495,3 +554,29 @@ pub enum OpaqueExprReason {
 }
 
 pub use super::identity::ScopeIdentity as ExprScopeIdentity;
+
+/// A literal as it serializes: each string it holds masked where a report
+/// prints it and the literal is not shown.
+/// The fields [`Expr::Literal`] serializes ([`serialize_literal`]).
+#[cfg(feature = "schema")]
+#[derive(JsonSchema)]
+// Only its schema is used: a literal is serialized by `serialize_literal`.
+#[allow(dead_code)]
+struct LiteralFields {
+    literal: LiteralValue,
+}
+
+fn serialize_literal<S: serde::Serializer>(
+    literal: &LiteralValue,
+    origin: &super::identity::TextOrigin,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let mut out = serializer.serialize_struct("Literal", 1)?;
+    if origin.masked_in_print() {
+        out.serialize_field("literal", &literal.masked())?;
+    } else {
+        out.serialize_field("literal", literal)?;
+    }
+    out.end()
+}

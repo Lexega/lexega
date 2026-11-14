@@ -4,7 +4,7 @@
 //! IR-side predicate extraction — `ScalarExpr → PredicateFact`.
 //!
 //! Projects the predicate `ScalarExpr` trees carried on
-//! [`RelPlan::Filter`] (`WHERE` / `QUALIFY`) and
+//! [`RelPlan::Filter`] (`WHERE`, a `HAVING` that reads a select alias) and
 //! [`RelPlan::Aggregate`] (`HAVING`) nodes onto the
 //! [`crate::context::node_metadata::PredicateFact`] surface.
 //!
@@ -42,15 +42,18 @@
 //! catch-all. Adding a new variant fails compilation here, requiring
 //! an explicit classification.
 
+use std::collections::HashMap;
+
 use crate::context::node_metadata::{
-    ColumnRef, ColumnSourceType, FunctionCallFact, LogicalOperator, PredicateContext,
+    ColumnRef, ColumnSourceType, FunctionCallFact, IdentKey, LogicalOperator, PredicateContext,
     PredicateFact, PredicateOp, PredicateQuantifier, ScopeDescriptor, ScopeKind,
     ScopedPredicateFact, TableRef,
 };
 use crate::ir::column::{BindingTable, ColumnId, ColumnOrigin};
 use crate::ir::expression_fact::ScanIndex;
+use crate::ir::normalize::NameKind;
 use crate::ir::plan::{CteBody, InsertSource, JoinKind, ProjectItem, RelPlan, ResolvedFunc};
-use crate::ir::scalar::{Lit, QuantifiedRhs, Quantifier, ScalarExpr};
+use crate::ir::scalar::{FieldPath, Lit, QuantifiedRhs, Quantifier, ScalarExpr};
 
 // ── Temporal function classification ─────────────────────────────────────────
 
@@ -73,7 +76,8 @@ fn is_temporal_func(
 /// Resolve a `ColumnId` to a [`ColumnRef`] using the binding table and
 /// scan index.  Mirrors the resolution in
 /// [`crate::ir::expression_fact::scalar_to_expression_fact`] for
-/// `ScalarExpr::Column`.
+/// `ScalarExpr::Column`. A column a reference lists resolves to the
+/// table of the table column the plan pairs it with.
 pub(crate) fn column_id_to_ref(
     col: ColumnId,
     bindings: &BindingTable,
@@ -81,24 +85,16 @@ pub(crate) fn column_id_to_ref(
 ) -> ColumnRef {
     match bindings.get(col) {
         Some(binding) => {
-            let resolved_table = match &binding.origin {
-                ColumnOrigin::Table { table_node, .. } => scan_index.get(table_node).cloned(),
-                ColumnOrigin::Computed { .. }
-                | ColumnOrigin::SetOp { .. }
-                | ColumnOrigin::OuterRef { .. }
-                | ColumnOrigin::RecursiveRef { .. } => None,
-            };
-            // `source_type` is paired with `resolved_table`: only Table-origin
-            // bindings produce a base-table read for downstream consumers
-            // (e.g., catalog validation at lib.rs:707 requires BaseTable to
-            // emit DATA_ACCESS:COLUMN:UNKNOWN). Non-Table origins resolve to
+            let resolved_table = scan_index.table_of(col, bindings).cloned();
+            // `source_type` is paired with the column's source: a table
+            // column, read directly or through a reference, is a
+            // base-table read for downstream consumers (e.g., catalog
+            // validation requires BaseTable to emit
+            // DATA_ACCESS:COLUMN:UNKNOWN); every other column resolves to
             // `Unknown`, matching the absence of a `resolved_table`.
-            let source_type = match &binding.origin {
-                ColumnOrigin::Table { .. } => ColumnSourceType::BaseTable,
-                ColumnOrigin::Computed { .. }
-                | ColumnOrigin::SetOp { .. }
-                | ColumnOrigin::OuterRef { .. }
-                | ColumnOrigin::RecursiveRef { .. } => ColumnSourceType::Unknown,
+            let source_type = match scan_index.source_column(col, bindings) {
+                Some(_) => ColumnSourceType::BaseTable,
+                None => ColumnSourceType::Unknown,
             };
             let mut col_ref =
                 ColumnRef::new(binding.display_name.clone()).with_source_type(source_type);
@@ -136,9 +132,10 @@ fn lit_to_predicate_value(lit: &Lit) -> Option<String> {
         Lit::Null => None,
         Lit::Bool(b) => Some(b.to_string()),
         Lit::Integer(s) | Lit::Float(s) | Lit::Str(s) => Some(s.clone()),
-        Lit::Bytes { value, .. } | Lit::Typed { value, .. } | Lit::Variant(value) => {
-            Some(value.clone())
-        }
+        Lit::Bytes { value, .. } | Lit::Typed { value, .. } => Some(value.clone()),
+        // A bind parameter or a variable: a value the statement does not
+        // know.
+        Lit::Variant(_) | Lit::Variable { .. } => None,
     }
 }
 
@@ -195,7 +192,7 @@ fn collect_function_calls(source: &str, expr: &ScalarExpr, out: &mut Vec<Functio
             collect_function_calls(source, left, out);
             collect_function_calls(source, right, out);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 collect_function_calls(source, operand, out);
             }
@@ -249,9 +246,22 @@ fn collect_function_calls(source: &str, expr: &ScalarExpr, out: &mut Vec<Functio
         ScalarExpr::PatternVarRef { .. } | ScalarExpr::WindowFn { .. } => {}
         // Subqueries: do not descend into the plan — only collect
         // from the scalar parts.
+        ScalarExpr::RowCmp {
+            quantifier: None,
+            left,
+            ..
+        } => {
+            for e in left {
+                collect_function_calls(source, e, out);
+            }
+        }
         ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
-        | ScalarExpr::QuantifiedCmp { .. } => {}
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp {
+            quantifier: Some(_),
+            ..
+        } => {}
     }
 }
 
@@ -276,7 +286,7 @@ fn scalar_has_temporal(expr: &ScalarExpr, catalog: &crate::ir::catalog::Function
         ScalarExpr::BinOp { left, right, .. } => {
             scalar_has_temporal(left, catalog) || scalar_has_temporal(right, catalog)
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             operands.iter().any(|o| scalar_has_temporal(o, catalog))
         }
         ScalarExpr::Like {
@@ -323,6 +333,11 @@ fn scalar_has_temporal(expr: &ScalarExpr, catalog: &crate::ir::catalog::Function
                 || scalar_has_temporal(high, catalog)
         }
         ScalarExpr::FieldAccess { base, .. } => scalar_has_temporal(base, catalog),
+        ScalarExpr::RowCmp {
+            quantifier: None,
+            left,
+            ..
+        } => left.iter().any(|e| scalar_has_temporal(e, catalog)),
         ScalarExpr::Column { .. }
         | ScalarExpr::OuterRef { .. }
         | ScalarExpr::Lit { .. }
@@ -332,6 +347,10 @@ fn scalar_has_temporal(expr: &ScalarExpr, catalog: &crate::ir::catalog::Function
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp {
+            quantifier: Some(_),
+            ..
+        }
         | ScalarExpr::Opaque { .. } => false,
     }
 }
@@ -340,11 +359,14 @@ fn scalar_has_subquery(expr: &ScalarExpr) -> bool {
     match expr {
         ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
-        | ScalarExpr::QuantifiedCmp { .. } => true,
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. } => true,
         ScalarExpr::BinOp { left, right, .. } => {
             scalar_has_subquery(left) || scalar_has_subquery(right)
         }
-        ScalarExpr::LogicalChain { operands, .. } => operands.iter().any(scalar_has_subquery),
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
+            operands.iter().any(scalar_has_subquery)
+        }
         ScalarExpr::Like {
             expr,
             pattern,
@@ -525,6 +547,31 @@ fn collect_subquery_plans_with_lift_info<'a>(
                 }
             }
         }
+        // As the comparison of a row with a scalar subquery, or the
+        // quantified comparison, it states.
+        ScalarExpr::RowCmp {
+            op,
+            quantifier,
+            negated,
+            left,
+            subquery,
+            ..
+        } => {
+            for e in left {
+                collect_subquery_plans_with_lift_info(e, outer_is_negated, outer_in_or, false, out);
+            }
+            let kind_ok = match quantifier {
+                None => matches!(op, crate::ir::scalar::ComparisonOp::Eq),
+                Some(quantifier) => matches!(
+                    (op, quantifier, negated),
+                    (crate::ir::scalar::ComparisonOp::Eq, Quantifier::Any, false)
+                ),
+            };
+            out.push(SubqueryLiftSite {
+                plan: subquery,
+                lift_eligible_descent: !outer_is_negated && !outer_in_or && kind_ok,
+            });
+        }
         ScalarExpr::BinOp {
             op, left, right, ..
         } => {
@@ -592,6 +639,18 @@ fn collect_subquery_plans_with_lift_info<'a>(
             let in_or = outer_in_or || matches!(op, crate::ir::scalar::LogicalOp::Or);
             for operand in operands {
                 collect_subquery_plans_with_lift_info(operand, outer_is_negated, in_or, false, out);
+            }
+        }
+        // A run of operators, as the last branch of the `BinOp` arm.
+        ScalarExpr::OperatorChain { operands, .. } => {
+            for operand in operands {
+                collect_subquery_plans_with_lift_info(
+                    operand,
+                    outer_is_negated,
+                    outer_in_or,
+                    false,
+                    out,
+                );
             }
         }
         ScalarExpr::UnaryOp { op, arg, .. } => {
@@ -735,25 +794,34 @@ fn collect_scope_owned_identities(
             }
             collect_scope_owned_identities(input, cols, scan_nodes);
         }
-        RelPlan::Filter { input, .. }
-        | RelPlan::Sort { input, .. }
+        RelPlan::Filter {
+            input, computed, ..
+        } => {
+            cols.extend(computed.iter().map(|item| item.output));
+            collect_scope_owned_identities(input, cols, scan_nodes);
+        }
+        RelPlan::Sort { input, .. }
         | RelPlan::Limit { input, .. }
         | RelPlan::TableSample { input, .. }
         | RelPlan::Unnest { input, .. } => collect_scope_owned_identities(input, cols, scan_nodes),
         RelPlan::Aggregate {
             input,
             output_columns,
+            computed,
             ..
         } => {
             cols.extend(output_columns.iter().copied());
+            cols.extend(computed.iter().map(|item| item.output));
             collect_scope_owned_identities(input, cols, scan_nodes);
         }
         RelPlan::Window {
             input,
             window_outputs,
+            computed,
             ..
         } => {
             cols.extend(window_outputs.iter().copied());
+            cols.extend(computed.iter().map(|item| item.output));
             collect_scope_owned_identities(input, cols, scan_nodes);
         }
         RelPlan::SetOp {
@@ -937,7 +1005,8 @@ fn apply_correlation_lift(result: &mut PlanPredicates, bindings: &BindingTable) 
 /// Follow a `ColumnId`'s binding origin chain to its underlying source
 /// `Scan` / `Values` / `CteRef` / `ModelRef` NodeId. Returns `None`
 /// when the chain terminates at a `Computed` / `SetOp` / `RecursiveRef`
-/// origin (no single source scan), or when the column has no binding.
+/// / `Unattributed` origin (no single source scan), or when the column
+/// has no binding.
 fn resolve_column_source_scan_node(
     col: ColumnId,
     bindings: &BindingTable,
@@ -949,8 +1018,10 @@ fn resolve_column_source_scan_node(
             ColumnOrigin::Table { table_node, .. } => return Some(*table_node),
             ColumnOrigin::OuterRef { outer_column, .. } => current = *outer_column,
             ColumnOrigin::Computed { .. }
+            | ColumnOrigin::Merged { .. }
             | ColumnOrigin::SetOp { .. }
-            | ColumnOrigin::RecursiveRef { .. } => return None,
+            | ColumnOrigin::RecursiveRef { .. }
+            | ColumnOrigin::Unattributed { .. } => return None,
         }
     }
     None
@@ -973,39 +1044,319 @@ fn in_list_literal_values(list: &[ScalarExpr]) -> Option<Vec<String>> {
 
 // ── Null-safe function detection ─────────────────────────────────────────────
 
-/// Returns `true` if `expr` is a call to a null-handling function
-/// whose output is non-NULL even when an input is NULL — `COALESCE`-
-/// like, `NVL2`-like (`ConditionalAfterFirst`), or never-null.
+/// What a call's argument shows of whether it is NULL.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nullness {
+    NotNull,
+    /// NULL in some row, by what the expression itself shows.
+    CanBeNull,
+    /// Neither is shown.
+    Unknown,
+}
+
+/// Returns `true` if `expr` is a call taken as not NULL.
+///
+/// An argument of a call is one of three kinds:
+///
+/// - not NULL: an argument that is no call and that `argument_not_null`
+///   accepts, or a call this function accepts;
+/// - can visibly be NULL: a column reference, or a field path over one,
+///   that `argument_not_null` does not accept; a `NULL` literal; a scalar
+///   `Strict` call with a positional argument of this kind (it returns
+///   NULL for a NULL argument); a `COALESCE`-like call whose positional
+///   arguments are all of this kind; an `NVL2`-like
+///   or `IFF`-like call with a positional argument after the first
+///   of this kind;
+/// - unknown: anything else, such as a call the catalog does not classify,
+///   a `Strict` call with no argument of the second kind, arithmetic, a
+///   `CASE`, a cast or a subquery.
+///
+/// Accepted:
+///
+/// - a never-null function, whatever its arguments;
+/// - a `COALESCE`-like function, unless every positional argument can
+///   visibly be NULL;
+/// - an `NVL2`-like function, unless a positional argument after the
+///   first can visibly be NULL.
+///
+/// Refused: a `Strict` call, whatever its arguments (arguments that are
+/// not NULL do not make it so: a function may return NULL for a value it
+/// cannot use), a call the catalog does not classify, and an unresolved
+/// call.
+///
+/// `argument_not_null` is asked about arguments that are not calls; a
+/// call among the arguments is sorted here. A name that lowered to a
+/// zero-argument call, as a date-part word does, is a call: it is
+/// unknown, not a column that can be NULL.
 ///
 /// The classification comes from the catalog-resident
 /// [`crate::ir::catalog::FunctionSignature::null_behavior`], honouring
 /// the architectural rule that analyses receive a [`FunctionId`](crate::ir::catalog::FunctionId) and
 /// consult the catalog rather than reaching back through the resolved
 /// id to recover the raw display name.
-/// [`crate::ir::catalog::NullBehavior::Unknown`] / `Strict` are
-/// conservative non-matches; `Unresolved` calls are also treated as
-/// non-matches because we can't prove non-null output without
-/// catalog backing.
 pub fn is_null_safe_scalar_func(
     expr: &ScalarExpr,
     func_catalog: &crate::ir::catalog::FunctionCatalog,
+    argument_not_null: &dyn Fn(&ScalarExpr) -> bool,
 ) -> bool {
-    use crate::ir::catalog::NullBehavior;
     match expr {
-        ScalarExpr::FuncCall { func, .. } => match func {
-            ResolvedFunc::Resolved { id, .. } => match func_catalog.signature(*id) {
-                Some(sig) => matches!(
-                    sig.null_behavior,
-                    NullBehavior::CoalesceLike
-                        | NullBehavior::ConditionalAfterFirst
-                        | NullBehavior::NeverNull
-                ),
-                None => false,
-            },
-            ResolvedFunc::Unresolved { .. } => false,
-        },
+        ScalarExpr::FuncCall { func, args, .. } => {
+            call_nullness(func, args, func_catalog, argument_not_null) == Nullness::NotNull
+        }
         _ => false,
     }
+}
+
+/// The kind of a call, from its function's catalog NULL behaviour and the
+/// kinds of its positional arguments.
+fn call_nullness(
+    func: &ResolvedFunc,
+    args: &[ScalarExpr],
+    func_catalog: &crate::ir::catalog::FunctionCatalog,
+    argument_not_null: &dyn Fn(&ScalarExpr) -> bool,
+) -> Nullness {
+    use crate::ir::catalog::{FunctionKind, NullBehavior};
+    let signature = match func {
+        ResolvedFunc::Resolved { id, .. } => func_catalog.signature(*id),
+        ResolvedFunc::Unresolved { .. } => None,
+    };
+    let Some(sig) = signature else {
+        return Nullness::Unknown;
+    };
+    let can_be_null = |argument: &ScalarExpr| {
+        argument_nullness(argument, func_catalog, argument_not_null) == Nullness::CanBeNull
+    };
+    match sig.null_behavior {
+        NullBehavior::NeverNull => Nullness::NotNull,
+        NullBehavior::CoalesceLike => {
+            if args.iter().all(can_be_null) {
+                Nullness::CanBeNull
+            } else {
+                Nullness::NotNull
+            }
+        }
+        NullBehavior::BranchOnCondition | NullBehavior::BranchOnNotNull => {
+            if args.iter().skip(1).any(can_be_null) {
+                Nullness::CanBeNull
+            } else {
+                Nullness::NotNull
+            }
+        }
+        // NULL for a NULL argument; what it returns for the others is not
+        // read. An aggregate or a window function takes its argument from
+        // other rows too.
+        NullBehavior::Strict => match sig.kind {
+            FunctionKind::Scalar => {
+                if args.iter().any(can_be_null) {
+                    Nullness::CanBeNull
+                } else {
+                    Nullness::Unknown
+                }
+            }
+            FunctionKind::Aggregate | FunctionKind::Window | FunctionKind::WindowAggregate => {
+                Nullness::Unknown
+            }
+        },
+        NullBehavior::NullOnlyWhenAllNull | NullBehavior::Unknown => Nullness::Unknown,
+    }
+}
+
+/// The kind of one argument of a call.
+fn argument_nullness(
+    argument: &ScalarExpr,
+    func_catalog: &crate::ir::catalog::FunctionCatalog,
+    argument_not_null: &dyn Fn(&ScalarExpr) -> bool,
+) -> Nullness {
+    let shown = match argument {
+        ScalarExpr::FuncCall { func, args, .. } => {
+            return call_nullness(func, args, func_catalog, argument_not_null);
+        }
+        ScalarExpr::Column { .. }
+        | ScalarExpr::OuterRef { .. }
+        | ScalarExpr::PatternVarRef { .. }
+        | ScalarExpr::FieldAccess { .. } => {
+            if is_column_path(argument) {
+                Nullness::CanBeNull
+            } else {
+                Nullness::Unknown
+            }
+        }
+        ScalarExpr::Lit { value, .. } => {
+            if matches!(value, Lit::Null) {
+                Nullness::CanBeNull
+            } else {
+                Nullness::Unknown
+            }
+        }
+        ScalarExpr::BinOp { .. }
+        | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
+        | ScalarExpr::UnaryOp { .. }
+        | ScalarExpr::Case { .. }
+        | ScalarExpr::Cast { .. }
+        | ScalarExpr::InList { .. }
+        | ScalarExpr::Between { .. }
+        | ScalarExpr::Like { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
+        | ScalarExpr::WindowFn { .. }
+        | ScalarExpr::Lambda { .. }
+        | ScalarExpr::Opaque { .. } => Nullness::Unknown,
+    };
+    if argument_not_null(argument) {
+        Nullness::NotNull
+    } else {
+        shown
+    }
+}
+
+/// Whether `expr` is a column reference, or field steps over one.
+fn is_column_path(mut expr: &ScalarExpr) -> bool {
+    while let ScalarExpr::FieldAccess { base, .. } = expr {
+        expr = base;
+    }
+    matches!(
+        expr,
+        ScalarExpr::Column { .. } | ScalarExpr::OuterRef { .. } | ScalarExpr::PatternVarRef { .. }
+    )
+}
+
+/// The column an atom's operand reads and the field path below it: a
+/// column or outer reference, or a field access over one with no cast
+/// and no dynamic index. A cast field is another value; a dynamic index
+/// names no one field.
+fn operand_column(expr: &ScalarExpr) -> Option<(ColumnId, FieldPath)> {
+    match expr {
+        ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } => {
+            Some((*column, FieldPath::empty()))
+        }
+        ScalarExpr::FieldAccess {
+            base,
+            path,
+            cast: None,
+            ..
+        } => {
+            let (column, below) = operand_column(base)?;
+            let path = below.extend(&FieldPath::from_field_steps(path));
+            (!path.has_dynamic()).then_some((column, path))
+        }
+        ScalarExpr::FieldAccess { cast: Some(_), .. }
+        | ScalarExpr::Lit { .. }
+        | ScalarExpr::BinOp { .. }
+        | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
+        | ScalarExpr::UnaryOp { .. }
+        | ScalarExpr::FuncCall { .. }
+        | ScalarExpr::Case { .. }
+        | ScalarExpr::Cast { .. }
+        | ScalarExpr::InList { .. }
+        | ScalarExpr::Between { .. }
+        | ScalarExpr::Like { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
+        | ScalarExpr::WindowFn { .. }
+        | ScalarExpr::Lambda { .. }
+        | ScalarExpr::PatternVarRef { .. }
+        | ScalarExpr::Opaque { .. } => None,
+    }
+}
+
+/// [`column_id_to_ref`] of `column`, named by the column followed by
+/// `path`.
+fn column_path_ref(
+    column: ColumnId,
+    path: &FieldPath,
+    bindings: &BindingTable,
+    scan_index: &ScanIndex,
+) -> ColumnRef {
+    let mut col_ref = column_id_to_ref(column, bindings, scan_index);
+    col_ref.name.push_str(&path.suffix_text());
+    col_ref
+}
+
+/// The variable, or the named or numbered parameter, `expr` reads: its
+/// identity and a reference naming it as written. A named or numbered
+/// parameter is known by its text, as a comparison that holds one is; an
+/// anonymous `?` is a new value at each read.
+fn operand_variable(source: &str, expr: &ScalarExpr) -> Option<(IdentKey, ColumnRef)> {
+    let ScalarExpr::Lit { value, span } = expr else {
+        return None;
+    };
+    let (key, written) = match value {
+        Lit::Variable { name, written } => (name.clone(), written.clone()),
+        Lit::Variant(_) => {
+            let text = span_text(source, *span);
+            if text.is_empty() || text == "?" {
+                return None;
+            }
+            (
+                IdentKey::from_normalized(text.to_string()),
+                text.to_string(),
+            )
+        }
+        Lit::Null
+        | Lit::Bool(_)
+        | Lit::Integer(_)
+        | Lit::Float(_)
+        | Lit::Str(_)
+        | Lit::Bytes { .. }
+        | Lit::Typed { .. } => return None,
+    };
+    Some((key, ColumnRef::new(written).with_span(*span)))
+}
+
+/// Where an atom sits in its predicate.
+#[derive(Clone, Copy)]
+struct AtomPlace {
+    context: PredicateContext,
+    logical_operator: Option<LogicalOperator>,
+    or_branch_id: u32,
+    not_isolation_id: u32,
+    scope_id: u32,
+    is_negated: bool,
+}
+
+/// An atom of the variable `key`, named by `reference`: it reads no column.
+fn variable_atom(
+    (key, reference): &(IdentKey, ColumnRef),
+    operator: PredicateOp,
+    literal_value: Option<String>,
+    in_list_values: Option<Vec<String>>,
+    place: AtomPlace,
+    span: crate::lexer::Span,
+) -> PredWithCorr {
+    PredWithCorr::new(
+        PredicateFact {
+            column_id: None,
+            field_path: FieldPath::empty(),
+            column: reference.clone(),
+            operator,
+            literal_value,
+            rhs_text: None,
+            has_temporal: false,
+            has_subquery: false,
+            subquery_column: None,
+            subquery_table: None,
+            function_calls: Vec::new(),
+            in_list_values,
+            between_bounds: None,
+            context: place.context,
+            logical_operator: place.logical_operator,
+            or_branch_id: place.or_branch_id,
+            not_isolation_id: place.not_isolation_id,
+            scope_id: place.scope_id,
+            join_scope_id: 0,
+            is_negated: place.is_negated,
+            is_reflexive: false,
+            variable: Some(key.clone()),
+            span,
+        },
+        Vec::new(),
+    )
 }
 
 // ── RHS text reconstruction ───────────────────────────────────────────────────
@@ -1023,6 +1374,13 @@ fn rhs_as_text(
     scan_index: &ScanIndex,
 ) -> Option<String> {
     match rhs {
+        // A bind parameter or a variable reads as it is written.
+        ScalarExpr::Lit {
+            value: Lit::Variant(_) | Lit::Variable { .. },
+            span,
+        } => Some(span_text(source, *span))
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
         ScalarExpr::Lit { value, .. } => lit_to_predicate_value(value),
         ScalarExpr::Column { column, .. } => {
             let col_ref = column_id_to_ref(*column, bindings, scan_index);
@@ -1101,13 +1459,13 @@ fn first_scan_table_from_plan(plan: &RelPlan) -> Option<TableRef> {
 
 /// Extract the first projected column and source table from a subquery plan.
 /// Used to populate `subquery_column` and `subquery_table` on
-/// [`PredicateFact`].
+/// [`PredicateFact`]. Neither where the plan does not know the column
+/// at the first position.
 fn subquery_column_and_table_from_plan(
     plan: &RelPlan,
     bindings: &BindingTable,
 ) -> (Option<ColumnRef>, Option<TableRef>) {
-    let schema = plan.output_schema();
-    let first_col_id = match schema.first().copied() {
+    let first_col_id = match plan.positional_columns().at(0).column() {
         Some(id) => id,
         None => return (None, None),
     };
@@ -1130,11 +1488,22 @@ pub(crate) struct PredWithCorr {
     /// `ColumnId` has `ColumnOrigin::OuterRef`).  Non-empty iff the predicate
     /// is correlated.
     outer_refs: Vec<ColumnRef>,
+    /// The named or numbered parameter (`:lo`, `$1`) a comparison compares
+    /// its column with, as written.
+    parameter: Option<String>,
 }
 
 impl PredWithCorr {
     fn new(fact: PredicateFact, outer_refs: Vec<ColumnRef>) -> Self {
-        Self { fact, outer_refs }
+        Self {
+            fact,
+            outer_refs,
+            parameter: None,
+        }
+    }
+
+    fn comparing(self, parameter: Option<String>) -> Self {
+        Self { parameter, ..self }
     }
 }
 
@@ -1333,23 +1702,22 @@ pub(crate) fn extract_scalar_predicates(
                     | crate::ir::scalar::UnaryOpKind::IsNotNull
             ) =>
         {
-            if let ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } =
-                arg.as_ref()
-            {
-                let col_ref = column_id_to_ref(*column, bindings, scan_index);
+            if let Some((column, field_path)) = operand_column(arg) {
+                let col_ref = column_path_ref(column, &field_path, bindings, scan_index);
                 let op_kind = match op {
                     crate::ir::scalar::UnaryOpKind::IsNull => PredicateOp::IsNull,
                     crate::ir::scalar::UnaryOpKind::IsNotNull => PredicateOp::IsNotNull,
                     _ => unreachable!("guarded by matches! above"),
                 };
-                let outer_refs = if is_outer_ref_column(*column, bindings) {
+                let outer_refs = if is_outer_ref_column(column, bindings) {
                     vec![col_ref.clone()]
                 } else {
                     vec![]
                 };
                 out.push(PredWithCorr::new(
                     PredicateFact {
-                        column_id: Some(*column),
+                        column_id: Some(column),
+                        field_path,
                         column: col_ref,
                         operator: op_kind,
                         literal_value: None,
@@ -1368,6 +1736,7 @@ pub(crate) fn extract_scalar_predicates(
                         join_scope_id: 0,
                         is_negated,
                         is_reflexive: false,
+                        variable: None,
                         between_bounds: None,
                         span: *span,
                     },
@@ -1384,37 +1753,135 @@ pub(crate) fn extract_scalar_predicates(
             let Some(op_kind) = parse_predicate_binop(*op) else {
                 return;
             };
-            if let ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } =
-                left.as_ref()
+            // A variable compared with itself: an atom of the variable,
+            // keyed by its identity apart from every column.
+            if let (
+                ScalarExpr::Lit {
+                    value: Lit::Variable { name, written },
+                    span: name_span,
+                },
+                ScalarExpr::Lit {
+                    value: Lit::Variable { name: other, .. },
+                    ..
+                },
+                PredicateOp::Compare(_),
+            ) = (left.as_ref(), right.as_ref(), op_kind)
             {
-                let col_ref = column_id_to_ref(*column, bindings, scan_index);
+                if name == other {
+                    out.push(PredWithCorr::new(
+                        PredicateFact {
+                            column_id: None,
+                            column: ColumnRef::new(written.clone()).with_span(*name_span),
+                            operator: op_kind,
+                            literal_value: None,
+                            rhs_text: rhs_as_text(source, right, bindings, scan_index),
+                            has_temporal: false,
+                            has_subquery: false,
+                            subquery_column: None,
+                            subquery_table: None,
+                            function_calls: Vec::new(),
+                            in_list_values: None,
+                            between_bounds: None,
+                            context,
+                            logical_operator: parent_logical_op,
+                            or_branch_id: *or_counter,
+                            not_isolation_id: current_not_isolation,
+                            scope_id,
+                            join_scope_id: 0,
+                            is_negated,
+                            is_reflexive: true,
+                            variable: Some(name.clone()),
+                            field_path: FieldPath::empty(),
+                            span: *span,
+                        },
+                        Vec::new(),
+                    ));
+                }
+            }
+            // A variable or a parameter compared with a literal: an atom
+            // of it, one value wherever it is read.
+            if let (Some(variable), ScalarExpr::Lit { value, .. }, PredicateOp::Compare(_)) =
+                (operand_variable(source, left), right.as_ref(), op_kind)
+            {
+                if let Some(literal_value) = lit_to_predicate_value(value) {
+                    let place = AtomPlace {
+                        context,
+                        logical_operator: parent_logical_op,
+                        or_branch_id: *or_counter,
+                        not_isolation_id: current_not_isolation,
+                        scope_id,
+                        is_negated,
+                    };
+                    out.push(variable_atom(
+                        &variable,
+                        op_kind,
+                        Some(literal_value),
+                        None,
+                        place,
+                        *span,
+                    ));
+                }
+            }
+            if let Some((column, field_path)) = operand_column(left) {
+                let col_ref = column_path_ref(column, &field_path, bindings, scan_index);
                 let literal_value = match right.as_ref() {
                     ScalarExpr::Lit { value, .. } => lit_to_predicate_value(value),
                     _ => None,
                 };
-                // Reflexive `x = x`: RHS is the same column id as the LHS.
-                // Recorded as a typed flag because the RHS column identity
+                // Reflexive `x = x`: RHS is the same column and path as the
+                // LHS. Recorded as a typed flag because the RHS identity
                 // is not otherwise preserved on the emitted fact.
                 let is_reflexive = matches!(op_kind, PredicateOp::Compare(_))
-                    && matches!(
-                        right.as_ref(),
-                        ScalarExpr::Column { column: rc, .. } | ScalarExpr::OuterRef { column: rc, .. }
-                            if rc == column
-                    );
+                    && operand_column(right).is_some_and(|(rc, rp)| rc == column && rp == field_path);
+                // A named or numbered parameter is one value wherever the
+                // statement reads it; an anonymous `?` a new one each time.
+                let compared_variant = match right.as_ref() {
+                    ScalarExpr::Lit {
+                        value: Lit::Variant(_) | Lit::Variable { .. },
+                        span,
+                    } => matches!(op_kind, PredicateOp::Compare(_)).then_some(*span),
+                    ScalarExpr::Lit { .. }
+                    | ScalarExpr::Column { .. }
+                    | ScalarExpr::OuterRef { .. }
+                    | ScalarExpr::BinOp { .. }
+                    | ScalarExpr::LogicalChain { .. }
+                    | ScalarExpr::OperatorChain { .. }
+                    | ScalarExpr::UnaryOp { .. }
+                    | ScalarExpr::FuncCall { .. }
+                    | ScalarExpr::Case { .. }
+                    | ScalarExpr::Cast { .. }
+                    | ScalarExpr::InList { .. }
+                    | ScalarExpr::Between { .. }
+                    | ScalarExpr::Like { .. }
+                    | ScalarExpr::Exists { .. }
+                    | ScalarExpr::ScalarSubquery { .. }
+                    | ScalarExpr::QuantifiedCmp { .. }
+                    | ScalarExpr::RowCmp { .. }
+                    | ScalarExpr::WindowFn { .. }
+                    | ScalarExpr::FieldAccess { .. }
+                    | ScalarExpr::Lambda { .. }
+                    | ScalarExpr::PatternVarRef { .. }
+                    | ScalarExpr::Opaque { .. } => None,
+                };
+                let parameter = compared_variant
+                    .map(|span| span_text(source, span))
+                    .filter(|text| !text.is_empty() && *text != "?")
+                    .map(str::to_string);
                 let rhs_text = rhs_as_text(source, right, bindings, scan_index);
                 let has_temporal = scalar_has_temporal(right, func_catalog);
                 let has_subquery = scalar_has_subquery(right);
                 let mut function_calls = Vec::new();
                 collect_function_calls(source, left, &mut function_calls);
                 collect_function_calls(source, right, &mut function_calls);
-                let outer_refs = if is_outer_ref_column(*column, bindings) {
+                let outer_refs = if is_outer_ref_column(column, bindings) {
                     vec![col_ref.clone()]
                 } else {
                     vec![]
                 };
                 out.push(PredWithCorr::new(
                     PredicateFact {
-                        column_id: Some(*column),
+                        column_id: Some(column),
+                        field_path,
                         column: col_ref,
                         operator: op_kind,
                         literal_value,
@@ -1434,10 +1901,12 @@ pub(crate) fn extract_scalar_predicates(
                         join_scope_id: 0,
                         is_negated,
                         is_reflexive,
+                        variable: None,
                         span: *span,
                     },
                     outer_refs,
-                ));
+                )
+                .comparing(parameter));
             }
             // Only left-is-column is handled; the mirrored
             // (literal op column) form is skipped.
@@ -1449,10 +1918,8 @@ pub(crate) fn extract_scalar_predicates(
 
         // ── IN / NOT IN list
         ScalarExpr::InList { expr, list, negated, span } => {
-            if let ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } =
-                expr.as_ref()
-            {
-                let col_ref = column_id_to_ref(*column, bindings, scan_index);
+            if let Some((column, field_path)) = operand_column(expr) {
+                let col_ref = column_path_ref(column, &field_path, bindings, scan_index);
                 let in_list_values = in_list_literal_values(list);
                 let operator = if *negated { PredicateOp::NotIn } else { PredicateOp::In };
                 let has_subquery = false;
@@ -1461,14 +1928,15 @@ pub(crate) fn extract_scalar_predicates(
                 for v in list {
                     collect_function_calls(source, v, &mut function_calls);
                 }
-                let outer_refs = if is_outer_ref_column(*column, bindings) {
+                let outer_refs = if is_outer_ref_column(column, bindings) {
                     vec![col_ref.clone()]
                 } else {
                     vec![]
                 };
                 out.push(PredWithCorr::new(
                     PredicateFact {
-                        column_id: Some(*column),
+                        column_id: Some(column),
+                        field_path,
                         column: col_ref,
                         operator,
                         literal_value: None,
@@ -1494,12 +1962,26 @@ pub(crate) fn extract_scalar_predicates(
                         // same column have disjoint value sets.
                         is_negated,
                         is_reflexive: false,
+                        variable: None,
                         between_bounds: None,
                         join_scope_id: 0,
                         span: *span,
                     },
                     outer_refs,
                 ));
+            } else if let (Some(variable), Some(values)) =
+                (operand_variable(source, expr), in_list_literal_values(list))
+            {
+                let place = AtomPlace {
+                    context,
+                    logical_operator: parent_logical_op,
+                    or_branch_id: *or_counter,
+                    not_isolation_id: current_not_isolation,
+                    scope_id,
+                    is_negated,
+                };
+                let operator = if *negated { PredicateOp::NotIn } else { PredicateOp::In };
+                out.push(variable_atom(&variable, operator, None, Some(values), place, *span));
             }
         }
 
@@ -1519,16 +2001,14 @@ pub(crate) fn extract_scalar_predicates(
         // BETWEEN arm doesn't currently set up. Non-literal bounds also
         // fall back to the opaque form.
         ScalarExpr::Between { expr, low, high, negated, span } => {
-            if let ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } =
-                expr.as_ref()
-            {
-                let col_ref = column_id_to_ref(*column, bindings, scan_index);
+            if let Some((column, field_path)) = operand_column(expr) {
+                let col_ref = column_path_ref(column, &field_path, bindings, scan_index);
                 let has_temporal = scalar_has_temporal(low, func_catalog)
                     || scalar_has_temporal(high, func_catalog);
                 let mut function_calls = Vec::new();
                 collect_function_calls(source, low, &mut function_calls);
                 collect_function_calls(source, high, &mut function_calls);
-                let outer_refs = if is_outer_ref_column(*column, bindings) {
+                let outer_refs = if is_outer_ref_column(column, bindings) {
                     vec![col_ref.clone()]
                 } else {
                     vec![]
@@ -1556,7 +2036,8 @@ pub(crate) fn extract_scalar_predicates(
                     // Lower bound atom: col >= low
                     out.push(PredWithCorr::new(
                         PredicateFact {
-                            column_id: Some(*column),
+                            column_id: Some(column),
+                            field_path: field_path.clone(),
                             column: col_ref.clone(),
                             operator: PredicateOp::Compare(
                                 crate::ir::scalar::ComparisonOp::GtEq,
@@ -1577,6 +2058,7 @@ pub(crate) fn extract_scalar_predicates(
                             join_scope_id: 0,
                             is_negated: false,
                             is_reflexive: false,
+                            variable: None,
                             between_bounds: None,
                             span: *span,
                         },
@@ -1585,7 +2067,8 @@ pub(crate) fn extract_scalar_predicates(
                     // Upper bound atom: col <= high
                     out.push(PredWithCorr::new(
                         PredicateFact {
-                            column_id: Some(*column),
+                            column_id: Some(column),
+                            field_path,
                             column: col_ref,
                             operator: PredicateOp::Compare(
                                 crate::ir::scalar::ComparisonOp::LtEq,
@@ -1606,6 +2089,7 @@ pub(crate) fn extract_scalar_predicates(
                             join_scope_id: 0,
                             is_negated: false,
                             is_reflexive: false,
+                            variable: None,
                             between_bounds: None,
                             span: *span,
                         },
@@ -1619,7 +2103,8 @@ pub(crate) fn extract_scalar_predicates(
                     };
                     out.push(PredWithCorr::new(
                         PredicateFact {
-                            column_id: Some(*column),
+                            column_id: Some(column),
+                            field_path,
                             column: col_ref,
                             operator,
                             literal_value: None,
@@ -1639,10 +2124,42 @@ pub(crate) fn extract_scalar_predicates(
                             join_scope_id: 0,
                             is_negated: *negated,
                             is_reflexive: false,
+                            variable: None,
                             span: *span,
                         },
                         outer_refs,
                     ));
+                }
+            } else if let Some(variable) = operand_variable(source, expr).filter(|_| !*negated) {
+                // `low <= v AND v <= high`, where both bounds are literals.
+                let bound = |bound: &ScalarExpr| {
+                    let ScalarExpr::Lit { value, .. } = bound else {
+                        return None;
+                    };
+                    lit_to_predicate_value(value)
+                };
+                if let (Some(low), Some(high)) = (bound(low), bound(high)) {
+                    let place = AtomPlace {
+                        context,
+                        logical_operator: parent_logical_op,
+                        or_branch_id: *or_counter,
+                        not_isolation_id: current_not_isolation,
+                        scope_id,
+                        is_negated,
+                    };
+                    for (comparison, value) in [
+                        (crate::ir::scalar::ComparisonOp::GtEq, low),
+                        (crate::ir::scalar::ComparisonOp::LtEq, high),
+                    ] {
+                        out.push(variable_atom(
+                            &variable,
+                            PredicateOp::Compare(comparison),
+                            Some(value),
+                            None,
+                            place,
+                            *span,
+                        ));
+                    }
                 }
             }
         }
@@ -1727,6 +2244,8 @@ pub(crate) fn extract_scalar_predicates(
                         join_scope_id: 0,
                         is_negated: effective_negated,
                         is_reflexive: false,
+                        variable: None,
+                        field_path: FieldPath::empty(),
                         between_bounds: None,
                         span: *span,
                     },
@@ -1748,8 +2267,13 @@ pub(crate) fn extract_scalar_predicates(
         | ScalarExpr::PatternVarRef { .. }
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
+        // A row compared with a subquery names no one column.
+        | ScalarExpr::RowCmp { .. }
         // Non-NOT unary operators (e.g. unary minus): no predicate.
         | ScalarExpr::UnaryOp { .. }
+        // A run of arithmetic compares nothing, as a non-comparison
+        // `BinOp` above.
+        | ScalarExpr::OperatorChain { .. }
         | ScalarExpr::Opaque { .. } => {}
     }
 }
@@ -1757,11 +2281,17 @@ pub(crate) fn extract_scalar_predicates(
 // ── ScopedPredicateFact wrapping ─────────────────────────────────────────────
 
 fn wrap_in_scope(
+    compared_parameters: &mut HashMap<crate::lexer::Span, String>,
     predicates: &[PredWithCorr],
     scope_path: Vec<ScopeDescriptor>,
     scope_id: u32,
     parent_scope_id: u32,
 ) -> Vec<ScopedPredicateFact> {
+    compared_parameters.extend(predicates.iter().filter_map(|p| {
+        p.parameter
+            .as_ref()
+            .map(|parameter| (p.fact.span, parameter.clone()))
+    }));
     predicates
         .iter()
         .map(|p| ScopedPredicateFact {
@@ -1816,6 +2346,10 @@ pub struct PlanPredicates {
     /// Populated by `walk_subquery_predicates_in_expr` / `walk_plan`
     /// and consumed by the lift post-pass.
     pub(crate) scope_lift_eligibility: std::collections::BTreeMap<u32, bool>,
+    /// The named or numbered parameter each comparison compares its
+    /// column with, by the comparison's span. Read by
+    /// [`hold_named_parameters`].
+    pub(crate) compared_parameters: HashMap<crate::lexer::Span, String>,
 }
 
 /// Extract [`PredicateFact`] and [`ScopedPredicateFact`] from a
@@ -1842,6 +2376,7 @@ pub fn extract_predicates_from_plan(
         scope_owned_columns: std::collections::BTreeMap::new(),
         scope_owned_scan_nodes: std::collections::BTreeMap::new(),
         scope_lift_eligibility: std::collections::BTreeMap::new(),
+        compared_parameters: HashMap::new(),
     };
     let main_scope = vec![ScopeDescriptor::new(ScopeKind::MainQuery, 0)];
     let mut or_counter = 0u32;
@@ -1880,8 +2415,65 @@ pub fn extract_predicates_from_plan(
     // inner atom that references an outer-owned column at lift-eligible
     // position. See [`apply_correlation_lift`] for the contract.
     apply_correlation_lift(&mut result, bindings);
+    hold_named_parameters(&mut result);
 
     result
+}
+
+/// A named or numbered parameter is one value wherever the statement
+/// reads it. Where every known value the statement compares a column's
+/// name with is one such parameter, each comparison with it holds it,
+/// as written, as its value, so the comparisons are read against each
+/// other (`id > $1 AND id < $1`). Beside any other value (a literal,
+/// another parameter) it is a value not known, as an anonymous `?` is.
+fn hold_named_parameters(result: &mut PlanPredicates) {
+    let parameters = std::mem::take(&mut result.compared_parameters);
+    if parameters.is_empty() {
+        return;
+    }
+    // Per column name: the one parameter its known values are, or `None`
+    // where they are not one.
+    let mut held: std::collections::BTreeMap<IdentKey, Option<&str>> =
+        std::collections::BTreeMap::new();
+    let facts = result
+        .where_predicates
+        .iter()
+        .chain(&result.having_predicates)
+        .chain(result.scoped_predicates.iter().map(|sp| &sp.predicate));
+    for fact in facts {
+        let value = match parameters.get(&fact.span) {
+            Some(parameter) => Some(parameter.as_str()),
+            None if fact.literal_value.is_some()
+                || fact.in_list_values.is_some()
+                || fact.between_bounds.is_some() =>
+            {
+                None
+            }
+            None => continue,
+        };
+        held.entry(IdentKey::new_as(&fact.column.name, NameKind::Column))
+            .and_modify(|one| {
+                if *one != value {
+                    *one = None;
+                }
+            })
+            .or_insert(value);
+    }
+    let hold = |fact: &mut PredicateFact| {
+        if let Some(parameter) = parameters.get(&fact.span) {
+            if held.get(&IdentKey::new_as(&fact.column.name, NameKind::Column))
+                == Some(&Some(parameter.as_str()))
+            {
+                fact.literal_value = Some(parameter.clone());
+            }
+        }
+    };
+    result.where_predicates.iter_mut().for_each(hold);
+    result.having_predicates.iter_mut().for_each(hold);
+    result
+        .scoped_predicates
+        .iter_mut()
+        .for_each(|sp| hold(&mut sp.predicate));
 }
 
 /// Recursive plan walk for predicate extraction.
@@ -1914,7 +2506,7 @@ fn walk_plan(
     result: &mut PlanPredicates,
 ) {
     match plan {
-        // ── WHERE / QUALIFY Filter ────────────────────────────────────────
+        // ── WHERE / HAVING / QUALIFY Filter ───────────────────────────────────
         RelPlan::Filter {
             input,
             predicate,
@@ -1924,16 +2516,23 @@ fn walk_plan(
             use crate::ir::plan::FilterKind;
             // QUALIFY predicates are not `where_predicates`;
             // they're emitted on `has_qualify`. Skip extraction for QUALIFY.
-            if matches!(kind, FilterKind::Where) {
+            // A HAVING that reads a select alias sits here, above the
+            // projection, and is read as an aggregate's own HAVING is:
+            // with its own OR-branch numbering.
+            let read = match kind {
+                FilterKind::Where => Some((PredicateContext::Where, *or_counter)),
+                FilterKind::Having => Some((PredicateContext::Having, 0)),
+                FilterKind::Qualify => None,
+            };
+            if let Some((context, mut local_or)) = read {
                 let mut local_preds: Vec<PredWithCorr> = Vec::new();
-                let mut local_or = *or_counter;
                 extract_scalar_predicates(
                     source,
                     predicate,
                     bindings,
                     scan_index,
                     func_catalog,
-                    PredicateContext::Where,
+                    context,
                     scope_id,
                     &mut local_or,
                     not_isolation_counter,
@@ -1942,14 +2541,17 @@ fn walk_plan(
                     None,
                     &mut local_preds,
                 );
-                *or_counter = local_or;
-
-                // `where_predicates` only collects from the immediate scope (scope_id == 0
-                // means main query or CTE body being merged into the outer list).
-                result
-                    .where_predicates
-                    .extend(local_preds.iter().map(|p| p.fact.clone()));
+                let facts = local_preds.iter().map(|p| p.fact.clone());
+                if matches!(kind, FilterKind::Where) {
+                    *or_counter = local_or;
+                    // `where_predicates` only collects from the immediate scope (scope_id == 0
+                    // means main query or CTE body being merged into the outer list).
+                    result.where_predicates.extend(facts);
+                } else {
+                    result.having_predicates.extend(facts);
+                }
                 result.scoped_predicates.extend(wrap_in_scope(
+                    &mut result.compared_parameters,
                     &local_preds,
                     scope_path.to_vec(),
                     scope_id,
@@ -2010,6 +2612,7 @@ fn walk_plan(
                     .having_predicates
                     .extend(local_preds.iter().map(|p| p.fact.clone()));
                 result.scoped_predicates.extend(wrap_in_scope(
+                    &mut result.compared_parameters,
                     &local_preds,
                     scope_path.to_vec(),
                     scope_id,
@@ -2158,6 +2761,7 @@ fn walk_plan(
                 scope_owned_columns: std::collections::BTreeMap::new(),
                 scope_owned_scan_nodes: std::collections::BTreeMap::new(),
                 scope_lift_eligibility: std::collections::BTreeMap::new(),
+                compared_parameters: HashMap::new(),
             };
             walk_plan(
                 source,
@@ -2178,6 +2782,9 @@ fn walk_plan(
             result
                 .scoped_predicates
                 .extend(inner_result.scoped_predicates);
+            result
+                .compared_parameters
+                .extend(inner_result.compared_parameters);
         }
 
         // ── DML predicates ────────────────────────────────────────────────
@@ -2219,6 +2826,7 @@ fn walk_plan(
                     .where_predicates
                     .extend(local_preds.iter().map(|p| p.fact.clone()));
                 result.scoped_predicates.extend(wrap_in_scope(
+                    &mut result.compared_parameters,
                     &local_preds,
                     scope_path.to_vec(),
                     scope_id,
@@ -2282,6 +2890,7 @@ fn walk_plan(
                     .where_predicates
                     .extend(local_preds.iter().map(|p| p.fact.clone()));
                 result.scoped_predicates.extend(wrap_in_scope(
+                    &mut result.compared_parameters,
                     &local_preds,
                     scope_path.to_vec(),
                     scope_id,
@@ -2344,6 +2953,7 @@ fn walk_plan(
                 &mut on_preds,
             );
             result.scoped_predicates.extend(wrap_in_scope(
+                &mut result.compared_parameters,
                 &on_preds,
                 scope_path.to_vec(),
                 merge_on_scope_id,
@@ -2398,6 +3008,7 @@ fn walk_plan(
                         .where_predicates
                         .extend(local_preds.iter().map(|p| p.fact.clone()));
                     result.scoped_predicates.extend(wrap_in_scope(
+                        &mut result.compared_parameters,
                         &local_preds,
                         scope_path.to_vec(),
                         branch_scope_id,
@@ -2431,6 +3042,7 @@ fn walk_plan(
                         // Emit to scoped_predicates only (avoid
                         // duplicate ON atoms in where_predicates).
                         result.scoped_predicates.extend(wrap_in_scope(
+                            &mut result.compared_parameters,
                             &on_into_branch,
                             scope_path.to_vec(),
                             branch_scope_id,
@@ -2477,7 +3089,7 @@ fn walk_plan(
                 if let ProjectItem::Expr(e) = item {
                     walk_subquery_predicates_in_expr(
                         source,
-                        &e.expr,
+                        e.as_written(input),
                         bindings,
                         scan_index,
                         func_catalog,
@@ -2539,7 +3151,7 @@ fn walk_plan(
         // WHERE (`ON s.status = 'CANCELLED' AND s.customer_id = c.id`).
         // Without this extraction the IR-fold view of `where_predicates`
         // silently drops those filters and downstream consumers (e.g.
-        // `cross_scope_contra_signals`) miss real contradictions.
+        // `cross_scope_contra_findings`) miss real contradictions.
         //
         // Predicates from ALL join kinds are extracted uniformly with
         // `PredicateContext::JoinCondition`. Outer-join semantics (a
@@ -2639,6 +3251,7 @@ fn walk_plan(
                     .where_predicates
                     .extend(local_preds.iter().map(|p| p.fact.clone()));
                 result.scoped_predicates.extend(wrap_in_scope(
+                    &mut result.compared_parameters,
                     &local_preds,
                     scope_path.to_vec(),
                     scope_id,
@@ -2676,6 +3289,7 @@ fn walk_plan(
                     scope_owned_columns: std::collections::BTreeMap::new(),
                     scope_owned_scan_nodes: std::collections::BTreeMap::new(),
                     scope_lift_eligibility: std::collections::BTreeMap::new(),
+                    compared_parameters: HashMap::new(),
                 };
                 walk_plan(
                     source,
@@ -2696,6 +3310,9 @@ fn walk_plan(
                 result
                     .scoped_predicates
                     .extend(branch_result.scoped_predicates);
+                result
+                    .compared_parameters
+                    .extend(branch_result.compared_parameters);
             }
         }
 
@@ -2974,6 +3591,7 @@ fn walk_subquery_predicates_in_expr(
             scope_owned_columns: std::collections::BTreeMap::new(),
             scope_owned_scan_nodes: std::collections::BTreeMap::new(),
             scope_lift_eligibility: std::collections::BTreeMap::new(),
+            compared_parameters: HashMap::new(),
         };
         // Seed the sub_result's maps so the inner walk's nested
         // descents see the chain. The outer map already carries
@@ -3022,6 +3640,9 @@ fn walk_subquery_predicates_in_expr(
         result
             .scoped_predicates
             .extend(sub_result.scoped_predicates);
+        result
+            .compared_parameters
+            .extend(sub_result.compared_parameters);
         for (sid, owned) in sub_result.scope_owned_columns {
             result.scope_owned_columns.entry(sid).or_insert(owned);
         }
@@ -3030,6 +3651,243 @@ fn walk_subquery_predicates_in_expr(
         }
         for (sid, elig) in sub_result.scope_lift_eligibility {
             result.scope_lift_eligibility.entry(sid).or_insert(elig);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::catalog::{CatalogDialect, FunctionCatalog};
+    use crate::ir::scalar::BinOpKind;
+    use crate::lexer::Span;
+
+    const NOWHERE: Span = Span { start: 0, end: 0 };
+
+    const Y: u32 = 1;
+    const Z: u32 = 2;
+
+    fn column(id: u32) -> ScalarExpr {
+        ScalarExpr::Column {
+            column: ColumnId::new(id),
+            span: NOWHERE,
+        }
+    }
+
+    fn lit(value: Lit) -> ScalarExpr {
+        ScalarExpr::Lit {
+            value,
+            span: NOWHERE,
+        }
+    }
+
+    fn text(value: &str) -> ScalarExpr {
+        lit(Lit::Str(value.to_string()))
+    }
+
+    fn one() -> ScalarExpr {
+        lit(Lit::Integer("1".to_string()))
+    }
+
+    fn call_of(func: ResolvedFunc, args: Vec<ScalarExpr>) -> ScalarExpr {
+        ScalarExpr::FuncCall {
+            func,
+            args,
+            named_args: Vec::new(),
+            distinct: false,
+            span: NOWHERE,
+            non_values: Vec::new(),
+        }
+    }
+
+    fn snowflake() -> FunctionCatalog {
+        FunctionCatalog::for_dialect(CatalogDialect::Snowflake)
+    }
+
+    /// A call of the Snowflake catalog's function `name`.
+    fn call(name: &str, args: Vec<ScalarExpr>) -> ScalarExpr {
+        let id = snowflake().lookup(name).expect("a function of the catalog");
+        call_of(ResolvedFunc::Resolved { id, span: NOWHERE }, args)
+    }
+
+    /// A call of a function no catalog holds.
+    fn unknown_call(args: Vec<ScalarExpr>) -> ScalarExpr {
+        call_of(ResolvedFunc::unresolved("MY_UDF", None, NOWHERE), args)
+    }
+
+    /// Whether the call is accepted by a caller that vouches for a literal
+    /// other than `NULL` and for the columns in `vouched`.
+    fn accepted_with(expr: &ScalarExpr, vouched: &[u32]) -> bool {
+        is_null_safe_scalar_func(expr, &snowflake(), &|argument| match argument {
+            ScalarExpr::Lit { value, .. } => !matches!(value, Lit::Null),
+            ScalarExpr::Column { column, .. } => vouched.contains(&column.as_u32()),
+            ScalarExpr::OuterRef { .. }
+            | ScalarExpr::BinOp { .. }
+            | ScalarExpr::LogicalChain { .. }
+            | ScalarExpr::OperatorChain { .. }
+            | ScalarExpr::UnaryOp { .. }
+            | ScalarExpr::FuncCall { .. }
+            | ScalarExpr::Case { .. }
+            | ScalarExpr::Cast { .. }
+            | ScalarExpr::InList { .. }
+            | ScalarExpr::Between { .. }
+            | ScalarExpr::Like { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::ScalarSubquery { .. }
+            | ScalarExpr::QuantifiedCmp { .. }
+            | ScalarExpr::RowCmp { .. }
+            | ScalarExpr::WindowFn { .. }
+            | ScalarExpr::FieldAccess { .. }
+            | ScalarExpr::Lambda { .. }
+            | ScalarExpr::PatternVarRef { .. }
+            | ScalarExpr::Opaque { .. } => false,
+        })
+    }
+
+    fn accepted(expr: &ScalarExpr) -> bool {
+        accepted_with(expr, &[])
+    }
+
+    /// `COALESCE(y, <default>)`.
+    fn defaulted(default: ScalarExpr) -> ScalarExpr {
+        call("COALESCE", vec![column(Y), default])
+    }
+
+    #[test]
+    fn a_default_that_is_not_null_settles_a_coalesce() {
+        let _folding = crate::ir::normalize::default_folding();
+        assert!(accepted(&defaulted(one())));
+        assert!(accepted(&defaulted(call("CURRENT_DATE", vec![]))));
+        assert!(accepted(&defaulted(defaulted(one()))));
+        // A column the caller vouches for.
+        assert!(accepted_with(&defaulted(column(Z)), &[Z]));
+    }
+
+    #[test]
+    fn a_default_that_can_visibly_be_null_does_not() {
+        let _folding = crate::ir::normalize::default_folding();
+        for default in [
+            column(Z),
+            lit(Lit::Null),
+            // A field path over a column.
+            ScalarExpr::FieldAccess {
+                base: Box::new(column(Z)),
+                path: Vec::new(),
+                cast: None,
+                span: NOWHERE,
+            },
+            // NULL where `z` is.
+            call("UPPER", vec![column(Z)]),
+            call("CONCAT", vec![text("a"), column(Z)]),
+            // NULL where both are.
+            call("COALESCE", vec![column(Z), lit(Lit::Null)]),
+            // One of its branches.
+            call("IFF", vec![one(), column(Z), text("a")]),
+        ] {
+            assert!(!accepted(&defaulted(default.clone())), "{default:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_of_which_nothing_is_shown_settles_a_coalesce() {
+        let _folding = crate::ir::normalize::default_folding();
+        for default in [
+            // A function of values that are not NULL may still return NULL,
+            // and is not shown to.
+            call("UPPER", vec![text("a")]),
+            call("TO_DATE", vec![text("9999-12-31")]),
+            unknown_call(vec![column(Z)]),
+            call("NULLIF", vec![column(Z), one()]),
+            // A window function reads other rows.
+            call("LAG", vec![column(Z)]),
+            ScalarExpr::BinOp {
+                op: BinOpKind::Add,
+                left: Box::new(column(Z)),
+                right: Box::new(one()),
+                span: NOWHERE,
+            },
+        ] {
+            assert!(accepted(&defaulted(default.clone())), "{default:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_part_argument_is_no_column_that_can_be_null() {
+        let _folding = crate::ir::normalize::default_folding();
+        // `DATEADD(day, -1, CURRENT_DATE)`: the part is no value.
+        let dateadd = |date: ScalarExpr| {
+            let ScalarExpr::FuncCall {
+                func,
+                args,
+                named_args,
+                distinct,
+                span,
+                ..
+            } = call("DATEADD", vec![one(), date])
+            else {
+                unreachable!("call builds a call");
+            };
+            ScalarExpr::FuncCall {
+                func,
+                args,
+                named_args,
+                distinct,
+                non_values: vec![crate::ir::scalar::NonValueArg {
+                    position: 0,
+                    value: crate::ir::scalar::NonValue::Unit(crate::ast::DatePart::Day),
+                }],
+                span,
+            }
+        };
+        assert!(accepted(&defaulted(dateadd(call("CURRENT_DATE", vec![])))));
+        // With a column for the date it is NULL where the column is.
+        assert!(!accepted(&defaulted(dateadd(column(Z)))));
+    }
+
+    #[test]
+    fn an_iff_is_refused_where_a_branch_can_visibly_be_null() {
+        let _folding = crate::ir::normalize::default_folding();
+        let upper = || call("UPPER", vec![text("b")]);
+        assert!(accepted(&call("IFF", vec![column(Y), text("a"), upper()])));
+        assert!(accepted(&call("NVL2", vec![column(Y), one(), one()])));
+        assert!(!accepted(&call("IFF", vec![one(), column(Y), one()])));
+        let null_branch = call("IFF", vec![one(), text("a"), lit(Lit::Null)]);
+        assert!(!accepted(&null_branch));
+    }
+
+    #[test]
+    fn a_call_that_is_null_for_a_null_argument_is_refused_alone() {
+        let _folding = crate::ir::normalize::default_folding();
+        assert!(!accepted(&call("UPPER", vec![text("a")])));
+        assert!(!accepted(&call("CONCAT", vec![text("a"), text("b")])));
+        assert!(!accepted(&call("LAG", vec![one()])));
+        assert!(!accepted(&call("NULLIF", vec![text("a"), text("b")])));
+        assert!(!accepted(&unknown_call(vec![one()])));
+    }
+
+    #[test]
+    fn a_subquerys_first_column_is_the_one_at_its_first_position() {
+        let _folding = crate::ir::normalize::default_folding();
+        for (src, first) in [
+            ("SELECT email FROM users", Some("email")),
+            ("SELECT email, * FROM users", Some("email")),
+            ("SELECT *, upper(email) AS u FROM users", None),
+            ("SELECT * FROM users", None),
+        ] {
+            let tokens = crate::lexer::tokenize(src);
+            let script = crate::parser::parse_script(src, &tokens.tokens).expect("parse");
+            let functions = FunctionCatalog::for_dialect(CatalogDialect::Default);
+            let (plan, _, bindings, _) = crate::ir::lower_query_full_with_bindings(
+                &script.stmts[0],
+                src,
+                crate::ir::StrictMode::Permissive,
+                &functions,
+                &crate::ir::SessionContext::default(),
+                None,
+            )
+            .expect("lower");
+            let (column, _) = subquery_column_and_table_from_plan(&plan, &bindings);
+            assert_eq!(column.map(|c| c.name).as_deref(), first, "{src}");
         }
     }
 }

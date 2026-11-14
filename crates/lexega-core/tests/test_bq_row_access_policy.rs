@@ -179,11 +179,14 @@ fn test_bq_create_row_access_policy_risk() {
 
     let report = analyze_risk(sql).expect("should analyze BigQuery CREATE ROW ACCESS POLICY");
 
-    // CREATE ROW ACCESS POLICY should generate info-level positive signal
+    // CREATE ROW ACCESS POLICY is reported as info-level context
     assert!(
-        report.summary.total_reported_signals > 0,
-        "BigQuery CREATE ROW ACCESS POLICY should generate signals (got {})",
-        report.summary.total_reported_signals
+        report.context.iter().any(|f| {
+            let RuleMatch::Analysis(ref p) = f;
+            p.matched_rule == "RAP-NEW"
+        }),
+        "BigQuery CREATE ROW ACCESS POLICY should report RAP-NEW context (got {} context entries)",
+        report.context.len()
     );
 }
 
@@ -200,7 +203,7 @@ fn test_bq_create_row_access_policy_true_filter_is_critical() {
     );
 
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "RAP-ALLOW-ALL"
         }),
@@ -221,7 +224,7 @@ fn test_bq_create_row_access_policy_1eq1_filter_is_critical() {
     );
 
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "RAP-ALLOW-ALL"
         }),
@@ -239,15 +242,15 @@ fn test_bq_drop_row_access_policy_risk() {
 
     let report = analyze_risk(sql).expect("should analyze BigQuery DROP ROW ACCESS POLICY");
 
-    // Dropping a policy is critical
+    // Dropping a policy is medium
     assert!(
-        report.summary.critical_count >= 1,
-        "BigQuery DROP ROW ACCESS POLICY should be critical"
+        report.summary.medium_count >= 1,
+        "BigQuery DROP ROW ACCESS POLICY should be medium"
     );
 
     // Should find RAP-DROP violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "RAP-DROP"
         }),
@@ -297,9 +300,9 @@ fn test_bq_multi_statement_risk_analysis() {
 
     let report = analyze_risk(sql).expect("should analyze multiple BigQuery policy statements");
 
-    // Should have at least 2 critical signals (DROP + DROP ALL)
+    // Should have at least 2 critical findings (DROP + DROP ALL)
     let total_critical_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|f| matches!(f.risk_level(), RiskLevel::Critical))
         .map(|f| {

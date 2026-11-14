@@ -9,7 +9,7 @@
 //! - ALTER VOLUME actions (RENAME TO, OWNER TO, SET TAGS, UNSET TAGS)
 //! - DROP VOLUME with IF EXISTS
 //! - Formatting (semantic preservation via verify_formatting_safe)
-//! - Risk analysis (signal generation and evidence counts)
+//! - Risk analysis (finding generation and evidence counts)
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -47,9 +47,16 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -281,68 +288,68 @@ fn format_drop_volume_if_exists() {
 }
 
 // ============================================================================
-// Risk Analysis — Signal Detection
+// Risk Analysis — Finding Detection
 // ============================================================================
 
 #[test]
-fn signal_create_volume() {
+fn finding_create_volume() {
     let report = dbx_analyze("CREATE VOLUME my_vol;");
     assert!(
-        has_signal(&report, "DBX-VOL-NEW"),
+        has_context(&report, "DBX-VOL-NEW"),
         "Should detect DBX-VOL-NEW (Volume Created)"
     );
 }
 
 #[test]
-fn signal_create_external_volume() {
+fn finding_create_external_volume() {
     let report = dbx_analyze("CREATE EXTERNAL VOLUME ext_vol LOCATION 's3://bucket/path';");
     assert!(
-        has_signal(&report, "DBX-VOL-NEW"),
+        has_context(&report, "DBX-VOL-NEW"),
         "Should detect DBX-VOL-NEW (Volume Created) for external volume"
     );
 }
 
 #[test]
-fn signal_alter_volume_owner() {
+fn finding_alter_volume_owner() {
     let report = dbx_analyze("ALTER VOLUME my_vol SET OWNER TO admin;");
     assert!(
-        has_signal(&report, "DBX-VOL-OWNER-CHG"),
+        has_finding(&report, "DBX-VOL-OWNER-CHG"),
         "Should detect DBX-VOL-OWNER-CHG (Volume Ownership Transfer)"
     );
 }
 
 #[test]
-fn signal_drop_volume() {
+fn finding_drop_volume() {
     let report = dbx_analyze("DROP VOLUME IF EXISTS old_vol;");
     assert!(
-        has_signal(&report, "DBX-VOL-DROP"),
+        has_finding(&report, "DBX-VOL-DROP"),
         "Should detect DBX-VOL-DROP (Volume Dropped)"
     );
 }
 
 #[test]
-fn signal_alter_volume_rename() {
+fn finding_alter_volume_rename() {
     let report = dbx_analyze("ALTER VOLUME my_vol RENAME TO new_name;");
     assert!(
-        has_signal(&report, "DBX-VOL-NAME-CHG"),
+        has_finding(&report, "DBX-VOL-NAME-CHG"),
         "Should detect DBX-VOL-NAME-CHG (Volume Renamed)"
     );
 }
 
 #[test]
-fn signal_alter_volume_set_tags() {
+fn finding_alter_volume_set_tags() {
     let report = dbx_analyze("ALTER VOLUME my_vol SET TAGS ('env' = 'prod');");
     assert!(
-        has_signal(&report, "DBX-VOL-TAG-CHG"),
+        has_context(&report, "DBX-VOL-TAG-CHG"),
         "Should detect DBX-VOL-TAG-CHG (Volume Tags Modified)"
     );
 }
 
 #[test]
-fn signal_alter_volume_unset_tags() {
+fn finding_alter_volume_unset_tags() {
     let report = dbx_analyze("ALTER VOLUME my_vol UNSET TAGS ('env');");
     assert!(
-        has_signal(&report, "DBX-VOL-TAG-RMV"),
+        has_finding(&report, "DBX-VOL-TAG-RMV"),
         "Should detect DBX-VOL-TAG-RMV (Volume Tags Removed)"
     );
 }
@@ -367,34 +374,34 @@ fn multi_statement_all_volume_ops() {
 
     // All 7 statements should be analyzed
     assert!(
-        report.summary.total_reported_signals >= 6,
-        "Expected at least 6 signals from 7 volume statements, got {}",
-        report.summary.total_reported_signals
+        report.entries().count() >= 6,
+        "Expected at least 6 findings or context entries from 7 volume statements, got {}",
+        report.entries().count()
     );
 
-    // Verify signals from all operation types
+    // Verify findings from all operation types
     assert!(
-        has_signal(&report, "DBX-VOL-NEW"),
+        has_context(&report, "DBX-VOL-NEW"),
         "Should have Volume Created (DBX-VOL-NEW)"
     );
     assert!(
-        has_signal(&report, "DBX-VOL-OWNER-CHG"),
+        has_finding(&report, "DBX-VOL-OWNER-CHG"),
         "Should have Volume Ownership Transfer (DBX-VOL-OWNER-CHG)"
     );
     assert!(
-        has_signal(&report, "DBX-VOL-DROP"),
+        has_finding(&report, "DBX-VOL-DROP"),
         "Should have Volume Dropped (DBX-VOL-DROP)"
     );
     assert!(
-        has_signal(&report, "DBX-VOL-NAME-CHG"),
+        has_finding(&report, "DBX-VOL-NAME-CHG"),
         "Should have Volume Renamed (DBX-VOL-NAME-CHG)"
     );
     assert!(
-        has_signal(&report, "DBX-VOL-TAG-CHG"),
+        has_context(&report, "DBX-VOL-TAG-CHG"),
         "Should have Volume Tags Modified (DBX-VOL-TAG-CHG)"
     );
     assert!(
-        has_signal(&report, "DBX-VOL-TAG-RMV"),
+        has_finding(&report, "DBX-VOL-TAG-RMV"),
         "Should have Volume Tags Removed (DBX-VOL-TAG-RMV)"
     );
 }
@@ -408,9 +415,9 @@ fn multi_statement_evidence_count() {
     "#;
     let report = dbx_analyze(sql);
 
-    // Count evidence across all matching signals (may be deduplicated by rule)
+    // Count evidence across all matching findings (may be deduplicated by rule)
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|f| matches!(f, RuleMatch::Analysis(g) if g.matched_rule == "DBX-VOL-DROP"))
         .map(|f| {

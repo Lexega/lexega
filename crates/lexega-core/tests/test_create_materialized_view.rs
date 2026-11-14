@@ -19,9 +19,10 @@ use lexega_core::{
 // ============================================================================
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify_bq(sql: &str) {
@@ -382,7 +383,7 @@ SELECT val FROM t3;",
 // ============================================================================
 
 #[test]
-fn test_materialized_view_governance_signal() {
+fn test_materialized_view_governance_finding() {
     let sql = "CREATE MATERIALIZED VIEW my_mv AS
 SELECT region, COUNT(*) AS cnt
 FROM t

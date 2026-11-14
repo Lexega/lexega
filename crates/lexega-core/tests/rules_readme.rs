@@ -41,3 +41,41 @@ fn the_readme_states_the_corpus_as_it_is() {
         );
     }
 }
+
+/// The list `rules/README.md` gives of the rules that read a fact needing
+/// analysis: the `` - `ID` `` lines of its block opened by `summary`.
+fn listed_under(summary: &str) -> Vec<String> {
+    README
+        .split_once(summary)
+        .map(|(_, after)| after)
+        .and_then(|after| after.split_once("</details>"))
+        .map(|(block, _)| {
+            block
+                .lines()
+                .filter_map(|line| line.strip_prefix("- `")?.strip_suffix('`'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_readme_lists_each_rule_that_reads_analysis() {
+    let rules = all_builtin_rules().expect("corpus loads");
+    let mut expected: Vec<String> = rules
+        .iter()
+        .filter(|r| r.triggers.reads_reasoning())
+        .map(|r| r.id.clone())
+        .collect();
+    expected.sort();
+    let summary = format!(
+        "<summary>The {} rules that read a fact needing analysis</summary>",
+        expected.len()
+    );
+    let block: String = expected.iter().map(|id| format!("- `{id}`\n")).collect();
+    assert_eq!(
+        listed_under(&summary),
+        expected,
+        "rules/README.md should list, after {summary}:\n\n{block}"
+    );
+}

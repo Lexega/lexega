@@ -21,9 +21,10 @@ use lexega_syntax::{
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 /// Parse + format + verify round-trip under PostgreSQL dialect.

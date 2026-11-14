@@ -24,8 +24,7 @@ fn mssql_cfg() -> AnalysisConfig {
 fn rule_ids_cfg(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -35,8 +34,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -171,8 +172,10 @@ fn test_url_and_replace_compose() {
 fn test_databricks_restore_not_hijacked() {
     // `RESTORE [TABLE] name TO {VERSION|TIMESTAMP} AS OF …` must still parse on
     // Databricks and must not produce a T-SQL restore finding.
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::databricks();
+    let config = FormatterConfig {
+        dialect: dialect::databricks(),
+        ..Default::default()
+    };
     let dbx_cfg = AnalysisConfig {
         dialect: Some(dialect::databricks()),
         ..Default::default()

@@ -26,8 +26,7 @@ fn mssql_cfg() -> AnalysisConfig {
 fn rule_ids_cfg(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -37,8 +36,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -165,6 +166,8 @@ fn test_public_scheme_fires_rule() {
         "CREATE EXTERNAL DATA SOURCE a WITH (LOCATION = 'wasbs://c@a.blob.core.windows.net');",
         "CREATE EXTERNAL DATA SOURCE b WITH (LOCATION = 'https://x.dfs.core.windows.net');",
         "CREATE EXTERNAL DATA SOURCE c WITH (LOCATION = 's3://bucket/key');",
+        // A national string's scheme is its value's.
+        "CREATE EXTERNAL DATA SOURCE d WITH (LOCATION = N'wasbs://c@a.blob.core.windows.net');",
     ] {
         let ids = rule_ids(sql);
         assert!(

@@ -1,0 +1,82 @@
+alter_session.rs::parse_session_set_params	session parameter: a word, not an object name
+alter_session.rs::parse_session_unset_params	session parameter: a word, not an object name
+alter_table.rs::null_written	lists the `.` among the tokens it passes over; reads no name
+alter_table.rs::parse_column_alteration	column name: one part
+alter_table.rs::parse_column_definition	column name: one part
+alter_table.rs::parse_rename_action	column names of RENAME COLUMN: one part
+alter_view.rs::parse_alter_view_alter_column_action	column name: one part
+alter_view.rs::parse_alter_view_rename_column	column names of RENAME COLUMN: one part
+core.rs::read_object_name	the shared reader
+create_masking_policy.rs::parse_masking_policy_signature	parameter name: one part
+create_row_access_policy.rs::parse_row_access_signature	parameter name: one part
+create_stage.rs::try_parse_credential_option	option key: a word, not an object name
+create_table.rs::try_parse_create_table_stmt	the name region before the column list, absorbing what a template writes; the shared reader reads the region (object_ref_of_range)
+create_view.rs::try_parse_create_view_stmt_with_parser	the name region before the column list, absorbing what a template writes; the shared reader reads the region (object_ref_of_range)
+create_view.rs::try_parse_single_view_column	column name: one part
+cte.rs::try_parse_single_cte	common table expression name: one part
+dbx_catalog.rs::try_parse_alter_catalog	collation name: one part
+dbx_catalog.rs::try_parse_create_catalog	collation name: one part
+expr.rs::parse_primary_expr_in_mode	expression grammar: column references and member access
+expr.rs::parse_star_exclude	expression grammar: qualified star and its column list
+expr_functions.rs::parse_function_arg	named argument: one part
+expr_functions.rs::parse_introduced_argument	character set or XML element name a keyword introduces: one part, no object
+expr_functions.rs::pass_call_argument_rest	expression grammar: a lookahead over an argument's tokens
+expr_operators.rs::operator_call_at	expression grammar: OPERATOR(schema.op) lookahead
+expr_operators.rs::parse_mul_expr_in_mode	expression grammar: member access
+insert.rs::parse_insert_target_and_columns	the `.` after a rowset function's call; the name after it is read by the shared reader (object_name_end)
+jinja_expr.rs::parse_jinja_postfix_expr	template expression grammar: attribute access
+jinja_stmt.rs::parse_jinja_set_stmt	template expression grammar: attribute access in a SET target
+mssql_security_object.rs::try_parse_mssql_security_object_stmt	certificate, key or credential name: one part
+mssql_statements.rs::try_parse_mssql_alter_external_model	external model name: a database-scoped object owned by a principal, one part
+mssql_statements.rs::try_parse_mssql_create_external_model	external model name: a database-scoped object owned by a principal, one part
+mssql_statements.rs::try_parse_mssql_create_vector_index	index name: one part (the table is read by the shared reader)
+mssql_statements.rs::try_parse_mssql_drop_external_model	external model name: a database-scoped object owned by a principal, one part
+mysql_grant.rs::parse_mysql_grant_object	the `*.*` and `db.*` grant levels after the shared reader's name
+mysql_set.rs::consume_dotted_name_span	system variable name, not an object name
+password_policy.rs::try_parse_create_password_policy	property names: words, not object names
+pg_admin.rs::try_parse_pg_drop_rule_stmt	rule name: one part (the table is read by the shared reader)
+pg_copy.rs::parse_pg_copy_target	psql variable name after `:`, not an object name
+pg_domain.rs::parse_alter_domain_action	constraint names and the new domain name: one part
+pg_domain.rs::try_parse_domain_constraint	constraint name: one part
+pg_prepare.rs::try_parse_drop_prepare_stmt	prepared statement name: a session object, one part
+pg_prepare.rs::try_parse_pg_execute_stmt	prepared statement name: a session object, one part
+pg_prepare.rs::try_parse_pg_prepare_stmt	prepared statement name: a session object, one part
+pg_utility.rs::parse_prefixed_column	column name: one part
+pg_utility.rs::skip_index_key_modifiers	skips an index key's operator class and options
+pg_utility.rs::try_parse_comment_on_stmt	lookahead: where the object kind words end and the name starts
+principal.rs::mysql_account_host_at	MySQL account host (`'u'@host.example`), not an object name
+principal.rs::record_setting_value	lookahead: a column written `t.c` ends a setting's value; no name is kept
+principal.rs::setting_name_end	setting key lookahead for secret recording
+schema.rs::parse_alter_schema_action	collation name: one part
+schema.rs::try_parse_create_schema	collation name: one part
+scripting.rs::compound_header_end	token scan of a header: names every punctuation kind, reads no name
+scripting.rs::read_for_loop_header	range operator `..` of a FOR loop
+scripting.rs::read_set_variable_name	session variable name, its last part kept
+scripting.rs::try_parse_begin_transaction_stmt	transaction name: one part
+scripting.rs::try_parse_declare_stmt	variable, cursor and condition names: one part
+scripting.rs::try_parse_let_stmt_in_block	variable name: one part
+scripting.rs::try_parse_mssql_label	label: one part
+scripting.rs::try_parse_mssql_trigger_state	lookahead: DATABASE as a scope word or a name (the names are read by the shared reader)
+scripting.rs::try_parse_raise_stmt_in_block	exception name: one part
+scripting.rs::try_parse_savepoint_stmt	savepoint name: one part
+scripting.rs::try_parse_signal_stmt	condition name: one part
+scripting.rs::try_parse_start_transaction_stmt	transaction name: one part
+select.rs::parse_into_scripting_vars	variable and record field targets, not object names
+select.rs::parse_unpivot_clause	column name: one part
+select.rs::parse_window_clause	window name: one part
+select_projection.rs::parse_optional_alias	alias: one part
+select_projection.rs::parse_star_projection	expression grammar: qualified star
+session_policy.rs::try_parse_create_session_policy	property names: words, not object names
+snowflake_account_ddl.rs::parse_alter_security_integration_action	property names: words, not object names
+snowflake_account_ddl.rs::try_parse_alter_alert	property names: words, not object names
+snowflake_account_ddl.rs::try_parse_alter_network_rule	property names: words, not object names
+snowflake_account_ddl.rs::try_parse_alter_secret	property names: words, not object names
+snowflake_account_ddl.rs::walk_object_properties_until	property names: words, not object names
+sql_stmt.rs::parse_delete_target	the qualified star after the shared reader's name
+sql_stmt.rs::try_parse_merge_stmt_with_parser	the word NAME of UPDATE ALL BY NAME
+table_ref.rs::at_hint_list_without_with	lookahead: a table hint list written without WITH
+table_ref.rs::parse_table_factor_impl	the file path after a stage's name (`@d1.s1.stg/f.csv`), read after the shared reader's name
+table_ref.rs::read_declared_column	declared column name: one part
+table_ref.rs::stream_prefix_at	lookahead: STREAM before a table's name
+table_ref.rs::try_parse_index_hints	index name in a hint: one part
+table_ref.rs::try_parse_partition_selection	partition name: one part

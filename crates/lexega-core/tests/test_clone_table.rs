@@ -8,7 +8,7 @@
 //!   TBLPROPERTIES, LOCATION, qualified names, backtick-quoted identifiers
 //! - Snowflake: CLONE with AT/BEFORE time travel
 //! - Formatting (semantic preservation)
-//! - Risk analysis (signal generation)
+//! - Risk analysis (finding generation)
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -70,10 +70,9 @@ fn sf_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
@@ -330,35 +329,35 @@ fn format_sf_clone_before_statement_preserves() {
 // ============================================================================
 
 #[test]
-fn risk_dbx_clone_signal() {
+fn risk_dbx_clone_finding() {
     let sql = "CREATE TABLE my_clone SHALLOW CLONE source_table;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
-        "Should find INFO-TBL-CLONE (table cloned) signal, signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-TBL-CLONE"),
+        "Should find INFO-TBL-CLONE (table cloned) finding, findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn risk_dbx_deep_clone_signal() {
+fn risk_dbx_deep_clone_finding() {
     let sql = "CREATE TABLE my_clone DEEP CLONE source_table;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
+        has_finding(&report, "INFO-TBL-CLONE"),
         "DEEP CLONE should also trigger INFO-TBL-CLONE"
     );
 }
 
 #[test]
-fn risk_dbx_clone_with_temporal_signal() {
+fn risk_dbx_clone_with_temporal_finding() {
     let sql = "CREATE TABLE my_clone SHALLOW CLONE source_table VERSION AS OF 5;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
+        has_finding(&report, "INFO-TBL-CLONE"),
         "CLONE with VERSION AS OF should trigger INFO-TBL-CLONE"
     );
 }
@@ -368,24 +367,24 @@ fn risk_dbx_clone_with_temporal_signal() {
 // ============================================================================
 
 #[test]
-fn risk_sf_clone_signal() {
+fn risk_sf_clone_finding() {
     let sql = "CREATE TABLE my_clone CLONE source_table;";
     let report = sf_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
-        "Snowflake CLONE should trigger INFO-TBL-CLONE, signals: {:?}",
-        report.signals
+        has_finding(&report, "INFO-TBL-CLONE"),
+        "Snowflake CLONE should trigger INFO-TBL-CLONE, findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn risk_sf_clone_at_timestamp_signal() {
+fn risk_sf_clone_at_timestamp_finding() {
     let sql = "CREATE TABLE my_clone CLONE source_table AT (TIMESTAMP => '2024-01-01');";
     let report = sf_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
+        has_finding(&report, "INFO-TBL-CLONE"),
         "Snowflake CLONE with AT should trigger INFO-TBL-CLONE"
     );
 }
@@ -395,7 +394,7 @@ fn risk_sf_clone_at_timestamp_signal() {
 // ============================================================================
 
 #[test]
-fn risk_dbx_multi_clone_signals() {
+fn risk_dbx_multi_clone_findings() {
     let sql = r#"
         CREATE TABLE clone1 SHALLOW CLONE source1;
         CREATE TABLE clone2 DEEP CLONE source2;
@@ -403,10 +402,9 @@ fn risk_dbx_multi_clone_signals() {
     "#;
     let report = dbx_analyze(sql);
 
-    // Signals are deduplicated by rule — test evidence_count, not signal count
+    // Findings are deduplicated by rule — test evidence_count, not finding count
     let clone_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-TBL-CLONE"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -471,9 +469,9 @@ fn risk_dbx_shallow_clone_triggers_tbl_clone_shallow() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-CLONE-SHALLOW"),
-        "SHALLOW CLONE should trigger DBX-TBL-CLONE-SHALLOW, signals: {:?}",
-        report.signals
+        has_finding(&report, "DBX-TBL-CLONE-SHALLOW"),
+        "SHALLOW CLONE should trigger DBX-TBL-CLONE-SHALLOW, findings: {:?}",
+        report.findings
     );
 }
 
@@ -483,7 +481,7 @@ fn risk_dbx_deep_clone_does_not_trigger_tbl_clone_shallow() {
     let report = dbx_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-TBL-CLONE-SHALLOW"),
+        !has_finding(&report, "DBX-TBL-CLONE-SHALLOW"),
         "DEEP CLONE should NOT trigger DBX-TBL-CLONE-SHALLOW"
     );
 }
@@ -495,7 +493,7 @@ fn risk_dbx_bare_clone_does_not_trigger_tbl_clone_shallow() {
     let report = dbx_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-TBL-CLONE-SHALLOW"),
+        !has_finding(&report, "DBX-TBL-CLONE-SHALLOW"),
         "Bare CLONE (no SHALLOW keyword) should NOT trigger DBX-TBL-CLONE-SHALLOW"
     );
 }
@@ -507,7 +505,7 @@ fn risk_sf_clone_does_not_trigger_tbl_clone_shallow() {
     let report = sf_analyze(sql);
 
     assert!(
-        !has_signal(&report, "DBX-TBL-CLONE-SHALLOW"),
+        !has_finding(&report, "DBX-TBL-CLONE-SHALLOW"),
         "Snowflake CLONE should NOT trigger DBX-TBL-CLONE-SHALLOW"
     );
 }
@@ -519,11 +517,11 @@ fn risk_dbx_shallow_clone_also_triggers_info_c350() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-TBL-CLONE"),
+        has_finding(&report, "INFO-TBL-CLONE"),
         "SHALLOW CLONE should also trigger generic INFO-TBL-CLONE"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-CLONE-SHALLOW"),
+        has_finding(&report, "DBX-TBL-CLONE-SHALLOW"),
         "SHALLOW CLONE should trigger DBX-TBL-CLONE-SHALLOW"
     );
 }

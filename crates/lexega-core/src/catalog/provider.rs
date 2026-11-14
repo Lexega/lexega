@@ -23,9 +23,9 @@ use std::sync::Arc;
 pub enum UnquotedIdentCase {
     /// Unquoted identifiers → UPPERCASE (Snowflake, Oracle, DB2).
     Upper,
-    /// Unquoted identifiers → lowercase (PostgreSQL, Redshift).
+    /// Unquoted identifiers → lowercase (PostgreSQL, Redshift, Databricks).
     Lower,
-    /// Unquoted identifiers → preserve original case (BigQuery, MySQL, Databricks).
+    /// Unquoted identifiers → preserve original case (BigQuery, MySQL).
     Preserve,
 }
 
@@ -51,9 +51,10 @@ pub trait CatalogProvider: Send + Sync + fmt::Debug {
     ///
     /// - If the identifier is quoted (starts/ends with `"` or `` ` ``), the
     ///   quotes are stripped and the inner text is preserved verbatim — **unless**
-    ///   `LEXEGA_IDENTIFIER_CASE=ignore_quoted` is set, in which case quoted
-    ///   identifiers are also case-folded (mirrors Snowflake's
-    ///   `QUOTED_IDENTIFIERS_IGNORE_CASE` setting).
+    ///   the thread's folding folds a quoted relation name (the dialect's own
+    ///   rule, or `LEXEGA_IDENTIFIER_CASE=ignore_quoted`, which mirrors
+    ///   Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` setting), in which case
+    ///   quoted identifiers are also case-folded.
     /// - Otherwise, the identifier is folded according to [`unquoted_ident_case`](Self::unquoted_ident_case).
     fn normalize_identifier(&self, ident: &str) -> String {
         let trimmed = ident.trim();
@@ -181,7 +182,7 @@ impl CatalogProvider for BigQueryCatalogProvider {
     }
 }
 
-/// Databricks (Unity Catalog) – case-preserving, three-level hierarchy.
+/// Databricks (Unity Catalog) – lowercase, as Unity Catalog stores names; three-level hierarchy.
 /// Supports row filters and column masks via Unity Catalog table detail API.
 #[derive(Debug, Clone)]
 pub struct DatabricksCatalogProvider;
@@ -194,7 +195,7 @@ impl CatalogProvider for DatabricksCatalogProvider {
         "Databricks"
     }
     fn unquoted_ident_case(&self) -> UnquotedIdentCase {
-        UnquotedIdentCase::Preserve
+        UnquotedIdentCase::Lower
     }
     fn supports_grants(&self) -> bool {
         true
@@ -333,7 +334,7 @@ pub fn builtin_provider_names() -> &'static [&'static str] {
 /// Strip one layer of SQL quoting (double-quotes or backticks).
 ///
 /// Returns `(inner_text, was_quoted)`.
-fn strip_quoting(s: &str) -> (&str, bool) {
+pub(crate) fn strip_quoting(s: &str) -> (&str, bool) {
     let bytes = s.as_bytes();
     if bytes.len() >= 2 {
         let first = bytes[0];
@@ -349,18 +350,15 @@ fn strip_quoting(s: &str) -> (&str, bool) {
     (s, false)
 }
 
-/// Check whether the `LEXEGA_IDENTIFIER_CASE=ignore_quoted` override is active.
+/// Check whether quoted identifiers are case-folded the same as unquoted
+/// ones: the `LEXEGA_IDENTIFIER_CASE=ignore_quoted` override is set
+/// (mirroring Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` session
+/// parameter), or the dialect's own folding does so.
 ///
-/// When active, quoted identifiers are case-folded the same as unquoted ones
-/// (mirroring Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` session parameter).
-///
-/// This reads from the global `NormalizationConfig` cache (populated by
-/// `set_normalization_dialect()` or lazily from env vars). Falls back to
-/// checking the env var directly if the config module is not available.
+/// Read from the current thread's folding, the one `normalize_identifier`
+/// folds under, so a provider and `normalize_identifier` agree on whether
+/// quoted identifiers are case-folded.
 fn ignore_quoted_case_active() -> bool {
-    // Delegate to the canonical normalization config in ast_walker/normalize.rs.
-    // This ensures the provider trait and the normalize_identifier() function
-    // always agree on whether quoted identifiers should be case-folded.
     crate::ir::is_ignore_quoted_active()
 }
 
@@ -370,6 +368,7 @@ mod tests {
 
     #[test]
     fn snowflake_normalizes_upper() {
+        let _folding = crate::ir::normalize::default_folding();
         let p = SnowflakeCatalogProvider;
         assert_eq!(p.normalize_identifier("my_table"), "MY_TABLE");
         assert_eq!(p.normalize_identifier("\"my_table\""), "my_table");
@@ -378,6 +377,7 @@ mod tests {
 
     #[test]
     fn postgres_normalizes_lower() {
+        let _folding = crate::ir::normalize::default_folding();
         let p = PostgresCatalogProvider;
         assert_eq!(p.normalize_identifier("MY_TABLE"), "my_table");
         assert_eq!(p.normalize_identifier("\"MyTable\""), "MyTable");
@@ -385,6 +385,7 @@ mod tests {
 
     #[test]
     fn bigquery_preserves_case() {
+        let _folding = crate::ir::normalize::default_folding();
         let p = BigQueryCatalogProvider;
         assert_eq!(p.normalize_identifier("MyDataset"), "MyDataset");
         assert_eq!(p.normalize_identifier("`MyDataset`"), "MyDataset");
@@ -392,6 +393,7 @@ mod tests {
 
     #[test]
     fn mssql_bracket_identifiers() {
+        let _folding = crate::ir::normalize::default_folding();
         let p = MsSqlCatalogProvider;
         assert_eq!(p.normalize_identifier("[My Table]"), "My Table");
         assert_eq!(p.normalize_identifier("my_table"), "MY_TABLE");

@@ -24,6 +24,7 @@
 
 use lexega_core::analyzer::{AnalysisConfig, RiskLevel};
 use lexega_core::api::{analyze_risk, analyze_risk_with_policy_config};
+use lexega_core::facts::RiskLevel as RuleRisk;
 use lexega_core::rules::{all_builtin_rules, build_v1_rule_corpus, load_v1_rules, MergeError};
 
 const TRUNCATE_SQL: &str = "TRUNCATE TABLE my_table;";
@@ -35,23 +36,24 @@ fn config_with_overlay(custom_yaml: &str) -> AnalysisConfig {
     let custom = load_v1_rules(custom_yaml).expect("custom rules parse");
     let merged = build_v1_rule_corpus(custom, /* include_builtins = */ true)
         .expect("merge against built-ins succeeds");
-    let mut config = AnalysisConfig::default();
-    config.custom_rules = Some(merged);
-    config
+
+    AnalysisConfig {
+        custom_rules: Some(merged.into()),
+        ..Default::default()
+    }
 }
 
-fn truncate_signal(
+fn truncate_finding(
     report: &lexega_core::analyzer::AnalysisReport,
 ) -> &lexega_core::analyzer::RuleMatch {
     let matches: Vec<_> = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| s.rule_id() == Some(TRUNCATE_RULE_ID))
         .collect();
     assert_eq!(
         matches.len(),
         1,
-        "expected exactly one TBL-TRUNCATE signal (no override-double-fire); got {}",
+        "expected exactly one TBL-TRUNCATE finding (no override-double-fire); got {}",
         matches.len()
     );
     matches[0]
@@ -66,9 +68,9 @@ fn truncate_signal(
 #[test]
 fn baseline_builtin_truncate_fires_at_critical() {
     let report = analyze_risk(TRUNCATE_SQL).expect("analyze succeeds");
-    let signal = truncate_signal(&report);
+    let finding = truncate_finding(&report);
     assert_eq!(
-        signal.risk_level(),
+        finding.risk_level(),
         RiskLevel::Critical,
         "built-in TBL-TRUNCATE risk_level baseline must be Critical \
          (override tests pivot off this); update both this test and the \
@@ -97,7 +99,7 @@ fn custom_rule_overrides_builtin_severity_end_to_end() {
     // Re-state TBL-TRUNCATE with a lower severity + distinct message.
     // The trigger predicate is the same shape as the built-in
     // (`kind: truncate`) so behavioural firing semantics don't change —
-    // only the severity / message that customers read off the signal.
+    // only the severity / message that customers read off the finding.
     let custom_yaml = r#"
 rules:
   - id: TBL-TRUNCATE
@@ -110,14 +112,14 @@ rules:
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with overlay succeeds");
 
-    let signal = truncate_signal(&report);
+    let finding = truncate_finding(&report);
     assert_eq!(
-        signal.risk_level(),
+        finding.risk_level(),
         RiskLevel::Low,
         "custom rule's risk_level must win over built-in (built-in is Critical)"
     );
     assert_eq!(
-        signal.message(),
+        finding.message(),
         "OVERRIDDEN: TRUNCATE downgraded by policy",
         "custom message must replace built-in message on override"
     );
@@ -149,8 +151,8 @@ rules:
         let config = config_with_overlay(&yaml);
         let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
             .unwrap_or_else(|e| panic!("analyze({level_yaml}) failed: {e:?}"));
-        let signal = truncate_signal(&report);
-        let observed = signal.risk_level();
+        let finding = truncate_finding(&report);
+        let observed = finding.risk_level();
         let expected = match level_yaml {
             "info" => RiskLevel::Info,
             "low" => RiskLevel::Low,
@@ -161,7 +163,7 @@ rules:
         };
         assert_eq!(
             observed, expected,
-            "override({level_yaml}) → emitted signal risk_level should match"
+            "override({level_yaml}) → emitted finding risk_level should match"
         );
     }
 }
@@ -186,9 +188,9 @@ rules:
     let config = config_with_overlay(custom_yaml);
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with unrelated overlay succeeds");
-    let signal = truncate_signal(&report);
+    let finding = truncate_finding(&report);
     assert_eq!(
-        signal.risk_level(),
+        finding.risk_level(),
         RiskLevel::Critical,
         "TBL-TRUNCATE built-in severity must be untouched when a \
          different rule_id is overridden"
@@ -270,16 +272,16 @@ rules:
     let config = config_with_overlay(custom_yaml);
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with partial overlay succeeds");
-    let signal = truncate_signal(&report);
+    let finding = truncate_finding(&report);
 
     assert_eq!(
-        signal.risk_level(),
+        finding.risk_level(),
         RiskLevel::Low,
-        "partial override should land Low on the emitted signal \
+        "partial override should land Low on the emitted finding \
          (built-in is Critical)"
     );
     assert_eq!(
-        signal.message(),
+        finding.message(),
         builtin_msg,
         "partial override that omits `message` must inherit the built-in's \
          message verbatim — no field-level loss"
@@ -303,15 +305,15 @@ rules:
     let config = config_with_overlay(custom_yaml);
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with message-only overlay succeeds");
-    let signal = truncate_signal(&report);
+    let finding = truncate_finding(&report);
 
     assert_eq!(
-        signal.risk_level(),
+        finding.risk_level(),
         RiskLevel::Critical,
         "message-only override must NOT change severity"
     );
     assert_eq!(
-        signal.message(),
+        finding.message(),
         "Custom guidance: see runbook RB-42 before approving TRUNCATE",
         "message-only override must land the new message"
     );
@@ -336,14 +338,13 @@ rules:
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with enabled-false overlay succeeds");
     let matches: Vec<_> = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| s.rule_id() == Some(TRUNCATE_RULE_ID))
         .collect();
     assert!(
         matches.is_empty(),
         "partial override `enabled: false` should suppress the built-in; \
-         got {} TBL-TRUNCATE signal(s)",
+         got {} TBL-TRUNCATE finding(s)",
         matches.len()
     );
 }
@@ -363,9 +364,12 @@ rules:
     let config = config_with_overlay(custom_yaml);
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with severity+message overlay succeeds");
-    let signal = truncate_signal(&report);
-    assert_eq!(signal.risk_level(), RiskLevel::Medium);
-    assert_eq!(signal.message(), "Policy: TRUNCATE allowed in staging only");
+    let finding = truncate_finding(&report);
+    assert_eq!(finding.risk_level(), RiskLevel::Medium);
+    assert_eq!(
+        finding.message(),
+        "Policy: TRUNCATE allowed in staging only"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -482,14 +486,171 @@ rules:
     let report = analyze_risk_with_policy_config(TRUNCATE_SQL, &config)
         .expect("analyze with disable-override succeeds");
     let matches: Vec<_> = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| s.rule_id() == Some(TRUNCATE_RULE_ID))
         .collect();
     assert!(
         matches.is_empty(),
         "an `enabled: false` override should suppress the built-in; \
-         got {} TBL-TRUNCATE signal(s)",
+         got {} TBL-TRUNCATE finding(s)",
         matches.len()
     );
+}
+
+// A partial override of a former id overlays the rule that absorbed it.
+
+const FORMER_ID: &str = "SNW-PWDPOL-EXPIRY-STALE";
+const ABSORBING_ID: &str = "SNW-PWDPOL-EXPIRY-LONG";
+
+fn merged_rule(yaml: &str, id: &str) -> lexega_core::rules::Rule {
+    let loaded = load_v1_rules(yaml).expect("parses");
+    let corpus = build_v1_rule_corpus(loaded, true).expect("merges");
+    corpus
+        .into_iter()
+        .find(|r| r.id == id)
+        .expect("rule in corpus")
+}
+
+#[test]
+fn disabling_a_former_id_disables_the_rule_that_absorbed_it() {
+    let rule = merged_rule(
+        &format!("rules:\n  - id: {FORMER_ID}\n    enabled: false\n"),
+        ABSORBING_ID,
+    );
+    assert!(!rule.enabled);
+}
+
+#[test]
+fn a_risk_level_on_a_former_id_reaches_the_rule_that_absorbed_it() {
+    let rule = merged_rule(
+        &format!("rules:\n  - id: {FORMER_ID}\n    risk_level: critical\n"),
+        ABSORBING_ID,
+    );
+    assert_eq!(rule.risk_level, RuleRisk::Critical);
+}
+
+#[test]
+fn a_former_id_is_matched_without_regard_to_case() {
+    let rule = merged_rule(
+        "rules:\n  - id: snw-pwdpol-expiry-stale\n    enabled: false\n",
+        ABSORBING_ID,
+    );
+    assert!(!rule.enabled);
+}
+
+#[test]
+fn a_former_id_override_adds_no_rule_to_the_corpus() {
+    let loaded = load_v1_rules(&format!(
+        "rules:\n  - id: {FORMER_ID}\n    enabled: false\n"
+    ))
+    .expect("parses");
+    let corpus = build_v1_rule_corpus(loaded, true).expect("merges");
+    let builtin = all_builtin_rules().expect("built-ins");
+    assert_eq!(corpus.len(), builtin.len());
+    assert!(!corpus.iter().any(|r| r.id == FORMER_ID));
+}
+
+#[test]
+fn a_later_entry_wins_between_a_former_id_and_its_live_id() {
+    let yaml = format!(
+        "rules:\n  - id: {FORMER_ID}\n    risk_level: critical\n  - id: {ABSORBING_ID}\n    risk_level: info\n"
+    );
+    assert_eq!(merged_rule(&yaml, ABSORBING_ID).risk_level, RuleRisk::Info);
+    let yaml = format!(
+        "rules:\n  - id: {ABSORBING_ID}\n    risk_level: info\n  - id: {FORMER_ID}\n    risk_level: critical\n"
+    );
+    assert_eq!(
+        merged_rule(&yaml, ABSORBING_ID).risk_level,
+        RuleRisk::Critical
+    );
+}
+
+const FULL_RULE_UNDER_FORMER_ID: &str = "rules:\n  - id: SNW-PWDPOL-EXPIRY-STALE\n    risk_level: high\n    message: \"mine\"\n    triggers:\n      kind: grant\n";
+
+#[test]
+fn a_full_rule_under_a_former_id_replaces_the_rule_that_absorbed_it() {
+    let builtin = all_builtin_rules().expect("built-ins");
+    let position = builtin
+        .iter()
+        .position(|r| r.id == ABSORBING_ID)
+        .expect("absorbing rule");
+    let loaded = load_v1_rules(FULL_RULE_UNDER_FORMER_ID).expect("parses");
+    let corpus = build_v1_rule_corpus(loaded, true).expect("merges");
+    assert_eq!(corpus.len(), builtin.len());
+    assert!(!corpus.iter().any(|r| r.id == FORMER_ID));
+    let rule = &corpus[position];
+    assert_eq!(rule.id, ABSORBING_ID);
+    assert_eq!(rule.description, "mine");
+    assert_eq!(rule.risk_level, RuleRisk::High);
+    assert!(rule.former_ids.iter().any(|f| f == FORMER_ID));
+}
+
+#[test]
+fn a_full_rule_under_a_former_id_takes_the_canonical_id_without_builtins() {
+    let loaded = load_v1_rules(FULL_RULE_UNDER_FORMER_ID).expect("parses");
+    let corpus = build_v1_rule_corpus(loaded, false).expect("merges");
+    assert_eq!(corpus.len(), 1);
+    assert_eq!(corpus[0].id, ABSORBING_ID);
+}
+
+#[test]
+fn a_loaded_file_lists_the_entries_that_name_a_former_id() {
+    use lexega_core::rules::FormerIdOverride;
+    let yaml = format!(
+        "rules:\n  - id: {FORMER_ID}\n    enabled: false\n  - id: TBL-TRUNCATE\n    enabled: false\n"
+    );
+    let loaded = load_v1_rules(&yaml).expect("parses");
+    assert_eq!(
+        loaded.former_id_overrides(),
+        [FormerIdOverride {
+            former_id: FORMER_ID.to_string(),
+            canonical_id: ABSORBING_ID.to_string(),
+        }]
+    );
+    let loaded = load_v1_rules(FULL_RULE_UNDER_FORMER_ID).expect("parses");
+    assert_eq!(loaded.former_id_overrides().len(), 1);
+
+    // Rules handed over already built list the same entries.
+    let rules: Vec<lexega_core::rules::Rule> = loaded
+        .into_entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            lexega_core::rules::LoadedEntry::Full(rule) => Some(rule),
+            lexega_core::rules::LoadedEntry::Partial(_) => None,
+        })
+        .collect();
+    let built = lexega_core::rules::LoadedRuleset::from_full_rules(rules);
+    assert_eq!(
+        built.former_id_overrides(),
+        [FormerIdOverride {
+            former_id: FORMER_ID.to_string(),
+            canonical_id: ABSORBING_ID.to_string(),
+        }]
+    );
+}
+
+#[test]
+fn a_former_id_override_without_builtins_keeps_its_error() {
+    let loaded = load_v1_rules(&format!(
+        "rules:\n  - id: {FORMER_ID}\n    enabled: false\n"
+    ))
+    .expect("parses");
+    match build_v1_rule_corpus(loaded, false) {
+        Err(MergeError::PartialOverrideWithoutBuiltins { rule_id }) => {
+            assert_eq!(rule_id, FORMER_ID)
+        }
+        other => panic!("expected PartialOverrideWithoutBuiltins, got {other:?}"),
+    }
+}
+
+/// A configuration built per file from the run's one holds that corpus,
+/// not a copy of it: cloning the configuration copies no rule.
+#[test]
+fn a_cloned_configuration_shares_its_corpus() {
+    let config = config_with_overlay("rules:\n  - id: TBL-TRUNCATE\n    risk_level: low\n");
+    let per_file = config.clone();
+    let (Some(run), Some(file)) = (&config.custom_rules, &per_file.custom_rules) else {
+        panic!("both configurations hold the corpus");
+    };
+    assert!(std::sync::Arc::ptr_eq(run, file));
 }

@@ -7,9 +7,10 @@ use lexega_syntax::{format_sql_with_config, verify_formatting_safe, FormatterCon
 
 /// Helper: create a PG-dialect formatter config.
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(lexega_syntax::dialect::PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(lexega_syntax::dialect::PostgresDialect),
+        ..Default::default()
+    }
 }
 
 /// Helper: parse with PG dialect and check it doesn't become OpaqueContent.

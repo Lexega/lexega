@@ -50,6 +50,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn try_parse_mssql_restore_stmt(&mut self) -> ParseResult<AstStmt> {
         let _depth = self.track_depth("restore_db")?;
         let start_span = self.current_span();
+        let start_idx = self.idx;
 
         // 1. RESTORE keyword (Identifier in our lexer).
         let restore_tok = self
@@ -84,7 +85,10 @@ impl<'a> Parser<'a> {
 
         // 4. A bare `RESTORE DATABASE <name> [WITH ...]` (no FROM) is valid —
         //    recovery-only / bringing a database online. Stop scanning for a
-        //    source at WITH or statement end; otherwise skip up to FROM.
+        //    source at WITH or statement end; otherwise skip up to FROM (past
+        //    the files, filegroups or pages restored, where the dialect needs
+        //    no terminator).
+        let files_bound = self.clauses_bound(self.restore_files_end(self.idx));
         let mut has_from = false;
         loop {
             let tok = self.peek_non_trivia().ok_or_else(|| {
@@ -104,7 +108,8 @@ impl<'a> Parser<'a> {
                 TokenKind::Keyword(Keyword::With)
                     | TokenKind::Punctuation(Punctuation::Semi)
                     | TokenKind::Eof
-            ) {
+            ) || self.idx >= files_bound
+            {
                 break;
             }
             self.advance()
@@ -146,10 +151,20 @@ impl<'a> Parser<'a> {
 
         // 6. Consume the remainder of the statement (`= '<device>'`, additional
         //    comma sources, WITH <options>) up to a depth-0 semicolon or EOF,
+        //    or where the grammar ends if the dialect needs no terminator,
         //    recording whether WITH REPLACE is present.
+        let devices_end = if has_from {
+            self.device_list_rest_end(self.idx)
+        } else {
+            self.idx
+        };
+        let grammar_end = self
+            .with_list_end(devices_end, |j| self.restore_option_end(j))
+            .unwrap_or(devices_end);
+        let bound = self.clauses_bound(grammar_end);
         let mut replace = false;
         let mut depth: u32 = 0;
-        while let Some(tok) = self.peek_non_trivia() {
+        while let Some(tok) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             match tok.kind {
                 TokenKind::Punctuation(Punctuation::Semi) if depth == 0 => break,
                 TokenKind::Eof => break,
@@ -163,6 +178,8 @@ impl<'a> Parser<'a> {
                 .ok_or_eof(self.current_span(), vec![";".to_string()])?;
             end = t.span.end;
         }
+        // `WITH PASSWORD | MEDIAPASSWORD = '…'`.
+        self.record_secret_literals(start_idx, self.idx);
 
         let stmt_span = Span { start, end };
         let ast = AstMssqlRestore {
@@ -175,5 +192,32 @@ impl<'a> Parser<'a> {
             replace,
         };
         Ok(AstStmt::MssqlRestore(Box::new(ast)))
+    }
+
+    /// The index past the files, filegroups or pages restored at `i`:
+    /// `{ FILE | FILEGROUP | PAGE } = value` or `READ_WRITE_FILEGROUPS`,
+    /// comma-separated; `i` where there are none.
+    fn restore_files_end(&self, i: usize) -> usize {
+        self.comma_list_end(i, |j| {
+            self.any_words_end(j, &[&["FILE"], &["FILEGROUP"], &["PAGE"]])
+                .and_then(|k| self.eq_value_end(k))
+                .or_else(|| self.words_end(j, &["READ_WRITE_FILEGROUPS"]))
+        })
+        .unwrap_or(i)
+    }
+
+    /// The index past a RESTORE option at `i`: `MOVE value TO value`, or
+    /// `name [= value [AFTER value]] [(…)]`.
+    fn restore_option_end(&self, i: usize) -> Option<usize> {
+        if let Some(moved) = self.words_end(i, &["MOVE"]) {
+            let to = self.words_end(self.option_value_end(moved)?, &["TO"])?;
+            return self.option_value_end(to);
+        }
+        let end = self.option_item_end(i)?;
+        Some(
+            self.words_end(end, &["AFTER"])
+                .and_then(|after| self.option_value_end(after))
+                .unwrap_or(end),
+        )
     }
 }

@@ -7,7 +7,7 @@
 // DBX-TBL-CACHE / INFO-DBX-TBL-CACHE-LAZY, DBX-TBL-UNCACHE,
 // INFO-DBX-TBL-CLUSTER-CFG rule family end-to-end:
 //
-//   parse → IR TableMaintenancePlan → derive_facts → evaluate_rules → Signal
+//   parse → IR TableMaintenancePlan → derive_facts → evaluate_rules → Finding
 //
 // Plus parity assertions vs `analyze_risk`, so customer policy /
 // exception bundles that reference these rule_ids fire from either
@@ -27,8 +27,7 @@ fn fact_rule_ids(sql: &str) -> Vec<String> {
 fn risk_rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk(sql).expect("analyze_risk succeeds");
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()
 }

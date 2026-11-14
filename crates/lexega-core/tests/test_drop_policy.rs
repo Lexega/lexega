@@ -135,20 +135,20 @@ fn test_drop_row_access_policy_quoted_identifier() {
 // =============================================================================
 
 #[test]
-fn test_drop_masking_policy_critical_risk() {
+fn test_drop_masking_policy_medium_risk() {
     let sql = "DROP MASKING POLICY email_mask;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal for dropping masking policy
+    // Should have medium finding for dropping masking policy
     assert!(
-        report.summary.critical_count >= 1,
-        "Should have critical signal for dropping masking policy"
+        report.summary.medium_count >= 1,
+        "Should have medium finding for dropping masking policy"
     );
 
     // Should find MASK-DROP violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "MASK-DROP"
         }),
@@ -157,7 +157,7 @@ fn test_drop_masking_policy_critical_risk() {
 }
 
 #[test]
-fn test_drop_masking_policy_if_exists_critical_risk() {
+fn test_drop_masking_policy_if_exists_medium_risk() {
     // IF EXISTS must not be consumed as the policy name: that would split
     // the statement and leave a phantom unparsed `EXISTS <name>` tail.
     let sql = "DROP MASKING POLICY IF EXISTS email_mask;";
@@ -170,7 +170,7 @@ fn test_drop_masking_policy_if_exists_critical_risk() {
     );
 
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "MASK-DROP"
         }),
@@ -179,15 +179,15 @@ fn test_drop_masking_policy_if_exists_critical_risk() {
 }
 
 #[test]
-fn test_drop_masking_policy_qualified_name_critical() {
+fn test_drop_masking_policy_qualified_name_medium() {
     let sql = "DROP MASKING POLICY prod_db.security.email_mask;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal
+    // Should have medium finding
     assert!(
-        report.summary.critical_count >= 1,
-        "Qualified DROP MASKING POLICY should be critical"
+        report.summary.medium_count >= 1,
+        "Qualified DROP MASKING POLICY should be medium"
     );
 }
 
@@ -196,20 +196,20 @@ fn test_drop_masking_policy_qualified_name_critical() {
 // =============================================================================
 
 #[test]
-fn test_drop_row_access_policy_critical_risk() {
+fn test_drop_row_access_policy_medium_risk() {
     let sql = "DROP ROW ACCESS POLICY secure_rows;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal for dropping row access policy
+    // Should have medium finding for dropping row access policy
     assert!(
-        report.summary.critical_count >= 1,
-        "Should have critical signal for dropping row access policy"
+        report.summary.medium_count >= 1,
+        "Should have medium finding for dropping row access policy"
     );
 
     // Should find RAP-DROP violation
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.matched_rule == "RAP-DROP"
         }),
@@ -218,28 +218,28 @@ fn test_drop_row_access_policy_critical_risk() {
 }
 
 #[test]
-fn test_drop_row_access_policy_if_exists_critical() {
+fn test_drop_row_access_policy_if_exists_medium() {
     let sql = "DROP ROW ACCESS POLICY IF EXISTS secure_rows;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should still be critical even with IF EXISTS
+    // Should still be medium even with IF EXISTS
     assert!(
-        report.summary.critical_count >= 1,
-        "DROP ROW ACCESS POLICY IF EXISTS should still be critical"
+        report.summary.medium_count >= 1,
+        "DROP ROW ACCESS POLICY IF EXISTS should still be medium"
     );
 }
 
 #[test]
-fn test_drop_row_access_policy_qualified_name_critical() {
+fn test_drop_row_access_policy_qualified_name_medium() {
     let sql = "DROP ROW ACCESS POLICY IF EXISTS prod_db.security.secure_rows;";
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have critical signal
+    // Should have medium finding
     assert!(
-        report.summary.critical_count >= 1,
-        "Qualified DROP ROW ACCESS POLICY should be critical"
+        report.summary.medium_count >= 1,
+        "Qualified DROP ROW ACCESS POLICY should be medium"
     );
 }
 
@@ -257,11 +257,11 @@ fn test_drop_multiple_policies_multi_statement() {
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Count total evidence across all critical signals (deduplication groups by rule, but tracks each occurrence)
-    let total_critical_evidence: usize = report
-        .signals
+    // Count total evidence across all medium findings (deduplication groups by rule, but tracks each occurrence)
+    let total_medium_evidence: usize = report
+        .findings
         .iter()
-        .filter(|f| matches!(f.risk_level(), RiskLevel::Critical))
+        .filter(|f| matches!(f.risk_level(), RiskLevel::Medium))
         .map(|f| {
             let RuleMatch::Analysis(ref p) = f;
             p.evidence_count.unwrap_or(1)
@@ -270,9 +270,9 @@ fn test_drop_multiple_policies_multi_statement() {
 
     // Should have at least 3 evidence entries (one for each DROP)
     assert!(
-        total_critical_evidence >= 3,
+        total_medium_evidence >= 3,
         "Should have evidence for each dropped policy, got {}",
-        total_critical_evidence
+        total_medium_evidence
     );
 }
 
@@ -287,10 +287,10 @@ fn test_mixed_policy_operations() {
 
     let report = analyze_risk(sql).expect("should analyze successfully");
 
-    // Should have signals for both DROP statements (critical)
+    // Should have findings for both DROP statements (medium)
     // DROP MASKING POLICY (MASK-DROP) + DROP ROW ACCESS POLICY (RAP-DROP)
-    let drop_masking_signals = report
-        .signals
+    let drop_masking_findings = report
+        .findings
         .iter()
         .filter(|f| {
             let RuleMatch::Analysis(ref p) = f;
@@ -298,8 +298,8 @@ fn test_mixed_policy_operations() {
         })
         .count();
 
-    let drop_row_access_signals = report
-        .signals
+    let drop_row_access_findings = report
+        .findings
         .iter()
         .filter(|f| {
             let RuleMatch::Analysis(ref p) = f;
@@ -308,11 +308,11 @@ fn test_mixed_policy_operations() {
         .count();
 
     assert!(
-        drop_masking_signals >= 1,
+        drop_masking_findings >= 1,
         "Should find at least one MASK-DROP (masking policy dropped)"
     );
     assert!(
-        drop_row_access_signals >= 1,
+        drop_row_access_findings >= 1,
         "Should find at least one RAP-DROP (row access policy dropped)"
     );
 }

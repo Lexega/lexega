@@ -8,7 +8,6 @@ use std::fs;
 /// Benchmark formatting deeply nested SQL structures to ensure
 /// recursion protection doesn't significantly impact performance
 /// even at the edge of acceptable nesting depths.
-
 fn format_50_level_nested_subqueries(c: &mut Criterion) {
     let sql = fs::read_to_string("tests/fixtures/test_nesting_50.sql")
         .expect("Failed to read test_nesting_50.sql");

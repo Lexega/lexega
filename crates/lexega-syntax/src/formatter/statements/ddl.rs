@@ -35,9 +35,19 @@ pub fn format_drop(printer: &mut Printer, drop: &AstDrop) -> Result<(), Formatte
         printer.space();
     }
 
-    // Object name - use push_identifier_span_v2 for identifier casing
-    if let Some(name_span) = drop.target_name_span {
-        printer.push_identifier_span_v2(name_span);
+    // Object name, and what follows it before CASCADE / RESTRICT - use
+    // push_identifier_span_v2 for identifier casing
+    if let Some(name_span) = drop.target_name.as_ref().map(|name| name.span) {
+        let rest_end = drop
+            .cascade_restrict_span
+            .map_or(drop.span.end, |s| s.start);
+        let end = printer
+            .tokens_span_within(name_span.end, rest_end)
+            .map_or(name_span.end, |rest| rest.end);
+        printer.push_identifier_span_v2(Span {
+            start: name_span.start,
+            end,
+        });
     }
 
     // CASCADE/RESTRICT - use push_keyword_span for keyword casing
@@ -75,9 +85,18 @@ pub fn format_truncate(
         printer.space();
     }
 
-    // Table name - use push_identifier_span_v2 for identifier casing
-    if let Some(table_span) = truncate.target_table_span {
-        printer.push_identifier_span_v2(table_span);
+    // Table names and the options after them - use push_identifier_span_v2
+    // for identifier casing
+    if let Some(table_span) = truncate.target_table.as_ref().map(|table| table.span) {
+        let end = printer
+            .tokens_span_within(table_span.end, truncate.span.end)
+            .map_or(table_span.end, |rest| rest.end);
+        printer.push_identifier_span_v2(Span {
+            start: truncate
+                .only_span
+                .map_or(table_span.start, |only| only.start),
+            end,
+        });
     }
 
     Ok(())
@@ -107,7 +126,7 @@ pub fn format_alter_table(
 
     // Table name
     printer.space();
-    printer.push_identifier_span_v2(alter.name_span);
+    printer.push_identifier_span_v2(alter.written_name_span);
 
     // Actions
     for (i, action) in alter.actions.iter().enumerate() {
@@ -161,6 +180,26 @@ fn format_alter_table_action(
             printer.space();
             printer.push_identifier_span_v2(*new_name_span);
         }
+        ChangeColumn {
+            change_span,
+            column_span,
+            old_name_span,
+            new_name_span,
+            definition_span,
+            null_written: _,
+        } => {
+            printer.push_keyword_span(*change_span);
+            emit_opt_keyword(printer, *column_span, false);
+            // A line comment ends the line; the next word starts the next.
+            printer.space_if_needed();
+            printer.push_identifier_span_v2(*old_name_span);
+            printer.space_if_needed();
+            printer.push_identifier_span_v2(*new_name_span);
+            if definition_span.start < definition_span.end {
+                printer.space_if_needed();
+                printer.push_span(*definition_span);
+            }
+        }
         SwapWith {
             swap_span,
             with_span,
@@ -174,21 +213,25 @@ fn format_alter_table_action(
         AddColumn {
             add_span,
             column_span,
+            if_not_exists_span,
             columns_span,
+            parenthesized,
             columns,
         } => {
+            emit_words_before(printer, action.span.start, add_span.map(|s| s.start));
             emit_opt_keyword(printer, *add_span, true);
             emit_opt_keyword(printer, *column_span, false);
-            if columns.is_empty() {
-                // Fallback: emit columns_span verbatim
-                printer.space();
+            emit_opt_keyword(printer, *if_not_exists_span, false);
+            // A line comment ends the line; the next word starts the next.
+            if *parenthesized || columns.is_empty() {
+                printer.space_if_needed();
                 printer.push_span(*columns_span);
             } else {
                 for (ci, col) in columns.iter().enumerate() {
                     if ci > 0 {
                         printer.push(",");
                     }
-                    printer.space();
+                    printer.space_if_needed();
                     printer.push_span(col.full_span);
                 }
             }
@@ -200,18 +243,31 @@ fn format_alter_table_action(
             columns,
         } => {
             emit_opt_keyword(printer, *drop_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            if columns.is_empty() {
-                printer.space();
-                printer.push_span(*columns_span);
-            } else {
-                for (ci, col_span) in columns.iter().enumerate() {
-                    if ci > 0 {
+            // A later item of a T-SQL `DROP` list starts at `COLUMN`.
+            emit_opt_keyword(printer, *column_span, drop_span.is_none());
+            printer.space();
+            // Names listed with commas ending the span each go on a line of
+            // their own, as the actions of a list do.
+            match columns.split_first() {
+                Some((first, rest))
+                    if columns
+                        .last()
+                        .is_some_and(|last| last.end == columns_span.end)
+                        && !rest.is_empty() =>
+                {
+                    printer.push_span(Span {
+                        start: columns_span.start,
+                        end: first.end,
+                    });
+                    for column in rest {
+                        printer.indent_down();
                         printer.push(",");
+                        printer.newline();
+                        printer.indent_up();
+                        printer.push_span(name_through_gap(printer, *column));
                     }
-                    printer.space();
-                    printer.push_identifier_span_v2(*col_span);
                 }
+                Some(_) | None => printer.push_span(*columns_span),
             }
         }
         AlterColumn {
@@ -219,13 +275,24 @@ fn format_alter_table_action(
             column_span,
             column_name_span,
             operation_span,
+            nullability: _,
+            altered_type: _,
+            default_span: _,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            if operation_span.start < operation_span.end {
+                printer.space_if_needed();
+                printer.push_span(*operation_span);
+            }
+        }
+        AlterColumnList {
+            alter_span,
+            list_span,
+            columns: _,
+        } => {
+            printer.push_keyword_span(*alter_span);
             printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            printer.space();
-            printer.push_span(*operation_span);
+            printer.push_span(*list_span);
         }
 
         // ====================================================================
@@ -235,7 +302,11 @@ fn format_alter_table_action(
             add_span,
             constraint_span,
             details_span,
+            details: _,
+            expressions: _,
+            default_span: _,
         } => {
+            emit_words_before(printer, action.span.start, add_span.map(|s| s.start));
             emit_opt_keyword(printer, *add_span, true);
             emit_opt_keyword(printer, *constraint_span, false);
             printer.space();
@@ -299,7 +370,7 @@ fn format_alter_table_action(
             parameters_span,
         } => {
             emit_opt_keyword(printer, *set_span, true);
-            printer.space();
+            printer.space_if_needed();
             printer.push_span(*parameters_span);
         }
         Unset {
@@ -307,7 +378,7 @@ fn format_alter_table_action(
             parameters_span,
         } => {
             emit_opt_keyword(printer, *unset_span, true);
-            printer.space();
+            printer.space_if_needed();
             printer.push_span(*parameters_span);
         }
 
@@ -436,11 +507,13 @@ fn format_alter_table_action(
             emit_opt_keyword(printer, *policy_span, false);
         }
         SetColumnMaskingPolicy(inner) => {
-            emit_opt_keyword(printer, inner.alter_span, true);
-            emit_opt_keyword(printer, inner.column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(inner.column_name_span);
-            emit_opt_keyword(printer, inner.set_span, false);
+            emit_column_lead(
+                printer,
+                inner.alter_span,
+                inner.column_span,
+                inner.column_name_span,
+            );
+            emit_after_column_lead(printer, inner.set_span);
             emit_opt_keyword(printer, inner.masking_span, false);
             emit_opt_keyword(printer, inner.policy_span, false);
             printer.space();
@@ -459,11 +532,8 @@ fn format_alter_table_action(
             masking_span,
             policy_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *unset_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *unset_span);
             emit_opt_keyword(printer, *masking_span, false);
             emit_opt_keyword(printer, *policy_span, false);
         }
@@ -474,15 +544,18 @@ fn format_alter_table_action(
             set_span,
             mask_span,
             function_name_span,
+            using_columns_span,
+            ..
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *set_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *set_span);
             emit_opt_keyword(printer, *mask_span, false);
             printer.space();
             printer.push_identifier_span_v2(*function_name_span);
+            if let Some(using) = using_columns_span {
+                printer.space();
+                printer.push_span(*using);
+            }
         }
         DropColumnMask {
             alter_span,
@@ -491,19 +564,18 @@ fn format_alter_table_action(
             drop_span,
             mask_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *drop_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *drop_span);
             emit_opt_keyword(printer, *mask_span, false);
         }
         SetColumnProjectionPolicy(inner) => {
-            emit_opt_keyword(printer, inner.alter_span, true);
-            emit_opt_keyword(printer, inner.column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(inner.column_name_span);
-            emit_opt_keyword(printer, inner.set_span, false);
+            emit_column_lead(
+                printer,
+                inner.alter_span,
+                inner.column_span,
+                inner.column_name_span,
+            );
+            emit_after_column_lead(printer, inner.set_span);
             emit_opt_keyword(printer, inner.projection_span, false);
             emit_opt_keyword(printer, inner.policy_span, false);
             printer.space();
@@ -518,11 +590,8 @@ fn format_alter_table_action(
             projection_span,
             policy_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *unset_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *unset_span);
             emit_opt_keyword(printer, *projection_span, false);
             emit_opt_keyword(printer, *policy_span, false);
         }
@@ -534,6 +603,7 @@ fn format_alter_table_action(
             set_span,
             tag_span,
             assignments_span,
+            ..
         } => {
             emit_opt_keyword(printer, *set_span, true);
             emit_opt_keyword(printer, *tag_span, false);
@@ -544,6 +614,7 @@ fn format_alter_table_action(
             unset_span,
             tag_span,
             tags_span,
+            ..
         } => {
             emit_opt_keyword(printer, *unset_span, true);
             emit_opt_keyword(printer, *tag_span, false);
@@ -557,12 +628,10 @@ fn format_alter_table_action(
             set_span,
             tag_span,
             assignments_span,
+            ..
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *set_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *set_span);
             emit_opt_keyword(printer, *tag_span, false);
             printer.space();
             printer.push_span(*assignments_span);
@@ -574,12 +643,10 @@ fn format_alter_table_action(
             unset_span,
             tag_span,
             tags_span,
+            ..
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *unset_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *unset_span);
             emit_opt_keyword(printer, *tag_span, false);
             printer.space();
             printer.push_span(*tags_span);
@@ -755,11 +822,8 @@ fn format_alter_table_action(
             options_span,
             options_list_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *set_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *set_span);
             emit_opt_keyword(printer, *options_span, false);
             printer.space();
             printer.push_span(*options_list_span);
@@ -772,11 +836,8 @@ fn format_alter_table_action(
             not_span,
             null_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *drop_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *drop_span);
             emit_opt_keyword(printer, *not_span, false);
             emit_opt_keyword(printer, *null_span, false);
         }
@@ -789,11 +850,8 @@ fn format_alter_table_action(
             type_span,
             data_type_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *set_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *set_span);
             emit_opt_keyword(printer, *data_span, false);
             emit_opt_keyword(printer, *type_span, false);
             printer.space();
@@ -806,12 +864,10 @@ fn format_alter_table_action(
             set_span,
             default_span,
             expr_span,
+            expr: _,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *set_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *set_span);
             emit_opt_keyword(printer, *default_span, false);
             printer.space();
             printer.push_span(*expr_span);
@@ -823,11 +879,8 @@ fn format_alter_table_action(
             drop_span,
             default_span,
         } => {
-            emit_opt_keyword(printer, *alter_span, true);
-            emit_opt_keyword(printer, *column_span, false);
-            printer.space();
-            printer.push_identifier_span_v2(*column_name_span);
-            emit_opt_keyword(printer, *drop_span, false);
+            emit_column_lead(printer, *alter_span, *column_span, *column_name_span);
+            emit_after_column_lead(printer, *drop_span);
             emit_opt_keyword(printer, *default_span, false);
         }
 
@@ -870,7 +923,25 @@ fn format_alter_table_action(
         // ====================================================================
         // Fallback Variants
         // ====================================================================
-        GovernanceSpan { span } | Unknown { span } => {
+        SetSchema { .. } => {
+            let text = action_text(printer, action);
+            match printer.token_span_from(action.span.start) {
+                Some(set) => {
+                    emit_opt_keyword(printer, Some(set), true);
+                    if let Some(rest) = printer.tokens_span_within(set.end, text.end) {
+                        printer.space();
+                        printer.push_span(rest);
+                    }
+                }
+                None => printer.push_span(text),
+            }
+        }
+        OwnerTo { .. } | AttachPartition { .. } | DetachPartition { .. } | SwitchTo { .. } => {
+            let text = action_text(printer, action);
+            printer.push_span(text);
+        }
+        GovernanceSpan { span } | Unknown { span } | NamedAction { span, .. } => {
+            emit_words_before(printer, action.span.start, Some(span.start));
             printer.push_span(*span);
         }
     }
@@ -878,9 +949,69 @@ fn format_alter_table_action(
     Ok(())
 }
 
+/// A name of one token with the whitespace after it, up to the next token;
+/// any other name as it is.
+fn name_through_gap(printer: &Printer, name: Span) -> Span {
+    if printer.token_span_from(name.start) != Some(name) {
+        return name;
+    }
+    printer.token_span_from(name.end).map_or(name, |next| Span {
+        start: name.start,
+        end: next.start,
+    })
+}
+
+/// The action as written: its first token to its last. An action that ends
+/// the source has an empty span, and its tokens are the rest of the source.
+fn action_text(printer: &Printer, action: &AstAlterTableAction) -> Span {
+    let end = if action.span.end > action.span.start {
+        action.span.end
+    } else {
+        u32::MAX
+    };
+    printer
+        .tokens_span_within(action.span.start, end)
+        .unwrap_or(action.span)
+}
+
+/// Emits the words an action writes before the part its kind prints from
+/// (`start`): T-SQL's `WITH {CHECK | NOCHECK}` before `ADD`.
+fn emit_words_before(printer: &mut Printer, action_start: u32, start: Option<u32>) {
+    if let Some(words) = start.and_then(|s| printer.tokens_span_within(action_start, s)) {
+        printer.push_keyword_span(words);
+        printer.space();
+    }
+}
+
 /// Helper: emit an optional keyword span with a leading space.
 /// If `first` is true, no leading space is emitted (start of action).
 #[inline]
+/// `[ALTER | MODIFY] [COLUMN] <name>` of an action on a column. A later item
+/// of a list starts at `COLUMN` or at the name, at the line's indentation.
+fn emit_column_lead(
+    printer: &mut Printer,
+    alter_span: Option<Span>,
+    column_span: Option<Span>,
+    column_name_span: Span,
+) {
+    emit_opt_keyword(printer, alter_span, true);
+    emit_opt_keyword(printer, column_span, alter_span.is_none());
+    if alter_span.is_some() || column_span.is_some() {
+        printer.space_if_needed();
+    }
+    printer.push_identifier_span_v2(column_name_span);
+}
+
+/// The operation's first keyword after a column's lead ([`emit_column_lead`]):
+/// where a line comment after the name ended the line, at the line's
+/// indentation.
+fn emit_after_column_lead(printer: &mut Printer, span: Option<Span>) {
+    if let Some(span) = span {
+        printer.space_if_needed();
+        printer.push_keyword_span(span);
+    }
+}
+
 fn emit_opt_keyword(printer: &mut Printer, span: Option<Span>, first: bool) {
     if let Some(s) = span {
         if !first {
@@ -924,8 +1055,10 @@ fn emit_table_options(
     // Check if we have any individual options
     let has_individual_options = !all_table_option_spans.is_empty();
 
-    // Add table_options_span as fallback if no individual options
-    if !has_individual_options {
+    // Add table_options_span as fallback if no individual options; a copied
+    // table's `COPY source` is held by no option span, so it is written
+    // from the whole options region.
+    if !has_individual_options || table.variant == AstCreateTableVariant::Copy {
         if let Some(span) = table.table_options_span {
             all_table_option_spans.push(span);
         }
@@ -944,7 +1077,7 @@ fn emit_table_options(
             end: last_end,
         };
 
-        printer.newline();
+        printer.end_line();
         printer.push_span(combined_span);
         return Ok(true);
     }
@@ -960,10 +1093,32 @@ pub fn format_create_table(
     // CREATE keyword - use push_keyword_span to emit trivia
     printer.push_keyword_span(table.keyword_span);
 
-    // OR REPLACE (if present) - use push_span for proper trivia emission
-    if let Some(or_replace_span) = table.or_replace_span {
+    // OR REPLACE (if present) - use push_span for proper trivia emission;
+    // `REPLACE TABLE`'s replace is the keyword already written.
+    if let Some(or_replace_span) = table.or_replace_span.filter(|s| *s != table.keyword_span) {
         printer.space();
         printer.push_span(or_replace_span);
+    }
+
+    // Words no field carries before the first modifier (Snowflake `OR
+    // ALTER`, Databricks `OR REFRESH`), as written.
+    let leading_end = table.or_replace_span.map_or(table.keyword_span.end, |s| {
+        s.end.max(table.keyword_span.end)
+    });
+    let first_modifier = [
+        table.scoped_span,
+        table.temp_kind_span,
+        table.table_kind_span,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|s| s.start)
+    .min()
+    .unwrap_or(table.table_keyword_span.start);
+    let leading = printer.tokens_span_within(leading_end, first_modifier);
+    if let Some(words) = leading {
+        printer.space();
+        printer.push_keyword_span(words);
     }
 
     // PROCEDURE SCOPED prefix (procedure-scoped temporary table) - emitted
@@ -985,17 +1140,45 @@ pub fn format_create_table(
         printer.push_span(kind_span);
     }
 
+    // A modifier no field carries (PostgreSQL UNLOGGED), as written.
+    let modifiers_end = [
+        Some(table.keyword_span),
+        table.or_replace_span,
+        leading,
+        table.scoped_span,
+        table.temp_kind_span,
+        table.table_kind_span,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|s| s.end)
+    .max()
+    .unwrap_or(table.keyword_span.end);
+    if let Some(modifier) =
+        printer.tokens_span_within(modifiers_end, table.table_keyword_span.start)
+    {
+        printer.space();
+        printer.push_keyword_span(modifier);
+    }
+
     // TABLE keyword - use push_keyword_span
     printer.space();
     printer.push_keyword_span(table.table_keyword_span);
 
-    // Table name - use push_identifier_span_v2 for identifier casing
+    // Table name, after any IF NOT EXISTS - use push_identifier_span_v2 for
+    // identifier casing
+    let name_start = printer
+        .tokens_span_within(table.table_keyword_span.end, table.name.span.start)
+        .map_or(table.name.span.start, |prefix| prefix.start);
     printer.space();
-    printer.push_identifier_span_v2(table.name_span);
+    printer.push_identifier_span_v2(Span {
+        start: name_start,
+        end: table.name.span.end,
+    });
 
     // Handle different CREATE TABLE variants
     match table.variant {
-        AstCreateTableVariant::Plain => {
+        AstCreateTableVariant::Plain | AstCreateTableVariant::Copy => {
             // Column definitions
             if let Some(_columns_span) = table.columns_span {
                 // Use lparen_span to properly emit trivia for opening paren
@@ -1010,14 +1193,7 @@ pub fn format_create_table(
                 printer.newline();
                 printer.indent_up();
 
-                for (idx, col) in table.columns.iter().enumerate() {
-                    format_table_column(printer, col, idx > 0)?;
-                }
-
-                // Constraints
-                for constraint in &table.constraints {
-                    format_table_constraint(printer, constraint)?;
-                }
+                format_table_items(printer, table)?;
 
                 printer.indent_down();
                 printer.newline();
@@ -1112,14 +1288,7 @@ pub fn format_create_table(
                 printer.newline();
                 printer.indent_up();
 
-                for (idx, col) in table.columns.iter().enumerate() {
-                    format_table_column(printer, col, idx > 0)?;
-                }
-
-                // Constraints (if any in CTAS)
-                for constraint in &table.constraints {
-                    format_table_constraint(printer, constraint)?;
-                }
+                format_table_items(printer, table)?;
 
                 printer.indent_down();
                 printer.newline();
@@ -1339,13 +1508,65 @@ fn format_table_column(
 fn format_table_constraint(
     printer: &mut Printer,
     constraint: &AstCreateTableConstraint,
+    needs_comma: bool,
 ) -> Result<(), FormatterError> {
     printer.emit_comments_before(constraint.full_span.start);
-    printer.push_char(',');
-    printer.newline();
+    if needs_comma {
+        printer.push_char(',');
+        printer.newline();
+    }
     // Use push_span to preserve trailing trivia (comments)
     printer.push_span(constraint.full_span);
 
+    Ok(())
+}
+
+/// An item of a table's parenthesised list ([`format_table_items`]).
+enum TableItem<'t> {
+    Column(&'t AstCreateTableColumn),
+    Constraint(&'t AstCreateTableConstraint),
+    /// `LIKE table [INCLUDING …]`.
+    Like(Span),
+}
+
+/// Format the items of a table's parenthesised list, columns, keys,
+/// index definitions, other constraints and `LIKE` items, in the order
+/// written.
+fn format_table_items(printer: &mut Printer, table: &AstCreateTable) -> Result<(), FormatterError> {
+    let mut items: Vec<(u32, TableItem<'_>)> = table
+        .columns
+        .iter()
+        .map(|column| (column.full_span.start, TableItem::Column(column)))
+        .chain(table.constraints.iter().map(|constraint| {
+            (
+                constraint.full_span.start,
+                TableItem::Constraint(constraint),
+            )
+        }))
+        .chain(
+            table
+                .like_elements
+                .iter()
+                .map(|like| (like.span.start, TableItem::Like(like.span))),
+        )
+        .collect();
+    items.sort_by_key(|(start, _)| *start);
+    for (index, (_, item)) in items.into_iter().enumerate() {
+        let needs_comma = index > 0;
+        match item {
+            TableItem::Column(column) => format_table_column(printer, column, needs_comma)?,
+            TableItem::Constraint(constraint) => {
+                format_table_constraint(printer, constraint, needs_comma)?
+            }
+            TableItem::Like(span) => {
+                if needs_comma {
+                    printer.push_char(',');
+                    printer.newline();
+                }
+                printer.push_span(span);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1421,7 +1642,7 @@ pub fn format_create_view(
 
     // View name - use push_identifier_span_v2 for identifier casing
     printer.space();
-    printer.push_identifier_span_v2(view.name_span);
+    printer.push_identifier_span_v2(view.name.span);
 
     // Column list (if present) - use CST syntax nodes for trivia preservation
     if let Some(column_list_id) = view.column_list_id {
@@ -1611,7 +1832,7 @@ pub fn format_create_view(
         .or(view.bq_options_span)
         .map(|s| s.start);
 
-    for option_span in [
+    let option_spans = [
         view.row_access_policy_span,
         view.aggregation_policy_span,
         view.join_policy_span,
@@ -1624,9 +1845,16 @@ pub fn format_create_view(
         // Only emit comment here if it's before materialized clauses (or no materialized clauses)
         view.comment_span
             .filter(|cs| mat_clauses_start.is_none_or(|ms| cs.start < ms)),
-    ]
-    .iter()
-    .filter_map(|s| *s)
+    ];
+    // Options none of the above reads (T-SQL's `WITH SCHEMABINDING`) are
+    // emitted as written.
+    let unread_options = view
+        .options_span
+        .filter(|_| option_spans.iter().all(Option::is_none));
+    for option_span in option_spans
+        .iter()
+        .chain([&unread_options])
+        .filter_map(|s| *s)
     {
         printer.newline();
         printer.push_span(option_span);

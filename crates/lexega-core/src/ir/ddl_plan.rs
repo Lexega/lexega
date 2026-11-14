@@ -7,7 +7,7 @@
 //! not a query-bearing relational tree (`SELECT` / `INSERT` /
 //! `UPDATE` / `DELETE` / `MERGE`). It is intentionally **a single
 //! struct, not an AST mirror**: it captures the small set of facts
-//! IR-side analyses and signal emitters consume — verb (action),
+//! IR-side analyses and finding emitters consume — verb (action),
 //! object (what kind of thing is being acted on), target identity,
 //! optional inner body, and a typed options slot — without
 //! enumerating one variant per AST statement kind.
@@ -147,10 +147,12 @@ pub struct DdlPlan {
     /// re-walking the AST. Single-action — Postgres `ALTER TRIGGER`
     /// grammar permits one sub-action per statement.
     pub pg_trigger: Option<IrTriggerDetail>,
-    /// `ALTER TABLE … {ENABLE|DISABLE} TRIGGER …` typed action
-    /// identity. Populated only when this `DdlPlan` originated from
-    /// [`crate::ast::AstStmt::PgAlterTableTriggerState`]; `None` for
-    /// every other AST kind. Carries the typed
+    /// `ALTER TABLE … {ENABLE|DISABLE} TRIGGER …` and T-SQL
+    /// `{ENABLE|DISABLE} TRIGGER … ON …` typed action identity.
+    /// Populated only when this `DdlPlan` originated from
+    /// [`crate::ast::AstStmt::PgAlterTableTriggerState`] or
+    /// [`crate::ast::AstStmt::MssqlTriggerState`]; `None` for every
+    /// other AST kind. Carries the typed
     /// [`IrTriggerStateAction`] so the facts-side projection can
     /// curate it into the public
     /// [`crate::facts::ddl::TriggerStateAction`] vocabulary without
@@ -219,6 +221,19 @@ pub struct DdlPlan {
     /// Carries the referenced base object and its part count so the facts-side
     /// projection can expose `ddl.synonym.*` without re-walking the AST.
     pub synonym: Option<crate::ir::SynonymPlan>,
+    /// Each table a `TRUNCATE` lists, in order. Empty for every other AST
+    /// kind, and for a `TRUNCATE` whose tables are no list of names or one
+    /// with a name not read.
+    pub(crate) truncated: Vec<TruncatedTable>,
+}
+
+/// One table a `TRUNCATE` lists ([`DdlPlan::truncated`]).
+#[derive(Debug, Clone)]
+pub(crate) struct TruncatedTable {
+    pub(crate) target: DdlTarget,
+    /// PostgreSQL `ONLY` before it: the table alone, none of a table that
+    /// inherits from it.
+    pub(crate) only: bool,
 }
 
 /// IR-internal typed recognition for a `SHOW` statement. The facts-side
@@ -288,7 +303,17 @@ pub struct IrBqOptionsDetail {
     /// spans, in source order. Includes the values already present
     /// in [`Self::options`]; duplication is intentional so content-
     /// pattern rules don't need to traverse the structured pairs.
-    pub all_literal_values: Vec<String>,
+    pub all_literal_values: Vec<IrBqLiteral>,
+}
+
+/// One string literal of a BQ credential-bearing span.
+#[derive(Debug, Clone)]
+pub struct IrBqLiteral {
+    /// The literal's decoded value.
+    pub value: String,
+    /// The password of each URL the literal holds with user information,
+    /// decoded; one a placeholder overlaps is left out.
+    pub url_password_literals: Vec<String>,
 }
 
 /// IR-internal typed identity of a single `<key> = '<literal>'` option
@@ -469,6 +494,8 @@ pub struct PrincipalOptionsIr {
     /// clause (no surrounding quotes). `None` if the parser saw no
     /// password clause.
     pub password_literal: Option<String>,
+    /// A clause that sets the password is written, whatever its value.
+    pub password_set: bool,
     /// MySQL `'user'@'host'` host literal content (no surrounding
     /// quotes). `None` for non-MySQL or unqualified forms.
     pub mysql_host: Option<String>,
@@ -517,6 +544,7 @@ pub struct SnowflakeUserOptionsIr {
     pub rsa_public_key_set: bool,
     pub rsa_public_key_2_set: bool,
     pub network_policy: Option<String>,
+    pub network_policy_unset: bool,
 }
 
 /// IR mirror of [`crate::ast::types::AstSecondaryRolesMode`].
@@ -660,6 +688,7 @@ impl DdlPlan {
             (A::Create, O::Task) => K::CreateTask,
             (A::Alter, O::Task) => K::AlterTask,
             (A::Drop, O::Task) => K::DropTask,
+            (A::Execute, O::Task) => K::ExecuteTask,
             (A::Create, O::Warehouse) => K::CreateWarehouse,
             (A::Alter, O::Warehouse) => K::AlterWarehouse,
             (A::Drop, O::Warehouse) => K::DropWarehouse,
@@ -697,17 +726,22 @@ impl DdlPlan {
 /// [`DdlPlan::schema_mutations`].
 ///
 /// Closed enum; adding a variant is a design action. The variants
-/// here cover the three ALTER actions whose downstream consumers
-/// need element identity beyond a per-category boolean:
+/// here cover the ALTER actions whose downstream consumers need
+/// element identity beyond a per-category boolean:
 /// [`AstAlterTableActionKind::RenameTo`],
-/// [`AstAlterTableActionKind::AddColumn`], and
-/// [`AstAlterTableActionKind::DropColumn`]. Other ALTER variants are
+/// [`AstAlterTableActionKind::AddColumn`],
+/// [`AstAlterTableActionKind::DropColumn`],
+/// [`AstAlterTableActionKind::RenameColumn`] and a `CHANGE` that renames,
+/// `SWAP WITH`, a column's `SET TAG` / `UNSET TAG`, and every action whose
+/// effect on the columns is not read.
+/// The actions read as keeping the columns carry no mutation; they are
 /// represented at the IR layer only via their per-category aggregate
 /// flags on [`super::table_plan::TableAlterFlags`].
 ///
 /// [`AstAlterTableActionKind::RenameTo`]: crate::ast::AstAlterTableActionKind::RenameTo
 /// [`AstAlterTableActionKind::AddColumn`]: crate::ast::AstAlterTableActionKind::AddColumn
 /// [`AstAlterTableActionKind::DropColumn`]: crate::ast::AstAlterTableActionKind::DropColumn
+/// [`AstAlterTableActionKind::RenameColumn`]: crate::ast::AstAlterTableActionKind::RenameColumn
 #[derive(Debug, Clone)]
 pub enum DdlSchemaMutation {
     /// `ALTER TABLE x RENAME TO y` — the table identity changes.
@@ -726,6 +760,50 @@ pub enum DdlSchemaMutation {
     /// `column_name` is the un-normalized identifier text from the
     /// AST.
     DropColumn { column_name: String },
+    /// `ALTER TABLE x RENAME COLUMN from TO to` — a column's name
+    /// changes. Both names are the un-normalized identifier text from
+    /// the AST.
+    RenameColumn { from: String, to: String },
+    /// `ALTER TABLE x SWAP WITH other` — the two tables exchange
+    /// contents, columns included.
+    SwapWith { other: DdlTarget },
+    /// `ALTER TABLE x {ALTER | MODIFY} [COLUMN] col SET TAG t = 'v', …` —
+    /// the column carries each tag, with its value, in place of any tag
+    /// of the same name. `column_name` is the un-normalized identifier
+    /// text; each tag is as a catalog records one: its name's parts
+    /// folded as the dialect folds a name, its value where it is a string.
+    SetColumnTags {
+        column_name: String,
+        tags: Vec<crate::catalog::CatalogTag>,
+    },
+    /// `ALTER TABLE x {ALTER | MODIFY} [COLUMN] col UNSET TAG t, …` — the
+    /// column carries no tag of each name, the parts a name omits
+    /// agreeing with any. Each tag is named as in [`Self::SetColumnTags`],
+    /// with no value.
+    UnsetColumnTags {
+        column_name: String,
+        tags: Vec<crate::catalog::CatalogTag>,
+    },
+    /// `ALTER TABLE x ALTER COLUMN col [SET DATA] TYPE t`, T-SQL `ALTER
+    /// COLUMN col t`, MySQL `MODIFY | CHANGE`: the column holds values of
+    /// type `data_type`, written as a catalog records a type, from then on;
+    /// `None` where the new type is not read. `column_name` is the
+    /// un-normalized identifier text.
+    SetColumnType {
+        column_name: String,
+        data_type: Option<String>,
+    },
+    /// An action whose effect on the table's columns is not read: one the
+    /// parser keeps as written, or a column action whose names it could
+    /// not read. The table's columns are not known to be complete after it.
+    ColumnsUnread,
+    /// An action that may put the values of one relation under another's
+    /// name in a way the plan does not state: a partition switched,
+    /// exchanged, attached or detached, a parent inherited, rows appended
+    /// from another table, a relation moved to another schema, a schema or
+    /// a database renamed or swapped, a view's query replaced, a column
+    /// computed from others, or an action kept as written.
+    NamesUnread,
 }
 
 /// Abstract verb performed by a DDL statement.
@@ -780,7 +858,9 @@ pub enum DdlAction {
 /// Three-part identity (`db.schema.name`) plus the source span
 /// of the name token(s). Components beyond `name` are populated
 /// only when the statement spelled them out — qualifier inference
-/// from session/env is a consumer concern.
+/// from session/env is a consumer concern. A target that names a
+/// relation holds each component as written, quotes and case kept, as a
+/// table a query reads is; any other target holds each folded.
 #[derive(Debug, Clone)]
 pub struct DdlTarget {
     /// Bare object name (last identifier component).
@@ -806,7 +886,7 @@ pub struct DdlOptions {
     pub if_exists: bool,
     /// `CREATE … IF NOT EXISTS`. Distinguished from `if_exists`
     /// because `DROP IF EXISTS` and `CREATE IF NOT EXISTS` carry
-    /// different signal semantics.
+    /// different finding semantics.
     pub if_not_exists: bool,
     /// `CREATE TEMPORARY …` / `CREATE TEMP …`.
     pub temporary: bool,
@@ -826,6 +906,9 @@ pub struct DdlOptions {
     /// facts projection can distinguish "explicit RESTRICT" from
     /// "neither keyword present".
     pub restrict: bool,
+    /// MySQL `LOAD DATA … REPLACE`: a row loaded that meets a row held on
+    /// a unique key replaces it, the row held deleted first.
+    pub replaces_duplicates: bool,
 }
 
 /// Typed sibling carrier for `ALTER DOMAIN`. Lives on
@@ -936,8 +1019,8 @@ pub enum IrTriggerAlterAction {
 }
 
 /// Typed sibling carrier for `ALTER TABLE … {ENABLE|DISABLE}
-/// TRIGGER …`. Lives on [`DdlPlan::pg_trigger_state`]; `None` for
-/// every other AST kind. Parallel-shape sibling of [`IrTriggerDetail`]
+/// TRIGGER …` and T-SQL `{ENABLE|DISABLE} TRIGGER … ON …`. Lives on
+/// [`DdlPlan::pg_trigger_state`]; `None` for every other AST kind. Parallel-shape sibling of [`IrTriggerDetail`]
 /// — different action vocabulary, different SQL surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IrTriggerStateDetail {

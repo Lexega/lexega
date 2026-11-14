@@ -32,6 +32,7 @@ use super::statement_facts::StatementFacts;
 use super::strict::StrictMode;
 use super::types::SessionContext;
 use crate::catalog::CatalogIndex;
+use crate::lexer::token::Span;
 
 /// Explicit input bundle for [`super::lower_dispatch::lower_stmt`].
 ///
@@ -40,6 +41,11 @@ pub struct IrLowerInputs<'a> {
     /// Original SQL source — used for span resolution and identifier
     /// extraction during lowering.
     pub source: &'a str,
+    /// The placeholder spans `source` was parsed with: where a render or a
+    /// substitution wrote text for a value it could not resolve. A
+    /// credential value overlapping one is no literal. Empty for text
+    /// parsed without any.
+    pub placeholder_spans: &'a [Span],
     /// Strict-mode policy. Permissive permits opaque fall-through to
     /// [`super::plan::RelPlan::Opaque`] / typed
     /// [`super::error::LowerError`](crate::ir::lower::LowerError) terminals; strict modes refuse
@@ -50,6 +56,9 @@ pub struct IrLowerInputs<'a> {
     pub func_catalog: &'a FunctionCatalog,
     /// Session context (current database / schema, search path).
     pub session: &'a SessionContext,
+    /// What the dialect the statement was parsed in states its syntax
+    /// means.
+    pub meaning: crate::dialect::SyntaxMeaning,
     /// Optional indexed catalog snapshot — when `Some`, the lowerer
     /// seeds [`IndexedCatalogContext`] with column / table tags and
     /// downstream analyses can resolve table-qualified references.
@@ -77,11 +86,14 @@ pub struct IrLowerInputs<'a> {
     pub flatten_body_into: Option<&'a dyn LoweredBodySink>,
 }
 
-/// Receives the statements lowered inside a DDL body.
+/// Receives the statements lowered inside a DDL body, each with the span
+/// of the statement it was lowered from.
 pub trait LoweredBodySink {
     /// A query-bearing (or policy-with-predicates) inner statement.
+    #[allow(clippy::too_many_arguments)] // the statement's span and its lowering side-band
     fn rel(
         &self,
+        statement: Span,
         plan: &RelPlan,
         bindings: &BindingTable,
         catalog_ctx: &IndexedCatalogContext,
@@ -91,7 +103,7 @@ pub trait LoweredBodySink {
     );
 
     /// A non-query inner DDL statement.
-    fn ddl(&self, plan: &DdlPlan, privilege_plan: Option<&PrivilegePlan>);
+    fn ddl(&self, statement: Span, plan: &DdlPlan, privilege_plan: Option<&PrivilegePlan>);
 }
 
 /// Unified return shape from [`super::lower_dispatch::lower_stmt`].

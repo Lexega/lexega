@@ -25,6 +25,7 @@ pub mod recognition;
 pub mod types;
 pub mod usage;
 
+use std::borrow::Cow;
 use std::process;
 
 use extension::Extension;
@@ -39,6 +40,7 @@ pub fn run(args: Vec<String>, ext: &dyn Extension) {
 /// precedence over the built-in ones of the same name.
 pub fn dispatch(args: &[String], ext: &dyn Extension) {
     let program = args.first().map(String::as_str).unwrap_or("lexega");
+    let args = &*dialect_after_command(args, ext);
     let Some(command) = args.get(1).map(String::as_str) else {
         ext.usage(program);
         process::exit(1);
@@ -62,6 +64,52 @@ pub fn dispatch(args: &[String], ext: &dyn Extension) {
             process::exit(1);
         }
     }
+}
+
+/// `args` with a `--dialect <DIALECT>` that precedes the command moved to the
+/// end of the command's arguments, where each command reads its options. A
+/// command that reads no dialect refuses it, as does a word that is no
+/// command, with the usage.
+fn dialect_after_command<'a>(args: &'a [String], ext: &dyn Extension) -> Cow<'a, [String]> {
+    if args.get(1).map(String::as_str) != Some("--dialect") {
+        return Cow::Borrowed(args);
+    }
+    let Some(dialect) = args.get(2) else {
+        eprintln!(
+            "Error: --dialect requires a value ({})",
+            io::DIALECT_OPTIONS
+        );
+        process::exit(1);
+    };
+    let Some(command) = args.get(3) else {
+        return Cow::Owned(vec![args[0].clone()]);
+    };
+    let reads_dialect = matches!(
+        command.as_str(),
+        "fmt" | "format" | "analyze" | "risk" | "ci" | "review"
+    ) || ext.reads_dialect(command);
+    let informational = matches!(
+        command.as_str(),
+        "-h" | "--help" | "help" | "-V" | "--version" | "version" | "--licenses"
+    );
+    let mut moved = vec![args[0].clone(), command.clone()];
+    moved.extend_from_slice(&args[4..]);
+    if informational {
+        return Cow::Owned(moved);
+    }
+    if !reads_dialect {
+        eprintln!("Error: --dialect does not apply to '{command}', or it is not a command");
+        eprintln!();
+        ext.usage(&args[0]);
+        process::exit(1);
+    }
+    // Options end at a bare `--`; the dialect goes before what follows it.
+    let at = moved
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(moved.len());
+    moved.splice(at..at, ["--dialect".to_string(), dialect.clone()]);
+    Cow::Owned(moved)
 }
 
 /// True when a panic message is std's stdout/stderr broken-pipe write failure.

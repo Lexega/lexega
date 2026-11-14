@@ -19,9 +19,10 @@ use lexega_core::dialect::{mysql, snowflake};
 use lexega_core::{format_sql_with_config, parse_sql_with_dialect, FormatterConfig};
 
 fn mysql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mysql();
-    config
+    FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) {
@@ -203,8 +204,10 @@ fn test_snowflake_rejects_table_statement() {
 fn test_table_statement_is_analyzed_not_opaque() {
     // Query-bearing: the analyzer lowers it (no panic, statement analyzed),
     // unlike an opaque fragment.
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mysql());
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mysql()),
+        ..Default::default()
+    };
     let report = lexega_core::api::analyze_risk_with_policy_config("TABLE orders;", &config)
         .expect("analysis should succeed");
     assert_eq!(

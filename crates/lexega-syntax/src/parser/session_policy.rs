@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterSessionPolicy, SyntaxAlterSessionPolicyAction, SyntaxCreateSessionPolicy,
     SyntaxDropSessionPolicy,
@@ -664,19 +665,8 @@ impl<'a> Parser<'a> {
                         self.advance(); // consume TAG
                         let tag_span = Some(next_tok.span);
 
-                        // Parse tag assignments: tag1 = 'value1', tag2 = 'value2', ...
-                        let assignments_start = self.current_span().start;
-                        while let Some(tok) = self.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        let assignments_end = self.current_span().start;
-                        let assignments_span = Span {
-                            start: assignments_start,
-                            end: assignments_end,
-                        };
+                        let (assignments_span, tags) =
+                            self.parse_tag_list(TagListShape::Assignments)?;
 
                         vec![AstAlterSessionPolicyAction {
                             node_id: self.id_gen.next(),
@@ -689,6 +679,7 @@ impl<'a> Parser<'a> {
                                 set_span,
                                 tag_span,
                                 assignments_span,
+                                tags,
                             },
                         }]
                     }
@@ -709,19 +700,7 @@ impl<'a> Parser<'a> {
                         self.advance(); // consume TAG
                         let tag_span = Some(next_tok.span);
 
-                        // Parse tag names: tag1, tag2, ...
-                        let tags_start = self.current_span().start;
-                        while let Some(tok) = self.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            self.advance();
-                        }
-                        let tags_end = self.current_span().start;
-                        let tags_span = Span {
-                            start: tags_start,
-                            end: tags_end,
-                        };
+                        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                         vec![AstAlterSessionPolicyAction {
                             node_id: self.id_gen.next(),
@@ -734,6 +713,7 @@ impl<'a> Parser<'a> {
                                 unset_span,
                                 tag_span,
                                 tags_span,
+                                tags,
                             },
                         }]
                     }
@@ -1064,19 +1044,7 @@ impl<'a> Parser<'a> {
 
     fn is_alter_session_policy_action_boundary(&self, tok: &crate::lexer::Token) -> bool {
         matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
-            || matches!(
-                tok.kind,
-                TokenKind::Keyword(
-                    Keyword::Alter
-                        | Keyword::Create
-                        | Keyword::Drop
-                        | Keyword::Select
-                        | Keyword::Insert
-                        | Keyword::Update
-                        | Keyword::Delete
-                        | Keyword::Merge
-                )
-            )
+            || self.is_statement_keyword(tok)
     }
 
     /// Parse role list: ( role1, role2, ... ) or () or ('ALL')

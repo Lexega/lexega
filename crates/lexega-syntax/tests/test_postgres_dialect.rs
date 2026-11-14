@@ -188,3 +188,114 @@ fn test_postgres_british_spelling() {
     assert!(dialect.is_keyword("ANALYZE"));
     assert!(dialect.is_keyword("ANALYSE"));
 }
+
+#[test]
+fn psql_g_and_gexec_end_the_statement_and_gexec_sends_the_query() {
+    use lexega_syntax::lexer::token::{PsqlMetaCommand, TriviaKind};
+    use lexega_syntax::lexer::{Punctuation, TokenKind};
+    use lexega_syntax::AstStmt;
+    let pg = postgres();
+    let text = |sql: &str, span: lexega_syntax::lexer::Span| {
+        sql[span.start as usize..span.end as usize].to_string()
+    };
+    // The command, to the end of its line, is trivia of a `;` of no width.
+    let sql = "DELETE FROM users \\g out.txt\nSELECT 1;";
+    let tokens = lexega_syntax::lexer::tokenize_with_dialect(sql, &*pg).tokens;
+    let terminator = tokens
+        .iter()
+        .find(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::Semi)))
+        .expect("a terminator");
+    assert_eq!(terminator.span.start, terminator.span.end);
+    let command = terminator
+        .leading_trivia
+        .iter()
+        .find(|t| matches!(t.kind, TriviaKind::PsqlMetaCommand(_)))
+        .expect("the command");
+    assert_eq!(
+        command.kind,
+        TriviaKind::PsqlMetaCommand(PsqlMetaCommand::Go)
+    );
+    assert_eq!(text(sql, command.span), "\\g out.txt");
+    let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+    assert!(matches!(
+        script.stmts.as_slice(),
+        [AstStmt::Delete(_), AstStmt::Select(_)]
+    ));
+
+    // Another dialect, a body and another command do not read it.
+    let other = snowflake();
+    let tokens =
+        lexega_syntax::lexer::tokenize_with_dialect("DELETE FROM users \\g", &*other).tokens;
+    assert!(tokens.iter().any(|t| matches!(t.kind, TokenKind::Unknown)));
+    let body = "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT '\\g' $$;";
+    assert!(lexega_syntax::lexer::tokenize_with_dialect(body, &*pg)
+        .tokens
+        .iter()
+        .all(|t| t
+            .leading_trivia
+            .iter()
+            .all(|tr| !matches!(tr.kind, TriviaKind::PsqlMetaCommand(_)))));
+    let tokens = lexega_syntax::lexer::tokenize_with_dialect("DELETE FROM users \\gx", &*pg).tokens;
+    assert!(tokens.iter().any(|t| matches!(t.kind, TokenKind::Unknown)));
+
+    // `\gexec` sends the query, which is read whole.
+    let sql = "SELECT 'DROP TABLE ' || tablename FROM pg_tables \\gexec\nDELETE FROM t;";
+    let script = lexega_syntax::parse_sql_with_dialect(sql, &*pg).expect("parses");
+    let [AstStmt::PsqlGexec(gexec), AstStmt::Delete(_)] = script.stmts.as_slice() else {
+        panic!("{:?}", script.stmts);
+    };
+    assert!(matches!(gexec.query.as_ref(), AstStmt::Select(_)));
+    assert_eq!(text(sql, gexec.command_span), "\\gexec");
+    assert_eq!(
+        text(sql, gexec.span),
+        "SELECT 'DROP TABLE ' || tablename FROM pg_tables"
+    );
+
+    // Formatted, the command keeps its line: what follows stays a statement
+    // of its own.
+    let config = lexega_syntax::FormatterConfig {
+        dialect: postgres(),
+        ..Default::default()
+    };
+    for sql in [
+        "DELETE FROM users \\g\nSELECT 1;",
+        "SELECT 'x' FROM t \\gexec\nDELETE FROM t;",
+        "DELETE FROM users \\g out.txt\nSELECT 1 \\g",
+    ] {
+        let formatted = lexega_syntax::format_sql_with_config(sql, &config).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*pg)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+        let again = lexega_syntax::parse_sql_with_dialect(&formatted, &*pg).expect("parses");
+        assert_eq!(again.stmts.len(), 2, "{formatted}");
+    }
+}
+
+/// Each name PostgreSQL gives a type names the type, and a name of no such
+/// type names none of them; another dialect gives no type other names.
+#[test]
+fn each_name_postgres_gives_a_type_names_that_type() {
+    let pg = postgres();
+    for (words, name) in [
+        ("int", "integer"),
+        ("int4", "integer"),
+        ("integer", "integer"),
+        ("int8", "bigint"),
+        ("varchar", "character varying"),
+        ("character varying", "character varying"),
+        ("bool", "boolean"),
+        ("float8", "double precision"),
+        ("decimal", "numeric"),
+        ("time without time zone", "time"),
+        ("time", "time"),
+        ("timetz", "time with time zone"),
+        ("timestamp without time zone", "timestamp"),
+        ("timestamptz", "timestamp with time zone"),
+        ("varbit", "bit varying"),
+    ] {
+        assert_eq!(pg.type_name(words), Some(name), "{words}");
+    }
+    for words in ["text", "double", "date", "timestamp_ntz", "int4 array"] {
+        assert_eq!(pg.type_name(words), None, "{words}");
+    }
+    assert_eq!(snowflake().type_name("int4"), None);
+}

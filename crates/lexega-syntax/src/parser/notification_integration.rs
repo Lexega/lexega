@@ -33,6 +33,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 impl<'a> Parser<'a> {
     /// Parse `CREATE [OR REPLACE] NOTIFICATION INTEGRATION
@@ -326,27 +327,8 @@ impl<'a> Parser<'a> {
                             .peek_non_trivia()
                             .map(|t| t.span.start)
                             .unwrap_or(tag_span.end);
-                        let mut action_end;
-                        loop {
-                            let _tag_name_span = self.parse_qualified_name_span()?;
-                            let _eq = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
-                            let val = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["value".to_string()])?;
-                            action_end = val.span.end;
-                            if let Some(comma_tok) = self.peek_non_trivia() {
-                                if matches!(
-                                    &comma_tok.kind,
-                                    TokenKind::Punctuation(Punctuation::Comma)
-                                ) {
-                                    self.advance();
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
+                        let (list_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
+                        let action_end = list_span.end;
                         let tags_span = Span {
                             start: tags_start,
                             end: action_end,
@@ -363,6 +345,7 @@ impl<'a> Parser<'a> {
                                 set_span,
                                 tag_span,
                                 tags_span,
+                                tags,
                             },
                         });
                     } else if matches!(prop_tok.kind, TokenKind::Keyword(Keyword::Comment)) {
@@ -455,21 +438,8 @@ impl<'a> Parser<'a> {
                             .peek_non_trivia()
                             .map(|t| t.span.start)
                             .unwrap_or(tag_span.end);
-                        let mut action_end;
-                        loop {
-                            let tag_name_span = self.parse_qualified_name_span()?;
-                            action_end = tag_name_span.end;
-                            if let Some(comma_tok) = self.peek_non_trivia() {
-                                if matches!(
-                                    &comma_tok.kind,
-                                    TokenKind::Punctuation(Punctuation::Comma)
-                                ) {
-                                    self.advance();
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
+                        let (list_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                        let action_end = list_span.end;
                         let tags_span = Span {
                             start: tags_start,
                             end: action_end,
@@ -486,6 +456,7 @@ impl<'a> Parser<'a> {
                                 unset_span,
                                 tag_span,
                                 tags_span,
+                                tags,
                             },
                         });
                     } else if matches!(prop_tok.kind, TokenKind::Keyword(Keyword::Comment)) {
@@ -674,6 +645,7 @@ fn consume_property_value(p: &mut Parser<'_>) -> ParseResult<u32> {
         ));
     };
     if matches!(first.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+        let from = p.idx;
         let lparen = p.advance().expect_invariant("left paren in property value");
         let mut depth = 1;
         let mut last_end = lparen.span.end;
@@ -689,6 +661,8 @@ fn consume_property_value(p: &mut Parser<'_>) -> ParseResult<u32> {
                 break;
             }
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        p.record_unparsed_secrets(from, p.idx);
         Ok(last_end)
     } else {
         let val = p

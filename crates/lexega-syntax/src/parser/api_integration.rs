@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterApiIntegration, SyntaxAlterApiIntegrationAction, SyntaxCreateApiIntegration,
     SyntaxDropApiIntegration,
@@ -326,6 +327,9 @@ impl<'a> Parser<'a> {
                             let _eq = self
                                 .advance()
                                 .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
+                            if let Some(secret) = self.secret_value_at(self.idx) {
+                                self.redaction_spans.push(secret);
+                            }
                             let val = self
                                 .advance()
                                 .ok_or_eof(self.current_span(), vec!["value".to_string()])?;
@@ -575,29 +579,8 @@ impl<'a> Parser<'a> {
                             .peek_non_trivia()
                             .map(|t| t.span.start)
                             .unwrap_or(tag_span.end);
-                        let mut action_end;
-
-                        loop {
-                            let _tag_name_span = self.parse_qualified_name_span()?;
-                            let _eq = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
-                            let val = self
-                                .advance()
-                                .ok_or_eof(self.current_span(), vec!["value".to_string()])?;
-                            action_end = val.span.end;
-
-                            if let Some(comma_tok) = self.peek_non_trivia() {
-                                if matches!(
-                                    &comma_tok.kind,
-                                    TokenKind::Punctuation(Punctuation::Comma)
-                                ) {
-                                    self.advance();
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
+                        let (list_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
+                        let action_end = list_span.end;
 
                         let tags_span = Span {
                             start: tags_start,
@@ -615,6 +598,7 @@ impl<'a> Parser<'a> {
                                 set_span: Some(set_span),
                                 tag_span: Some(tag_span),
                                 tags_span,
+                                tags,
                             },
                         });
                     } else if let TokenKind::Identifier { .. } = prop_tok.kind {
@@ -692,6 +676,12 @@ impl<'a> Parser<'a> {
                             start: value_start,
                             end: value_end,
                         };
+                        if crate::parser::core::is_credential_value_property(&lexeme_upper) {
+                            let idx = self.tokens.partition_point(|t| t.span.start < value_start);
+                            if let Some(secret) = self.secret_value_at(idx) {
+                                self.redaction_spans.push(secret);
+                            }
+                        }
                         let action_end = value_end;
                         let action_span = Span {
                             start: action_start,
@@ -818,23 +808,8 @@ impl<'a> Parser<'a> {
                             .peek_non_trivia()
                             .map(|t| t.span.start)
                             .unwrap_or(tag_span.end);
-                        let mut action_end;
-
-                        loop {
-                            let tag_name_span = self.parse_qualified_name_span()?;
-                            action_end = tag_name_span.end;
-
-                            if let Some(comma_tok) = self.peek_non_trivia() {
-                                if matches!(
-                                    &comma_tok.kind,
-                                    TokenKind::Punctuation(Punctuation::Comma)
-                                ) {
-                                    self.advance();
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
+                        let (list_span, tags) = self.parse_tag_list(TagListShape::Names)?;
+                        let action_end = list_span.end;
 
                         let tags_span = Span {
                             start: tags_start,
@@ -852,6 +827,7 @@ impl<'a> Parser<'a> {
                                 unset_span: Some(unset_span),
                                 tag_span: Some(tag_span),
                                 tags_span,
+                                tags,
                             },
                         });
                     } else if matches!(prop_tok.kind, TokenKind::Keyword(Keyword::Comment)) {

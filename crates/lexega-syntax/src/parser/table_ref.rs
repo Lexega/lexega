@@ -13,10 +13,39 @@
 
 use crate::ast::*;
 use crate::cst::TokenId;
+use crate::dialect::LabelPosition;
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Span, Token, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{NamePosition, Parser};
 use crate::parser::select::InlineFragmentCollection;
+
+/// A Databricks / Spark `LATERAL VIEW [OUTER] generator(...) [table_alias]
+/// [[AS] column [, column]...]` clause, read after its `LATERAL`.
+struct LateralViewClause {
+    outer: bool,
+    call: AstExpr,
+    alias: Option<AstIdentifier>,
+    columns: Option<Vec<AstIdentifier>>,
+    end: u32,
+}
+
+/// A declared-column list read through its `)` ([`Parser::read_column_list`]).
+pub(crate) enum ColumnList {
+    /// Every column, a nested list's in its place.
+    Declared(Vec<AstTableFunctionColumn>),
+    /// A list holding a column written in a grammar not read.
+    Unread,
+}
+
+impl ColumnList {
+    /// The columns, where every one was read.
+    pub(crate) fn declared(self) -> Option<Vec<AstTableFunctionColumn>> {
+        match self {
+            ColumnList::Declared(columns) => Some(columns),
+            ColumnList::Unread => None,
+        }
+    }
+}
 
 /// Result of parsing an alias with optional column list for VALUES clause
 struct ValuesAliasWithColumns {
@@ -49,6 +78,7 @@ fn is_table_clause_keyword(lexeme: &str) -> bool {
         || lexeme.eq_ignore_ascii_case("FULL")
         || lexeme.eq_ignore_ascii_case("CROSS")
         || lexeme.eq_ignore_ascii_case("NATURAL")
+        || lexeme.eq_ignore_ascii_case("USING") // a join's constraint
         || lexeme.eq_ignore_ascii_case("MATCH_RECOGNIZE")
         || lexeme.eq_ignore_ascii_case("PIVOT")
         || lexeme.eq_ignore_ascii_case("UNPIVOT")
@@ -113,6 +143,51 @@ fn classify_simple_table_hint_keyword(lexeme: &str) -> crate::ast::AstTableHintK
     }
 }
 
+/// Whether T-SQL takes the hint `kind` in a list written without `WITH`,
+/// alone in parentheses after a table in `FROM` ("Table Hints
+/// (Transact-SQL)": `FROM t (NOLOCK)`).
+fn hint_written_without_with(kind: &crate::ast::AstTableHintKind) -> bool {
+    use crate::ast::AstTableHintKind as K;
+    match kind {
+        K::NoLock
+        | K::ReadUncommitted
+        | K::UpdLock
+        | K::RepeatableRead
+        | K::Serializable
+        | K::ReadCommitted
+        | K::TabLock
+        | K::TabLockX
+        | K::PagLock
+        | K::RowLock
+        | K::NoWait
+        | K::ReadPast
+        | K::XLock
+        | K::Snapshot
+        | K::NoExpand => true,
+        K::ReadCommittedLock
+        | K::HoldLock
+        | K::ForceScan
+        | K::KeepIdentity
+        | K::KeepDefaults
+        | K::IgnoreConstraints
+        | K::IgnoreTriggers
+        | K::OtherSimple
+        | K::Index { .. }
+        | K::ForceSeek { .. }
+        | K::SpatialWindowMaxCells { .. } => false,
+    }
+}
+
+/// How a T-SQL table hint list may be introduced where it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HintIntroducer {
+    /// `WITH (…)` only: a DML target.
+    With,
+    /// `WITH (…)`, or the hints T-SQL takes without it alone in
+    /// parentheses: a table in `FROM`.
+    WithOrParentheses,
+}
+
 /// Check if a lexeme is a table-specific clause keyword (SAMPLE, AT, CHANGES, etc.)
 #[inline]
 fn is_table_specific_clause(lexeme: &str) -> bool {
@@ -127,9 +202,10 @@ fn is_table_specific_clause(lexeme: &str) -> bool {
 }
 
 // Implementation methods will be added here via:
-/// A second alias after PIVOT / UNPIVOT / MATCH_RECOGNIZE: the alias, its
-/// `AS` token, the column list, and the list's parentheses.
-type SecondAliasWithColumns = (
+/// An alias with its column list (a derived table's, or a second alias
+/// after PIVOT / UNPIVOT / MATCH_RECOGNIZE): the alias, its `AS` token, the
+/// column list, and the list's parentheses.
+pub(crate) type SecondAliasWithColumns = (
     Option<AstIdentifier>,
     Option<TokenId>,
     Option<Vec<AstIdentifier>>,
@@ -150,40 +226,14 @@ type JoinModifiers = (
 );
 
 impl<'a> Parser<'a> {
-    /// Parse Databricks/Spark-style lateral view generator syntax:
-    /// LATERAL VIEW [OUTER] generator_fn(...) [table_alias] [AS col_alias[, ...]]
+    /// Parse Databricks/Spark-style lateral view generator syntax written as
+    /// a FROM item after a comma:
+    /// LATERAL VIEW [OUTER] generator_fn(...) [table_alias] [AS col_alias]
     fn parse_lateral_view_factor(
         &mut self,
         lateral_start: u32,
     ) -> ParseResult<Option<Box<AstTableRef>>> {
-        let view_tok = self.peek().ok_or_else(|| {
-            ParseError::new(
-                self.current_span(),
-                ParseErrorKind::InvalidSyntax {
-                    message: "Expected VIEW after LATERAL".to_string(),
-                },
-            )
-        })?;
-
-        if !matches!(view_tok.kind, TokenKind::Keyword(Keyword::View)) {
-            return Err(ParseError::new(
-                view_tok.span,
-                ParseErrorKind::InvalidSyntax {
-                    message: "Expected VIEW after LATERAL".to_string(),
-                },
-            ));
-        }
-        self.advance(); // consume VIEW
-
-        // Optional OUTER keyword
-        if let Some(tok) = self.peek() {
-            if matches!(tok.kind, TokenKind::Keyword(Keyword::Outer)) {
-                self.advance(); // consume OUTER
-            }
-        }
-
-        // Generator function call (e.g., explode(...), posexplode(...), inline(...))
-        let table_func = self.parse_expr_with_recovery()?;
+        let (_, table_func) = self.parse_lateral_view_generator()?;
         let mut name_end = table_func.span().end;
 
         // Optional table alias (e.g., exploded)
@@ -212,6 +262,7 @@ impl<'a> Parser<'a> {
         let match_recognize = None;
 
         let name = AstObjectRef {
+            name_kind: crate::ast::AstTableNameKind::Catalog,
             node_id: self.id_gen.next(),
             span: Span {
                 start: lateral_start,
@@ -284,6 +335,140 @@ impl<'a> Parser<'a> {
         ))))
     }
 
+    /// The generator of a `LATERAL VIEW` clause after a FROM item, as a
+    /// table-function source: its alias names the table and its columns
+    /// the call's columns.
+    fn lateral_view_table_ref(&mut self, clause: LateralViewClause) -> Box<AstTableRef> {
+        let call_span = clause.call.span();
+        let name = AstObjectRef {
+            name_kind: crate::ast::AstTableNameKind::Catalog,
+            node_id: self.id_gen.next(),
+            span: call_span,
+            // A generator call: not a dotted identifier.
+            parts: None,
+            identifier_arg: None,
+        };
+        Box::new(crate::parser::sql_stmt::build_table_ref(
+            self.id_gen.next(),
+            Span {
+                start: call_span.start,
+                end: clause.end,
+            },
+            name,
+            clause.alias,
+            clause.columns,
+            None, // result_alias
+            None, // result_alias_columns
+            None, // subquery
+            None, // subquery_lparen_span
+            None, // subquery_rparen_span
+            None, // values
+            None, // lateral keyword span
+            None, // time_travel
+            None, // sample
+            None, // changes
+            None, // stage_options
+            Some(Box::new(clause.call)),
+            None, // with_offset
+            None, // pivot
+            None, // unpivot
+            None, // match_recognize
+            None, // table_hints
+            None, // syntax_id
+        ))
+    }
+
+    /// The rest of a `LATERAL VIEW` clause after its `LATERAL`: `VIEW
+    /// [OUTER] generator(...) [table_alias] [[AS] column [, column]...]`.
+    /// A name before `AS` or before the columns is the table alias.
+    fn parse_lateral_view_clause(&mut self) -> ParseResult<LateralViewClause> {
+        let (outer, call) = self.parse_lateral_view_generator()?;
+        let mut end = call.span().end;
+
+        // The table alias: a bare name, never one after `AS`.
+        let as_next = self
+            .peek()
+            .is_some_and(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::As)));
+        let alias = match as_next {
+            true => None,
+            false => self.parse_simple_alias_with_as().map(|(alias, _)| alias),
+        };
+        if let Some(alias) = &alias {
+            end = alias.span.end;
+        }
+
+        // The column aliases, with or without `AS`.
+        let columns = match self.parse_simple_alias_with_as() {
+            Some((first, _)) => {
+                end = first.span.end;
+                let mut columns = vec![first];
+                while let Some(comma) = self.peek() {
+                    if !matches!(
+                        comma.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                    ) || !self
+                        .can_be_label(self.idx + 1, LabelPosition::ColumnLabel { after_as: true })
+                    {
+                        break;
+                    }
+                    self.advance(); // consume ','
+                    let column = self.advance().expect_invariant("column alias after peek");
+                    end = column.span.end;
+                    columns.push(AstIdentifier {
+                        node_id: self.id_gen.next(),
+                        span: column.span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
+                    });
+                }
+                Some(columns)
+            }
+            None => None,
+        };
+
+        Ok(LateralViewClause {
+            outer,
+            call,
+            alias,
+            columns,
+            end,
+        })
+    }
+
+    /// `VIEW [OUTER] generator(...)` after a `LATERAL`: whether `OUTER` is
+    /// written, and the call.
+    fn parse_lateral_view_generator(&mut self) -> ParseResult<(bool, AstExpr)> {
+        let view_tok = self.peek().ok_or_else(|| {
+            ParseError::new(
+                self.current_span(),
+                ParseErrorKind::InvalidSyntax {
+                    message: "Expected VIEW after LATERAL".to_string(),
+                },
+            )
+        })?;
+
+        if !matches!(view_tok.kind, TokenKind::Keyword(Keyword::View)) {
+            return Err(ParseError::new(
+                view_tok.span,
+                ParseErrorKind::InvalidSyntax {
+                    message: "Expected VIEW after LATERAL".to_string(),
+                },
+            ));
+        }
+        self.advance(); // consume VIEW
+
+        let outer = self
+            .peek()
+            .is_some_and(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::Outer)));
+        if outer {
+            self.advance(); // consume OUTER
+        }
+
+        // Generator function call (e.g., explode(...), posexplode(...), inline(...))
+        let call = self.parse_expr_with_recovery()?;
+        Ok((outer, call))
+    }
+
     /// Parse optional second alias with optional column list: [AS] alias [(col1, col2, ...)]
     /// Used after PIVOT/UNPIVOT clauses which can have column renames
     fn parse_optional_second_alias_with_columns(&mut self) -> SecondAliasWithColumns {
@@ -300,75 +485,61 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume AS
             }
 
-            // Check for identifier (after AS or standalone)
-            if let Some(alias_tok) = self.peek() {
-                if self.can_be_alias_token(alias_tok)
-                    && !self.is_databricks_time_travel_ahead()
-                    && !self.should_stop_scan_at_statement_start(alias_tok)
-                {
-                    let alias_lexeme = alias_tok.lexeme(self.source);
-                    let is_clause_keyword = is_table_clause_keyword(alias_lexeme)
-                        || self.dialect.is_clause_boundary_keyword(alias_lexeme);
-                    let is_match_condition_call = alias_tok
-                        .lexeme(self.source)
-                        .eq_ignore_ascii_case("MATCH_CONDITION")
-                        && self.peek_ahead(1).is_some_and(|tok| {
-                            matches!(
-                                tok.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                            )
-                        });
+            // The alias (after AS or standalone)
+            let position = LabelPosition::TableAlias {
+                after_as: second_as_token.is_some(),
+            };
+            if self.can_be_label(self.idx, position) {
+                let alias_tok = self.advance().expect_invariant("alias token");
+                second_alias = Some(AstIdentifier {
+                    node_id: self.id_gen.next(),
+                    span: alias_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
+                });
 
-                    if !is_clause_keyword && !is_match_condition_call {
-                        let alias_tok = self.advance().expect_invariant("alias token");
-                        second_alias = Some(AstIdentifier {
-                            node_id: self.id_gen.next(),
-                            span: alias_tok.span,
-                        });
+                // Parse optional column list after alias: (col1, col2, ...)
+                // This is used for PIVOT ... AS p (col1, col2, col3, ...)
+                if let Some(lparen) = self.peek() {
+                    if matches!(
+                        lparen.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                    ) {
+                        columns_lparen = Some(self.current_token_id());
+                        self.advance(); // consume '('
+                        let mut columns = Vec::new();
 
-                        // Parse optional column list after alias: (col1, col2, ...)
-                        // This is used for PIVOT ... AS p (col1, col2, col3, ...)
-                        if let Some(lparen) = self.peek() {
+                        while let Some(col_tok) = self.peek() {
                             if matches!(
-                                lparen.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                                col_tok.kind,
+                                TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
                             ) {
-                                columns_lparen = Some(self.current_token_id());
-                                self.advance(); // consume '('
-                                let mut columns = Vec::new();
-
-                                while let Some(col_tok) = self.peek() {
-                                    if matches!(
-                                        col_tok.kind,
-                                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                                    ) {
-                                        columns_rparen = Some(self.current_token_id());
-                                        self.advance(); // consume ')' - end of list
-                                        break;
-                                    }
-                                    if matches!(
-                                        col_tok.kind,
-                                        TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                                    ) {
-                                        self.advance(); // consume ','
-                                        continue;
-                                    }
-                                    if self.can_be_identifier_token(col_tok) {
-                                        let col_tok =
-                                            self.advance().expect_invariant("column token");
-                                        columns.push(AstIdentifier {
-                                            node_id: self.id_gen.next(),
-                                            span: col_tok.span,
-                                        });
-                                    } else {
-                                        break; // unexpected token
-                                    }
-                                }
-
-                                if !columns.is_empty() {
-                                    alias_columns = Some(columns);
-                                }
+                                columns_rparen = Some(self.current_token_id());
+                                self.advance(); // consume ')' - end of list
+                                break;
                             }
+                            if matches!(
+                                col_tok.kind,
+                                TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                            ) {
+                                self.advance(); // consume ','
+                                continue;
+                            }
+                            if self.can_be_identifier_token(col_tok) {
+                                let col_tok = self.advance().expect_invariant("column token");
+                                columns.push(AstIdentifier {
+                                    node_id: self.id_gen.next(),
+                                    span: col_tok.span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
+                                });
+                            } else {
+                                break; // unexpected token
+                            }
+                        }
+
+                        if !columns.is_empty() {
+                            alias_columns = Some(columns);
                         }
                     }
                 }
@@ -401,60 +572,59 @@ impl<'a> Parser<'a> {
         }
 
         // Check for alias identifier
-        if let Some(alias_tok) = self.peek() {
-            if self.can_be_alias_token(alias_tok)
-                && !self.is_databricks_time_travel_ahead()
-                && !self.should_stop_scan_at_statement_start(alias_tok)
-            {
-                let is_clause_keyword = is_table_clause_keyword(alias_tok.lexeme(self.source));
-                if !is_clause_keyword {
-                    let alias_tok = self.advance().expect_invariant("alias token");
-                    alias = Some(AstIdentifier {
-                        node_id: self.id_gen.next(),
-                        span: alias_tok.span,
-                    });
+        let position = LabelPosition::TableAlias {
+            after_as: as_token.is_some(),
+        };
+        if self.can_be_label(self.idx, position) {
+            let alias_tok = self.advance().expect_invariant("alias token");
+            alias = Some(AstIdentifier {
+                node_id: self.id_gen.next(),
+                span: alias_tok.span,
+                kind: crate::ast::AstIdentifierKind::Name,
+                templated: None,
+            });
 
-                    // Parse optional column list: (col1, col2, ...)
-                    if let Some(lparen) = self.peek() {
+            // Parse optional column list: (col1, col2, ...)
+            if let Some(lparen) = self.peek() {
+                if matches!(
+                    lparen.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                ) {
+                    self.advance(); // consume '('
+                    lparen_id = Some(self.last_token_id());
+                    let mut col_list = Vec::new();
+
+                    while let Some(col_tok) = self.peek() {
                         if matches!(
-                            lparen.kind,
-                            TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                            col_tok.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
                         ) {
-                            self.advance(); // consume '('
-                            lparen_id = Some(self.last_token_id());
-                            let mut col_list = Vec::new();
-
-                            while let Some(col_tok) = self.peek() {
-                                if matches!(
-                                    col_tok.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                                ) {
-                                    self.advance(); // consume ')'
-                                    rparen_id = Some(self.last_token_id());
-                                    break;
-                                }
-                                if matches!(
-                                    col_tok.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                                ) {
-                                    self.advance(); // consume ','
-                                    continue;
-                                }
-                                if self.can_be_identifier_token(col_tok) {
-                                    let col_tok = self.advance().expect_invariant("column token");
-                                    col_list.push(AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: col_tok.span,
-                                    });
-                                } else {
-                                    break; // unexpected token
-                                }
-                            }
-
-                            if !col_list.is_empty() {
-                                columns = Some(col_list);
-                            }
+                            self.advance(); // consume ')'
+                            rparen_id = Some(self.last_token_id());
+                            break;
                         }
+                        if matches!(
+                            col_tok.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                        ) {
+                            self.advance(); // consume ','
+                            continue;
+                        }
+                        if self.can_be_identifier_token(col_tok) {
+                            let col_tok = self.advance().expect_invariant("column token");
+                            col_list.push(AstIdentifier {
+                                node_id: self.id_gen.next(),
+                                span: col_tok.span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
+                            });
+                        } else {
+                            break; // unexpected token
+                        }
+                    }
+
+                    if !col_list.is_empty() {
+                        columns = Some(col_list);
                     }
                 }
             }
@@ -479,11 +649,46 @@ impl<'a> Parser<'a> {
         self.tokens.get(pos)
     }
 
-    /// Check if the current position has a Databricks time travel pattern:
+    /// Whether a clause of the table reference, or the clause after it,
+    /// starts at token `at`, where a table's alias written without `AS`
+    /// would be: a query or table clause keyword, the dialect's clause
+    /// boundary, a table clause with its parenthesised part (`AT (…)`,
+    /// `SAMPLE BERNOULLI (…)`, `UNPIVOT INCLUDE NULLS (…)`),
+    /// `MATCH_CONDITION (…)`, Databricks time travel, or a join.
+    pub(crate) fn starts_table_clause_at(&self, at: usize) -> bool {
+        let Some(tok) = self.tokens.get(at) else {
+            return false;
+        };
+        let lexeme = tok.lexeme(self.source);
+        let paren_at = |i: usize| {
+            self.tokens.get(i).is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                )
+            })
+        };
+        let word_at = |i: usize| {
+            self.tokens.get(i).is_some_and(|t| {
+                matches!(t.kind, TokenKind::Identifier { .. } | TokenKind::Keyword(_))
+            })
+        };
+        let table_clause = is_table_specific_clause(lexeme)
+            && (paren_at(at + 1)
+                || (word_at(at + 1) && paren_at(at + 2))
+                || (word_at(at + 1) && word_at(at + 2) && paren_at(at + 3)));
+        is_table_clause_keyword(lexeme)
+            || table_clause
+            || self.dialect.is_clause_boundary_keyword(lexeme)
+            || (lexeme.eq_ignore_ascii_case("MATCH_CONDITION") && paren_at(at + 1))
+            || self.is_databricks_time_travel_at(at)
+            || self.is_join_or_clause_keyword_at(at)
+    }
+
+    /// Whether token `at` starts a Databricks time travel pattern:
     ///   TIMESTAMP AS OF ... | VERSION AS OF ...
-    /// Used to prevent alias parsing from consuming VERSION/TIMESTAMP.
-    fn is_databricks_time_travel_ahead(&self) -> bool {
-        let tok = match self.peek() {
+    fn is_databricks_time_travel_at(&self, at: usize) -> bool {
+        let tok = match self.tokens.get(at) {
             Some(t) => t,
             None => return false,
         };
@@ -493,7 +698,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         // Second token must be AS
-        if let Some(as_tok) = self.peek_ahead(1) {
+        if let Some(as_tok) = self.tokens.get(at + 1) {
             if !matches!(as_tok.kind, TokenKind::Keyword(Keyword::As)) {
                 return false;
             }
@@ -501,17 +706,17 @@ impl<'a> Parser<'a> {
             return false;
         }
         // Third token must be OF
-        if let Some(of_tok) = self.peek_ahead(2) {
+        if let Some(of_tok) = self.tokens.get(at + 2) {
             matches!(of_tok.kind, TokenKind::Keyword(Keyword::Of))
         } else {
             false
         }
     }
 
-    /// Check if a keyword at current position starts a join or clause pattern
+    /// Check if the keyword at token `at` starts a join or clause pattern
     /// Returns true if the keyword cannot be used as an identifier in this context
-    fn is_join_or_clause_keyword(&self) -> bool {
-        let tok = match self.peek() {
+    fn is_join_or_clause_keyword_at(&self, at: usize) -> bool {
+        let tok = match self.tokens.get(at) {
             Some(t) => t,
             None => return false,
         };
@@ -551,21 +756,24 @@ impl<'a> Parser<'a> {
         match kw {
             Keyword::Directed => {
                 // DIRECTED JOIN vs AS directed
-                self.peek_ahead(1)
+                self.tokens
+                    .get(at + 1)
                     .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                     .unwrap_or(false)
             }
 
             Keyword::Connect => {
                 // CONNECT BY vs AS connect
-                self.peek_ahead(1)
+                self.tokens
+                    .get(at + 1)
                     .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::By)))
                     .unwrap_or(false)
             }
 
             Keyword::Start => {
                 // START WITH vs AS start
-                self.peek_ahead(1)
+                self.tokens
+                    .get(at + 1)
                     .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::With)))
                     .unwrap_or(false)
             }
@@ -576,29 +784,30 @@ impl<'a> Parser<'a> {
             | Keyword::Right
             | Keyword::Full
             | Keyword::Cross
-            | Keyword::Outer => self.lookahead_join_pattern(),
+            | Keyword::Outer => self.lookahead_join_pattern_at(at),
 
             // ASOF is a standalone join type, cannot be combined with LEFT/RIGHT/FULL
             Keyword::Asof => self
-                .peek_ahead(1)
+                .tokens
+                .get(at + 1)
                 .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                 .unwrap_or(false),
 
-            Keyword::Natural => self.lookahead_natural_join_pattern(),
+            Keyword::Natural => self.lookahead_natural_join_pattern_at(at),
 
             _ => false,
         }
     }
 
-    /// Check if current position starts a join pattern like "LEFT JOIN", "LEFT OUTER JOIN", or "LEFT DIRECTED JOIN"
-    /// Assumes current token is a join type keyword (INNER, LEFT, RIGHT, FULL, CROSS)
-    fn lookahead_join_pattern(&self) -> bool {
-        let first = match self.peek() {
+    /// Check if token `at` starts a join pattern like "LEFT JOIN", "LEFT OUTER JOIN", or "LEFT DIRECTED JOIN"
+    /// Assumes the token is a join type keyword (INNER, LEFT, RIGHT, FULL, CROSS)
+    fn lookahead_join_pattern_at(&self, at: usize) -> bool {
+        let first = match self.tokens.get(at) {
             Some(t) => t,
             None => return false,
         };
 
-        let next = match self.peek_ahead(1) {
+        let next = match self.tokens.get(at + 1) {
             Some(t) => t,
             None => return false,
         };
@@ -613,19 +822,34 @@ impl<'a> Parser<'a> {
             );
         }
 
+        // T-SQL `INNER HASH JOIN`, `LEFT OUTER LOOP JOIN`.
+        let hinted = matches!(
+            first.kind,
+            TokenKind::Keyword(Keyword::Inner | Keyword::Left | Keyword::Right | Keyword::Full)
+        );
+        let hint_at = match matches!(next.kind, TokenKind::Keyword(Keyword::Outer)) {
+            true => at + 2,
+            false => at + 1,
+        };
+        if hinted && self.join_hint_at(hint_at).is_some() {
+            return true;
+        }
+
         match &next.kind {
             // Direct patterns: LEFT JOIN, INNER JOIN, etc.
             TokenKind::Keyword(Keyword::Join) => true,
 
             // LEFT DIRECTED JOIN
             TokenKind::Keyword(Keyword::Directed) => self
-                .peek_ahead(2)
+                .tokens
+                .get(at + 2)
                 .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                 .unwrap_or(false),
 
             // LEFT OUTER JOIN
             TokenKind::Keyword(Keyword::Outer) => self
-                .peek_ahead(2)
+                .tokens
+                .get(at + 2)
                 .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                 .unwrap_or(false),
 
@@ -633,10 +857,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check if current NATURAL keyword starts a join pattern
+    /// Check if the NATURAL keyword at token `at` starts a join pattern
     /// Handles: NATURAL JOIN, NATURAL INNER/CROSS JOIN, NATURAL LEFT/RIGHT/FULL [OUTER/ASOF] JOIN
-    fn lookahead_natural_join_pattern(&self) -> bool {
-        let next = match self.peek_ahead(1) {
+    fn lookahead_natural_join_pattern_at(&self, at: usize) -> bool {
+        let next = match self.tokens.get(at + 1) {
             Some(t) => t,
             None => return false,
         };
@@ -647,13 +871,14 @@ impl<'a> Parser<'a> {
 
             // NATURAL INNER JOIN, NATURAL CROSS JOIN
             TokenKind::Keyword(Keyword::Inner | Keyword::Cross) => self
-                .peek_ahead(2)
+                .tokens
+                .get(at + 2)
                 .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                 .unwrap_or(false),
 
             // NATURAL LEFT/RIGHT/FULL [OUTER/ASOF] JOIN
             TokenKind::Keyword(Keyword::Left | Keyword::Right | Keyword::Full) => {
-                let tok_2 = match self.peek_ahead(2) {
+                let tok_2 = match self.tokens.get(at + 2) {
                     Some(t) => t,
                     None => return false,
                 };
@@ -664,7 +889,8 @@ impl<'a> Parser<'a> {
 
                     // NATURAL LEFT OUTER JOIN
                     TokenKind::Keyword(Keyword::Outer) => self
-                        .peek_ahead(3)
+                        .tokens
+                        .get(at + 3)
                         .map(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)))
                         .unwrap_or(false),
 
@@ -689,6 +915,7 @@ impl<'a> Parser<'a> {
 
         // Name span covers the call expression itself.
         let name = AstObjectRef {
+            name_kind: crate::ast::AstTableNameKind::Catalog,
             node_id: self.id_gen.next(),
             span: Span {
                 start: start_pos,
@@ -741,7 +968,16 @@ impl<'a> Parser<'a> {
         let name_span_end = name.span.end;
 
         // Parse optional TVF schema clause: OPENJSON(...) WITH (colName type [path], ...)
-        let tvf_schema_span = self.try_parse_tvf_with_clause();
+        let tvf_schema = self.try_parse_tvf_with_clause();
+        let tvf_schema_span = tvf_schema.as_ref().map(|(span, _)| *span);
+        let mut table_function_columns = match tvf_schema {
+            Some((_, columns)) => columns.declared(),
+            None => self.columns_read_with_call(func_expr_opt.as_deref()),
+        }
+        .map(Box::new);
+        // PostgreSQL `WITH ORDINALITY`.
+        let with_ordinality_span = self.parse_with_ordinality();
+        let mut column_definitions_span = None;
 
         // Parse optional alias with AS token tracking
         let (alias, as_token) = self
@@ -761,6 +997,7 @@ impl<'a> Parser<'a> {
                     lparen.kind,
                     TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                 ) {
+                    let lparen_idx = self.idx;
                     alias_columns_lparen = Some(self.current_token_id());
                     self.advance(); // consume '('
                     let mut columns = Vec::new();
@@ -783,10 +1020,34 @@ impl<'a> Parser<'a> {
                             continue;
                         }
                         if self.can_be_identifier_token(col_tok) {
+                            // An item that is more than a name (`a int`, PostgreSQL's
+                            // column definition list) is no alias column: the list is
+                            // left unread from its `(`.
+                            let item_ends = self.peek_ahead(1).is_some_and(|next| {
+                                matches!(
+                                    next.kind,
+                                    TokenKind::Punctuation(
+                                        crate::lexer::Punctuation::Comma
+                                            | crate::lexer::Punctuation::RParen
+                                    )
+                                )
+                            });
+                            if !item_ends {
+                                self.idx = lparen_idx;
+                                alias_columns_lparen = None;
+                                columns.clear();
+                                if let Some((defined, span)) = self.parse_column_definition_list() {
+                                    table_function_columns = Some(Box::new(defined));
+                                    column_definitions_span = Some(span);
+                                }
+                                break;
+                            }
                             let col_tok = self.advance().expect_invariant("column token");
                             columns.push(AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: col_tok.span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             });
                         } else {
                             break; // unexpected token
@@ -848,7 +1109,9 @@ impl<'a> Parser<'a> {
             .or_else(|| changes.as_deref().map(|c| c.span.end))
             .or_else(|| with_offset.as_ref().map(|wo| wo.span.end))
             .or(alias_columns_end)
+            .or_else(|| column_definitions_span.map(|s| s.end))
             .or_else(|| alias.as_ref().map(|a| a.span.end))
+            .or_else(|| with_ordinality_span.map(|s| s.end))
             .or_else(|| tvf_schema_span.map(|s| s.end))
             .unwrap_or(name_span_end);
         let complete_span = Span {
@@ -900,7 +1163,90 @@ impl<'a> Parser<'a> {
             syntax_id,
         );
         table_ref.tvf_schema_span = tvf_schema_span;
+        table_ref.table_function_columns = table_function_columns;
+        table_ref.column_definitions_span = column_definitions_span;
+        table_ref.with_ordinality_span = with_ordinality_span;
         Ok(Some(Box::new(table_ref)))
+    }
+
+    /// `WITH ORDINALITY` at the current token, consumed; `None`, consuming
+    /// nothing, elsewhere.
+    fn parse_with_ordinality(&mut self) -> Option<Span> {
+        let with = self
+            .peek()
+            .filter(|t| matches!(t.kind, TokenKind::Keyword(Keyword::With)))?;
+        if !self.is_word(self.peek_ahead(1), "ORDINALITY") {
+            return None;
+        }
+        self.advance();
+        let ordinality = self.advance()?;
+        Some(Span {
+            start: with.span.start,
+            end: ordinality.span.end,
+        })
+    }
+
+    /// A column-definition list `( name type [, …] )` from the `(` at the
+    /// current token through its `)`: the columns a table function yields,
+    /// each with its type, and the list's span. `None`, consuming nothing,
+    /// where that is not written.
+    fn parse_column_definition_list(
+        &mut self,
+    ) -> Option<(Vec<crate::ast::AstTableFunctionColumn>, Span)> {
+        let (from, errors) = (self.idx, self.recovery_errors.len());
+        let read = self.read_column_definition_list();
+        if read.is_none() {
+            self.idx = from;
+            self.recovery_errors.truncate(errors);
+        }
+        read
+    }
+
+    fn read_column_definition_list(
+        &mut self,
+    ) -> Option<(Vec<crate::ast::AstTableFunctionColumn>, Span)> {
+        let open = self.peek().filter(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+            )
+        })?;
+        self.advance();
+        let mut columns = Vec::new();
+        loop {
+            let name = self.peek().filter(|t| self.can_be_identifier_token(t))?;
+            self.advance();
+            let data_type = self.parse_data_type()?.ok()?;
+            let end = self.tokens.get(self.idx.checked_sub(1)?)?.span.end;
+            columns.push(crate::ast::AstTableFunctionColumn {
+                name: AstIdentifier {
+                    node_id: self.id_gen.next(),
+                    span: name.span,
+                    kind: crate::ast::AstIdentifierKind::of(&name.kind),
+                    templated: None,
+                },
+                kind: crate::ast::AstTableFunctionColumnKind::Value {
+                    data_type,
+                    path: None,
+                },
+                span: Span {
+                    start: name.span.start,
+                    end,
+                },
+            });
+            let next = self.advance()?;
+            match next.kind {
+                TokenKind::Punctuation(crate::lexer::Punctuation::Comma) => {}
+                TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
+                    let span = Span {
+                        start: open.span.start,
+                        end: next.span.end,
+                    };
+                    return Some((columns, span));
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Parse simple alias with AS token tracking: [AS] identifier
@@ -910,36 +1256,24 @@ impl<'a> Parser<'a> {
         if let Some(next_tok) = self.peek() {
             match &next_tok.kind {
                 TokenKind::Keyword(Keyword::As) => {
-                    if let Some(alias_tok) = self.peek_ahead(1) {
-                        if self.can_be_alias_token(alias_tok) {
-                            let as_token_id = self.current_token_id();
-                            self.advance()?; // consume AS
-                            let alias_tok = self.advance()?;
-                            return Some((
-                                AstIdentifier {
-                                    node_id: self.id_gen.next(),
-                                    span: alias_tok.span,
-                                },
-                                Some(as_token_id),
-                            ));
-                        }
+                    if self.can_be_label(self.idx + 1, LabelPosition::TableAlias { after_as: true })
+                    {
+                        let as_token_id = self.current_token_id();
+                        self.advance()?; // consume AS
+                        let alias_tok = self.advance()?;
+                        return Some((
+                            AstIdentifier {
+                                node_id: self.id_gen.next(),
+                                span: alias_tok.span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
+                            },
+                            Some(as_token_id),
+                        ));
                     }
                 }
                 TokenKind::Identifier { .. } => {
-                    if self.should_stop_scan_at_statement_start(next_tok) {
-                        return None;
-                    }
-
-                    // Check if this identifier is a clause boundary keyword (e.g. WINDOW in PG)
-                    let lexeme = next_tok.lexeme(self.source);
-                    if is_table_clause_keyword(lexeme)
-                        || is_table_specific_clause(lexeme)
-                        || self.dialect.is_clause_boundary_keyword(lexeme)
-                    {
-                        return None;
-                    }
-                    // Databricks: don't consume VERSION/TIMESTAMP as alias if followed by AS OF
-                    if self.is_databricks_time_travel_ahead() {
+                    if !self.can_be_label(self.idx, LabelPosition::TableAlias { after_as: false }) {
                         return None;
                     }
                     let alias_tok = self.advance()?;
@@ -947,6 +1281,8 @@ impl<'a> Parser<'a> {
                         AstIdentifier {
                             node_id: self.id_gen.next(),
                             span: alias_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
                         },
                         None, // No AS keyword
                     ));
@@ -959,8 +1295,8 @@ impl<'a> Parser<'a> {
 
     /// Parse optional TVF schema clause: `WITH (colName type [path] [AS JSON], ...)`.
     /// Used by OPENJSON, OPENXML, OPENROWSET and similar T-SQL table-valued functions.
-    /// Returns the span covering `WITH (...)` if found, None otherwise.
-    fn try_parse_tvf_with_clause(&mut self) -> Option<Span> {
+    /// Returns the span covering `WITH (...)` and its columns if found, None otherwise.
+    fn try_parse_tvf_with_clause(&mut self) -> Option<(Span, ColumnList)> {
         // Must see WITH followed by ( (not WITH OFFSET, not WITH identifier)
         let tok = self.peek()?;
         if !matches!(tok.kind, TokenKind::Keyword(Keyword::With)) {
@@ -973,34 +1309,249 @@ impl<'a> Parser<'a> {
         ) {
             return None;
         }
-
-        // Consume WITH
-        let with_tok = self.advance()?;
-        let start = with_tok.span.start;
-
-        // Consume balanced (...)
-        let _lparen = self.advance()?; // consume (
-        let mut depth: u32 = 1;
-        let mut end = _lparen.span.end;
-
-        while depth > 0 {
-            let tok = self.advance()?;
-            match tok.kind {
-                TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
-                TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = tok.span.end;
-                    }
-                }
-                TokenKind::Eof => return None,
-                _ => {}
-            }
-        }
-
-        Some(Span { start, end })
+        let start = self.advance()?.span.start;
+        let columns = self.read_column_list()?;
+        let end = self.consumed_end()?;
+        Some((Span { start, end }, columns))
     }
 
+    /// The columns the call `call` declares in a clause read with it: a
+    /// `WITH (…)` schema an expression read after it
+    /// (`AstExpr::TvfWithSchema`), else a `COLUMNS (…)` argument.
+    fn columns_read_with_call(
+        &mut self,
+        call: Option<&AstExpr>,
+    ) -> Option<Vec<crate::ast::AstTableFunctionColumn>> {
+        let call = call?;
+        if let AstExpr::TvfWithSchema {
+            with_schema_span, ..
+        } = call
+        {
+            return self.declared_columns.remove(with_schema_span);
+        }
+        let AstExpr::FunctionCall { args, .. } = call else {
+            return None;
+        };
+        args.iter().find_map(|arg| match arg.as_ref() {
+            crate::ast::AstFunctionArg::Unparsed { span } => self.declared_columns.remove(span),
+            crate::ast::AstFunctionArg::Positional(_)
+            | crate::ast::AstFunctionArg::Named { .. }
+            | crate::ast::AstFunctionArg::Lambda { .. }
+            | crate::ast::AstFunctionArg::AliasedArg { .. }
+            | crate::ast::AstFunctionArg::BulkArg { .. }
+            | crate::ast::AstFunctionArg::Table { .. }
+            | crate::ast::AstFunctionArg::DataType { .. }
+            | crate::ast::AstFunctionArg::NonValue { .. }
+            | crate::ast::AstFunctionArg::Introduced { .. } => None,
+        })
+    }
+
+    /// Where the last token read ends.
+    pub(crate) fn consumed_end(&self) -> Option<u32> {
+        self.idx
+            .checked_sub(1)
+            .and_then(|last| self.tokens.get(last))
+            .map(|last| last.span.end)
+    }
+
+    /// Whether the token `tok` is the word `word`, keyword or name.
+    pub(crate) fn is_word(&self, tok: Option<&Token>, word: &str) -> bool {
+        tok.is_some_and(|t| {
+            matches!(t.kind, TokenKind::Keyword(_) | TokenKind::Identifier { .. })
+                && t.lexeme(self.source).eq_ignore_ascii_case(word)
+        })
+    }
+
+    /// A declared-column list `( column [, …] )`, read once from its `(`,
+    /// the current token, through its `)`: each column `name FOR
+    /// ORDINALITY`, `name type [FORMAT JSON | EXISTS] [PATH] [path] [AS
+    /// JSON] [on empty / error]`, or `NESTED [PATH] path [AS name] COLUMNS (
+    /// … )`, whose columns are listed in its place. From a column written
+    /// otherwise on, the list is passed over to its `)` and is
+    /// [`ColumnList::Unread`]. `None` where the input ends first.
+    pub(crate) fn read_column_list(&mut self) -> Option<ColumnList> {
+        use crate::lexer::Punctuation;
+        if !matches!(
+            self.advance()?.kind,
+            TokenKind::Punctuation(Punctuation::LParen)
+        ) {
+            return None;
+        }
+        let mut columns = Vec::new();
+        loop {
+            if !self.read_declared_column(&mut columns)? {
+                return self.pass_column_list_rest();
+            }
+            let separator = self.peek()?;
+            if matches!(separator.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                self.advance();
+                return Some(ColumnList::Declared(columns));
+            }
+            if !matches!(separator.kind, TokenKind::Punctuation(Punctuation::Comma)) {
+                return self.pass_column_list_rest();
+            }
+            self.advance();
+        }
+    }
+
+    /// The rest of a column list read up to the current token, inside it,
+    /// passed over through its `)`.
+    fn pass_column_list_rest(&mut self) -> Option<ColumnList> {
+        use crate::lexer::Punctuation;
+        let mut depth = 1usize;
+        loop {
+            let tok = self.advance()?;
+            if matches!(tok.kind, TokenKind::Eof) {
+                return None;
+            }
+            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                depth += 1;
+            } else if matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(ColumnList::Unread);
+                }
+            }
+        }
+    }
+
+    /// One column definition of a declared-column list at the current
+    /// token, read into `into` (a nested list's columns, each): `false`,
+    /// stopped at a token of the definition, where it is written in a
+    /// grammar not read; `None` where the input ends first.
+    fn read_declared_column(
+        &mut self,
+        into: &mut Vec<crate::ast::AstTableFunctionColumn>,
+    ) -> Option<bool> {
+        use crate::ast::AstTableFunctionColumnKind as Kind;
+        use crate::lexer::{LiteralKind, Punctuation};
+        let first = self.peek()?;
+        if self.is_word(Some(first), "NESTED") {
+            self.advance();
+            if self.is_word(self.peek(), "PATH") {
+                self.advance();
+            }
+            if !matches!(self.peek()?.kind, TokenKind::Literal(LiteralKind::String)) {
+                return Some(false);
+            }
+            self.advance();
+            if matches!(self.peek()?.kind, TokenKind::Keyword(Keyword::As)) {
+                if !self
+                    .peek_ahead(1)
+                    .is_some_and(|name| self.can_be_identifier_token(name))
+                {
+                    return Some(false);
+                }
+                self.advance();
+                self.advance();
+            }
+            if !self.is_word(self.peek(), "COLUMNS")
+                || !self
+                    .peek_ahead(1)
+                    .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))
+            {
+                return Some(false);
+            }
+            self.advance();
+            return match self.read_column_list()? {
+                ColumnList::Declared(nested) => {
+                    into.extend(nested);
+                    Some(true)
+                }
+                ColumnList::Unread => Some(false),
+            };
+        }
+        if !self.can_be_identifier_token(first) {
+            return Some(false);
+        }
+        let name_span = self.advance()?.span;
+        let name = crate::ast::AstIdentifier {
+            node_id: self.id_gen.next(),
+            span: name_span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: None,
+        };
+        let mut end;
+        let kind = if matches!(self.peek()?.kind, TokenKind::Keyword(Keyword::For))
+            && self.is_word(self.peek_ahead(1), "ORDINALITY")
+        {
+            self.advance();
+            end = self.advance()?.span.end;
+            Kind::Ordinality
+        } else {
+            let type_from = self.idx;
+            let Some(Ok(data_type)) = self.parse_data_type() else {
+                self.idx = type_from;
+                return Some(false);
+            };
+            end = self.consumed_end()?;
+            let mut json = false;
+            let mut exists = false;
+            if self.is_word(self.peek(), "FORMAT") && self.is_word(self.peek_ahead(1), "JSON") {
+                self.advance();
+                end = self.advance()?.span.end;
+                json = true;
+            } else if matches!(self.peek()?.kind, TokenKind::Keyword(Keyword::Exists)) {
+                end = self.advance()?.span.end;
+                exists = true;
+            }
+            if self.is_word(self.peek(), "PATH") {
+                end = self.advance()?.span.end;
+            }
+            let mut path = None;
+            if matches!(self.peek()?.kind, TokenKind::Literal(LiteralKind::String)) {
+                let written = self.advance()?.span;
+                end = written.end;
+                path = Some(written);
+            }
+            if !json
+                && !exists
+                && matches!(self.peek()?.kind, TokenKind::Keyword(Keyword::As))
+                && self.is_word(self.peek_ahead(1), "JSON")
+            {
+                self.advance();
+                end = self.advance()?.span.end;
+                json = true;
+            }
+            if exists {
+                Kind::Exists { data_type, path }
+            } else if json {
+                Kind::Json { data_type, path }
+            } else {
+                Kind::Value { data_type, path }
+            }
+        };
+        // What follows (`NULL ON EMPTY`, `ERROR ON ERROR`, `WITH WRAPPER`):
+        // part of the definition, up to its `,` or the list's `)`.
+        let mut depth = 0usize;
+        while let Some(tok) = self.peek() {
+            let closes = matches!(tok.kind, TokenKind::Punctuation(Punctuation::RParen));
+            if depth == 0
+                && (closes || matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)))
+            {
+                break;
+            }
+            if matches!(tok.kind, TokenKind::Eof) {
+                return None;
+            }
+            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                depth += 1;
+            } else if closes {
+                depth -= 1;
+            }
+            end = tok.span.end;
+            self.advance();
+        }
+        into.push(crate::ast::AstTableFunctionColumn {
+            name,
+            kind,
+            span: Span {
+                start: name_span.start,
+                end,
+            },
+        });
+        Some(true)
+    }
     /// Parse optional WITH OFFSET [AS alias] clause (BigQuery UNNEST modifier).
     /// Returns Some(AstWithOffset) if WITH OFFSET is found, None otherwise.
     fn parse_with_offset_clause(&mut self) -> Option<crate::ast::AstWithOffset> {
@@ -1084,7 +1635,8 @@ impl<'a> Parser<'a> {
         matches!(
             next.kind,
             TokenKind::Identifier {
-                kind: crate::lexer::IdentifierKind::Unquoted
+                kind: crate::lexer::IdentifierKind::Unquoted,
+                ..
             }
         ) && next.lexeme(self.source).eq_ignore_ascii_case("oj")
     }
@@ -1114,81 +1666,21 @@ impl<'a> Parser<'a> {
             rparen_span: rcurly_span,
             inner_join_count,
             odbc_oj_span: Some(oj_span),
+            alias_span: None,
         }));
         inner.span.start = lcurly_span.start;
         inner.span.end = rcurly_span.end;
         Ok(Some(inner))
     }
 
-    /// Helper: parse a table name from an already-consumed token
-    /// Used when we've determined a keyword (like TABLE) should be treated as a table name
-    fn parse_table_name_from_token(
+    /// The table whose name the keyword `TABLE`, written without a call,
+    /// begins (`FROM table`), read at the current token, with its alias,
+    /// time travel and sample.
+    fn parse_table_word_factor(
         &mut self,
-        ident_tok: Token,
         lateral_keyword_span: Option<Span>,
-        _select_span: Span,
     ) -> Option<Box<AstTableRef>> {
-        // This is the same logic as the generic table-name identifier path
-        // We've already consumed ident_tok, so start from there
-        let mut end_span = ident_tok.span.end;
-        let identifier_arg: Option<Box<AstExpr>> = None;
-        // Per-identifier-token spans for the structurally dotted name.
-        // Each entry is one identifier token's exact span — by
-        // construction trivia-free (the lexer emits comments and
-        // whitespace as their own tokens, never folded into an
-        // identifier token). Downstream consumers that need to
-        // decompose `db.schema.table` MUST iterate this instead of
-        // byte-slicing `name.span` and splitting on `.`, because the
-        // merged span necessarily covers any trivia between parts.
-        let mut parts: Vec<Option<Span>> = vec![Some(ident_tok.span)];
-
-        // Handle qualified identifiers: db.schema.table or schema.table.
-        // T-SQL allows omitted components (`master..tbl`): a dot
-        // immediately followed by another dot is an empty slot, recorded
-        // as `None` so the positional db/schema/name decomposition stays
-        // correct downstream.
-        while let Some(dot_tok) = self.peek() {
-            if matches!(
-                dot_tok.kind,
-                TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-            ) {
-                let dot_end = dot_tok.span.end;
-                self.advance(); // consume dot
-                                // Next should be identifier or keyword - after dot, ANY keyword is allowed
-                if let Some(next_tok) = self.peek() {
-                    if self.can_be_identifier_after_dot_token(next_tok) {
-                        let next = self.advance()?;
-                        end_span = next.span.end;
-                        parts.push(Some(next.span));
-                    } else if matches!(
-                        next_tok.kind,
-                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-                    ) {
-                        // Omitted component (`a..b`): empty slot, the next
-                        // loop iteration consumes the following dot.
-                        end_span = dot_end;
-                        parts.push(None);
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Create object ref from the parsed name
-        let name = AstObjectRef {
-            node_id: self.id_gen.next(),
-            span: Span {
-                start: ident_tok.span.start,
-                end: end_span,
-            },
-            parts: Some(parts),
-            identifier_arg,
-        };
+        let name = self.parse_object_ref_with_argument(NamePosition::TableWord)?;
 
         // Parse optional alias
         let (alias, _as_token) = if let Some((ident, tok)) = self.parse_simple_alias_with_as() {
@@ -1302,6 +1794,11 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // A name a template writes some part of: `t_{{ s }}`, `{{ ref('m') }}`.
+        if let Some(name) = self.parse_templated_object_ref() {
+            return self.finish_named_table_factor(name, lateral_keyword_span);
+        }
+
         let tok = match self.peek() {
             Some(t) => t,
             None => return Ok(None),
@@ -1336,19 +1833,8 @@ impl<'a> Parser<'a> {
                 });
 
                 if !has_lparen {
-                    // TABLE without '(' - treat as regular table name
-                    // Let it fall through to the generic identifier table-name path below
-                    // by not consuming and proceeding to the next match arm
-                    // Since we can't actually fall through in Rust, we need to duplicate the logic
-                    // or restructure. For now, just consume and process as identifier
-                    let ident_tok = self.advance().expect_invariant("just peeked TABLE");
-                    // Continue with the identifier logic from line 947...
-                    // Rather than duplicate 100+ lines, just set end_span and continue below
-                    return Ok(self.parse_table_name_from_token(
-                        ident_tok.clone(),
-                        lateral_keyword_span,
-                        select_span,
-                    ));
+                    // `TABLE` without `(` begins the table's name.
+                    return Ok(self.parse_table_word_factor(lateral_keyword_span));
                 }
 
                 // TABLE(...) - parse as table function
@@ -1417,6 +1903,7 @@ impl<'a> Parser<'a> {
                 };
 
                 let name = AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
                     node_id: self.id_gen.next(),
                     span: Span {
                         start: start_span,
@@ -1475,6 +1962,7 @@ impl<'a> Parser<'a> {
                 };
 
                 let name = AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
                     node_id: self.id_gen.next(),
                     span: name_span,
                     // VALUES alias: span covers the alias region, not
@@ -1544,57 +2032,39 @@ impl<'a> Parser<'a> {
                     return Ok(None);
                 }
 
+                let at_idx = self.idx;
                 let at_tok = self.advance().expect_invariant("just peeked @"); // consume '@'
                 let start_span = at_tok.span.start;
 
-                // Parse stage name (can be qualified: namespace.stage or just stage)
-                let first_part = self
-                    .peek()
-                    .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                if !self.can_be_identifier_token(first_part) {
-                    return Err(ParseError::unexpected_token(
-                        first_part.span,
-                        vec!["identifier".to_string()],
-                        Parser::token_description(first_part, self.source),
-                    ));
-                }
-                let first_tok = self.advance().expect_invariant("just peeked identifier");
-                let mut end_span = first_tok.span.end;
-
-                // Check for dot and continue parsing qualified name
-                while let Some(dot_tok) = self.peek() {
-                    if matches!(
-                        dot_tok.kind,
-                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-                    ) {
-                        self.advance(); // consume dot
-                                        // Check for identifier or keyword after dot (or slash for path)
-                        if let Some(next_tok) = self.peek() {
-                            if self.can_be_identifier_after_dot_token(next_tok) {
-                                let next_tok =
-                                    self.advance().expect_invariant("just peeked identifier");
-                                end_span = next_tok.span.end;
-                            } else if matches!(
-                                next_tok.kind,
-                                TokenKind::Operator(crate::lexer::Operator::Slash)
-                            ) {
-                                // Path segment starting with slash
-                                break;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
+                // The stage's name, before its path.
+                let stage_name = self.stage_name_at(at_idx).map(|(next, name)| {
+                    self.idx = next;
+                    name
+                });
+                let name_end = match stage_name.as_ref() {
+                    Some(name) => name.span.end,
+                    None => {
+                        let first_part = self
+                            .peek()
+                            .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
+                        return Err(ParseError::unexpected_token(
+                            first_part.span,
+                            vec!["identifier".to_string()],
+                            Parser::token_description(first_part, self.source),
+                        ));
                     }
-                }
+                };
+                let mut end_span = name_end;
 
                 // Parse optional path segments: /path/to/files/
                 // Note: In Snowflake, slashes can appear after stage name
-                // We'll just consume tokens until we hit something that's not a valid path character
+                // We'll just consume tokens until we hit something that's not a valid path character.
+                // A path is written without a gap: the first token set apart
+                // from it ends it, so an alias after the path is not part of it.
                 while let Some(next_tok) = self.peek() {
+                    if next_tok.span.start != end_span {
+                        break;
+                    }
                     match &next_tok.kind {
                         TokenKind::Operator(crate::lexer::Operator::Slash) => {
                             let slash = self.advance().expect_invariant("just peeked slash");
@@ -1607,7 +2077,9 @@ impl<'a> Parser<'a> {
 
                             // Common case: extension token after dot
                             if let Some(after_dot) = self.peek() {
-                                if self.can_be_identifier_after_dot_token(after_dot) {
+                                if after_dot.span.start == end_span
+                                    && self.can_be_identifier_after_dot_token(after_dot)
+                                {
                                     let part =
                                         self.advance().expect_invariant("just peeked extension");
                                     end_span = part.span.end;
@@ -1624,6 +2096,7 @@ impl<'a> Parser<'a> {
                 }
 
                 let name = AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Stage,
                     node_id: self.id_gen.next(),
                     span: Span {
                         start: start_span,
@@ -1635,6 +2108,13 @@ impl<'a> Parser<'a> {
                     parts: None,
                     identifier_arg: None,
                 };
+                let stage = stage_name.map(|name| crate::ast::AstStageRef {
+                    path: (end_span > name_end).then_some(Span {
+                        start: name_end,
+                        end: end_span,
+                    }),
+                    name,
+                });
 
                 // Parse optional stage options: ( FILE_FORMAT => 'format', PATTERN => 'regex' )
                 let stage_options = if let Some(lparen) = self.peek() {
@@ -1678,98 +2158,30 @@ impl<'a> Parser<'a> {
                     None
                 };
 
-                // Parse optional alias with AS tracking
-                let mut alias = None;
-                let mut as_token = None;
-                if let Some(next_tok) = self.peek() {
-                    match &next_tok.kind {
-                        TokenKind::Keyword(Keyword::As) => {
-                            if let Some(alias_tok) = self.peek_ahead(1) {
-                                if self.can_be_alias_token(alias_tok) {
-                                    as_token = Some(self.current_token_id());
-                                    self.advance(); // consume AS
-                                    let alias_tok =
-                                        self.advance().expect_invariant("just peeked alias");
-                                    alias = Some(AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: alias_tok.span,
-                                    });
-                                }
-                            }
-                        }
-                        TokenKind::Identifier { .. }
-                            if !self.should_stop_scan_at_statement_start(next_tok) =>
-                        {
-                            // Check if this identifier is a clause keyword
-                            let is_clause_keyword =
-                                is_table_clause_keyword(next_tok.lexeme(self.source));
-
-                            if !is_clause_keyword {
-                                let alias_tok =
-                                    self.advance().expect_invariant("just peeked identifier");
-                                alias = Some(AstIdentifier {
-                                    node_id: self.id_gen.next(),
-                                    span: alias_tok.span,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
+                // The alias and the clauses a table reference may carry
+                // follow a stage as they follow a table.
+                let mut table = self.finish_table_ref(name, stage_options, lateral_keyword_span)?;
+                if let Some(table) = table.as_mut() {
+                    table.stage = stage.map(Box::new);
                 }
-
-                // Create SyntaxTableRef if we have an alias
-                let syntax_id = if alias.is_some() {
-                    let syntax_ref = crate::syntax::SyntaxTableRef {
-                        as_keyword: as_token,
-                        result_alias_as_keyword: None,
-                        subquery_lparen: None,
-                        subquery_rparen: None,
-                        alias_columns_lparen: None,
-                        alias_columns_rparen: None,
-                        result_alias_columns_lparen: None,
-                        result_alias_columns_rparen: None,
-                        span: name.span,
-                    };
-                    Some(self.syntax_arena.alloc_table_ref(syntax_ref))
-                } else {
-                    None
-                };
-
-                Ok(Some(Box::new(crate::parser::sql_stmt::build_table_ref(
-                    self.id_gen.next(),
-                    name.span,
-                    name,
-                    alias,
-                    None, // alias_columns
-                    None, // result_alias
-                    None, // result_alias_columns
-                    None, // subquery
-                    None, // subquery_lparen_span
-                    None, // subquery_rparen_span
-                    None, // values
-                    lateral_keyword_span,
-                    None, // time_travel
-                    None, // sample
-                    None, // changes
-                    stage_options,
-                    None,      // table_function
-                    None,      // with_offset
-                    None,      // pivot
-                    None,      // unpivot
-                    None,      // match_recognize
-                    None,      // table_hints
-                    syntax_id, // syntax_id with AS tracking
-                ))))
+                Ok(table)
             }
             // Allow positional pipe input references like FROM $1 to be
             // modeled as a regular table reference whose object name span
             // covers the $n token. This keeps the AST simple while still
-            // round-tripping Snowflake's pipe-number FROM syntax.
-            TokenKind::Literal(crate::lexer::LiteralKind::Position) => {
+            // round-tripping Snowflake's pipe-number FROM syntax. In FROM a
+            // `$<n>` names a relation, however the dialect reads one in an
+            // expression.
+            TokenKind::Literal(
+                crate::lexer::LiteralKind::Position
+                | crate::lexer::LiteralKind::Parameter
+                | crate::lexer::LiteralKind::Money,
+            ) => {
                 let pos_tok = self
                     .advance()
                     .expect_invariant("just peeked position literal");
                 let name = AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
                     node_id: self.id_gen.next(),
                     span: pos_tok.span,
                     // Snowflake positional pipe input (`$1`): single
@@ -1803,300 +2215,14 @@ impl<'a> Parser<'a> {
                     None, // syntax_id
                 ))))
             }
-            // Jinja expression as table name: FROM {{ table_name }} or FROM {{ ref('model') }}
-            TokenKind::JinjaExprOpen => {
-                let start_tok = self.advance().expect_invariant("just peeked {{"); // consume {{
-                let start_span = start_tok.span.start;
-
-                // Parse the Jinja expression content
-                let jinja_expr = self.parse_jinja_expr()?;
-
-                // Expect closing }}
-                let close_tok = if let Some(tok) = self.peek() {
-                    if matches!(tok.kind, TokenKind::JinjaExprClose) {
-                        self.advance().expect_invariant("just peeked }}")
-                    } else {
-                        return Err(ParseError::unexpected_token(
-                            tok.span,
-                            vec!["}}".to_string()],
-                            Parser::token_description(tok, self.source),
-                        ));
-                    }
-                } else {
-                    return Err(ParseError::new(
-                        start_tok.span,
-                        ParseErrorKind::UnexpectedEof {
-                            expected: vec!["}}".to_string()],
-                        },
-                    ));
-                };
-
-                let mut end_span = close_tok.span.end;
-
-                // Handle qualified identifiers with Jinja: schema.{{ table }} or {{ schema }}.table
-                while let Some(dot_tok) = self.peek() {
-                    if matches!(
-                        dot_tok.kind,
-                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-                    ) {
-                        self.advance(); // consume dot
-
-                        // After dot, accept identifier, keyword, or another Jinja expression
-                        if let Some(next_tok) = self.peek() {
-                            match &next_tok.kind {
-                                TokenKind::JinjaExprOpen => {
-                                    // Another Jinja expression after dot
-                                    self.advance(); // consume {{
-                                    let _ = self.parse_jinja_expr()?;
-
-                                    if let Some(close) = self.peek() {
-                                        if matches!(close.kind, TokenKind::JinjaExprClose) {
-                                            let close_tok =
-                                                self.advance().expect_invariant("just peeked }}");
-                                            end_span = close_tok.span.end;
-                                        } else {
-                                            return Err(ParseError::unexpected_token(
-                                                close.span,
-                                                vec!["}}".to_string()],
-                                                Parser::token_description(close, self.source),
-                                            ));
-                                        }
-                                    }
-                                }
-                                _ if self.can_be_identifier_after_dot_token(next_tok) => {
-                                    let next_tok =
-                                        self.advance().expect_invariant("just peeked identifier");
-                                    end_span = next_tok.span.end;
-                                }
-                                _ => {
-                                    return Err(ParseError::unexpected_token(
-                                        next_tok.span,
-                                        vec!["identifier or Jinja expression".to_string()],
-                                        Parser::token_description(next_tok, self.source),
-                                    ));
-                                }
-                            }
-                        } else {
-                            return Err(ParseError::new(
-                                dot_tok.span,
-                                ParseErrorKind::UnexpectedEof {
-                                    expected: vec!["identifier or Jinja expression".to_string()],
-                                },
-                            ));
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                let name = AstObjectRef {
-                    node_id: self.id_gen.next(),
-                    span: Span {
-                        start: start_span,
-                        end: end_span,
-                    },
-                    // Jinja-templated table name: not a
-                    // structurally-decomposable dotted identifier, so no
-                    // parts.
-                    parts: None,
-                    identifier_arg: jinja_expr.map(Box::new).map(|e| {
-                        Box::new(AstExpr::JinjaPlaceholder {
-                            node_id: self.id_gen.next(),
-                            kind: crate::ast::JinjaKind::Expression,
-                            span: Span {
-                                start: start_span,
-                                end: end_span,
-                            },
-                            expr: Some(*e),
-                            syntax_id: None,
-                        })
-                    }),
-                };
-
-                // Parse optional alias with AS tracking
-                let mut alias = None;
-                let mut as_token = None;
-                if let Some(next_tok) = self.peek() {
-                    match &next_tok.kind {
-                        TokenKind::Keyword(Keyword::As) => {
-                            if let Some(alias_tok) = self.peek_ahead(1) {
-                                if self.can_be_alias_token(alias_tok) {
-                                    as_token = Some(self.current_token_id());
-                                    self.advance(); // consume AS
-                                    let alias_tok =
-                                        self.advance().expect_invariant("just peeked alias");
-                                    alias = Some(AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: alias_tok.span,
-                                    });
-                                }
-                            }
-                        }
-                        TokenKind::Identifier { .. }
-                            if !self.should_stop_scan_at_statement_start(next_tok) =>
-                        {
-                            // Check if this identifier is a table clause keyword like SAMPLE
-                            let is_table_clause =
-                                is_table_specific_clause(next_tok.lexeme(self.source));
-                            let is_clause_keyword =
-                                is_table_clause_keyword(next_tok.lexeme(self.source));
-
-                            if !is_table_clause
-                                && !is_clause_keyword
-                                && !self.is_databricks_time_travel_ahead()
-                            {
-                                let alias_tok =
-                                    self.advance().expect_invariant("just peeked identifier");
-                                alias = Some(AstIdentifier {
-                                    node_id: self.id_gen.next(),
-                                    span: alias_tok.span,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Parse optional CHANGES clause or time travel clause (mutually exclusive)
-                let changes = self.parse_changes_clause()?;
-                let time_travel = if changes.is_none() {
-                    self.parse_time_travel_clause()?
-                } else {
-                    None
-                };
-
-                // Parse optional SAMPLE clause (after Jinja table name)
-                let sample = self.parse_sample_clause()?;
-
-                // Parse optional PIVOT or UNPIVOT clause (mutually exclusive)
-                let pivot = self.parse_pivot_clause()?;
-                let unpivot = if pivot.is_none() {
-                    self.parse_unpivot_clause()?
-                } else {
-                    None
-                };
-
-                // Parse optional MATCH_RECOGNIZE clause
-                let match_recognize = self.parse_match_recognize().ok().flatten();
-
-                // Try to parse alias again if we haven't got one yet (handles "FROM {{ table }} AT (...) alias")
-                if alias.is_none() {
-                    if let Some(next_tok) = self.peek() {
-                        match &next_tok.kind {
-                            TokenKind::Keyword(Keyword::As) => {
-                                if let Some(alias_tok) = self.peek_ahead(1) {
-                                    if self.can_be_alias_token(alias_tok) {
-                                        as_token = Some(self.current_token_id());
-                                        self.advance(); // consume AS
-                                        let alias_tok =
-                                            self.advance().expect_invariant("just peeked alias");
-                                        alias = Some(AstIdentifier {
-                                            node_id: self.id_gen.next(),
-                                            span: alias_tok.span,
-                                        });
-                                    }
-                                }
-                            }
-                            TokenKind::Identifier { .. } => {
-                                let is_clause_keyword =
-                                    is_table_clause_keyword(next_tok.lexeme(self.source));
-
-                                if !is_clause_keyword {
-                                    let alias_tok =
-                                        self.advance().expect_invariant("just peeked identifier");
-                                    alias = Some(AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: alias_tok.span,
-                                    });
-                                }
-                            }
-                            TokenKind::Keyword(_) => {
-                                let is_dialect_boundary = self
-                                    .dialect
-                                    .is_clause_boundary_keyword(next_tok.lexeme(self.source));
-                                if self.can_be_alias_token(next_tok)
-                                    && !self.is_join_or_clause_keyword()
-                                    && !is_dialect_boundary
-                                {
-                                    let alias_tok = self
-                                        .advance()
-                                        .expect_invariant("just peeked keyword-alias");
-                                    alias = Some(AstIdentifier {
-                                        node_id: self.id_gen.next(),
-                                        span: alias_tok.span,
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                // Box the optional clauses
-                let sample = sample.map(Box::new);
-                let changes = changes.map(Box::new);
-                let match_recognize = match_recognize.map(Box::new);
-                let pivot = pivot.map(Box::new);
-                let unpivot = unpivot.map(Box::new);
-
-                // Calculate complete span including all clauses
-                let complete_span = crate::parser::sql_stmt::calculate_table_ref_span(
-                    name.span,
-                    &alias,
-                    &None,
-                    &time_travel,
-                    &sample,
-                    &changes,
-                    &pivot,
-                    &unpivot,
-                    &match_recognize,
-                    &None, // table_hints (not applicable for lateral subquery)
-                );
-
-                // Create SyntaxTableRef if we have an alias
-                let syntax_id = if alias.is_some() {
-                    let syntax_ref = crate::syntax::SyntaxTableRef {
-                        as_keyword: as_token,
-                        result_alias_as_keyword: None,
-                        subquery_lparen: None,
-                        subquery_rparen: None,
-                        alias_columns_lparen: None,
-                        alias_columns_rparen: None,
-                        result_alias_columns_lparen: None,
-                        result_alias_columns_rparen: None,
-                        span: complete_span,
-                    };
-                    Some(self.syntax_arena.alloc_table_ref(syntax_ref))
-                } else {
-                    None
-                };
-
-                Ok(Some(Box::new(crate::parser::sql_stmt::build_table_ref(
-                    self.id_gen.next(),
-                    complete_span,
-                    name,
-                    alias,
-                    None, // alias_columns
-                    None, // result_alias
-                    None, // result_alias_columns
-                    None, // subquery
-                    None, // subquery_lparen_span
-                    None, // subquery_rparen_span
-                    None, // values
-                    lateral_keyword_span,
-                    time_travel,
-                    sample,
-                    changes,
-                    None, // stage_options
-                    None, // table_function
-                    None, // with_offset
-                    pivot,
-                    unpivot,
-                    match_recognize,
-                    None,      // table_hints
-                    syntax_id, // syntax_id with AS tracking
-                ))))
-            }
+            // A template expression whose `}}` is never written: a name a
+            // template writes is read above.
+            TokenKind::JinjaExprOpen => Err(ParseError::new(
+                tok.span,
+                ParseErrorKind::UnexpectedEof {
+                    expected: vec!["}}".to_string()],
+                },
+            )),
             _ => Ok(None),
         }
     }
@@ -2126,14 +2252,39 @@ impl<'a> Parser<'a> {
 
         // Parse the subquery/VALUES body using natural descent
         // No token slicing - just parse from current position
+        let mut subquery_error = None;
         let (subquery, values) = if is_values {
             // Parse VALUES clause
+            let errors = self.recovery_errors.len();
             let values_result = self.parse_values();
-            (None, values_result)
+            // `(VALUES (1) UNION SELECT …)`: the rows are a query's first
+            // operand; read again as that query.
+            if self
+                .peek()
+                .is_some_and(|t| crate::parser::sql_stmt::is_set_op_keyword(&t.kind).is_some())
+            {
+                self.idx = saved_inner_idx;
+                self.recovery_errors.truncate(errors);
+                (Some(Box::new(self.try_parse_set_or_select_stmt()?)), None)
+            } else {
+                (None, values_result)
+            }
         } else {
             // Parse SELECT/WITH subquery directly - skip full statement dispatch
             // This reduces call depth and avoids stack overflow in debug builds
             match self.try_parse_set_or_select_stmt() {
+                // A query the `)` does not close is the first table of a
+                // joined group: `( (SELECT …) d JOIN a USING (k) )`.
+                Ok(_)
+                    if !self.peek().is_some_and(|t| {
+                        matches!(
+                            t.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+                        )
+                    }) =>
+                {
+                    (None, None)
+                }
                 Ok(stmt) => {
                     // Accept SELECT or SetSelect (UNION/INTERSECT/EXCEPT) as subquery
                     match &stmt {
@@ -2149,6 +2300,7 @@ impl<'a> Parser<'a> {
                         return Err(e); // Propagate fatal error
                     }
                     // Parse failed - return None to continue with fallback logic
+                    subquery_error = Some(e);
                     (None, None)
                 }
             }
@@ -2166,57 +2318,27 @@ impl<'a> Parser<'a> {
             });
             if !next_is_rparen {
                 self.idx = saved_inner_idx;
-                let inner_factor = self.parse_table_factor(lparen_span)?;
-                if let Some(mut inner) = inner_factor {
-                    self.parse_join_chain(&mut inner)?;
-                    let inner_join_count = inner.joins.len() as u16;
-                    // Expect closing `)` for the paren group
-                    let rparen_tok = match self.peek() {
-                        Some(t)
-                            if matches!(
-                                t.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                            ) =>
-                        {
-                            self.advance().expect_invariant("RParen confirmed by peek")
-                        }
-                        Some(t) => {
-                            return Err(ParseError::new(
-                                t.span,
-                                ParseErrorKind::InvalidSyntax {
-                                    message: "Expected ')' to close parenthesised join group"
-                                        .to_string(),
-                                },
-                            ));
-                        }
-                        None => {
-                            return Err(ParseError::new(
-                                lparen_span,
-                                ParseErrorKind::InvalidSyntax {
-                                    message: "Missing closing ')' for parenthesised join group"
-                                        .to_string(),
-                                },
-                            ));
-                        }
-                    };
-                    let rparen_span = rparen_tok.span;
-                    inner.paren_group = Some(Box::new(crate::ast::ParenGroupInfo {
-                        lparen_span,
-                        rparen_span,
-                        inner_join_count,
-                        odbc_oj_span: None,
-                    }));
-                    inner.span.start = lparen_span.start;
-                    inner.span.end = rparen_span.end;
-                    if let Some(lat_span) = lateral_keyword_span {
-                        inner.lateral_keyword_span = Some(lat_span);
-                        inner.span.start = lat_span.start;
-                    }
-                    return Ok(Some(inner));
+                if let Some(group) =
+                    self.parse_paren_group_rest(lparen_span, lateral_keyword_span)?
+                {
+                    return Ok(Some(group));
                 }
                 // parse_table_factor returned None — nothing parseable inside `(`.
                 // Fall through to the existing path which will surface the
                 // "Expected ')'" error for a clearer diagnostic.
+            } else if let Some(err) = subquery_error {
+                // A subquery read to its `)` that does not parse is no table,
+                // unless the parentheses hold one: `FROM (users)`.
+                let at_rparen = self.idx;
+                self.idx = saved_inner_idx;
+                match self.parse_paren_group_rest(lparen_span, lateral_keyword_span) {
+                    Ok(Some(group)) => return Ok(Some(group)),
+                    Err(e) if e.kind.is_resource_exhaustion() => return Err(e),
+                    Ok(None) | Err(_) => {
+                        self.idx = at_rparen;
+                        return Err(err);
+                    }
+                }
             }
         }
 
@@ -2253,6 +2375,7 @@ impl<'a> Parser<'a> {
             end: rparen_span.end,
         };
         let name = AstObjectRef {
+            name_kind: crate::ast::AstTableNameKind::Catalog,
             node_id: self.id_gen.next(),
             span: name_span,
             // Subquery name span: covers `(SELECT ...)` parens, not a
@@ -2274,124 +2397,8 @@ impl<'a> Parser<'a> {
 
         // Parse first optional alias (can appear before PIVOT/UNPIVOT/MATCH_RECOGNIZE)
         // This handles: FROM (SELECT ...) alias PIVOT (...)
-        let mut alias = None;
-        let mut as_token = None;
-        let mut alias_columns = None;
-        let mut alias_columns_lparen_id = None;
-        let mut alias_columns_rparen_id = None;
-        if let Some(next_tok) = self.peek() {
-            if self.can_be_alias_token(next_tok)
-                || matches!(next_tok.kind, TokenKind::Keyword(Keyword::As))
-            {
-                if matches!(next_tok.kind, TokenKind::Keyword(Keyword::As))
-                    && self
-                        .peek_ahead(1)
-                        .is_some_and(|alias_tok| self.can_be_alias_token(alias_tok))
-                {
-                    as_token = Some(self.current_token_id());
-                    self.advance(); // consume AS
-                }
-                if let Some(alias_tok) = self.peek() {
-                    if self.can_be_alias_token(alias_tok) {
-                        // Check if this identifier is actually a clause keyword
-                        let is_clause_keyword =
-                            is_table_clause_keyword(alias_tok.lexeme(self.source))
-                                || self
-                                    .dialect
-                                    .is_clause_boundary_keyword(alias_tok.lexeme(self.source));
-
-                        // Special case: MATCH_CONDITION followed by '(' is not an alias
-                        let is_match_condition_call = if alias_tok
-                            .lexeme(self.source)
-                            .eq_ignore_ascii_case("MATCH_CONDITION")
-                        {
-                            self.peek_ahead(1).is_some_and(|tok| {
-                                matches!(
-                                    tok.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                                )
-                            })
-                        } else {
-                            false
-                        };
-
-                        if !is_clause_keyword && !is_match_condition_call {
-                            let alias_tok =
-                                self.advance().expect_invariant("just peeked identifier");
-                            alias = Some(AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_tok.span,
-                            });
-
-                            // Parse optional column list after alias: (col1, col2, ...)
-                            if let Some(lparen) = self.peek() {
-                                if matches!(
-                                    lparen.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                                ) {
-                                    self.advance(); // consume '('
-                                    alias_columns_lparen_id = Some(self.last_token_id());
-                                    let mut columns = Vec::new();
-
-                                    loop {
-                                        if let Some(col_tok) = self.peek() {
-                                            if self.can_be_identifier_token(col_tok) {
-                                                let col_tok = self
-                                                    .advance()
-                                                    .expect_invariant("just peeked column");
-                                                columns.push(AstIdentifier {
-                                                    node_id: self.id_gen.next(),
-                                                    span: col_tok.span,
-                                                });
-
-                                                // Check for comma or closing paren
-                                                if let Some(next) = self.peek() {
-                                                    if matches!(
-                                                        next.kind,
-                                                        TokenKind::Punctuation(
-                                                            crate::lexer::Punctuation::Comma
-                                                        )
-                                                    ) {
-                                                        self.advance(); // consume ','
-                                                        continue;
-                                                    } else if matches!(
-                                                        next.kind,
-                                                        TokenKind::Punctuation(
-                                                            crate::lexer::Punctuation::RParen
-                                                        )
-                                                    ) {
-                                                        self.advance(); // consume ')'
-                                                        alias_columns_rparen_id =
-                                                            Some(self.last_token_id());
-                                                        break;
-                                                    }
-                                                }
-                                                break;
-                                            } else if matches!(
-                                                col_tok.kind,
-                                                TokenKind::Punctuation(
-                                                    crate::lexer::Punctuation::RParen
-                                                )
-                                            ) {
-                                                self.advance(); // consume ')' - empty list
-                                                alias_columns_rparen_id =
-                                                    Some(self.last_token_id());
-                                                break;
-                                            }
-                                        }
-                                        break;
-                                    }
-
-                                    if !columns.is_empty() {
-                                        alias_columns = Some(columns);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (alias, as_token, alias_columns, alias_columns_lparen_id, alias_columns_rparen_id) =
+            self.parse_derived_table_alias();
 
         // Parse optional PIVOT or UNPIVOT clause (mutually exclusive)
         let pivot = self.parse_pivot_clause()?;
@@ -2520,15 +2527,363 @@ impl<'a> Parser<'a> {
         Ok(Some(table_ref))
     }
 
+    /// The rest of a parenthesised table after its `(`: a table factor, its
+    /// join chain and the closing `)` (`(users)`, `(t1 a JOIN t2 b ON …)`).
+    /// `None` where no table factor starts after the `(`.
+    fn parse_paren_group_rest(
+        &mut self,
+        lparen_span: Span,
+        lateral_keyword_span: Option<Span>,
+    ) -> ParseResult<Option<Box<AstTableRef>>> {
+        let Some(mut inner) = self.parse_table_factor(lparen_span)? else {
+            return Ok(None);
+        };
+        self.parse_join_chain(&mut inner)?;
+        let inner_join_count = inner.joins.len() as u16;
+        // Expect closing `)` for the paren group
+        let rparen_tok = match self.peek() {
+            Some(t)
+                if matches!(
+                    t.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+                ) =>
+            {
+                self.advance().expect_invariant("RParen confirmed by peek")
+            }
+            Some(t) => {
+                return Err(ParseError::new(
+                    t.span,
+                    ParseErrorKind::InvalidSyntax {
+                        message: "Expected ')' to close parenthesised join group".to_string(),
+                    },
+                ));
+            }
+            None => {
+                return Err(ParseError::new(
+                    lparen_span,
+                    ParseErrorKind::InvalidSyntax {
+                        message: "Missing closing ')' for parenthesised join group".to_string(),
+                    },
+                ));
+            }
+        };
+        let rparen_span = rparen_tok.span;
+        // An alias after a group that joins tables names the group, the
+        // derived table `(SELECT * FROM <group>) AS j (c1, …)`.
+        if inner_join_count > 0 {
+            let from = self.idx;
+            let (alias, _as_token, columns, _lparen, _rparen) = self.parse_derived_table_alias();
+            let start = self.tokens.get(from).map(|t| t.span.start);
+            if let (Some(alias), Some(start), Some(end)) = (alias, start, self.consumed_end()) {
+                let group = crate::ast::ParenGroupInfo {
+                    lparen_span,
+                    rparen_span,
+                    inner_join_count: 0,
+                    odbc_oj_span: None,
+                    alias_span: Some(Span { start, end }),
+                };
+                return Ok(Some(self.aliased_join_group(
+                    inner,
+                    group,
+                    alias,
+                    columns,
+                    lateral_keyword_span,
+                )));
+            }
+        }
+        inner.paren_group = Some(Box::new(crate::ast::ParenGroupInfo {
+            lparen_span,
+            rparen_span,
+            inner_join_count,
+            odbc_oj_span: None,
+            alias_span: None,
+        }));
+        inner.span.start = lparen_span.start;
+        inner.span.end = rparen_span.end;
+        if let Some(lat_span) = lateral_keyword_span {
+            inner.lateral_keyword_span = Some(lat_span);
+            inner.span.start = lat_span.start;
+        }
+        // A sample clause and an alias written after the `)` of a group
+        // that is one table are that table's (`(users) TABLESAMPLE (…) u`),
+        // where it has none of its own.
+        if inner_join_count == 0 && inner.sample.is_none() {
+            if let Some(sample) = self.parse_sample_clause()? {
+                inner.span.end = inner.span.end.max(sample.span.end);
+                inner.sample = Some(Box::new(sample));
+            }
+        }
+        if inner_join_count == 0 && inner.alias.is_none() && inner.alias_columns.is_none() {
+            let (alias, as_token, columns, columns_lparen, columns_rparen) =
+                self.parse_derived_table_alias();
+            if let Some(alias) = alias {
+                // As a table's span ends ([`calculate_table_ref_span`]).
+                let columns_end = columns
+                    .as_ref()
+                    .and_then(|columns| columns.last())
+                    .map(|column| column.span.end);
+                inner.span.end = [Some(alias.span.end), columns_end]
+                    .into_iter()
+                    .flatten()
+                    .fold(inner.span.end, u32::max);
+                let syntax = match inner.syntax_id {
+                    Some(id) => *self.syntax_arena.get_table_ref(id),
+                    None => crate::syntax::SyntaxTableRef {
+                        as_keyword: None,
+                        result_alias_as_keyword: None,
+                        subquery_lparen: None,
+                        subquery_rparen: None,
+                        alias_columns_lparen: None,
+                        alias_columns_rparen: None,
+                        result_alias_columns_lparen: None,
+                        result_alias_columns_rparen: None,
+                        span: inner.span,
+                    },
+                };
+                inner.syntax_id = Some(self.syntax_arena.alloc_table_ref(
+                    crate::syntax::SyntaxTableRef {
+                        as_keyword: as_token,
+                        alias_columns_lparen: columns_lparen,
+                        alias_columns_rparen: columns_rparen,
+                        span: inner.span,
+                        ..syntax
+                    },
+                ));
+                inner.alias = Some(Box::new(alias));
+                inner.alias_columns = columns.map(Box::new);
+            }
+        }
+        Ok(Some(inner))
+    }
+
+    /// The derived table an aliased join group is (`(a JOIN b ON …) AS j
+    /// (c1, …)`): its subquery the `SELECT *` over `group_table`, the
+    /// group's tables and joins, which is not written; its alias and column
+    /// list the written ones; `group` the parentheses and the alias as
+    /// written, which the formatter writes.
+    fn aliased_join_group(
+        &mut self,
+        group_table: Box<AstTableRef>,
+        group: crate::ast::ParenGroupInfo,
+        alias: AstIdentifier,
+        alias_columns: Option<Vec<AstIdentifier>>,
+        lateral_keyword_span: Option<Span>,
+    ) -> Box<AstTableRef> {
+        use crate::ast::{
+            AstProjection, AstProjectionKind, AstStarProjection, FromItem, FromItemKind,
+        };
+        let body_span = group_table.span;
+        let star = AstProjection {
+            node_id: self.id_gen.next(),
+            kind: AstProjectionKind::Star(Box::new(AstStarProjection {
+                node_id: self.id_gen.next(),
+                star_span: body_span,
+                qualifier: None,
+                ilike: None,
+                exclude: None,
+                replace: None,
+                rename: None,
+            })),
+            exclude: None,
+            span: body_span,
+        };
+        let from = vec![FromItem {
+            node_id: self.id_gen.next(),
+            kind: FromItemKind::TableRef(group_table),
+        }];
+        let select = crate::parser::sql_stmt::build_select(
+            self.id_gen.next(),
+            body_span,
+            body_span, // select_span
+            None,      // select_as_qualifier
+            None,      // set_quantifier
+            None,      // set_quantifier_span
+            None,      // top
+            star,
+            from,
+            Vec::new(), // statement_fragments
+            None,       // where_clause
+            None,       // group_by
+            None,       // having
+            None,       // connect_by
+            None,       // order_by
+            None,       // qualify
+            None,       // into_target
+            None,       // limit
+            None,       // offset
+            None,       // limit_keyword_span
+            None,       // fetch_clause_span
+            None,       // offset_keyword_span
+            None,       // for_update
+            None,       // semicolon_token
+            None,       // window_clause
+        );
+        let parens = Span {
+            start: group.lparen_span.start,
+            end: group.rparen_span.end,
+        };
+        let name = AstObjectRef {
+            name_kind: crate::ast::AstTableNameKind::Catalog,
+            node_id: self.id_gen.next(),
+            span: parens,
+            parts: None,
+            identifier_arg: None,
+        };
+        let span = Span {
+            start: lateral_keyword_span.map_or(parens.start, |lateral| lateral.start),
+            end: group.alias_span.map_or(parens.end, |alias| alias.end),
+        };
+        let mut table = crate::parser::sql_stmt::build_table_ref(
+            self.id_gen.next(),
+            span,
+            name,
+            Some(alias),
+            alias_columns,
+            None, // result_alias
+            None, // result_alias_columns
+            Some(Box::new(AstStmt::Select(Box::new(select)))),
+            Some(group.lparen_span),
+            Some(group.rparen_span),
+            None, // values
+            lateral_keyword_span,
+            None, // time_travel
+            None, // sample
+            None, // changes
+            None, // stage_options
+            None, // table_function
+            None, // with_offset
+            None, // pivot
+            None, // unpivot
+            None, // match_recognize
+            None, // table_hints
+            None, // syntax_id
+        );
+        table.paren_group = Some(Box::new(group));
+        Box::new(table)
+    }
+
+    /// The alias written after a derived table's `)`, or a parenthesised
+    /// table's: `[AS] alias [(column, …)]` or a templated alias; none where
+    /// the word is a clause keyword. Returned as the alias, its `AS`
+    /// token, the column list and the list's parentheses.
+    pub(crate) fn parse_derived_table_alias(&mut self) -> SecondAliasWithColumns {
+        let mut alias = None;
+        let mut as_token = None;
+        let mut alias_columns = None;
+        let mut alias_columns_lparen_id = None;
+        let mut alias_columns_rparen_id = None;
+        if let Some(next_tok) = self.peek() {
+            if matches!(next_tok.kind, TokenKind::JinjaExprOpen) {
+                alias = self.parse_template_led_alias();
+            } else {
+                let after_as = matches!(next_tok.kind, TokenKind::Keyword(Keyword::As));
+                if after_as
+                    && (self.can_be_label(self.idx + 1, LabelPosition::TableAlias { after_as })
+                        || self.templated_part_at(self.idx + 1).is_some())
+                {
+                    as_token = Some(self.current_token_id());
+                    self.advance(); // consume AS
+                }
+                if (!after_as || as_token.is_some())
+                    && (self.can_be_label(self.idx, LabelPosition::TableAlias { after_as })
+                        || self.templated_part_at(self.idx).is_some())
+                {
+                    alias = self.take_alias();
+
+                    // Parse optional column list after alias: (col1, col2, ...)
+                    if let Some(lparen) = self.peek() {
+                        if matches!(
+                            lparen.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+                        ) {
+                            self.advance(); // consume '('
+                            alias_columns_lparen_id = Some(self.last_token_id());
+                            let mut columns = Vec::new();
+
+                            loop {
+                                if let Some(col_tok) = self.peek() {
+                                    if self.can_be_identifier_token(col_tok) {
+                                        let col_tok =
+                                            self.advance().expect_invariant("just peeked column");
+                                        columns.push(AstIdentifier {
+                                            node_id: self.id_gen.next(),
+                                            span: col_tok.span,
+                                            kind: crate::ast::AstIdentifierKind::Name,
+                                            templated: None,
+                                        });
+
+                                        // Check for comma or closing paren
+                                        if let Some(next) = self.peek() {
+                                            if matches!(
+                                                next.kind,
+                                                TokenKind::Punctuation(
+                                                    crate::lexer::Punctuation::Comma
+                                                )
+                                            ) {
+                                                self.advance(); // consume ','
+                                                continue;
+                                            } else if matches!(
+                                                next.kind,
+                                                TokenKind::Punctuation(
+                                                    crate::lexer::Punctuation::RParen
+                                                )
+                                            ) {
+                                                self.advance(); // consume ')'
+                                                alias_columns_rparen_id =
+                                                    Some(self.last_token_id());
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    } else if matches!(
+                                        col_tok.kind,
+                                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+                                    ) {
+                                        self.advance(); // consume ')' - empty list
+                                        alias_columns_rparen_id = Some(self.last_token_id());
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+
+                            if !columns.is_empty() {
+                                alias_columns = Some(columns);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (
+            alias,
+            as_token,
+            alias_columns,
+            alias_columns_lparen_id,
+            alias_columns_rparen_id,
+        )
+    }
+
     /// Parses a table factor starting with an identifier or keyword-as-identifier.
-    /// Handles qualified names (db.schema.table), IDENTIFIER(...), TABLE(...) UDTFs,
+    /// Handles qualified names (db.schema.table), IDENTIFIER(...),
     /// table-valued functions, aliases, time travel, PIVOT/UNPIVOT, MATCH_RECOGNIZE, etc.
     /// Extracted from `parse_table_factor_impl` to reduce stack frame size of the main dispatch.
     fn parse_table_factor_identifier(
         &mut self,
         lateral_keyword_span: Option<Span>,
     ) -> ParseResult<Option<Box<AstTableRef>>> {
-        let lateral = lateral_keyword_span.is_some();
+        // `STREAM name` / `STREAM ( name )`: `STREAM` and `(` consumed here,
+        // the name read below as any table's.
+        let stream = match self.stream_prefix_at() {
+            Some(parenthesized) => {
+                let stream_tok = self.advance().expect_invariant("STREAM confirmed by peek");
+                if parenthesized {
+                    self.advance(); // consume '('
+                }
+                Some((stream_tok.span.start, parenthesized))
+            }
+            None => None,
+        };
         // tok is still the peeked token (not yet consumed)
         let tok = self.peek().expect_invariant("caller verified token exists");
 
@@ -2551,302 +2906,167 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Treat a leading IDENTIFIER token as a generic table name, but
-        // also handle the Snowflake IDENTIFIER(...) helper when followed
-        // by '(' so that constructs like FROM IDENTIFIER(:table_name)
-        // are accepted inside scripting blocks. We slice the full span
-        // from IDENTIFIER through the closing ')' into the AstObjectRef.
-        // Also handle TABLE(function_call) for UDTFs.
-        let ident_tok = self.advance().expect_invariant("just peeked identifier");
-        let mut end_span = ident_tok.span.end;
-        let mut identifier_arg: Option<Box<AstExpr>> = None;
-        // Per-identifier-token spans for the structurally dotted name.
-        // See `AstObjectRef::parts` for the rationale: each entry must
-        // be the exact span of one identifier token, never wider, so
-        // downstream consumers can decompose `db.schema.table` without
-        // re-parsing the merged span (which would drag in any trivia
-        // emitted between parts). Set to `None` below if we enter
-        // `TABLE(...)`, `IDENTIFIER(...)`, or hit a Jinja interpolation
-        // inside the dotted-name loop — in those cases the name is not
-        // a structurally-decomposable dotted identifier.
-        let mut parts: Option<Vec<Option<Span>>> = Some(vec![Some(ident_tok.span)]);
-
-        // Handle TABLE(function_call) for UDTFs
-        if ident_tok.lexeme(self.source).eq_ignore_ascii_case("TABLE") {
-            if let Some(lp) = self.peek() {
-                if matches!(
-                    lp.kind,
-                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                ) {
-                    parts = None;
-                    let _ = self.advance(); // consume '('
-                    let mut depth: usize = 1;
-                    while let Some(t) = self.advance() {
-                        match t.kind {
-                            TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
-                            TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
-                                depth -= 1;
-                                end_span = t.span.end;
-                                if depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        } else if ident_tok
-            .lexeme(self.source)
-            .eq_ignore_ascii_case("IDENTIFIER")
-        {
-            // IDENTIFIER(string_literal | session_var | bind_var | scripting_var)
-            // Try to parse the argument expression for formatter support
-            if let Some(lp) = self.peek() {
-                if matches!(
-                    lp.kind,
-                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                ) {
-                    parts = None;
-                    self.advance(); // consume '('
-
-                    // Save position to try parsing
-                    let saved_idx = self.idx;
-
-                    // Try to parse the argument expression
-                    let arg_expr = self.parse_expr().ok();
-
-                    // Check if parsing succeeded and we have closing paren
-                    let parsed_ok = if let Some(ref _expr) = arg_expr {
-                        if let Some(rp) = self.peek() {
-                            matches!(
-                                rp.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                            )
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if parsed_ok {
-                        // Successfully parsed - consume closing paren
-                        if let Some(rp_tok) = self.advance() {
-                            end_span = rp_tok.span.end;
-                        }
-                        // Store parsed argument for later use
-                        identifier_arg = arg_expr.map(Box::new);
-                    } else {
-                        // Fall back to span collection
-                        self.idx = saved_idx;
-                        let mut depth: usize = 1;
-                        let mut found_closing = false;
-                        while let Some(t) = self.advance() {
-                            match t.kind {
-                                TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => {
-                                    depth += 1
-                                }
-                                TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
-                                    depth -= 1;
-                                    end_span = t.span.end;
-                                    if depth == 0 {
-                                        found_closing = true;
-                                        break;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !found_closing {
-                            return Err(ParseError::new(
-                                ident_tok.span,
-                                ParseErrorKind::InvalidSyntax {
-                                    message: "Missing closing ')' for IDENTIFIER(...) function"
-                                        .to_string(),
-                                },
-                            ));
-                        }
-                    }
-                }
-            }
-        } else if lateral {
-            // LATERAL followed by a regular table name (not a function call)
-            // This shouldn't normally happen as function calls are handled above,
-            // but keep for safety
-        }
-
-        // Handle qualified identifiers: db.schema.table or schema.table or schema.{{ table }}
-        // Continue consuming dot-separated identifiers or Jinja expressions
-        while let Some(dot_tok) = self.peek() {
-            if matches!(
-                dot_tok.kind,
-                TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
-            ) {
-                self.advance(); // consume dot
-                                // Check for identifier, keyword, or Jinja expression after dot
-                if let Some(next_tok) = self.peek() {
-                    match &next_tok.kind {
-                        TokenKind::JinjaExprOpen => {
-                            // Jinja expression after dot: schema.{{ table }}
-                            // The name is no longer a clean dotted identifier
-                            // chain. Drop parts to None
-                            // so consumers don't try to decompose a name
-                            // whose middle segment is a templated value.
-                            parts = None;
-                            self.advance(); // consume {{
-                            let _ = self.parse_jinja_expr()?;
-
-                            if let Some(close) = self.peek() {
-                                if matches!(close.kind, TokenKind::JinjaExprClose) {
-                                    let close_tok =
-                                        self.advance().expect_invariant("just peeked }}");
-                                    end_span = close_tok.span.end;
-                                } else {
-                                    return Err(ParseError::unexpected_token(
-                                        close.span,
-                                        vec!["}}".to_string()],
-                                        Parser::token_description(close, self.source),
-                                    ));
-                                }
-                            } else {
-                                return Err(ParseError::new(
-                                    next_tok.span,
-                                    ParseErrorKind::UnexpectedEof {
-                                        expected: vec!["}}".to_string()],
-                                    },
-                                ));
-                            }
-                        }
-                        _ if self.can_be_identifier_after_dot_token(next_tok) => {
-                            let next_tok =
-                                self.advance().expect_invariant("just peeked identifier");
-                            end_span = next_tok.span.end;
-                            if let Some(p) = parts.as_mut() {
-                                p.push(Some(next_tok.span));
-                            }
-                        }
-                        TokenKind::Punctuation(crate::lexer::Punctuation::Dot) => {
-                            // T-SQL omitted component (`master..tbl`): empty
-                            // slot recorded as `None`; the next iteration
-                            // consumes the following dot.
-                            end_span = dot_tok.span.end;
-                            if let Some(p) = parts.as_mut() {
-                                p.push(None);
-                            }
-                        }
-                        _ => {
-                            // Dot not followed by identifier or Jinja - error
-                            return Err(ParseError::unexpected_token(
-                                next_tok.span,
-                                vec!["identifier or Jinja expression".to_string()],
-                                Parser::token_description(next_tok, self.source),
-                            ));
-                        }
-                    }
-                } else {
-                    return Err(ParseError::new(
-                        dot_tok.span,
-                        ParseErrorKind::UnexpectedEof {
-                            expected: vec!["identifier or Jinja expression".to_string()],
-                        },
-                    ));
-                }
-            } else {
-                break;
-            }
-        }
-
-        let name = AstObjectRef {
-            node_id: self.id_gen.next(),
-            span: Span {
-                start: ident_tok.span.start,
-                end: end_span,
-            },
-            parts,
-            identifier_arg,
+        // The table's name, with the argument of an `IDENTIFIER(…)` name.
+        let Some(name) = self.parse_object_ref_with_argument(NamePosition::Object) else {
+            return Err(ParseError::new(
+                self.current_span(),
+                ParseErrorKind::InvalidSyntax {
+                    message: "Expected a table name".to_string(),
+                },
+            ));
         };
 
-        // Check if qualified name is followed by '(' — table-valued function call
-        // e.g., ML.PREDICT(...), ML.EVALUATE(...), schema.my_tvf(...)
-        if let Some(lp) = self.peek() {
-            if matches!(
+        match stream {
+            Some((start, parenthesized)) => {
+                self.finish_stream_table_factor(start, parenthesized, name, lateral_keyword_span)
+            }
+            None => self.finish_named_table_factor(name, lateral_keyword_span),
+        }
+    }
+
+    /// Whether the tokens at the current one are a streaming read of a
+    /// table where the dialect has one: `STREAM name` or `STREAM ( name )`,
+    /// `name` an object name not called; `Some(true)` for the parenthesized
+    /// form.
+    fn stream_prefix_at(&self) -> Option<bool> {
+        use crate::lexer::Punctuation;
+        if !self.dialect.stream_reads_a_table() {
+            return None;
+        }
+        let stream = self.peek()?;
+        if !stream.lexeme(self.source).eq_ignore_ascii_case("STREAM") {
+            return None;
+        }
+        let is = |n: usize, p: Punctuation| {
+            self.peek_ahead(n)
+                .is_some_and(|t| t.kind == TokenKind::Punctuation(p))
+        };
+        let parenthesized = is(1, Punctuation::LParen);
+        let k = if parenthesized { 2 } else { 1 };
+        let first = self.peek_ahead(k)?;
+        let starts_name = if parenthesized {
+            self.can_be_identifier_token(first)
+        } else {
+            // A word that ends the table reference is no name (`FROM stream
+            // WHERE …`, `FROM stream AS s`).
+            matches!(first.kind, TokenKind::Identifier { .. })
+                && !self.starts_table_clause_at(self.idx + k)
+        };
+        if !starts_name {
+            return None;
+        }
+        let after = self.object_name_end(self.idx + k)? - self.idx;
+        if parenthesized {
+            is(after, Punctuation::RParen).then_some(true)
+        } else {
+            (!is(after, Punctuation::LParen) && !is(after, Punctuation::Dot)).then_some(false)
+        }
+    }
+
+    /// The streaming read of the table `name` whose `STREAM` starts at
+    /// `start` ([`Self::stream_prefix_at`]): the `)` of the parenthesized
+    /// form, then what follows a table ([`Self::finish_table_ref`]).
+    fn finish_stream_table_factor(
+        &mut self,
+        start: u32,
+        parenthesized: bool,
+        name: AstObjectRef,
+        lateral_keyword_span: Option<Span>,
+    ) -> ParseResult<Option<Box<AstTableRef>>> {
+        let mut end = name.span.end;
+        if parenthesized {
+            let rparen = self.advance().ok_or_else(|| {
+                ParseError::new(
+                    name.span,
+                    ParseErrorKind::UnexpectedEof {
+                        expected: vec![")".to_string()],
+                    },
+                )
+            })?;
+            end = rparen.span.end;
+        }
+        let mut table = self.finish_table_ref(name, None, lateral_keyword_span)?;
+        if let Some(table) = table.as_mut() {
+            table.stream_span = Some(Span { start, end });
+            table.span.start = table.span.start.min(start);
+            table.span.end = table.span.end.max(end);
+        }
+        Ok(table)
+    }
+
+    /// The table factor whose name was just read: a table-valued function
+    /// call where `(` follows the name (`ML.PREDICT(…)`, `schema.my_tvf(…)`,
+    /// `{{ schema }}.fn(…)`), read by the function-call reader into
+    /// `table_function` and named by the parts of its name, its span the
+    /// call's ([`Self::finish_table_function_parse`]); else the table and
+    /// what follows it ([`Self::finish_table_ref`]), T-SQL hints in
+    /// parentheses included (`t (NOLOCK)`).
+    fn finish_named_table_factor(
+        &mut self,
+        name: AstObjectRef,
+        lateral_keyword_span: Option<Span>,
+    ) -> ParseResult<Option<Box<AstTableRef>>> {
+        if !self.peek().is_some_and(|lp| {
+            matches!(
                 lp.kind,
                 TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-            ) {
-                // Consume balanced parens to get the full function call span
-                let mut depth: usize = 0;
-                let tvf_start = ident_tok.span.start;
-                let mut tvf_end = end_span;
-                while let Some(t) = self.advance() {
-                    match t.kind {
-                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
-                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => {
-                            depth -= 1;
-                            tvf_end = t.span.end;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let tvf_name = AstObjectRef {
-                    node_id: self.id_gen.next(),
-                    span: Span {
-                        start: tvf_start,
-                        end: tvf_end,
-                    },
-                    // Table-valued function call detected after a
-                    // qualified prefix (`schema.my_tvf(...)`): the
-                    // name span now covers the whole call, so it is
-                    // no longer a structurally-decomposable identifier.
-                    parts: None,
-                    identifier_arg: None,
-                };
-                let alias = self
-                    .parse_simple_alias_with_as()
-                    .map(|(alias, _as_tok)| alias);
-                let final_end = alias.as_ref().map(|a| a.span.end).unwrap_or(tvf_end);
-                return Ok(Some(Box::new(AstTableRef {
-                    node_id: self.id_gen.next(),
-                    name: Box::new(tvf_name),
-                    prefix_inline_fragments: Box::new(Vec::new()),
-                    suffix_inline_fragments: Box::new(Vec::new()),
-                    alias: alias.map(Box::new),
-                    alias_columns: None,
-                    result_alias: None,
-                    result_alias_columns: None,
-                    subquery: None,
-                    subquery_lparen_span: None,
-                    subquery_rparen_span: None,
-                    paren_group: None,
-                    values: None,
-                    lateral_keyword_span,
-                    only_span: None,
-                    time_travel: None,
-                    sample: None,
-                    changes: None,
-                    stage_options: None,
-                    table_function: None,
-                    tvf_schema_span: None,
-                    with_offset: None,
-                    pivot: None,
-                    unpivot: None,
-                    match_recognize: None,
-                    table_hints: None,
-                    index_hints: None,
-                    partition_selection: None,
-                    joins: Box::new(Vec::new()),
-                    syntax_id: None,
-                    span: Span {
-                        start: tvf_start,
-                        end: final_end,
-                    },
-                })));
-            }
+            ) && !self.should_stop_scan_at_statement_start(lp)
+        }) || self.at_hint_list_without_with()
+        {
+            return self.finish_table_ref(name, None, lateral_keyword_span);
         }
+        let start = name.span.start;
+        let call = self.parse_function_call_from_lparen(
+            name.span,
+            None,
+            crate::parser::expr_functions::CallSite::TableFunction,
+        )?;
+        let call_name = AstObjectRef {
+            name_kind: name.name_kind,
+            node_id: self.id_gen.next(),
+            span: Span {
+                start,
+                end: call.span().end,
+            },
+            // The span covers the call; the parts are the function's name.
+            parts: name.parts,
+            identifier_arg: None,
+        };
+        self.finish_table_function_parse(
+            start,
+            call_name,
+            Some(Box::new(call)),
+            lateral_keyword_span,
+        )
+    }
 
+    /// The table alias at the current token, consumed: a name a template
+    /// writes some of ([`Self::parse_templated_identifier`]), or the token.
+    fn take_alias(&mut self) -> Option<AstIdentifier> {
+        if let Some(alias) = self.parse_templated_identifier() {
+            return Some(alias);
+        }
+        let tok = self.advance()?;
+        Some(AstIdentifier {
+            node_id: self.id_gen.next(),
+            span: tok.span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: None,
+        })
+    }
+
+    /// What follows the name of a table reference, parsed the same way
+    /// for a table and for a stage: partition selection, alias, hints,
+    /// `CHANGES` or time travel, `SAMPLE`, `PIVOT` or `UNPIVOT`,
+    /// `MATCH_RECOGNIZE` and the alias after them. `stage_options` is the
+    /// parenthesized option list a stage reference carries before these.
+    /// The reference's span runs from the name to the last of them.
+    fn finish_table_ref(
+        &mut self,
+        name: AstObjectRef,
+        stage_options: Option<AstStageOptions>,
+        lateral_keyword_span: Option<Span>,
+    ) -> ParseResult<Option<Box<AstTableRef>>> {
         // MySQL partition selection: `tbl PARTITION (p0, p1)` — between the
         // table name and the alias (dialect-gated inside).
         let partition_selection = self.try_parse_partition_selection()?;
@@ -2858,94 +3078,32 @@ impl<'a> Parser<'a> {
         if let Some(next_tok) = self.peek() {
             match &next_tok.kind {
                 TokenKind::Keyword(Keyword::As) => {
-                    if let Some(alias_tok) = self.peek_ahead(1) {
-                        // Accept both identifiers and keywords as aliases (context-sensitive parsing)
-                        if self.can_be_alias_token(alias_tok) {
-                            let as_tok_id = self.current_token_id();
-                            self.advance(); // consume AS
-                            let alias_tok = self.advance().expect_invariant("just peeked alias");
-                            alias = Some(AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_tok.span,
-                            });
-                            as_token = Some(as_tok_id);
-                        }
-                    }
-                }
-                TokenKind::Identifier { .. } => {
-                    if self.should_stop_scan_at_statement_start(next_tok) {
-                        // MSSQL semicolonless scripts: don't consume next statement start as alias
-                    } else {
-                        // Check if this identifier is actually a table clause keyword
-                        let is_table_clause =
-                            is_table_specific_clause(next_tok.lexeme(self.source));
-
-                        // Check if it's a query clause keyword or dialect-specific boundary
-                        let is_query_clause = is_table_clause_keyword(next_tok.lexeme(self.source))
-                            || self
-                                .dialect
-                                .is_clause_boundary_keyword(next_tok.lexeme(self.source));
-
-                        // Special case: MATCH_CONDITION followed by '(' is not an alias
-                        // (it's part of ASOF JOIN syntax)
-                        let is_match_condition_call = if next_tok
-                            .lexeme(self.source)
-                            .eq_ignore_ascii_case("MATCH_CONDITION")
-                        {
-                            self.peek_ahead(1).is_some_and(|tok| {
-                                matches!(
-                                    tok.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                                )
-                            })
-                        } else {
-                            false
-                        };
-
-                        // Only consume as alias if it's not a clause keyword and not table clause
-                        // Table clauses can appear before OR after alias, so don't consume them yet
-                        if !is_table_clause
-                            && !is_query_clause
-                            && !is_match_condition_call
-                            && !self.is_databricks_time_travel_ahead()
-                        {
-                            let alias_tok =
-                                self.advance().expect_invariant("just peeked identifier");
-                            alias = Some(AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_tok.span,
-                            });
-                        }
-                    }
-                }
-                TokenKind::Keyword(_) => {
-                    // Keywords can be used as table aliases (context-sensitive parsing)
-                    // Use lookahead to determine if this keyword starts a new clause/construct
-                    // Also check dialect-specific clause boundaries (e.g., RETURNING in PostgreSQL)
-                    let is_dialect_boundary = self
-                        .dialect
-                        .is_clause_boundary_keyword(next_tok.lexeme(self.source));
-                    if self.can_be_alias_token(next_tok)
-                        && !self.is_join_or_clause_keyword()
-                        && !is_dialect_boundary
-                        && !self.should_stop_scan_at_statement_start(next_tok)
+                    if self.can_be_label(self.idx + 1, LabelPosition::TableAlias { after_as: true })
+                        || self.templated_part_at(self.idx + 1).is_some()
                     {
-                        let alias_tok =
-                            self.advance().expect_invariant("just peeked keyword-alias");
-                        alias = Some(AstIdentifier {
-                            node_id: self.id_gen.next(),
-                            span: alias_tok.span,
-                        });
+                        let as_tok_id = self.current_token_id();
+                        self.advance(); // consume AS
+                        alias = self.take_alias();
+                        as_token = Some(as_tok_id);
                     }
+                }
+                TokenKind::JinjaExprOpen => alias = self.parse_template_led_alias(),
+                // A table clause can come before or after the alias, so one
+                // is not consumed here.
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                    if self
+                        .can_be_label(self.idx, LabelPosition::TableAlias { after_as: false }) =>
+                {
+                    alias = self.take_alias();
                 }
                 _ => {}
             }
         }
 
-        // T-SQL table hints: WITH (NOLOCK), WITH (UPDLOCK, HOLDLOCK), etc.
+        // T-SQL table hints: WITH (NOLOCK), WITH (UPDLOCK, HOLDLOCK), (NOLOCK).
         // Must come after alias resolution (FROM t alias WITH (NOLOCK))
         // and before CHANGES/time_travel (T-SQL doesn't have those anyway).
-        let table_hints = self.try_parse_table_hint_clause()?;
+        let table_hints = self.try_parse_table_hint_clause(HintIntroducer::WithOrParentheses)?;
 
         // MySQL index hints: USE|FORCE|IGNORE INDEX|KEY [...] (...) — after
         // the alias, before joins (dialect-gated inside).
@@ -3002,72 +3160,23 @@ impl<'a> Parser<'a> {
             if let Some(next_tok) = self.peek() {
                 match &next_tok.kind {
                     TokenKind::Keyword(Keyword::As) => {
-                        if let Some(alias_tok) = self.peek_ahead(1) {
-                            if self.can_be_alias_token(alias_tok) {
-                                let as_tok_id = self.current_token_id();
-                                self.advance(); // consume AS
-                                let alias_tok =
-                                    self.advance().expect_invariant("just peeked alias");
-                                alias = Some(AstIdentifier {
-                                    node_id: self.id_gen.next(),
-                                    span: alias_tok.span,
-                                });
-                                as_token = Some(as_tok_id);
-                            }
+                        if self.can_be_label(
+                            self.idx + 1,
+                            LabelPosition::TableAlias { after_as: true },
+                        ) {
+                            let as_tok_id = self.current_token_id();
+                            self.advance(); // consume AS
+                            alias = self.take_alias();
+                            as_token = Some(as_tok_id);
                         }
                     }
-                    TokenKind::Identifier { .. } => {
-                        if !self.should_stop_scan_at_statement_start(next_tok) {
-                            let is_clause_keyword =
-                                is_table_clause_keyword(next_tok.lexeme(self.source));
-
-                            let is_dialect_boundary = self
-                                .dialect
-                                .is_clause_boundary_keyword(next_tok.lexeme(self.source));
-
-                            let is_match_condition_call = if next_tok
-                                .lexeme(self.source)
-                                .eq_ignore_ascii_case("MATCH_CONDITION")
-                            {
-                                self.peek_ahead(1).is_some_and(|tok| {
-                                    matches!(
-                                        tok.kind,
-                                        TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                                    )
-                                })
-                            } else {
-                                false
-                            };
-
-                            if !is_clause_keyword
-                                && !is_dialect_boundary
-                                && !is_match_condition_call
-                            {
-                                let alias_tok =
-                                    self.advance().expect_invariant("just peeked identifier");
-                                alias = Some(AstIdentifier {
-                                    node_id: self.id_gen.next(),
-                                    span: alias_tok.span,
-                                });
-                            }
-                        }
-                    }
-                    TokenKind::Keyword(_) => {
-                        let is_dialect_boundary = self
-                            .dialect
-                            .is_clause_boundary_keyword(next_tok.lexeme(self.source));
-                        if self.can_be_alias_token(next_tok)
-                            && !self.is_join_or_clause_keyword()
-                            && !is_dialect_boundary
-                            && !self.should_stop_scan_at_statement_start(next_tok)
-                        {
-                            let alias_tok =
-                                self.advance().expect_invariant("just peeked keyword-alias");
-                            alias = Some(AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_tok.span,
-                            });
-                        }
+                    TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                        if self.can_be_label(
+                            self.idx,
+                            LabelPosition::TableAlias { after_as: false },
+                        ) =>
+                    {
+                        alias = self.take_alias();
                     }
                     _ => {}
                 }
@@ -3099,6 +3208,10 @@ impl<'a> Parser<'a> {
         // Partition selection precedes the alias; extend when no alias followed.
         if let Some(ps) = partition_selection.as_ref() {
             complete_span.end = complete_span.end.max(ps.span.end);
+        }
+        // So do a stage's options.
+        if let Some(options) = stage_options.as_ref() {
+            complete_span.end = complete_span.end.max(options.span.end);
         }
 
         // Create SyntaxTableRef if we have an alias or result_alias (simple table case)
@@ -3135,7 +3248,7 @@ impl<'a> Parser<'a> {
             time_travel,
             sample,
             changes,
-            None, // stage_options
+            stage_options,
             None, // table_function
             None, // with_offset
             pivot,
@@ -3155,18 +3268,23 @@ impl<'a> Parser<'a> {
             None => return Ok(None),
         };
         // Only proceed if the first token is a known join modifier.
-        match &first.kind {
-            TokenKind::Keyword(Keyword::Inner)
-            | TokenKind::Keyword(Keyword::Left)
-            | TokenKind::Keyword(Keyword::Right)
-            | TokenKind::Keyword(Keyword::Full)
-            | TokenKind::Keyword(Keyword::Cross)
-            | TokenKind::Keyword(Keyword::Outer)
-            | TokenKind::Keyword(Keyword::Asof)
-            | TokenKind::Keyword(Keyword::Natural)
-            | TokenKind::Keyword(Keyword::Directed)
-            | TokenKind::Keyword(Keyword::Lateral) => {}
-            _ => return Ok(None),
+        let is_modifier = matches!(
+            first.kind,
+            TokenKind::Keyword(
+                Keyword::Inner
+                    | Keyword::Left
+                    | Keyword::Right
+                    | Keyword::Full
+                    | Keyword::Cross
+                    | Keyword::Outer
+                    | Keyword::Asof
+                    | Keyword::Natural
+                    | Keyword::Directed
+                    | Keyword::Lateral
+            )
+        );
+        if !is_modifier && self.semi_or_anti_at(first).is_none() {
+            return Ok(None);
         }
 
         let mut kind = crate::ast::AstJoinKind::Inner;
@@ -3187,6 +3305,17 @@ impl<'a> Parser<'a> {
 
         // Consume one or more modifier tokens (NATURAL, INNER/LEFT/RIGHT/FULL, CROSS, DIRECTED, optional OUTER).
         while let Some(tok) = self.peek() {
+            // Databricks `[LEFT] SEMI` / `[LEFT] ANTI`.
+            if let Some(semi_or_anti) = self.semi_or_anti_at(tok) {
+                let side_tok = self.advance().expect_invariant("SEMI / ANTI after peek");
+                if !saw_any {
+                    modifier_span_start = side_tok.span.start;
+                }
+                kind = semi_or_anti;
+                saw_any = true;
+                saw_explicit_type = true;
+                continue;
+            }
             match &tok.kind {
                 TokenKind::Keyword(Keyword::Natural) => {
                     let nat_tok = self
@@ -3390,6 +3519,63 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The join kind `SEMI` or `ANTI` at `tok` names, where the dialect
+    /// reads the word as a join keyword, never a table alias (Databricks).
+    fn semi_or_anti_at(&self, tok: &Token) -> Option<crate::ast::AstJoinKind> {
+        let kind = if self.is_word(Some(tok), "SEMI") {
+            crate::ast::AstJoinKind::LeftSemi
+        } else if self.is_word(Some(tok), "ANTI") {
+            crate::ast::AstJoinKind::LeftAnti
+        } else {
+            return None;
+        };
+        (!self
+            .dialect
+            .keyword_can_be_unquoted_alias(tok.lexeme(self.source)))
+        .then_some(kind)
+    }
+
+    /// Whether `tok` is MySQL's `STRAIGHT_JOIN`, written in place of `JOIN`,
+    /// where the dialect reads it as a keyword, never a table alias.
+    fn is_straight_join(&self, tok: &Token) -> bool {
+        self.is_word(Some(tok), "STRAIGHT_JOIN")
+            && !self
+                .dialect
+                .keyword_can_be_unquoted_alias(tok.lexeme(self.source))
+    }
+
+    /// The T-SQL join hint the word `tok` names (`LOOP`, `HASH`, `MERGE`,
+    /// `REMOTE`), if it names one.
+    pub(crate) fn join_hint_kind(&self, tok: &Token) -> Option<AstJoinHintKind> {
+        let is = |word: &str| self.is_word(Some(tok), word);
+        if is("LOOP") {
+            Some(AstJoinHintKind::Loop)
+        } else if is("HASH") {
+            Some(AstJoinHintKind::Hash)
+        } else if is("MERGE") {
+            Some(AstJoinHintKind::Merge)
+        } else if is("REMOTE") {
+            Some(AstJoinHintKind::Remote)
+        } else {
+            None
+        }
+    }
+
+    /// The join hint at token `at`, where `JOIN` follows it: T-SQL writes
+    /// one between a join's type and `JOIN` (`INNER HASH JOIN`).
+    fn join_hint_at(&self, at: usize) -> Option<AstJoinHint> {
+        let tok = self.tokens.get(at)?;
+        let kind = self.join_hint_kind(tok)?;
+        let joins = self
+            .tokens
+            .get(at + 1)
+            .is_some_and(|t| matches!(t.kind, TokenKind::Keyword(Keyword::Join)));
+        joins.then_some(AstJoinHint {
+            kind,
+            span: tok.span,
+        })
+    }
+
     /// Parse MATCH_CONDITION clause for ASOF JOIN
     /// Syntax: MATCH_CONDITION ( comparison_expr )
     fn parse_match_condition(&mut self) -> Option<crate::ast::AstMatchCondition> {
@@ -3462,6 +3648,55 @@ impl<'a> Parser<'a> {
                     break;
                 }
             };
+            // Databricks / Spark `LATERAL VIEW [OUTER] generator(...)`: the
+            // generator's rows joined to each row before it, as a lateral
+            // cross join (`OUTER`: a left one, keeping rows it yields none
+            // for).
+            if matches!(first_tok.kind, TokenKind::Keyword(Keyword::Lateral))
+                && self
+                    .peek_ahead(1)
+                    .is_some_and(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::View)))
+            {
+                let lateral_span = self
+                    .advance()
+                    .expect_invariant("LATERAL confirmed by peek")
+                    .span;
+                let clause = self.parse_lateral_view_clause()?;
+                let kind = match clause.outer {
+                    true => crate::ast::AstJoinKind::LeftOuter,
+                    false => crate::ast::AstJoinKind::Cross,
+                };
+                let mut span_end = clause.end;
+                let right = self.lateral_view_table_ref(clause);
+                let InlineFragmentCollection {
+                    fragments: suffix_inline_fragments,
+                } = self.collect_trailing_inline_fragments();
+                if let Some(last) = suffix_inline_fragments.last() {
+                    span_end = span_end.max(last.span.end);
+                }
+                base.joins.push(Box::new(crate::ast::AstJoin {
+                    node_id: self.id_gen.next(),
+                    kind,
+                    apply_keyword_span: None,
+                    directed_keyword_span: None,
+                    lateral_keyword_span: Some(lateral_span),
+                    asof_keyword_span: None,
+                    straight_join_span: None,
+                    join_hint: None,
+                    match_condition: None,
+                    prefix_inline_fragments,
+                    right,
+                    constraint: crate::ast::AstJoinConstraint::None,
+                    suffix_inline_fragments,
+                    span: Span {
+                        start: lateral_span.start,
+                        end: span_end,
+                    },
+                }));
+                base.span.end = base.span.end.max(span_end);
+                continue;
+            }
+
             // If we see a bare DIRECTED followed by JOIN, treat it as a
             // hard syntax error scenario at the SELECT level. The join-chain
             // helper itself just stops; the caller (SELECT parser) will see
@@ -3481,7 +3716,8 @@ impl<'a> Parser<'a> {
             }
 
             // Check for bare JOIN keyword (without modifiers)
-            let is_bare_join = matches!(first_tok.kind, TokenKind::Keyword(Keyword::Join));
+            let is_bare_join = matches!(first_tok.kind, TokenKind::Keyword(Keyword::Join))
+                || self.is_straight_join(first_tok);
 
             let (
                 kind,
@@ -3515,6 +3751,20 @@ impl<'a> Parser<'a> {
                 }
             };
 
+            let typed = matches!(
+                kind,
+                crate::ast::AstJoinKind::Inner
+                    | crate::ast::AstJoinKind::LeftOuter
+                    | crate::ast::AstJoinKind::RightOuter
+                    | crate::ast::AstJoinKind::FullOuter
+            );
+            let join_hint = (typed && !is_bare_join && !apply)
+                .then(|| self.join_hint_at(self.idx))
+                .flatten();
+            if join_hint.is_some() {
+                self.advance();
+            }
+
             let join_kw = match self.peek() {
                 Some(t) => t,
                 None => {
@@ -3526,7 +3776,9 @@ impl<'a> Parser<'a> {
                 }
             };
             let expect_apply = apply;
-            let is_join_keyword = matches!(join_kw.kind, TokenKind::Keyword(Keyword::Join));
+            let straight_join = self.is_straight_join(join_kw);
+            let is_join_keyword =
+                matches!(join_kw.kind, TokenKind::Keyword(Keyword::Join)) || straight_join;
             let is_apply_ident = matches!(join_kw.kind, TokenKind::Identifier { .. })
                 && join_kw.lexeme(self.source).eq_ignore_ascii_case("APPLY");
 
@@ -3550,7 +3802,7 @@ impl<'a> Parser<'a> {
             }
             // Right-hand table: reuse table-factor parser so joins can target
             // subqueries or aliased tables in future extensions.
-            let right = match self.parse_table_factor(Span {
+            let mut right = match self.parse_table_factor(Span {
                 start: modifier_span_start,
                 end: join_kw.span.end,
             }) {
@@ -3590,8 +3842,56 @@ impl<'a> Parser<'a> {
             let InlineFragmentCollection {
                 fragments: between_table_and_constraint,
             } = self.collect_leading_inline_fragments();
-            if !between_table_and_constraint.is_empty() {
+            let fragments_between = !between_table_and_constraint.is_empty();
+            if fragments_between {
                 prefix_inline_fragments.extend(between_table_and_constraint);
+            }
+
+            // `a JOIN b JOIN c ON … ON …`: joins written after a right side
+            // with no condition of its own are its joins where a condition
+            // for this join follows them; otherwise they are this chain's.
+            let mut joins_after = Vec::new();
+            let mut fragments_after = Vec::new();
+            if !expect_apply
+                && !fragments_between
+                && matches!(
+                    kind,
+                    crate::ast::AstJoinKind::Inner
+                        | crate::ast::AstJoinKind::LeftOuter
+                        | crate::ast::AstJoinKind::RightOuter
+                        | crate::ast::AstJoinKind::FullOuter
+                )
+                && self.peek().is_some_and(|tok| {
+                    matches!(
+                        tok.kind,
+                        TokenKind::Keyword(
+                            Keyword::Join
+                                | Keyword::Inner
+                                | Keyword::Left
+                                | Keyword::Right
+                                | Keyword::Full
+                                | Keyword::Cross
+                                | Keyword::Natural
+                                | Keyword::Outer
+                                | Keyword::Asof
+                                | Keyword::Directed
+                        )
+                    )
+                })
+            {
+                let _depth = self.track_depth("join chain")?;
+                let joins_before = right.joins.len();
+                let fragments_before = right.suffix_inline_fragments.len();
+                let end_before = right.span.end;
+                self.parse_join_chain(&mut right)?;
+                let closed = self.peek().is_some_and(|tok| {
+                    matches!(tok.kind, TokenKind::Keyword(Keyword::On | Keyword::Using))
+                });
+                if !closed {
+                    joins_after = right.joins.split_off(joins_before);
+                    fragments_after = right.suffix_inline_fragments.split_off(fragments_before);
+                    right.span.end = end_before;
+                }
             }
 
             // Optional join condition: ON <expr> or USING(...).
@@ -3662,6 +3962,8 @@ impl<'a> Parser<'a> {
                                         cols.push(AstIdentifier {
                                             node_id: self.id_gen.next(),
                                             span: ident_tok.span,
+                                            kind: crate::ast::AstIdentifierKind::Name,
+                                            templated: None,
                                         });
                                     }
                                     TokenKind::Punctuation(crate::lexer::Punctuation::Comma) => {
@@ -3734,6 +4036,8 @@ impl<'a> Parser<'a> {
                 directed_keyword_span,
                 lateral_keyword_span,
                 asof_keyword_span,
+                straight_join_span: straight_join.then_some(join_op_tok.span),
+                join_hint,
                 match_condition, // Use the parsed MATCH_CONDITION
                 prefix_inline_fragments,
                 right,
@@ -3743,6 +4047,14 @@ impl<'a> Parser<'a> {
             };
             base.span.end = base.span.end.max(span_end);
             base.joins.push(Box::new(join));
+            if let Some(last) = joins_after.last() {
+                base.span.end = base.span.end.max(last.span.end);
+            }
+            base.joins.extend(joins_after);
+            if let Some(last) = fragments_after.last() {
+                base.span.end = base.span.end.max(last.span.end);
+            }
+            base.suffix_inline_fragments.extend(fragments_after);
         }
         Ok(())
     }
@@ -3860,6 +4172,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Keyword(Keyword::Use) => Some(AstIndexHintKind::Use),
                 TokenKind::Identifier {
                     kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
                 } => {
                     let lex = head.lexeme(self.source);
                     if lex.eq_ignore_ascii_case("FORCE") {
@@ -3877,6 +4190,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Keyword(Keyword::Key) => true,
                 TokenKind::Identifier {
                     kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
                 } => t.lexeme(self.source).eq_ignore_ascii_case("INDEX"),
                 _ => false,
             });
@@ -4027,8 +4341,96 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Whether the current token opens a hint list T-SQL takes without
+    /// `WITH`: `(`, one or more such hints ([`hint_written_without_with`])
+    /// separated by commas, `)`. Where the dialect has no table hints it
+    /// never does, and `name(…)` is a call.
+    pub(crate) fn at_hint_list_without_with(&self) -> bool {
+        use crate::lexer::{Punctuation, TokenKind};
+        if !self.dialect.supports_table_hints()
+            || !self
+                .peek()
+                .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))
+        {
+            return false;
+        }
+        let mut k = 1;
+        loop {
+            let Some(hint) = self.peek_ahead(k) else {
+                return false;
+            };
+            if !hint_written_without_with(&classify_simple_table_hint_keyword(
+                hint.lexeme(self.source),
+            )) {
+                return false;
+            }
+            match self.peek_ahead(k + 1).map(|t| &t.kind) {
+                Some(TokenKind::Punctuation(Punctuation::RParen)) => return true,
+                Some(TokenKind::Punctuation(Punctuation::Comma)) => k += 2,
+                Some(
+                    TokenKind::Punctuation(
+                        Punctuation::LParen
+                        | Punctuation::LBracket
+                        | Punctuation::RBracket
+                        | Punctuation::LCurly
+                        | Punctuation::RCurly
+                        | Punctuation::Semi
+                        | Punctuation::Dot
+                        | Punctuation::Colon,
+                    )
+                    | TokenKind::Keyword(_)
+                    | TokenKind::Identifier { .. }
+                    | TokenKind::Literal(_)
+                    | TokenKind::Operator(_)
+                    | TokenKind::LineComment
+                    | TokenKind::BlockComment
+                    | TokenKind::JinjaComment
+                    | TokenKind::JinjaExprOpen
+                    | TokenKind::JinjaExprClose
+                    | TokenKind::JinjaStmtOpen
+                    | TokenKind::JinjaStmtClose
+                    | TokenKind::JinjaPipe
+                    | TokenKind::JinjaTilde
+                    | TokenKind::JinjaDoubleStar
+                    | TokenKind::JinjaDoubleSlash
+                    | TokenKind::JinjaDoubleEq
+                    | TokenKind::JinjaAnd
+                    | TokenKind::JinjaOr
+                    | TokenKind::JinjaNot
+                    | TokenKind::JinjaIn
+                    | TokenKind::JinjaIs
+                    | TokenKind::JinjaTrue
+                    | TokenKind::JinjaFalse
+                    | TokenKind::JinjaNull
+                    | TokenKind::JinjaIf
+                    | TokenKind::JinjaElif
+                    | TokenKind::JinjaElse
+                    | TokenKind::JinjaEndIf
+                    | TokenKind::JinjaFor
+                    | TokenKind::JinjaEndFor
+                    | TokenKind::JinjaSet
+                    | TokenKind::JinjaEndSet
+                    | TokenKind::JinjaDocs
+                    | TokenKind::JinjaEndDocs
+                    | TokenKind::JinjaFilter
+                    | TokenKind::JinjaEndFilter
+                    | TokenKind::JinjaCall
+                    | TokenKind::JinjaEndCall
+                    | TokenKind::Placeholder
+                    | TokenKind::Eof
+                    | TokenKind::Unknown,
+                )
+                | None => return false,
+            }
+        }
+    }
+
+    /// The table hint list at the current token: `WITH (…)`, or where
+    /// `introducer` allows it a list T-SQL takes without `WITH`, whose
+    /// `with_keyword_span` is `None`.
     pub(crate) fn try_parse_table_hint_clause(
         &mut self,
+        introducer: HintIntroducer,
     ) -> crate::error::ParseResult<Option<Box<crate::ast::AstTableHintClause>>> {
         use crate::lexer::{Keyword, Punctuation, TokenKind};
 
@@ -4038,7 +4440,7 @@ impl<'a> Parser<'a> {
         }
 
         // Disambiguate: WITH ( = table hints, WITH identifier = CTE
-        let is_hint = match (self.peek(), self.peek_ahead(1)) {
+        let after_with = match (self.peek(), self.peek_ahead(1)) {
             (Some(with_tok), Some(next_tok)) => {
                 matches!(with_tok.kind, TokenKind::Keyword(Keyword::With))
                     && matches!(next_tok.kind, TokenKind::Punctuation(Punctuation::LParen))
@@ -4046,19 +4448,23 @@ impl<'a> Parser<'a> {
             _ => false,
         };
 
-        if !is_hint {
+        let with_keyword_span = if after_with {
+            Some(
+                self.advance()
+                    .expect_invariant("WITH keyword confirmed by peek")
+                    .span,
+            )
+        } else if introducer == HintIntroducer::WithOrParentheses
+            && self.at_hint_list_without_with()
+        {
+            None
+        } else {
             return Ok(None);
-        }
-
-        // Consume WITH
-        let with_tok = self
-            .advance()
-            .expect_invariant("WITH keyword confirmed by peek");
-        let with_keyword_span = with_tok.span;
+        };
 
         // Consume (
-        let _lparen_tok = self.advance().expect_invariant("LParen confirmed by peek");
-        let start = with_keyword_span.start;
+        let lparen_tok = self.advance().expect_invariant("LParen confirmed by peek");
+        let start = with_keyword_span.unwrap_or(lparen_tok.span).start;
 
         // Parse comma-separated hints
         let mut hints = Vec::new();

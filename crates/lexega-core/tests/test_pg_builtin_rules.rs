@@ -3,11 +3,11 @@
 
 //! Tests for PostgreSQL built-in analysis rules (PG-RLS-NEW through PG-SUB-CHG).
 //!
-//! Validates that PG statements emit the correct governance/security signals
-//! and that YAML rules match against those signals.
+//! Validates that PG statements emit the correct governance/security findings
+//! and that YAML rules match against those findings.
 
 use lexega_core::{
-    analyzer::{AnalysisConfig, RuleMatch},
+    analyzer::{AnalysisConfig, RiskLevel, RuleMatch},
     PostgresDialect,
 };
 
@@ -15,18 +15,18 @@ use lexega_core::api::{analyze_risk, analyze_risk_with_policy_config};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(report.entries()),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -36,10 +36,12 @@ fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
 
 /// Helper for PG-dialect-gated statements (COPY, REFRESH MATVIEW, SUBSCRIPTION)
 fn analyze_pg_dialect(sql: &str) -> HashSet<String> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
     match analyze_risk_with_policy_config(sql, &config) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(report.entries()),
         Err(e) => {
             eprintln!("Parse error (PG dialect): {:?}", e);
             HashSet::new()
@@ -50,6 +52,14 @@ fn analyze_pg_dialect(sql: &str) -> HashSet<String> {
 // ============================================================================
 // PG RLS POLICY (PG-RLS-NEW through PG-RLS-PERMISSIVE)
 // ============================================================================
+
+#[test]
+fn test_pg_grant_to_a_grantee_list_reads_every_grantee() {
+    let ids = analyze_pg_dialect("GRANT SELECT ON orders TO alice, PUBLIC;");
+    assert!(ids.contains("GRT-TO-PUBLIC"), "ids={ids:?}");
+    let ids = analyze_pg_dialect("GRANT SELECT ON orders TO alice, bob;");
+    assert!(!ids.contains("GRT-TO-PUBLIC"), "ids={ids:?}");
+}
 
 #[test]
 fn test_pg_rls_policy_created() {
@@ -284,6 +294,37 @@ fn test_pg_copy_to() {
         "PG-COPY-TO should fire for COPY TO. Got: {:?}",
         rules
     );
+}
+
+#[test]
+fn test_pg_copy_to_server_file_is_high() {
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config("COPY users TO '/tmp/export.csv';", &config)
+        .expect("analyze");
+    assert!(
+        report.entries().any(|m| match m {
+            RuleMatch::Analysis(g) =>
+                g.matched_rule == "PG-COPY-TO" && g.risk_level == RiskLevel::High,
+        }),
+        "PG-COPY-TO should fire at High on a server-file export"
+    );
+}
+
+#[test]
+fn test_pg_copy_to_stdout_is_a_client_export() {
+    for sql in [
+        "COPY users TO STDOUT;",
+        "COPY (SELECT id FROM users) TO STDOUT WITH (FORMAT csv);",
+    ] {
+        let rules = analyze_pg_dialect(sql);
+        assert!(
+            !rules.contains("PG-COPY-TO"),
+            "PG-COPY-TO must not fire on `{sql}`. Got: {rules:?}"
+        );
+    }
 }
 
 #[test]
@@ -549,6 +590,43 @@ fn test_pg_create_rule() {
 }
 
 #[test]
+fn a_rules_commands_raise_what_they_raise_on_their_own() {
+    // (rule, the rule each of its commands raises written on its own)
+    let cases = [
+        (
+            "CREATE RULE r AS ON INSERT TO orders DO ALSO DELETE FROM archive;",
+            "DML-WRITE-UNBOUNDED",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO orders DO (DELETE FROM archive; INSERT INTO log VALUES (1));",
+            "DML-WRITE-UNBOUNDED",
+        ),
+        (
+            "CREATE OR REPLACE RULE r AS ON UPDATE TO orders WHERE NEW.id > 0 DO INSTEAD UPDATE archive SET id = NEW.id;",
+            "DML-WRITE-UNBOUNDED",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO orders DO ALSO (DELETE FROM archive; NOTIFY ch);",
+            "DML-WRITE-UNBOUNDED",
+        ),
+    ];
+    for (sql, command_rule) in cases {
+        let rules = analyze_pg_dialect(sql);
+        assert!(
+            rules.contains("PG-RULE-NEW"),
+            "PG-RULE-NEW on {sql}: {rules:?}"
+        );
+        assert!(
+            rules.contains(command_rule),
+            "{command_rule} on {sql}: {rules:?}"
+        );
+    }
+    let rules = analyze_pg_dialect("CREATE RULE r AS ON DELETE TO orders DO INSTEAD NOTHING;");
+    assert!(rules.contains("PG-RULE-NEW"), "{rules:?}");
+    assert!(!rules.contains("DML-WRITE-UNBOUNDED"), "{rules:?}");
+}
+
+#[test]
 fn test_pg_publication() {
     let sql = "CREATE PUBLICATION my_pub FOR TABLE users, orders;";
     let rules = analyze_and_get_rules(sql);
@@ -583,9 +661,9 @@ fn test_pg_multi_policy_statements() {
         DROP POLICY old_policy ON orders CASCADE;
     "#;
     let report = analyze_risk(sql).expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
 
-    // All 3 statements should produce signals
+    // All 3 statements should produce findings
     assert!(
         rules.contains("INFO-PG-RLS-NEW"),
         "Should detect CREATE POLICY. Got: {:?}",
@@ -602,9 +680,9 @@ fn test_pg_multi_policy_statements() {
         rules
     );
     assert!(
-        report.summary.total_reported_signals >= 3,
-        "Should have at least 3 signals from 3 statements. Got: {}",
-        report.summary.total_reported_signals
+        report.entries().count() >= 3,
+        "Should have at least 3 findings and context entries from 3 statements. Got: {}",
+        report.entries().count()
     );
 }
 
@@ -616,7 +694,7 @@ fn test_pg_multi_domain_statements() {
         DROP DOMAIN phone CASCADE;
     "#;
     let report = analyze_risk(sql).expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
 
     assert!(
         rules.contains("INFO-PG-DOMAIN-NEW"),
@@ -636,16 +714,18 @@ fn test_pg_multi_domain_statements() {
 }
 
 #[test]
-fn test_pg_mixed_critical_signals() {
+fn test_pg_mixed_critical_findings() {
     let sql = r#"
         COPY users FROM PROGRAM 'malicious-cmd';
         ALTER SYSTEM SET log_connections = off;
         DROP OWNED BY hacked_user;
     "#;
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
 
     assert!(
         rules.contains("PG-COPY-PROGRAM"),
@@ -663,9 +743,14 @@ fn test_pg_mixed_critical_signals() {
         rules
     );
     assert!(
-        report.summary.critical_count >= 3,
-        "Should have at least 3 critical signals. Got: {}",
+        report.summary.critical_count >= 2,
+        "Should have at least 2 critical findings. Got: {}",
         report.summary.critical_count
+    );
+    assert!(
+        report.summary.medium_count >= 1,
+        "Should have at least 1 medium finding. Got: {}",
+        report.summary.medium_count
     );
 }
 
@@ -674,57 +759,76 @@ fn test_pg_mixed_critical_signals() {
 // ============================================================================
 
 #[test]
-fn test_pg_critical_risk_levels() {
-    // All of these should be Critical
-    let critical_sqls = vec![
-        ("PG-RLS-DROP", "DROP POLICY user_policy ON users;"),
+fn test_pg_risk_levels() {
+    // Each rule is reported at the level the built-in rule gives it
+    let expected_levels = vec![
+        (
+            "PG-RLS-DROP",
+            RiskLevel::High,
+            "DROP POLICY user_policy ON users;",
+        ),
         (
             "PG-RLS-CASCADE-DROP",
+            RiskLevel::High,
             "DROP POLICY user_policy ON users CASCADE;",
         ),
         (
             "PG-TRIG-CASCADE-DROP",
+            RiskLevel::High,
             "DROP TRIGGER audit_trigger ON orders CASCADE;",
         ),
         (
             "PG-COPY-PROGRAM",
+            RiskLevel::Critical,
             "COPY users FROM PROGRAM 'cat /etc/passwd';",
         ),
         (
             "PG-DOMAIN-CONSTR-CASCADE-DROP",
+            RiskLevel::Medium,
             "ALTER DOMAIN d DROP CONSTRAINT c CASCADE;",
         ),
-        ("PG-DOMAIN-CASCADE-DROP", "DROP DOMAIN d CASCADE;"),
-        ("PG-SYS-CFG-CHG", "ALTER SYSTEM SET shared_buffers = '1GB';"),
-        ("PG-OWNED-DROP", "DROP OWNED BY old_user;"),
+        (
+            "PG-DOMAIN-CASCADE-DROP",
+            RiskLevel::Critical,
+            "DROP DOMAIN d CASCADE;",
+        ),
+        (
+            "PG-SYS-CFG-CHG",
+            RiskLevel::Medium,
+            "ALTER SYSTEM SET shared_buffers = '1GB';",
+        ),
+        (
+            "PG-OWNED-DROP",
+            RiskLevel::Critical,
+            "DROP OWNED BY old_user;",
+        ),
     ];
 
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
 
-    for (expected_rule, sql) in critical_sqls {
-        let report =
-            analyze_risk_with_policy_config(sql, &config).expect(&format!("Should parse: {}", sql));
-        let rules = extract_rule_ids(&report.signals);
-        assert!(
-            rules.contains(expected_rule),
-            "{} should fire for: {}. Got: {:?}",
+    for (expected_rule, level, sql) in expected_levels {
+        let report = analyze_risk_with_policy_config(sql, &config)
+            .unwrap_or_else(|_| panic!("Should parse: {}", sql));
+        let matched = report
+            .entries()
+            .find(|m| m.rule_id() == Some(expected_rule));
+        assert_eq!(
+            matched.map(|m| m.risk_level()),
+            Some(level),
+            "{} should fire at {:?} for: {}",
             expected_rule,
-            sql,
-            rules
-        );
-        assert!(
-            report.summary.critical_count >= 1,
-            "Critical count should be >= 1 for {}. Got: {}",
-            expected_rule,
-            report.summary.critical_count
+            level,
+            sql
         );
     }
 }
 
 #[test]
 fn test_pg_info_risk_levels() {
-    // These should be Info level (positive governance signals)
+    // These should be Info level (positive governance findings)
     let info_sqls = vec![
         ("INFO-PG-RLS-NEW", "CREATE POLICY p ON t USING (true);"),
         ("INFO-PG-DOMAIN-NEW", "CREATE DOMAIN d AS TEXT;"),
@@ -735,8 +839,8 @@ fn test_pg_info_risk_levels() {
     ];
 
     for (expected_rule, sql) in info_sqls {
-        let report = analyze_risk(sql).expect(&format!("Should parse: {}", sql));
-        let rules = extract_rule_ids(&report.signals);
+        let report = analyze_risk(sql).unwrap_or_else(|_| panic!("Should parse: {}", sql));
+        let rules = extract_rule_ids(report.entries());
         assert!(
             rules.contains(expected_rule),
             "{} should fire for: {}. Got: {:?}",
@@ -758,7 +862,7 @@ fn test_pg_info_risk_levels() {
 //
 // `DO $$ … $$` bodies are sub-parsed (shared with CREATE PROCEDURE), so inner
 // statements are flattened and rule-evaluated alongside the block's own
-// PG-ANON-EXEC signal — parity with proc/func bodies.
+// PG-ANON-EXEC finding — parity with proc/func bodies.
 // ============================================================================
 
 #[test]
@@ -788,5 +892,99 @@ fn test_pg_do_block_tagged_inner_truncate_fires() {
         rules.contains("TBL-TRUNCATE"),
         "Inner TRUNCATE in a tagged DO body should be decomposed and fire TBL-TRUNCATE. Got: {:?}",
         rules
+    );
+}
+
+// ============================================================================
+// PG-LO-FILE-ACCESS: server-file access through large objects
+// ============================================================================
+
+#[test]
+fn test_pg_lo_file_access_wherever_the_call_is_written() {
+    for sql in [
+        "SELECT lo_export(lo_create(0), '/var/lib/postgresql/.ssh/authorized_keys');",
+        "SELECT COALESCE(lo_export(42, '/tmp/x'), 0);",
+        "SELECT id FROM t WHERE lo_import('/etc/passwd') > 0;",
+        "SELECT pg_catalog.lo_export(1, '/tmp/y');",
+        "WITH x AS (SELECT lo_import('/etc/shadow') AS o) SELECT o FROM x;",
+    ] {
+        assert!(
+            analyze_pg_dialect(sql).contains("PG-LO-FILE-ACCESS"),
+            "{sql}"
+        );
+    }
+    // A quoted name is another function; a string is no call.
+    for sql in [
+        "SELECT \"LO_EXPORT\"(1, '/tmp/y');",
+        "SELECT lo_create(0), length('lo_export') FROM t;",
+    ] {
+        assert!(
+            !analyze_pg_dialect(sql).contains("PG-LO-FILE-ACCESS"),
+            "{sql}"
+        );
+    }
+}
+
+// `ALL` on a routine or a type is its one privilege; on a table it is every one.
+#[test]
+fn grant_all_on_a_routine_is_its_one_privilege() {
+    for sql in [
+        "GRANT ALL ON FUNCTION app.set_tenant(p_tenant uuid) TO app_rw;",
+        "GRANT ALL ON PROCEDURE app.p() TO app_rw;",
+        "GRANT ALL ON ALL FUNCTIONS IN SCHEMA app TO app_rw;",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA app GRANT ALL ON FUNCTIONS TO app_rw;",
+    ] {
+        let ids = analyze_pg_dialect(sql);
+        assert!(
+            !ids.contains("GRT-ALL-PRIV") && !ids.contains("PG-DEFAULT-PRIV-ALL"),
+            "{sql}: {ids:?}"
+        );
+    }
+    assert!(analyze_pg_dialect("GRANT ALL ON TABLE app.t TO r;").contains("GRT-ALL-PRIV"));
+    assert!(
+        analyze_pg_dialect("ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT ALL ON TABLES TO r;")
+            .contains("PG-DEFAULT-PRIV-ALL")
+    );
+}
+
+// PostgreSQL refuses a DROP SCHEMA without CASCADE while the schema holds any
+// object; Snowflake drops them.
+#[test]
+fn drop_schema_is_critical_only_where_it_drops_the_schema_contents() {
+    let pg = analyze_pg_dialect("DROP SCHEMA IF EXISTS app;");
+    assert!(
+        pg.contains("SCHEMA-DROP-RESTRICT") && !pg.contains("SCHEMA-DROP"),
+        "{pg:?}"
+    );
+    let pg = analyze_pg_dialect("DROP SCHEMA app CASCADE;");
+    assert!(pg.contains("SCHEMA-DROP"), "{pg:?}");
+    let sf = analyze_and_get_rules("DROP SCHEMA app;");
+    assert!(sf.contains("SCHEMA-DROP"), "{sf:?}");
+    let sf = analyze_and_get_rules("DROP SCHEMA app RESTRICT;");
+    assert!(
+        sf.contains("SCHEMA-DROP-RESTRICT") && !sf.contains("SCHEMA-DROP"),
+        "{sf:?}"
+    );
+}
+
+// An always-true policy is no filter for whom it applies to: every role
+// unless it names some.
+#[test]
+fn an_always_true_policy_is_critical_only_for_every_role() {
+    for sql in [
+        "CREATE POLICY p ON app.users USING (true);",
+        "CREATE POLICY p ON app.users TO PUBLIC USING (true);",
+    ] {
+        let ids = analyze_pg_dialect(sql);
+        assert!(ids.contains("RAP-ALLOW-ALL"), "{sql}: {ids:?}");
+    }
+    let ids = analyze_pg_dialect(
+        "CREATE POLICY admin_all ON app.users TO app_admin USING (true) WITH CHECK (true);",
+    );
+    assert!(
+        ids.contains("PG-RLS-ROLE-ALL-ROWS")
+            && !ids.contains("RAP-ALLOW-ALL")
+            && !ids.contains("PG-RLS-WEAK-CHECK"),
+        "{ids:?}"
     );
 }

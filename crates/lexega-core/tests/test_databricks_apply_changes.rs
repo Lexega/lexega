@@ -28,9 +28,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -76,7 +76,7 @@ STORED AS SCD TYPE 1;
 }
 
 #[test]
-fn risk_create_flow_apply_changes_signal() {
+fn risk_create_flow_apply_changes_finding() {
     let sql = r#"
 CREATE FLOW flow_events_scd_apply
 AS APPLY CHANGES INTO LIVE.events_scd_apply
@@ -88,13 +88,13 @@ STORED AS SCD TYPE 2;
 
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-FLOW-NEW"),
+        has_context(&report, "DBX-FLOW-NEW"),
         "CREATE FLOW should trigger DBX-FLOW-NEW"
     );
 }
 
 #[test]
-fn risk_create_flow_auto_cdc_signal() {
+fn risk_create_flow_auto_cdc_finding() {
     let sql = r#"
 CREATE FLOW flow_events_scd_auto
 AS AUTO CDC INTO LIVE.events_scd_auto
@@ -106,7 +106,7 @@ STORED AS SCD TYPE 1;
 
     let report = dbx_analyze(sql);
     assert!(
-        has_signal(&report, "DBX-FLOW-NEW"),
+        has_context(&report, "DBX-FLOW-NEW"),
         "AUTO CDC CREATE FLOW should trigger DBX-FLOW-NEW"
     );
 }

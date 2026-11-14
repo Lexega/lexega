@@ -11,11 +11,11 @@ use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 
 /// Helper: collect all rule IDs from an analysis report.
-fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> Vec<String> {
+    findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
@@ -28,7 +28,7 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
 fn test_basic_unset_tag() {
     let sql = "ALTER DATABASE my_db UNSET TAG cost_center;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"DB-TAG-RMV".to_string()),
         "Should detect DB-TAG-RMV. Got: {:?}",
@@ -40,7 +40,7 @@ fn test_basic_unset_tag() {
 fn test_if_exists_variant() {
     let sql = "ALTER DATABASE IF EXISTS my_db UNSET TAG cost_center;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"DB-TAG-RMV".to_string()),
         "IF EXISTS variant should trigger. Got: {:?}",
@@ -52,7 +52,7 @@ fn test_if_exists_variant() {
 fn test_multiple_tags() {
     let sql = "ALTER DATABASE my_db UNSET TAG cost_center, env;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"DB-TAG-RMV".to_string()),
         "Multiple tags in one UNSET TAG should trigger. Got: {:?}",
@@ -64,7 +64,7 @@ fn test_multiple_tags() {
 fn test_quoted_database_name() {
     let sql = r#"ALTER DATABASE "My_Database" UNSET TAG owner;"#;
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"DB-TAG-RMV".to_string()),
         "Quoted database name should trigger. Got: {:?}",
@@ -80,12 +80,12 @@ fn test_quoted_database_name() {
 fn test_risk_level_is_medium() {
     let sql = "ALTER DATABASE my_db UNSET TAG cost_center;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "DB-TAG-RMV"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert_eq!(
                 a.risk_level,
@@ -100,12 +100,12 @@ fn test_risk_level_is_medium() {
 fn test_message_content() {
     let sql = "ALTER DATABASE my_db UNSET TAG cost_center;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "DB-TAG-RMV"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert!(
                 a.message.contains("tag removed") || a.message.contains("tag"),
@@ -157,7 +157,7 @@ fn test_multi_statement_evidence_count() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "DB-TAG-RMV"))
         .map(|s| match s {
@@ -185,20 +185,20 @@ fn test_multi_statement_analyzed() {
 }
 
 // ──────────────────────────────────────────────────────────
-// Signal evidence
+// Finding evidence
 // ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_signal_evidence_present() {
+fn test_finding_evidence_present() {
     let sql = "ALTER DATABASE my_db UNSET TAG cost_center;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "DB-TAG-RMV"));
-    assert!(signal.is_some(), "Signal should exist");
-    let evidence = signal.unwrap().evidence();
-    assert!(!evidence.is_empty(), "Signal should have evidence entries");
+    assert!(finding.is_some(), "Finding should exist");
+    let evidence = finding.unwrap().evidence();
+    assert!(!evidence.is_empty(), "Finding should have evidence entries");
 }
 
 // ──────────────────────────────────────────────────────────
@@ -209,7 +209,7 @@ fn test_signal_evidence_present() {
 fn test_not_triggered_by_set_tag() {
     let sql = "ALTER DATABASE my_db SET TAG cost_center = 'finance';";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"DB-TAG-RMV".to_string()),
         "SET TAG should NOT trigger DB-TAG-RMV. Got: {:?}",
@@ -221,7 +221,7 @@ fn test_not_triggered_by_set_tag() {
 fn test_not_triggered_by_rename() {
     let sql = "ALTER DATABASE my_db RENAME TO new_db;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"DB-TAG-RMV".to_string()),
         "RENAME should NOT trigger DB-TAG-RMV. Got: {:?}",
@@ -233,7 +233,7 @@ fn test_not_triggered_by_rename() {
 fn test_not_triggered_by_set_properties() {
     let sql = "ALTER DATABASE my_db SET DATA_RETENTION_TIME_IN_DAYS = 30;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"DB-TAG-RMV".to_string()),
         "SET properties should NOT trigger DB-TAG-RMV. Got: {:?}",
@@ -245,7 +245,7 @@ fn test_not_triggered_by_set_properties() {
 fn test_not_triggered_by_create_database() {
     let sql = "CREATE DATABASE my_db;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"DB-TAG-RMV".to_string()),
         "CREATE DATABASE should NOT trigger DB-TAG-RMV. Got: {:?}",
@@ -261,11 +261,12 @@ fn test_not_triggered_by_create_database() {
 fn test_set_tag_triggers_add_not_rmv() {
     let sql = "ALTER DATABASE my_db SET TAG cost_center = 'finance';";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
+    let context_ids = extract_rule_ids(&report.context);
     assert!(
-        ids.contains(&"DB-TAG-ADD".to_string()),
+        context_ids.contains(&"DB-TAG-ADD".to_string()),
         "SET TAG should trigger DB-TAG-ADD. Got: {:?}",
-        ids
+        context_ids
     );
     assert!(
         !ids.contains(&"DB-TAG-RMV".to_string()),

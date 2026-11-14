@@ -38,8 +38,8 @@ use crate::ast::{
     AstRevokeShape, AstRoleGrantBody, AstStmt,
 };
 use crate::error::{ParseError, ParseErrorKind, ParseResult};
-use crate::lexer::token::{LiteralKind, Span, Token, TokenKind};
-use crate::lexer::{Keyword, Operator, Punctuation};
+use crate::lexer::token::{Span, Token, TokenKind};
+use crate::lexer::{Keyword, Punctuation};
 use crate::parser::core::Parser;
 
 // ---------------------------------------------------------------------------
@@ -158,8 +158,17 @@ fn try_parse_grant_shape(p: &mut Parser<'_>) -> ParseResult<AstGrantShape> {
         let body = parse_role_body(p, /* qualified= */ false, /* expect_to= */ true)?;
         return Ok(AstGrantShape::Role(body));
     }
-    let body = parse_privilege_grant_body(p)?;
-    Ok(AstGrantShape::Privilege(body))
+    let start = p.idx;
+    match parse_privilege_grant_body(p) {
+        Ok(body) => Ok(AstGrantShape::Privilege(body)),
+        Err(error) => {
+            p.idx = start;
+            let (roles, grantees) =
+                parse_membership_body(p, Keyword::To, "TO", /* stop_at_cascade= */ false)
+                    .map_err(|_| error)?;
+            Ok(AstGrantShape::Membership { roles, grantees })
+        }
+    }
 }
 
 fn try_parse_revoke_shape(p: &mut Parser<'_>) -> ParseResult<AstRevokeShape> {
@@ -171,8 +180,17 @@ fn try_parse_revoke_shape(p: &mut Parser<'_>) -> ParseResult<AstRevokeShape> {
         let body = parse_role_body(p, /* qualified= */ false, /* expect_to= */ false)?;
         return Ok(AstRevokeShape::Role(body));
     }
-    let body = parse_privilege_revoke_body(p)?;
-    Ok(AstRevokeShape::Privilege(body))
+    let start = p.idx;
+    match parse_privilege_revoke_body(p) {
+        Ok(body) => Ok(AstRevokeShape::Privilege(body)),
+        Err(error) => {
+            p.idx = start;
+            let (roles, grantees) =
+                parse_membership_body(p, Keyword::From, "FROM", /* stop_at_cascade= */ true)
+                    .map_err(|_| error)?;
+            Ok(AstRevokeShape::Membership { roles, grantees })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,29 +200,41 @@ fn try_parse_revoke_shape(p: &mut Parser<'_>) -> ParseResult<AstRevokeShape> {
 fn parse_privilege_grant_body(p: &mut Parser<'_>) -> ParseResult<AstPrivilegeGrantBody> {
     let privileges = parse_privilege_list(p)?;
     expect_keyword(p, Keyword::On, "ON")?;
-    let object = parse_grant_object(p)?;
+    let objects = parse_grant_object_list(p)?;
     expect_keyword(p, Keyword::To, "TO")?;
-    let grantee = parse_grantee(p)?;
+    let grantees = parse_grantee_list(p)?;
     let with_grant_option = consume_with_grant_option(p);
     Ok(AstPrivilegeGrantBody {
         privileges,
-        objects: vec![object],
-        grantees: vec![grantee],
+        objects,
+        grantees,
         with_grant_option,
+        as_principal: None,
     })
 }
 
 fn parse_privilege_revoke_body(p: &mut Parser<'_>) -> ParseResult<AstPrivilegeRevokeBody> {
     let privileges = parse_privilege_list(p)?;
     expect_keyword(p, Keyword::On, "ON")?;
-    let object = parse_grant_object(p)?;
+    let objects = parse_grant_object_list(p)?;
     expect_keyword(p, Keyword::From, "FROM")?;
-    let grantee = parse_grantee(p)?;
+    let grantees = parse_grantee_list(p)?;
     Ok(AstPrivilegeRevokeBody {
         privileges,
-        objects: vec![object],
-        grantees: vec![grantee],
+        objects,
+        grantees,
+        as_principal: None,
     })
+}
+
+/// `grantee [, …]`.
+fn parse_grantee_list(p: &mut Parser<'_>) -> ParseResult<Vec<AstGrantee>> {
+    let mut grantees = vec![parse_grantee(p)?];
+    while peek_token_kind(p, TokenKind::Punctuation(Punctuation::Comma)) {
+        consume_one(p)?; // comma
+        grantees.push(parse_grantee(p)?);
+    }
+    Ok(grantees)
 }
 
 fn parse_role_body(
@@ -240,6 +270,55 @@ fn parse_role_body(
         role_name_span,
         grantee,
     })
+}
+
+/// `role [, …] {TO | FROM} grantee [, …]` and whatever follows the grantees
+/// (`WITH ADMIN OPTION`, `GRANTED BY role`), which is read to the
+/// statement's end; a trailing `CASCADE` / `RESTRICT` is left where
+/// `stop_at_cascade` says a REVOKE reads it.
+fn parse_membership_body(
+    p: &mut Parser<'_>,
+    separator: Keyword,
+    label: &str,
+    stop_at_cascade: bool,
+) -> ParseResult<(Vec<Span>, Vec<AstGrantee>)> {
+    let mut roles = vec![p.parse_object_name_span()?];
+    while peek_token_kind(p, TokenKind::Punctuation(Punctuation::Comma)) {
+        consume_one(p)?; // comma
+        roles.push(p.parse_object_name_span()?);
+    }
+    expect_keyword(p, separator, label)?;
+    let grantees = parse_grantee_list(p)?;
+    consume_membership_tail(p, stop_at_cascade);
+    Ok((roles, grantees))
+}
+
+/// Consumes the tokens left to the statement's terminator; with
+/// `stop_at_cascade`, not a `CASCADE` / `RESTRICT` that ends the statement.
+fn consume_membership_tail(p: &mut Parser<'_>, stop_at_cascade: bool) {
+    let from = p.idx;
+    while let Some(tok) = p.peek_non_trivia() {
+        let ends = matches!(
+            tok.kind,
+            TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+        );
+        let cascade = stop_at_cascade
+            && ["CASCADE", "RESTRICT"]
+                .iter()
+                .any(|word| tok.lexeme(p.source).eq_ignore_ascii_case(word))
+            && p.tokens.get(p.idx + 1).is_none_or(|next| {
+                matches!(
+                    next.kind,
+                    TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
+                )
+            });
+        if ends || cascade {
+            break;
+        }
+        p.advance();
+    }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
 }
 
 fn parse_ownership_body(p: &mut Parser<'_>) -> ParseResult<AstOwnershipGrantBody> {
@@ -448,6 +527,40 @@ fn classify_privilege(lexemes: &[String]) -> AstPrivilegeKind {
 // ---------------------------------------------------------------------------
 // Object spec (post-`ON`).
 // ---------------------------------------------------------------------------
+
+/// `ON <object> [, <name> …]`: a named object may be followed by more names
+/// of its kind (`ON TABLE a, b`, `ON a, b`, `ON FUNCTION f(int), g(text)`).
+fn parse_grant_object_list(p: &mut Parser<'_>) -> ParseResult<Vec<AstGrantObject>> {
+    let first = parse_grant_object(p)?;
+    let AstGrantObject::Single { object_kind, .. } = &first else {
+        return Ok(vec![first]);
+    };
+    let object_kind = object_kind.clone();
+    let mut objects = vec![first];
+    while peek_token_kind(p, TokenKind::Punctuation(Punctuation::Comma)) {
+        consume_one(p)?; // comma
+                         // The kind is written once; each later name's kind span is the
+                         // zero-width point where the name starts.
+        let here = p.peek_non_trivia().map(|t| t.span.start).unwrap_or(0);
+        let name_span = p.parse_qualified_name_span()?;
+        let function_signature = if peek_token_kind(p, TokenKind::Punctuation(Punctuation::LParen))
+        {
+            Some(parse_function_signature(p)?)
+        } else {
+            None
+        };
+        objects.push(AstGrantObject::Single {
+            object_kind: object_kind.clone(),
+            kind_span: Span {
+                start: here,
+                end: here,
+            },
+            name_span,
+            function_signature,
+        });
+    }
+    Ok(objects)
+}
 
 fn parse_grant_object(p: &mut Parser<'_>) -> ParseResult<AstGrantObject> {
     // ON ACCOUNT
@@ -889,44 +1002,16 @@ pub(crate) fn parse_grantee(p: &mut Parser<'_>) -> ParseResult<AstGrantee> {
 }
 
 /// Consume an optional MySQL `@host` grantee suffix, returning the extended
-/// span end. Handles the quoted form (`@` is `Operator::At` + a host token) and
-/// the unquoted form (`@host` lexes as a single AtVariable identifier). A no-op
-/// (returns `name_end`) when no `@host` follows — harmless for non-MySQL
-/// grantees, where `@` never appears in grantee position.
+/// span end. A no-op (returns `name_end`) when no `@host` follows — harmless
+/// for non-MySQL grantees, where `@` never appears in grantee position.
 fn consume_optional_grantee_host(p: &mut Parser<'_>, name_end: u32) -> u32 {
-    let at_present = matches!(
-        p.peek_non_trivia().map(|t| &t.kind),
-        Some(TokenKind::Operator(Operator::At))
-    );
-    if at_present {
-        let _ = consume_one(p); // @
-        let host_end = match p.peek_non_trivia() {
-            Some(h) => {
-                let ok = matches!(h.kind, TokenKind::Literal(LiteralKind::String))
-                    || p.can_be_identifier_token(h);
-                ok.then_some(h.span.end)
-            }
-            None => None,
-        };
-        if let Some(end) = host_end {
-            let _ = consume_one(p); // host
-            return end;
+    match p.mysql_account_host_at(p.idx) {
+        Some((end, _)) => {
+            p.idx = end;
+            p.tokens[end - 1].span.end
         }
-        return name_end;
+        None => name_end,
     }
-    // Unquoted `user@host`: the host lexes as a single `@host` AtVariable token.
-    let unquoted_host_end = p.peek_non_trivia().and_then(|t| {
-        if matches!(t.kind, TokenKind::Identifier { .. }) && t.lexeme(p.source).starts_with('@') {
-            Some(t.span.end)
-        } else {
-            None
-        }
-    });
-    if let Some(end) = unquoted_host_end {
-        let _ = consume_one(p); // @host
-        return end;
-    }
-    name_end
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1168,7 @@ fn peek_lexemes_n(p: &Parser<'_>, max: usize) -> Vec<(String, Span)> {
 /// Consume tokens until a semicolon, EOF, or a structural Jinja delimiter.
 /// Returns the byte position one past the last consumed token.
 pub(crate) fn consume_to_terminator(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = current_position(p);
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(
@@ -1094,6 +1180,8 @@ pub(crate) fn consume_to_terminator(p: &mut Parser<'_>) -> u32 {
         let consumed = p.advance().expect("peek confirmed");
         end = consumed.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }
 

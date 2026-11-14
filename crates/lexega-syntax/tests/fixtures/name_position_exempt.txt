@@ -1,0 +1,15 @@
+core.rs::identifier_argument_at	the shared reader: the argument of an IDENTIFIER(…) name its caller reads
+core.rs::name_span_at	the shared reader: a name's span without consuming it
+core.rs::object_name_end	the shared reader: where a name ends
+core.rs::object_ref_at	the shared reader: a name and its parts without consuming them
+core.rs::object_ref_of_range	the shared reader: the parts of a name region its caller bounds
+core.rs::parse_object_name_span	the shared reader: an object name's span, consumed
+core.rs::parse_object_ref	the shared reader: a name and its parts, consumed
+core.rs::parse_qualified_name_span	the shared reader: a name, or the string standing for it, consumed
+core.rs::parse_required_object_ref	the shared reader: a name and its parts, consumed, where one is required
+core.rs::read_object_name	the shared reader itself
+core.rs::take_name_or_token_span	the shared reader: a name's span, or the single reserved word standing for it, consumed
+core.rs::take_name_span	the shared reader: a name's span, consumed where one starts
+pg_admin.rs::create_rule_is_condition	a lookahead that tells T-SQL's CREATE RULE from PostgreSQL's; try_parse_mssql_create_rule_stmt reads the name
+scripting.rs::loadable_function_at	a lookahead that tells MySQL's loadable function from a CREATE FUNCTION with a body; try_parse_mysql_loadable_function reads the name
+alter_table.rs::data_type_span_at	a data type's name, read only to bound the type an ALTER COLUMN gives; the type is kept as text

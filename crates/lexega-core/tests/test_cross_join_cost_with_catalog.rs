@@ -78,23 +78,23 @@ fn test_cross_join_explicit_with_row_counts() {
     let report =
         analyze_risk_with_catalog_path(sql, Some(catalog_path)).expect("Analysis should succeed");
 
-    // Debug: print all signals
-    println!("All signals:");
-    for signal in &report.signals {
-        println!("  {:?}", signal);
+    // Debug: print all findings
+    println!("All findings:");
+    for finding in &report.findings {
+        println!("  {:?}", finding);
     }
 
     // Verify cross join warning is present (now from YAML rule Q-JOIN-CROSS-CENH)
-    let governance_signals: Vec<_> = report
-        .signals
+    let governance_findings: Vec<_> = report
+        .findings
         .iter()
         .filter(|f| matches!(f, RuleMatch::Analysis(_)))
         .collect();
 
-    println!("Found {} governance signals", governance_signals.len());
+    println!("Found {} governance findings", governance_findings.len());
 
-    // Find the cross join signal (rule Q-JOIN-CROSS-CENH)
-    let cross_join_signal = governance_signals
+    // Find the cross join finding (rule Q-JOIN-CROSS-CENH)
+    let cross_join_finding = governance_findings
         .iter()
         .find(|f| {
             let RuleMatch::Analysis(gs) = f;
@@ -103,8 +103,8 @@ fn test_cross_join_explicit_with_row_counts() {
         .expect("Should find CROSS JOIN warning (Q-JOIN-CROSS-CENH)");
 
     // Verify message contains row count estimates
-    let RuleMatch::Analysis(gs) = cross_join_signal;
-    println!("Governance signal message: {}", gs.message);
+    let RuleMatch::Analysis(gs) = cross_join_finding;
+    println!("Governance finding message: {}", gs.message);
 
     // Unified Q-JOIN-CROSS-CENH message template:
     // "Cross join between {left} and {right} on a catalog-attested
@@ -210,24 +210,24 @@ fn test_comma_join_with_multiple_tables() {
     let report =
         analyze_risk_with_catalog_path(sql, Some(catalog_path)).expect("Analysis should succeed");
 
-    // Debug: print all signals
-    println!("All signals:");
-    for signal in &report.signals {
-        println!("  {:?}", signal);
+    // Debug: print all findings
+    println!("All findings:");
+    for finding in &report.findings {
+        println!("  {:?}", finding);
     }
 
     // Verify comma-join warning is present (now from the unified
     // Q-JOIN-CROSS-CENH rule — comma-FROM lowers to `Join { kind: Cross,
     // implicit: true }` which the unified rule matches on `kind: cross`).
-    let governance_signals: Vec<_> = report
-        .signals
+    let governance_findings: Vec<_> = report
+        .findings
         .iter()
         .filter(|f| matches!(f, RuleMatch::Analysis(_)))
         .collect();
 
-    println!("Found {} governance signals", governance_signals.len());
+    println!("Found {} governance findings", governance_findings.len());
 
-    let comma_join_signal = governance_signals
+    let comma_join_finding = governance_findings
         .iter()
         .find(|f| {
             let RuleMatch::Analysis(gs) = f;
@@ -236,8 +236,8 @@ fn test_comma_join_with_multiple_tables() {
         .expect("Should find cross-join warning on comma-FROM (Q-JOIN-CROSS-CENH)");
 
     // Verify message contains expected content
-    let RuleMatch::Analysis(gs) = comma_join_signal;
-    println!("Governance signal message: {}", gs.message);
+    let RuleMatch::Analysis(gs) = comma_join_finding;
+    println!("Governance finding message: {}", gs.message);
 
     assert!(
         gs.message.contains("Cross join") || gs.message.contains("CROSS JOIN"),
@@ -250,7 +250,7 @@ fn test_comma_join_with_multiple_tables() {
     // witness `cartesian_estimate` is computed for each pair:
     //   inner pair a×b = 100k × 500k = 50,000,000,000 (50B)
     //   outer pair b×c = 500k × 500   =    250,000,000 (250M)
-    // Both clear the 10M gate. The first signal found is one of
+    // Both clear the 10M gate. The first finding found is one of
     // these; verify the per-pair-product string is interpolated.
     assert!(
         gs.message.contains("50000000000") || gs.message.contains("250000000"),
@@ -274,17 +274,47 @@ fn test_cross_join_without_catalog_stays_silent() {
 
     let report = analyze_risk(sql).expect("Analysis should succeed");
 
-    println!("All signals:");
-    for signal in &report.signals {
-        println!("  {:?}", signal);
+    println!("All findings:");
+    for finding in &report.findings {
+        println!("  {:?}", finding);
     }
 
     let cross_join_fired = report
-        .signals
+        .findings
         .iter()
         .any(|f| matches!(f, RuleMatch::Analysis(gs) if gs.matched_rule == "Q-JOIN-CROSS-CENH"));
     assert!(
         !cross_join_fired,
         "Q-JOIN-CROSS-CENH must stay silent without catalog row counts"
     );
+}
+
+/// A CTE bound in a nested scope, which reads the outer CTE of its name,
+/// is followed to the table it reads for the row-count estimate.
+#[test]
+fn test_cross_join_through_a_nested_cte_of_an_outer_name() {
+    let catalog_json = r#"{
+        "schema_version": 2,
+        "source": "test",
+        "databases": [{"name": {"name": "db1"}, "schemas": [{"name": {"name": "schema1"}, "tables": [
+            {"name": {"name": "large_table"}, "kind": "Table",
+             "columns": [{"name": {"name": "id"}, "data_type": "NUMBER", "nullable": false}],
+             "row_count_estimate": 1000000},
+            {"name": {"name": "small_table"}, "kind": "Table",
+             "columns": [{"name": {"name": "id"}, "data_type": "NUMBER", "nullable": false}],
+             "row_count_estimate": 500}
+        ]}]}]
+    }"#;
+    let catalog_path = std::env::temp_dir().join("test_cross_join_nested_cte_catalog.json");
+    fs::write(&catalog_path, catalog_json).expect("write catalog");
+    let sql = "WITH s AS (SELECT * FROM db1.schema1.large_table), \
+               t AS (SELECT * FROM (WITH s AS (SELECT * FROM s) SELECT * FROM s) z) \
+               SELECT * FROM db1.schema1.small_table CROSS JOIN t";
+    let report =
+        analyze_risk_with_catalog_path(sql, catalog_path.to_str()).expect("analysis succeeds");
+    let fired = report
+        .findings
+        .iter()
+        .any(|f| matches!(f, RuleMatch::Analysis(gs) if gs.matched_rule == "Q-JOIN-CROSS-CENH"));
+    assert!(fired, "{sql}: {:?}", report.findings);
 }

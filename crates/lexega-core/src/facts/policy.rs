@@ -236,6 +236,12 @@ pub struct RowAccessPolicyFacts {
     /// that omit the clause (the implicit default is `ALL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<PgPolicyCommand>,
+    /// PostgreSQL `TO role, …`: the roles the policy applies to, as
+    /// written (`public` for `TO PUBLIC`). Empty where the statement names
+    /// none: a new policy then applies to every role, and `ALTER POLICY`
+    /// keeps the roles it had.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<IdentName>,
 }
 
 impl Default for RowAccessPolicyFacts {
@@ -257,6 +263,7 @@ impl Default for RowAccessPolicyFacts {
             body_terminal_returns: Vec::new(),
             using_predicate: None,
             check_predicate: None,
+            applies_to: Vec::new(),
             permissiveness: None,
             command: None,
         }
@@ -467,7 +474,10 @@ pub struct AggregationPolicyFacts {
     /// Smallest `MIN_GROUP_SIZE` literal observed in the policy body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_group_size: Option<u32>,
-    /// Body uses (or branches via CASE to) `NO_AGGREGATION_CONSTRAINT()`.
+    /// The body's default result is `NO_AGGREGATION_CONSTRAINT`: a bare body,
+    /// or the `ELSE` of a `CASE`, which every role no `WHEN` names receives.
+    /// A `CASE` with no `ELSE` defaults to NULL and sets it. A `WHEN` that
+    /// exempts an authorised role does not.
     #[serde(default)]
     pub has_no_aggregation_constraint: bool,
     /// Body is a `CASE WHEN … THEN … ELSE … END` expression.
@@ -487,13 +497,16 @@ pub struct ProjectionPolicyFacts {
     /// Body uses (or branches via CASE to) `PROJECTION_CONSTRAINT(ALLOW => TRUE)`.
     #[serde(default)]
     pub has_allow_list: bool,
-    /// Body specifies `ENFORCEMENT => 'NULLIFY'` or `'NONE'` — neither
-    /// hard-blocks the query (`NULLIFY` substitutes NULL, `NONE`
-    /// performs no action), so both classify as enforcement disabled.
+    /// The body's default result blocks nothing: it allows projection
+    /// (`ALLOW => TRUE`) or states `ENFORCEMENT => 'NONE'`, in a bare body
+    /// or in the `ELSE` of a `CASE`, which every role no `WHEN` names
+    /// receives. A `CASE` with no `ELSE` defaults to NULL and sets it. A
+    /// `WHEN` that exempts an authorised role does not. `ENFORCEMENT =>
+    /// 'NULLIFY'` returns NULL in place of the data and does not set it.
     #[serde(default)]
     pub has_enforcement_disabled: bool,
-    /// Body specifies `ENFORCEMENT => …` with a value other than the
-    /// recognized disabled sentinels (`NULLIFY` / `NONE`).
+    /// Body specifies `ENFORCEMENT => …` with a value other than `NONE`
+    /// (`FAIL`, `NULLIFY`).
     #[serde(default)]
     pub has_enforcement_enabled: bool,
     /// Body is a `CASE WHEN … THEN … ELSE … END` expression.
@@ -514,8 +527,10 @@ pub struct JoinPolicyFacts {
     /// Body uses (or branches via CASE to) `JOIN_CONSTRAINT(JOIN_REQUIRED => TRUE)`.
     #[serde(default)]
     pub has_join_required: bool,
-    /// Body uses (or branches to) `JOIN_CONSTRAINT(JOIN_REQUIRED => FALSE)`
-    /// — the policy imposes no join restriction.
+    /// The body's default result is `JOIN_CONSTRAINT(JOIN_REQUIRED => FALSE)`
+    /// — the policy imposes no join restriction for the roles no `WHEN`
+    /// names. A `CASE` with no `ELSE` defaults to NULL and sets it. A `WHEN`
+    /// that exempts an authorised role does not.
     #[serde(default)]
     pub has_join_not_required: bool,
     /// Body is a `CASE WHEN … THEN … ELSE … END` expression.
@@ -530,11 +545,14 @@ pub struct JoinPolicyFacts {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct AuthenticationPolicyFacts {
+    /// CREATE-time: the methods `AUTHENTICATION_METHODS` lists; empty where
+    /// the property is absent (every method is then allowed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authentication_methods: Vec<AuthMethod>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mfa_authentication_methods: Vec<AuthMethod>,
     #[serde(default)]
+    /// CREATE-time: `MFA_ENROLLMENT`; `optional` where it is absent.
     pub mfa_enrollment: MfaEnrollmentLevel,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_types: Vec<ClientType>,
@@ -579,6 +597,9 @@ pub enum MfaEnrollmentLevel {
     #[default]
     Optional,
     Required,
+    /// `REQUIRED_PASSWORD_ONLY`: MFA is required of users who sign in with a
+    /// password.
+    RequiredPasswordOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

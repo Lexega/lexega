@@ -15,18 +15,31 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
+}
+
+/// Rule ids across findings and context.
+fn analyze_and_get_entries(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    let mut ids = extract_rule_ids(&report.findings);
+    ids.extend(extract_rule_ids(&report.context));
+    ids
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -38,15 +51,16 @@ fn assert_formats_safe(sql: &str) {
 #[test]
 fn test_create_service_fires_new() {
     let rules =
-        analyze_and_get_rules("CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec';");
+        analyze_and_get_context("CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec';");
     assert!(rules.contains("SNW-SERVICE-NEW"), "got {rules:?}");
 }
 
 #[test]
 fn test_create_service_without_eai_is_not_external_access() {
-    let rules =
-        analyze_and_get_rules("CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec';");
-    assert!(rules.contains("SNW-SERVICE-NEW"), "got {rules:?}");
+    let sql = "CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec';";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("SNW-SERVICE-NEW"), "got {context:?}");
+    let rules = analyze_and_get_entries(sql);
     assert!(
         !rules.contains("SNW-SERVICE-EXTERNAL-ACCESS"),
         "got {rules:?}"
@@ -55,10 +69,10 @@ fn test_create_service_without_eai_is_not_external_access() {
 
 #[test]
 fn test_create_service_with_eai_fires_external_access() {
-    let rules = analyze_and_get_rules(
-        "CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec' EXTERNAL_ACCESS_INTEGRATIONS=(eai1,eai2);",
-    );
-    assert!(rules.contains("SNW-SERVICE-NEW"), "got {rules:?}");
+    let sql = "CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION 'spec' EXTERNAL_ACCESS_INTEGRATIONS=(eai1,eai2);";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("SNW-SERVICE-NEW"), "got {context:?}");
+    let rules = analyze_and_get_rules(sql);
     assert!(
         rules.contains("SNW-SERVICE-EXTERNAL-ACCESS"),
         "got {rules:?}"
@@ -81,7 +95,7 @@ fn test_alter_service_suspend_resume_are_benign() {
         "ALTER SERVICE s RESUME;",
         "ALTER SERVICE IF EXISTS s SET MIN_INSTANCES=2;",
     ] {
-        let rules = analyze_and_get_rules(sql);
+        let rules = analyze_and_get_entries(sql);
         assert!(
             !rules.iter().any(|r| r.starts_with("SNW-SERVICE")),
             "{sql} -> {rules:?}"
@@ -100,8 +114,9 @@ fn test_service_dollar_spec_body_fires_and_formats() {
     // The inline `$$ … $$` YAML spec body is captured for span coverage but not
     // analyzed; the statement still recognizes as a service and round-trips.
     let sql = "CREATE SERVICE s IN COMPUTE POOL p FROM SPECIFICATION $$\nspec:\n  containers:\n  - name: main\n    image: /db/sc/repo/img\n$$ EXTERNAL_ACCESS_INTEGRATIONS=(eai1);";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("SNW-SERVICE-NEW"), "got {context:?}");
     let rules = analyze_and_get_rules(sql);
-    assert!(rules.contains("SNW-SERVICE-NEW"), "got {rules:?}");
     assert!(
         rules.contains("SNW-SERVICE-EXTERNAL-ACCESS"),
         "got {rules:?}"

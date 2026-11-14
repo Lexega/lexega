@@ -10,9 +10,10 @@ use lexega_syntax::dialect::bigquery;
 use lexega_syntax::{format_sql_with_config, verify_formatting_safe_with_dialect, FormatterConfig};
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify_bq(sql: &str) -> String {

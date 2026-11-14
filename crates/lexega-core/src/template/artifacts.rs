@@ -37,6 +37,23 @@ pub struct RenderArtifacts {
     /// A template was present but was not rendered: `sql` is the template
     /// text, the report must say NotRendered, and the message says why.
     pub render_error: Option<String>,
+    /// What the run does in the session beside `sql`: a hook's SQL, a
+    /// query the template runs while it renders, a seed it loads. Read for
+    /// what it writes.
+    pub session_sql: Vec<SessionSql>,
+}
+
+/// What a run does in the session beside the text a template renders
+/// ([`RenderArtifacts::session_sql`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSql {
+    /// SQL, by its text.
+    Read(String),
+    /// SQL whose text the render does not know.
+    Unread,
+    /// A seed loaded into the table of this name, in whatever schema:
+    /// every column of it.
+    Seed(String),
 }
 
 /// Map render placeholder records to lexer spans — byte offsets in the

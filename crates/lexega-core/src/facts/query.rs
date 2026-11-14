@@ -19,7 +19,7 @@ use schemars::JsonSchema;
 use crate::lexer::token::Span;
 
 use super::catalog::{CatalogTag, ColumnLineage, Nullability, TaintLabel};
-use super::expr::Expr;
+use super::expr::{Expr, FuncCallExpr};
 use super::identity::{ColumnRef, IdentName, ScopeIdentity, TableRef};
 
 /// A literal string argument passed to an `OPENROWSET(...)` call.
@@ -30,6 +30,30 @@ pub struct OpenrowsetArgFacts {
     /// The literal string value as written in the SQL source, including
     /// the surrounding single quotes.
     pub value: String,
+    /// The `key=value` entries the string writes read as a connection
+    /// string (`Server=s;UID=u;PWD=…;`), in order. For `OPENROWSET`'s
+    /// `'data source';'user';'password'` run, its strings under the keys
+    /// `Data Source`, `User ID` and `Password`. Empty when it writes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_string: Vec<ConnectionStringEntry>,
+}
+
+/// One `key=value` entry of a connection string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct ConnectionStringEntry {
+    /// The key as written (`raw`) and upper-cased (`normalized`): a
+    /// connection string's keys ignore case. Match with `key.normalized`
+    /// (`PWD`, `PASSWORD`, `UID`).
+    pub key: IdentName,
+    /// The value, without the `"…"` or `{…}` that may delimit it. Absent
+    /// when the engine rendered it from a template or substituted it for a
+    /// deploy variable. The value of a key that names a password or a
+    /// secret is masked in every report; a custom rule message that
+    /// interpolates it shows it unmasked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_literal: Option<String>,
 }
 
 /// A T-SQL `OPENROWSET(...)` table-valued function call observed in a
@@ -37,13 +61,27 @@ pub struct OpenrowsetArgFacts {
 /// from an external data source (typically by inline connection string),
 /// and is commonly reviewed for embedded credentials and cross-server
 /// data movement.
+/// A function call a query makes ([`QueryFacts::function_calls`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct FunctionCallEvent {
+    /// The function's name, as a call in an expression publishes it.
+    pub name: IdentName,
+    /// The schema written before the name, when one is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<IdentName>,
+    pub source_span: Option<Span>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct OpenrowsetCallFacts {
-    /// Literal string arguments of the call, in source order. Arguments
-    /// that are not string literals (variables, expressions, subqueries)
-    /// are omitted from this list.
+    /// Literal string arguments of the call, and an `OPENROWSET`
+    /// `'data source';'user';'password'` run (one entry, `value` the run as
+    /// written), in source order. Arguments that are not string literals
+    /// (variables, expressions, subqueries) are omitted from this list.
     pub string_args: Vec<OpenrowsetArgFacts>,
 }
 
@@ -81,6 +119,14 @@ pub enum FileExportTargetKind {
 pub struct QueryFacts {
     pub reads_table: Vec<TableEvent>,
     pub writes_table: Vec<TableEvent>,
+    /// Every base table the statement reads or writes, at any depth, once
+    /// per table: each of `reads_table` and `writes_table`, a table it both
+    /// reads and writes listed once, as it writes it. Each is anchored at
+    /// the statement's first reference to it (a table a model or another
+    /// script's relation reads, at the reference to that relation), and
+    /// they are listed in the order of those references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables_used: Vec<TableEvent>,
     pub scopes: Vec<ScopeFacts>,
     /// T-SQL `OPENROWSET(...)` calls observed in this query's FROM
     /// clause. Empty for queries that do not reference `OPENROWSET`.
@@ -93,6 +139,12 @@ pub struct QueryFacts {
     /// credentials. Empty when the query does not reference `OPENDATASOURCE`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opendatasource_calls: Vec<OpenrowsetCallFacts>,
+    /// Every function the query calls, wherever it is written (a select
+    /// item, a predicate, another call's argument, a subquery), each once
+    /// per call, in the order the calls are reached. Empty when it calls
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub function_calls: Vec<FunctionCallEvent>,
 
     /// MySQL `SELECT ... INTO OUTFILE 'file'` / `INTO DUMPFILE 'file'`
     /// targets: the statement writes its result set to a file on the
@@ -166,15 +218,17 @@ pub struct QueryFacts {
     pub repeated_subqueries: Vec<RepeatedSubqueryEvent>,
 
     /// Table references in this statement whose target was dropped or renamed
-    /// by an earlier statement in the same script. One entry per
+    /// by an earlier statement in the same script, or in a script run
+    /// before it (`--cross-script`). One entry per
     /// (statement-reference, mutation) pair.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_table_refs: Vec<StaleTableReference>,
 
     /// Column references in this statement that were removed by an
-    /// earlier `ALTER TABLE ... DROP COLUMN` in the same script.
-    /// Includes column references in projections, predicates, GROUP BY,
-    /// ORDER BY, and UPDATE-SET assignment targets.
+    /// earlier `ALTER TABLE ... DROP COLUMN` in the same script, or in a
+    /// script run before it (`--cross-script`). Includes column references
+    /// in projections, predicates, GROUP BY, ORDER BY, and UPDATE-SET
+    /// assignment targets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_column_refs: Vec<StaleColumnReference>,
 
@@ -189,11 +243,34 @@ pub struct QueryFacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references_column: Vec<ColumnReferenceEvent>,
 
+    /// Each column an `UPDATE … SET` assignment, a `MERGE` branch or the
+    /// update action of an upsert (`ON CONFLICT … DO UPDATE`, `ON
+    /// DUPLICATE KEY UPDATE`) writes to a table the attached catalog
+    /// knows, with the classification tags the column carries and those
+    /// of the value written. A column the catalog lists the table without
+    /// is not listed. Empty when no catalog is attached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub written_columns: Vec<WrittenColumnEvent>,
+
     /// MERGE statement structural facts. Present only for MERGE statements.
     /// Carries `with_schema_evolution: true` when the `WITH SCHEMA EVOLUTION`
     /// clause is present (Databricks/Delta).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeFacts>,
+
+    /// How an `UPDATE` or a `DELETE` reaches the rows of the tables it
+    /// writes, beside its own `WHERE`: how its `FROM` / `USING` list joins
+    /// each, the query it writes one through, and a cap on the rows it
+    /// writes. Absent for any other statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_rows: Option<TargetRowsFacts>,
+
+    /// What an `INSERT OVERWRITE` (Snowflake, Databricks) replaces: every
+    /// row of its target (`table`), or the rows of the partitions its
+    /// `PARTITION (…)` clause names (`partitions`). Absent for an insert
+    /// that keeps the rows its target holds, and for any other statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrite: Option<OverwriteFacts>,
 
     /// T-SQL table hints applied to a table reference or INSERT target
     /// in this statement. One entry per `WITH (...)` hint occurrence.
@@ -201,6 +278,142 @@ pub struct QueryFacts {
     /// T-SQL.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub table_hints: Vec<TableHintFact>,
+
+    /// The columns of the relation the statement returns, or that its
+    /// view, materialized view, dynamic table or `CREATE TABLE … AS`
+    /// makes, in order, each with what analysis shows of it. Stated where
+    /// the statement is compared with another version of it; empty
+    /// elsewhere, and for a statement that returns no rows (an `INSERT`,
+    /// `UPDATE`, `DELETE`, `MERGE`). A `*` the query does not expand adds
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_columns: Vec<super::diff::OutputColumnFact>,
+}
+
+impl QueryFacts {
+    /// True when these facts hold nothing of a query: no table, expression,
+    /// call or event in the statement or in any of its scopes.
+    pub(crate) fn holds_nothing(&self) -> bool {
+        let QueryFacts {
+            reads_table,
+            writes_table,
+            tables_used,
+            scopes,
+            openrowset_calls,
+            opendatasource_calls,
+            function_calls,
+            file_exports,
+            has_where,
+            has_tautology_where,
+            has_limit,
+            has_qualify,
+            has_having,
+            has_distinct,
+            has_sample,
+            has_implicit_cross_join,
+            implicit_cross_product_estimate,
+            has_join_predicate_filters,
+            schemas_touched,
+            column_constraints,
+            or_tautologies,
+            temporal_join_tables,
+            temporal_gating_expressions,
+            repeated_subqueries,
+            stale_table_refs,
+            stale_column_refs,
+            references_column,
+            written_columns,
+            merge,
+            target_rows,
+            overwrite,
+            table_hints,
+            output_columns,
+        } = self;
+        scopes.iter().all(ScopeFacts::holds_nothing)
+            && reads_table.is_empty()
+            && writes_table.is_empty()
+            && tables_used.is_empty()
+            && openrowset_calls.is_empty()
+            && opendatasource_calls.is_empty()
+            && function_calls.is_empty()
+            && file_exports.is_empty()
+            && !(*has_where
+                || *has_tautology_where
+                || *has_limit
+                || *has_qualify
+                || *has_having
+                || *has_distinct
+                || *has_sample
+                || *has_implicit_cross_join
+                || *has_join_predicate_filters)
+            && implicit_cross_product_estimate.is_none()
+            && schemas_touched.is_empty()
+            && column_constraints.is_empty()
+            && or_tautologies.is_empty()
+            && temporal_join_tables.is_empty()
+            && temporal_gating_expressions.is_empty()
+            && repeated_subqueries.is_empty()
+            && stale_table_refs.is_empty()
+            && stale_column_refs.is_empty()
+            && references_column.is_empty()
+            && written_columns.is_empty()
+            && merge.is_none()
+            && target_rows.is_none()
+            && overwrite.is_none()
+            && table_hints.is_empty()
+            && output_columns.is_empty()
+    }
+}
+
+impl ScopeFacts {
+    /// True when the scope holds nothing but its identity, kind and span.
+    fn holds_nothing(&self) -> bool {
+        let ScopeFacts {
+            scope_id: _,
+            kind: _,
+            source_span: _,
+            tables,
+            joins,
+            where_predicates,
+            join_predicates,
+            having_predicates,
+            predicates,
+            projections,
+            group_by,
+            order_by,
+            limit,
+            qualify,
+            aggregates,
+            window_functions,
+            set_operations,
+            star_projections,
+            scalar_subqueries,
+            table_functions,
+            has_distinct,
+            has_multiple_partition_schemes,
+            has_high_cardinality_group_by,
+            high_cardinality_group_by_columns,
+        } = self;
+        tables.is_empty()
+            && joins.is_empty()
+            && where_predicates.is_empty()
+            && join_predicates.is_empty()
+            && having_predicates.is_empty()
+            && predicates.is_empty()
+            && projections.is_empty()
+            && group_by.is_empty()
+            && order_by.is_empty()
+            && limit.is_none()
+            && qualify.is_none()
+            && aggregates.is_empty()
+            && window_functions.is_empty()
+            && set_operations.is_empty()
+            && star_projections.is_empty()
+            && scalar_subqueries.is_empty()
+            && table_functions.is_empty()
+            && !(*has_distinct || *has_multiple_partition_schemes || *has_high_cardinality_group_by)
+            && high_cardinality_group_by_columns.is_empty()
+    }
 }
 
 /// One T-SQL table hint occurrence.
@@ -252,6 +465,112 @@ pub enum MssqlTableHintKind {
     Other,
 }
 
+/// How an `UPDATE` or a `DELETE` reaches the rows of the tables it writes,
+/// beside its own `WHERE` ([`QueryFacts::target_rows`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct TargetRowsFacts {
+    /// One entry per table the statement writes: its target's, and in a
+    /// multi-table write each other table it writes (MySQL `UPDATE a JOIN b
+    /// … SET b.x = …`, `DELETE a, b FROM …`).
+    pub written: Vec<WrittenRowsFacts>,
+    /// The cap the statement puts on the rows it writes: T-SQL `UPDATE TOP
+    /// (n) [PERCENT]` / `DELETE TOP (n) [PERCENT]`, MySQL `UPDATE … LIMIT
+    /// n` / `DELETE … LIMIT n`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<RowCapFacts>,
+}
+
+/// What an `INSERT OVERWRITE` replaces ([`QueryFacts::overwrite`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OverwriteFacts {
+    /// Every row of the target.
+    Table,
+    /// The rows of the partitions its `PARTITION (…)` clause names.
+    Partitions,
+}
+
+/// How a write reaches the rows of one table it writes
+/// ([`TargetRowsFacts::written`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct WrittenRowsFacts {
+    /// How the statement's `FROM` / `USING` list joins the table's rows.
+    pub join: TargetJoin,
+    /// The query the statement writes the table through, where its target
+    /// names a derived table or a CTE (T-SQL `UPDATE x … FROM (SELECT …)
+    /// x`, `WITH c AS (…) UPDATE c …`): each row it writes is a row the
+    /// query returns. Absent where the statement writes the table itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_query: Option<TargetQueryFacts>,
+}
+
+/// A cap on a number of rows: `TOP (n) [PERCENT]`, `LIMIT n`, `FETCH FIRST
+/// n ROWS`, `OFFSET n`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct RowCapFacts {
+    /// The count is a percentage of the rows (`TOP (n) PERCENT`), not a
+    /// number of them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub percent: bool,
+    /// The count, where it is written as a number (`TOP (10)`, `LIMIT
+    /// 10`). Absent where it is an expression or a variable (`TOP (@n)`),
+    /// and where no count is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<f64>,
+    /// Only an `OFFSET` is written: it skips that many rows and keeps every
+    /// other one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub offset_only: bool,
+}
+
+/// How a write's `FROM` / `USING` list joins the rows of a table it writes
+/// ([`WrittenRowsFacts::join`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TargetJoin {
+    /// The table is none of the list's sources: there is no list, or the
+    /// table is read beside it (`UPDATE t … FROM s` pairs each row of `t`
+    /// with every row of `s`; in PostgreSQL, Snowflake, BigQuery,
+    /// Redshift and Databricks a source of the target's table, `UPDATE t …
+    /// FROM t t2`, is another instance of it).
+    NotASource,
+    /// Every join over the table's source keeps all of its rows: a cross
+    /// or comma join, a join with no condition or one that is always true,
+    /// the preserved side of an outer join.
+    AllRows,
+    /// Some join over the table's source keeps only the rows of it that
+    /// its condition matches: an inner or semi join with a condition, the
+    /// padded side of an outer join, a lateral join (`CROSS APPLY`) whose
+    /// right side reads the rows to its left (for an anti join, those it
+    /// does not match).
+    MatchedRows,
+}
+
+/// What the query a write goes through does to the rows of the table it
+/// writes ([`WrittenRowsFacts::through_query`]): the query, or a CTE or
+/// derived table it reads the table through.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct TargetQueryFacts {
+    /// It keeps only the rows a `WHERE` passes that is not always true
+    /// (`WHERE 1 = 1` does not count).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub where_filters: bool,
+    /// Each row cap it puts on the rows (`TOP`, `LIMIT`, `FETCH`,
+    /// `OFFSET`), outermost first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<RowCapFacts>,
+}
+
 /// Structural facts about a `MERGE` statement.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -265,6 +584,35 @@ pub struct MergeFacts {
     /// The statement's `WHEN …` branches, in source order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<MergeBranchFacts>,
+}
+
+/// A column an `UPDATE … SET` assignment, a `MERGE` branch or an
+/// upsert's update action writes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", schemars(rename = "WrittenColumn"))]
+pub struct WrittenColumnEvent {
+    /// The table written.
+    pub table: TableRef,
+    /// The column written.
+    pub column: IdentName,
+    /// Classification tags the catalog attaches to the column, or to its
+    /// table.
+    pub column_taint_labels: Vec<TaintLabel>,
+    /// Classification tags of the columns the written value is drawn
+    /// from, each once. Empty when the value reads no tagged column or
+    /// what it reads is not known.
+    pub value_taint_labels: Vec<TaintLabel>,
+    /// How much of a classified source the written value exposes, as a
+    /// projection's `value_exposure` says: whether it can surface the
+    /// value or only a digest, a count or a derived scalar of it. `Value`
+    /// when untainted or value-preserving.
+    #[serde(default)]
+    pub value_exposure: super::catalog::ValueExposure,
+    /// The assignment, the `INSERT` column or the `MERGE` action that
+    /// writes the column.
+    pub source_span: Option<Span>,
 }
 
 /// One `WHEN …` branch of a `MERGE` statement.
@@ -313,7 +661,8 @@ pub struct RepeatedSubqueryEvent {
 }
 
 /// A table reference in the current statement whose target was mutated
-/// (dropped or renamed) by an earlier statement in the same script.
+/// (dropped or renamed) by an earlier statement in the same script, or in
+/// a script run before it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -323,10 +672,18 @@ pub struct StaleTableReference {
     pub table: TableRef,
     /// What state the referenced table is in.
     pub state: StaleTableState,
-    /// 0-indexed position of the earlier script statement that mutated
-    /// the schema. Always strictly less than the current statement's
-    /// `script_context.statement_index`.
+    /// 0-indexed position, among the script's top-level statements, of the
+    /// statement that mutated the schema or holds the block, branch or loop
+    /// that did.
     pub mutated_at_index: u32,
+    /// The statement that mutated the schema is in a script run before
+    /// this one (`--cross-script`); `mutated_at_index` is its position in
+    /// that script.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutated_in_earlier_script: bool,
+    /// The file of that script, where it is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutated_in_file: Option<String>,
     /// Source span of the reference site in this statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span: Option<Span>,
@@ -357,7 +714,8 @@ pub enum DroppedObjectKind {
 }
 
 /// A column reference in the current statement that was removed by an
-/// earlier `ALTER TABLE ... DROP COLUMN` in the same script.
+/// earlier `ALTER TABLE ... DROP COLUMN` in the same script, or in a
+/// script run before it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -368,9 +726,17 @@ pub struct StaleColumnReference {
     pub table: Option<TableRef>,
     /// The column name as referenced in this statement.
     pub column: IdentName,
-    /// 0-indexed position of the earlier `ALTER TABLE ... DROP COLUMN`
-    /// statement.
+    /// 0-indexed position, among the script's top-level statements, of the
+    /// `ALTER TABLE ... DROP COLUMN` or of the statement holding it.
     pub mutated_at_index: u32,
+    /// The `DROP COLUMN` is in a script run before this one
+    /// (`--cross-script`); `mutated_at_index` is its position in that
+    /// script.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mutated_in_earlier_script: bool,
+    /// The file of that script, where it is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutated_in_file: Option<String>,
     pub source_span: Option<Span>,
 }
 
@@ -391,7 +757,9 @@ pub struct ColumnReferenceEvent {
     /// Catalog-presence outcome.
     ///
     /// - `true`: the catalog declared this column on its resolved table.
-    /// - `false`: the catalog declared the table but not this column.
+    /// - `false`: the catalog declared the table but not this column; for
+    ///   a column tied to no table, the tables in scope the catalog
+    ///   declares lack it and no other source can have it.
     /// - omitted: no catalog attached, the table was absent, or the
     ///   column resolved to a derived source (CTE, derived table,
     ///   VALUES, TVF).
@@ -495,7 +863,12 @@ pub struct ScopeFacts {
     pub set_operations: Vec<SetOpEvent>,
     pub star_projections: Vec<StarProjectionEvent>,
     pub scalar_subqueries: Vec<SubqueryRef>,
-    pub lateral_flattens: Vec<LateralEvent>,
+    /// Each table-valued function this scope reads from, in source order
+    /// (`FROM dbo.fn(1)`, `CROSS APPLY dbo.fn(t.id)`, `LATERAL
+    /// FLATTEN(…)`, `TABLE(fn(…))`, `UNNEST(…)`): a function's rows, never
+    /// a table of the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub table_functions: Vec<TableFunctionEvent>,
 
     /// `true` when this scope's output is `SELECT DISTINCT`. Per-scope
     /// analog of `query.has_distinct` (which only reflects the
@@ -525,7 +898,7 @@ pub struct ScopeFacts {
     /// Source span identifying where this scope begins — the outer
     /// SELECT keyword for an outer scope, the CTE name for a CTE
     /// scope, the derived-table SELECT for a derived-table scope,
-    /// etc. Per-witness emissions use it to anchor signals at the
+    /// etc. Per-witness emissions use it to anchor findings at the
     /// scope rather than the statement root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span: Option<Span>,
@@ -561,10 +934,20 @@ pub struct TableEvent {
     pub source_span: Option<Span>,
     pub catalog_tags: Vec<CatalogTag>,
     pub row_count: Option<u64>,
+    /// How many of the table's columns the statement uses. For a table
+    /// it reads: the distinct columns it names (a name the catalog does
+    /// not list counts too), and under `SELECT *` every column the
+    /// catalog lists that the star keeps. For a table it writes (an
+    /// `INSERT`, `UPDATE`, `DELETE` or `MERGE` target): the number of
+    /// columns the catalog declares for it. `null` when no catalog is
+    /// attached, the catalog has no entry for the table, or the statement
+    /// names none of its columns (`SELECT COUNT(*)`).
     pub column_count: Option<u32>,
     pub access_kind: TableAccessKind,
     /// Catalog-declared object kind. Omitted when no catalog is
-    /// attached or the catalog had no entry for the table.
+    /// attached, the catalog had no entry for the table, or the catalog
+    /// names only some of its columns (one built from dbt source tags),
+    /// which does not say what kind of object the table is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_kind: Option<TableKind>,
     /// Catalog-presence outcome. Omitted when no catalog was attached;
@@ -573,6 +956,18 @@ pub struct TableEvent {
     /// consulted and the table was not found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_catalog: Option<bool>,
+    /// Where the catalog was consulted and the table was not found: each
+    /// name it was looked for under, the parts the session gives a name
+    /// that omits them included (`dbo.Orders`; under a search path of two
+    /// schemas, `app.invoice, public.invoice`). Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub searched_as: Option<String>,
+    /// The table is one the session holds: named as a temporary table or a
+    /// table variable (T-SQL `#t`, `##t`, `@t`), or one an earlier
+    /// statement of the script created temporary and that is still there.
+    /// Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub temporary: bool,
 }
 
 /// The catalog-declared kind of a database object.
@@ -610,6 +1005,9 @@ pub enum TableAccessKind {
 pub struct JoinEvent {
     pub left: TableRef,
     pub right: TableRef,
+    /// What the right operand reads its rows from.
+    #[serde(default)]
+    pub right_source: JoinSource,
     pub kind: JoinKind,
     pub on_columns: Vec<JoinColumnPair>,
     pub on_predicate: Option<Expr>,
@@ -637,6 +1035,34 @@ pub struct JoinEvent {
     /// when both operand estimates are known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cartesian_estimate: Option<u64>,
+    /// The columns of an earlier outer join's padded row that this join
+    /// drops or is not shown to keep. A column is listed where this join
+    /// keeps only the matching rows of the operand holding the row, reads
+    /// the column in its condition (or, for a lateral right operand, in
+    /// that operand), and is not shown to pass the row with every column
+    /// the outer join pads NULL. Each carries its nullability where the
+    /// join reads it, with the pad's reason. Empty where nullability is
+    /// not analysed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_padded_columns: Vec<ColumnRef>,
+}
+
+/// What a join operand reads its rows from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum JoinSource {
+    /// A table, view or CTE (or a derived table over one).
+    #[default]
+    Table,
+    /// A table function whose arguments read no column of the other
+    /// operand (`dbo.fn(1)`, `range(10)`, `TABLE(my_tvf(1))`).
+    TableFunction,
+    /// A table function whose arguments read a column of the left
+    /// operand, so it is called once per left row (`LATERAL
+    /// FLATTEN(input => t.c)`, `CROSS APPLY OPENJSON(t.c)`, `,
+    /// UNNEST(t.c)`).
+    CorrelatedTableFunction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -667,15 +1093,22 @@ pub struct JoinColumnPair {
     pub right: ColumnRef,
     pub type_compatibility: TypeCompatibility,
     pub fk_relationship: FkRelationshipStatus,
-    /// `true` when at least one side of the equi-join pair is a
-    /// catalog-declared primary or unique key, meaning that side
-    /// cannot produce duplicate rows in the join output.
+    /// `true` when, on one side of the pair, the columns the join's `ON`
+    /// equates hold a key of that side's rows: every column of a primary
+    /// or unique key the catalog declares, the columns a `DISTINCT` or
+    /// `GROUP BY` of that side makes unique, or any column of a side that
+    /// yields at most one row. That side then matches each row of the
+    /// other at most once. `false` where no such key is known, and
+    /// wherever uniqueness is not analysed.
     #[serde(default)]
     pub unique_key_backed: bool,
-    /// `true` when a catalog is attached and `unique_key_backed` reflects
-    /// an actual catalog lookup. `false` when no catalog is attached,
-    /// in which case `unique_key_backed` is always `false` regardless
-    /// of the actual schema.
+    /// `true` when a catalog that lists its tables' keys is attached and
+    /// a key was looked for on a side whose column is not one a table
+    /// function yields. `false` when no catalog is attached, the catalog
+    /// lists no keys (one built from dbt source tags names only some
+    /// columns), or uniqueness is not analysed: a `false`
+    /// `unique_key_backed` then does not say the schema declares no key,
+    /// while a `true` one still holds.
     #[serde(default)]
     pub unique_key_backing_known: bool,
 }
@@ -800,7 +1233,7 @@ pub struct PredicateEvent {
 /// Cross-scope constraint effect for one (predicate, column) pair.
 /// Describes how a predicate's constraint on a column relates to an
 /// upstream constraint at a CTE or derived-table boundary.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", schemars(rename = "UpstreamPredicateEffect"))]
@@ -820,6 +1253,83 @@ pub struct PredicateCrossScopeEffect {
     /// Structural relationship between `consumer_constraint` and
     /// `upstream_constraint`. See [`CrossScopeConstraintRelationship`].
     pub relationship: CrossScopeConstraintRelationship,
+    /// Where the source writes the literals `upstream_constraint` holds.
+    #[serde(skip)]
+    pub(crate) upstream_origin: super::algebra::ConstraintOrigin,
+    /// Where the source writes the predicate `consumer_constraint` is
+    /// read from.
+    #[serde(skip)]
+    pub(crate) consumer_origin: super::identity::TextOrigin,
+}
+
+impl PredicateCrossScopeEffect {
+    /// The effect on `column` of the upstream constraint
+    /// `upstream_constraint` the boundary `upstream` holds, the consumer's
+    /// own constraint `consumer_constraint` relating to it as
+    /// `relationship`; made of text outside the statement until
+    /// [`Self::written_at`] places it.
+    pub fn new(
+        column: ColumnRef,
+        upstream: super::algebra::UpstreamFactsRef,
+        upstream_constraint: super::algebra::UpstreamConstraint,
+        consumer_constraint: Option<super::algebra::UpstreamConstraint>,
+        relationship: CrossScopeConstraintRelationship,
+    ) -> Self {
+        Self {
+            column,
+            upstream,
+            upstream_constraint,
+            consumer_constraint,
+            relationship,
+            upstream_origin: super::algebra::ConstraintOrigin::Elsewhere,
+            consumer_origin: super::identity::TextOrigin::default(),
+        }
+    }
+
+    /// These effects, their upstream constraint written at `upstream`
+    /// (`None` for text outside the statement) and their consumer's at
+    /// `consumer`: a report masks each where it prints it and that text is
+    /// masked.
+    pub fn written_at(mut self, upstream: Option<Span>, consumer: Option<Span>) -> Self {
+        self.upstream_origin = super::algebra::ConstraintOrigin::of(upstream);
+        self.consumer_origin = super::identity::TextOrigin(consumer);
+        self
+    }
+
+    /// Whether the upstream constraint is made of text outside the
+    /// statement.
+    pub(crate) fn quotes_text_elsewhere(&self) -> bool {
+        matches!(
+            self.upstream_origin,
+            super::algebra::ConstraintOrigin::Elsewhere
+        )
+    }
+}
+
+/// An effect as it serializes: each constraint's values masked where a
+/// report prints it and the text they are written in is masked.
+impl Serialize for PredicateCrossScopeEffect {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("PredicateCrossScopeEffect", 5)?;
+        out.serialize_field("column", &self.column)?;
+        out.serialize_field("upstream", &self.upstream)?;
+        match self.upstream_origin.masked_in_print() {
+            true => {
+                out.serialize_field("upstream_constraint", &self.upstream_constraint.masked())?
+            }
+            false => out.serialize_field("upstream_constraint", &self.upstream_constraint)?,
+        }
+        match &self.consumer_constraint {
+            Some(consumer) if self.consumer_origin.masked_in_print() => {
+                out.serialize_field("consumer_constraint", &consumer.masked())?
+            }
+            Some(consumer) => out.serialize_field("consumer_constraint", consumer)?,
+            None => out.skip_field("consumer_constraint")?,
+        }
+        out.serialize_field("relationship", &self.relationship)?;
+        out.end()
+    }
 }
 
 /// Relationship between a predicate's constraint and the upstream constraint
@@ -859,6 +1369,12 @@ pub struct PredicateNullEffect {
     pub column: ColumnRef,
     pub drops_null_row: bool,
     pub null_addressed: bool,
+    /// `true` when the column is NULL in a row an outer join pads and the
+    /// predicate is not shown to pass that row, every column of the padded
+    /// row it reads NULL together: it is shown to reject it, or what it
+    /// does with it is not decided.
+    #[serde(default)]
+    pub drops_padded_row: bool,
     pub aggregate_derived: bool,
     /// `true` when the predicate contains a bare `<>` or `!=`
     /// comparison whose left- or right-hand side is the column itself
@@ -872,16 +1388,15 @@ pub struct PredicateNullEffect {
     /// null-safe operators (`IS DISTINCT FROM`, `<=>`) do not set this.
     #[serde(default)]
     pub null_literal_compared: bool,
-    /// `true` when the column appears on either side of a bare
-    /// `Column = Column` equality inside an `INNER JOIN`'s `ON`
-    /// clause (or as a `USING` key) feeding into this predicate —
-    /// the join eliminates NULL rows, so surviving rows have non-NULL
-    /// values regardless of catalog nullability.
+    /// `true` when an inner join's condition below the predicate rejects
+    /// NULL for the column and no outer join pads it after: the join
+    /// drops the rows where it is NULL, so the rows the predicate reads
+    /// hold a value whatever the catalog declares.
     #[serde(default)]
     pub inner_join_key_protected: bool,
     /// Source span of the enclosing predicate (same as the parent
     /// predicate's `source_span`). Lets per-witness emissions walking
-    /// `null_effects` anchor the signal at the WHERE / QUALIFY clause
+    /// `null_effects` anchor the finding at the WHERE / QUALIFY clause
     /// rather than at the statement root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span: Option<Span>,
@@ -1140,12 +1655,44 @@ pub enum SubqueryPosition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(feature = "schema", schemars(rename = "LateralJoin"))]
-pub struct LateralEvent {
-    pub function: IdentName,
-    pub args: Vec<Expr>,
+#[cfg_attr(feature = "schema", schemars(rename = "TableFunctionCall"))]
+pub struct TableFunctionEvent {
+    /// The call, as a call in an expression is published: the function's
+    /// name and each argument (one written in a grammar no expression has
+    /// is opaque).
+    pub call: FuncCallExpr,
+    /// Whether the function is one the engine's function catalog holds,
+    /// which holds the same names for every dialect.
+    #[serde(default)]
+    pub origin: FunctionOrigin,
+    /// Whether the select list of the call's query reads a column the
+    /// call yields: directly, through a window or aggregate the list
+    /// reads that reads one, through the arguments of another call whose
+    /// columns it reads (`UNNEST(a.c) AS u1, UNNEST(u1.y) AS u2` selecting
+    /// `u2` reads `u1`), or by a star that covers the call (`*`, `f.*`).
+    #[serde(default)]
+    pub columns_selected: bool,
     pub alias: Option<IdentName>,
+    /// Written after `LATERAL`.
+    pub lateral: bool,
     pub source_span: Option<Span>,
+}
+
+/// Where a called function is defined.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionOrigin {
+    /// A function the engine's function catalog holds (`FLATTEN`, `UNNEST`,
+    /// `OPENJSON`, `STRING_SPLIT`, `jsonb_array_elements`). The catalog
+    /// holds the same names for every dialect, so a user's function named
+    /// like another dialect's built-in is one too.
+    BuiltIn,
+    /// Any other function: a user-defined or catalog function
+    /// (`dbo.orders_for`, `my_tvf`), or a built-in the function catalog
+    /// does not hold.
+    #[default]
+    User,
 }
 
 /// Per-column constraint facts. Carries the individual comparisons
@@ -1153,7 +1700,7 @@ pub struct LateralEvent {
 /// checks) and inconsistencies detected when all of those comparisons
 /// are taken together. Comparison values are stored as strings.
 /// Multiple inconsistencies can co-occur on the same column.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", schemars(rename = "ColumnConstraintChange"))]
@@ -1191,6 +1738,81 @@ pub struct ColumnConstraintEvent {
     /// are taken together.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<ColumnConstraintAnomaly>,
+}
+
+/// A column's constraints as they serialize: each value masked where a
+/// report prints them and the text of the comparisons holds a literal it
+/// does not show (`super::secrets::masked_in_print`).
+impl Serialize for ColumnConstraintEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Bound<'a> {
+            value: &'a str,
+            inclusive: bool,
+        }
+        #[derive(Serialize)]
+        struct Printed<'a> {
+            column: &'a IdentName,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            source_span: Option<Span>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            eq_values: Vec<&'a str>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            not_eq_values: Vec<&'a str>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            lower_bounds: Vec<Bound<'a>>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            upper_bounds: Vec<Bound<'a>>,
+            is_null_asserted: bool,
+            is_not_null_asserted: bool,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            anomalies: &'a [ColumnConstraintAnomaly],
+        }
+        let masked = super::secrets::masked_in_print(self.source_span);
+        let shown = |value: &str| -> String {
+            match masked {
+                true => super::MASKED_VALUE.to_string(),
+                false => value.to_string(),
+            }
+        };
+        let eq: Vec<String> = self.eq_values.iter().map(|v| shown(v)).collect();
+        let not_eq: Vec<String> = self.not_eq_values.iter().map(|v| shown(v)).collect();
+        let lower: Vec<String> = self.lower_bounds.iter().map(|b| shown(&b.value)).collect();
+        let upper: Vec<String> = self.upper_bounds.iter().map(|b| shown(&b.value)).collect();
+        let bounds = |values: &'_ [String], facts: &[RangeBoundFact]| -> Vec<(String, bool)> {
+            values
+                .iter()
+                .zip(facts)
+                .map(|(value, fact)| (value.clone(), fact.inclusive))
+                .collect()
+        };
+        let lower = bounds(&lower, &self.lower_bounds);
+        let upper = bounds(&upper, &self.upper_bounds);
+        Printed {
+            column: &self.column,
+            source_span: self.source_span,
+            eq_values: eq.iter().map(String::as_str).collect(),
+            not_eq_values: not_eq.iter().map(String::as_str).collect(),
+            lower_bounds: lower
+                .iter()
+                .map(|(value, inclusive)| Bound {
+                    value,
+                    inclusive: *inclusive,
+                })
+                .collect(),
+            upper_bounds: upper
+                .iter()
+                .map(|(value, inclusive)| Bound {
+                    value,
+                    inclusive: *inclusive,
+                })
+                .collect(),
+            is_null_asserted: self.is_null_asserted,
+            is_not_null_asserted: self.is_not_null_asserted,
+            anomalies: &self.anomalies,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// One bound from a column's range list (`lower_bounds` or

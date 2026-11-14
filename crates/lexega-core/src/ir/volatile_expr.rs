@@ -29,10 +29,22 @@ pub fn resolved_func_is_volatile(func: &ResolvedFunc, catalog: &FunctionCatalog)
     }
 }
 
+/// True iff `func` is volatile and its calls in one statement may
+/// return different values: volatile, and not one the catalog says
+/// returns one value per statement.
+fn resolved_func_varies_per_call(func: &ResolvedFunc, catalog: &FunctionCatalog) -> bool {
+    match func {
+        ResolvedFunc::Resolved { id, .. } => {
+            resolved_func_is_volatile(func, catalog) && !catalog.is_statement_stable(*id)
+        }
+        ResolvedFunc::Unresolved { .. } => false,
+    }
+}
+
 /// True iff `expr` directly reaches a volatile catalog function, or
-/// references a column that is volatile (per `input` for a local column,
-/// or `outer` for a correlated one). Column references resolve
-/// against the precomputed volatile sets instead of re-walking the plan.
+/// references a column in `volatile`, a correlated reference included.
+/// Column references resolve against the precomputed volatile set
+/// instead of re-walking the plan.
 ///
 /// Subquery bodies (`Exists`, `ScalarSubquery`, `QuantifiedCmp` over a
 /// subquery RHS) are intentionally NOT descended into: volatility inside
@@ -40,107 +52,87 @@ pub fn resolved_func_is_volatile(func: &ResolvedFunc, catalog: &FunctionCatalog)
 /// own scope is folded), not the containing scalar expression here.
 pub fn expr_is_volatile(
     expr: &ScalarExpr,
-    local: &BTreeSet<ColumnId>,
-    outer: &BTreeSet<ColumnId>,
+    volatile: &BTreeSet<ColumnId>,
     catalog: &FunctionCatalog,
 ) -> bool {
+    reaches(expr, volatile, &|func| {
+        resolved_func_is_volatile(func, catalog)
+    })
+}
+
+/// As [`expr_is_volatile`], for a value that may differ between two
+/// evaluations in one statement: a call to a volatile function the
+/// catalog does not say returns one value per statement, or a column of
+/// `varying`.
+pub(crate) fn expr_varies_per_row(
+    expr: &ScalarExpr,
+    varying: &BTreeSet<ColumnId>,
+    catalog: &FunctionCatalog,
+) -> bool {
+    reaches(expr, varying, &|func| {
+        resolved_func_varies_per_call(func, catalog)
+    })
+}
+
+/// Whether `expr`, outside its nested plans, calls a function `called`
+/// holds of or reads a column of `columns`.
+fn reaches(
+    expr: &ScalarExpr,
+    columns: &BTreeSet<ColumnId>,
+    called: &dyn Fn(&ResolvedFunc) -> bool,
+) -> bool {
+    let walk = |e: &ScalarExpr| reaches(e, columns, called);
     match expr {
         ScalarExpr::FuncCall {
             func,
             args,
             named_args,
             ..
-        } => {
-            resolved_func_is_volatile(func, catalog)
-                || args
-                    .iter()
-                    .any(|a| expr_is_volatile(a, local, outer, catalog))
-                || named_args
-                    .iter()
-                    .any(|(_, a)| expr_is_volatile(a, local, outer, catalog))
-        }
+        } => called(func) || args.iter().any(walk) || named_args.iter().any(|(_, a)| walk(a)),
         ScalarExpr::Like {
             expr,
             pattern,
             escape,
             ..
-        } => {
-            expr_is_volatile(expr, local, outer, catalog)
-                || expr_is_volatile(pattern, local, outer, catalog)
-                || escape
-                    .as_deref()
-                    .is_some_and(|e| expr_is_volatile(e, local, outer, catalog))
+        } => walk(expr) || walk(pattern) || escape.as_deref().is_some_and(walk),
+        ScalarExpr::BinOp { left, right, .. } => walk(left) || walk(right),
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
+            operands.iter().any(walk)
         }
-        ScalarExpr::BinOp { left, right, .. } => {
-            expr_is_volatile(left, local, outer, catalog)
-                || expr_is_volatile(right, local, outer, catalog)
-        }
-        ScalarExpr::LogicalChain { operands, .. } => operands
-            .iter()
-            .any(|o| expr_is_volatile(o, local, outer, catalog)),
-        ScalarExpr::UnaryOp { arg, .. } => expr_is_volatile(arg, local, outer, catalog),
+        ScalarExpr::UnaryOp { arg, .. } => walk(arg),
         ScalarExpr::Case {
             operand,
             branches,
             else_,
             ..
         } => {
-            operand
-                .as_ref()
-                .is_some_and(|o| expr_is_volatile(o, local, outer, catalog))
-                || branches.iter().any(|(c, r)| {
-                    expr_is_volatile(c, local, outer, catalog)
-                        || expr_is_volatile(r, local, outer, catalog)
-                })
-                || else_
-                    .as_ref()
-                    .is_some_and(|e| expr_is_volatile(e, local, outer, catalog))
+            operand.as_deref().is_some_and(walk)
+                || branches.iter().any(|(c, r)| walk(c) || walk(r))
+                || else_.as_deref().is_some_and(walk)
         }
-        ScalarExpr::Cast { expr, .. } => expr_is_volatile(expr, local, outer, catalog),
-        ScalarExpr::InList { expr, list, .. } => {
-            expr_is_volatile(expr, local, outer, catalog)
-                || list
-                    .iter()
-                    .any(|e| expr_is_volatile(e, local, outer, catalog))
-        }
+        ScalarExpr::Cast { expr, .. } => walk(expr),
+        ScalarExpr::InList { expr, list, .. } => walk(expr) || list.iter().any(walk),
         ScalarExpr::Between {
             expr, low, high, ..
-        } => {
-            expr_is_volatile(expr, local, outer, catalog)
-                || expr_is_volatile(low, local, outer, catalog)
-                || expr_is_volatile(high, local, outer, catalog)
-        }
+        } => walk(expr) || walk(low) || walk(high),
         ScalarExpr::QuantifiedCmp { left, right, .. } => {
-            expr_is_volatile(left, local, outer, catalog)
+            walk(left)
                 || match right {
-                    QuantifiedRhs::List(items) => items
-                        .iter()
-                        .any(|e| expr_is_volatile(e, local, outer, catalog)),
+                    QuantifiedRhs::List(items) => items.iter().any(walk),
                     QuantifiedRhs::Subquery(_, _) => false,
                 }
         }
+        ScalarExpr::RowCmp { left, .. } => left.iter().any(walk),
         ScalarExpr::WindowFn { call, .. } => {
-            resolved_func_is_volatile(&call.func, catalog)
-                || call
-                    .args
-                    .iter()
-                    .any(|a| expr_is_volatile(a, local, outer, catalog))
-                || call
-                    .partition_by
-                    .iter()
-                    .any(|p| expr_is_volatile(p, local, outer, catalog))
-                || call
-                    .order_by
-                    .iter()
-                    .any(|k| expr_is_volatile(&k.expr, local, outer, catalog))
+            called(&call.func)
+                || call.args.iter().any(walk)
+                || call.partition_by.iter().any(walk)
+                || call.order_by.iter().any(|k| walk(&k.expr))
         }
-        ScalarExpr::FieldAccess { base, .. } => expr_is_volatile(base, local, outer, catalog),
-        ScalarExpr::Lambda { body, .. } => expr_is_volatile(body, local, outer, catalog),
-        // A local reference resolves against this scope's volatile set; a
-        // correlated reference (an outer id carried by `Column`, or an
-        // `OuterRef`) resolves against the enclosing-scope set.
+        ScalarExpr::FieldAccess { base, .. } => walk(base),
+        ScalarExpr::Lambda { body, .. } => walk(body),
         ScalarExpr::Column { column, .. } | ScalarExpr::OuterRef { column, .. } => {
-            local.contains(column) || outer.contains(column)
+            columns.contains(column)
         }
         ScalarExpr::Lit { .. }
         | ScalarExpr::PatternVarRef { .. }

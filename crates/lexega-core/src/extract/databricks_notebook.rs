@@ -14,7 +14,8 @@
 
 use std::path::Path;
 
-use super::{ExtractedSql, SqlCallPattern, SqlEmbedding};
+use super::{python, ExtractedSql, OffsetMap, SqlCallPattern, SqlEmbedding};
+use crate::analyzer::LineIndex;
 
 /// The mandatory header for Databricks `.py` notebooks.
 const DATABRICKS_HEADER: &str = "# Databricks notebook source";
@@ -44,35 +45,40 @@ pub fn is_databricks_notebook(source: &str) -> bool {
 /// Splits the file into cells at `# COMMAND ----------` boundaries, then
 /// collects cells where every non-blank, non-comment line starts with
 /// `# MAGIC %sql`. The SQL content is reassembled with the magic prefix
-/// stripped.
+/// stripped, each line placed where it begins behind that prefix. The file
+/// is also Python (every magic line and delimiter is a comment), so the
+/// calls `patterns` names in its Python cells are extracted as from a plain
+/// `.py` file. Fragments come in file order.
 pub fn extract_sql(
     source: &str,
     file_path: &Path,
-    _patterns: &[SqlCallPattern],
+    patterns: &[SqlCallPattern],
 ) -> Vec<ExtractedSql> {
     if !is_databricks_notebook(source) {
         return Vec::new();
     }
 
-    let mut results = Vec::new();
+    let mut results = python::extract_sql(source, file_path, patterns);
+    let lines = LineIndex::new(source);
 
     // Split into cells by the delimiter.
     // First cell is the header + first code cell.
-    let cells: Vec<&str> = source.split(CELL_DELIMITER).collect();
-
-    let mut line_offset: u32 = 1; // 1-indexed line number
-
-    for cell_text in &cells {
-        let cell_lines: Vec<&str> = cell_text.lines().collect();
-        let cell_line_count = cell_lines.len() as u32;
-
-        // Check if this cell is a SQL magic cell
-        let mut sql_lines: Vec<&str> = Vec::new();
+    let mut cell_at = 0;
+    for cell_text in source.split(CELL_DELIMITER) {
+        // Check if this cell is a SQL magic cell: its SQL lines, each with
+        // the byte of the file it begins at.
+        let mut sql_lines: Vec<(&str, usize)> = Vec::new();
         let mut is_sql_cell = false;
-        let mut first_sql_line: u32 = 0;
 
-        for (i, line) in cell_lines.iter().enumerate() {
+        let mut line_at = cell_at;
+        for raw_line in cell_text.split_inclusive('\n') {
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let at = line_at;
+            line_at += raw_line.len();
             let trimmed = line.trim();
+            // The byte of the file `skip` bytes into the trimmed line.
+            let start_at = |skip: usize| at + (line.len() - line.trim_start().len()) + skip;
 
             // Skip empty lines and the header
             if trimmed.is_empty() || trimmed == DATABRICKS_HEADER {
@@ -87,10 +93,10 @@ pub fn extract_sql(
             if is_sql_cell {
                 // Already identified as SQL cell — collect continuation lines
                 if let Some(content) = trimmed.strip_prefix(MAGIC_PREFIX) {
-                    sql_lines.push(content);
+                    sql_lines.push((content, start_at(MAGIC_PREFIX.len())));
                 } else if trimmed == "# MAGIC" {
                     // Empty magic line → blank SQL line
-                    sql_lines.push("");
+                    sql_lines.push(("", start_at(trimmed.len())));
                 } else {
                     // Non-magic line interrupts the SQL cell
                     is_sql_cell = false;
@@ -99,14 +105,13 @@ pub fn extract_sql(
                 }
             } else {
                 // Not yet identified — look for the %sql marker
-                if trimmed.starts_with(SQL_MAGIC_PREFIX) {
+                if let Some(after_prefix) = trimmed.strip_prefix(SQL_MAGIC_PREFIX) {
                     is_sql_cell = true;
-                    first_sql_line = line_offset + i as u32;
                     // Check for inline SQL on the same line: # MAGIC %sql SELECT 1
-                    let after_prefix = trimmed.strip_prefix(SQL_MAGIC_PREFIX).unwrap_or("");
                     let inline = after_prefix.strip_prefix(' ').unwrap_or(after_prefix);
                     if !inline.is_empty() {
-                        sql_lines.push(inline);
+                        let skip = trimmed.len() - inline.len();
+                        sql_lines.push((inline, start_at(skip)));
                     }
                 } else if trimmed.starts_with("# MAGIC") {
                     // Different magic type (%md, %scala, etc.) — not a SQL cell
@@ -118,26 +123,45 @@ pub fn extract_sql(
             }
         }
 
-        if is_sql_cell && !sql_lines.is_empty() {
-            let sql = sql_lines.join("\n").trim().to_string();
-            if !sql.is_empty() {
-                results.push(ExtractedSql {
-                    sql,
-                    origin_file: file_path.to_path_buf(),
-                    origin_line: first_sql_line,
-                    origin_col: 0,
-                    embedding: SqlEmbedding::DatabricksMagicSql,
-                    dialect_hint: Some("databricks".to_string()),
-                    has_interpolation: false,
-                });
-            }
+        if is_sql_cell {
+            results.extend(cell_sql(&sql_lines, file_path, (source, &lines)));
         }
 
-        // Advance line counter: cell lines + 1 for the delimiter line
-        line_offset += cell_line_count + 1;
+        cell_at += cell_text.len() + CELL_DELIMITER.len();
     }
 
+    results.sort_by_key(|fragment| (fragment.origin.line, fragment.origin.column));
     results
+}
+
+/// The fragment a SQL cell's `lines` hold, each with the byte of the file
+/// `host` it begins at: their text without the blank lines and whitespace
+/// around it, each line placed where it begins. None where the cell holds
+/// no SQL.
+fn cell_sql(
+    lines: &[(&str, usize)],
+    file_path: &Path,
+    host: (&str, &LineIndex),
+) -> Option<ExtractedSql> {
+    let first = lines.iter().position(|(text, _)| !text.trim().is_empty())?;
+    let ((head, head_at), rest) = lines[first..].split_first()?;
+    let lead = head.len() - head.trim_start().len();
+    let mut sql = head[lead..].to_string();
+    let mut map = OffsetMap::starting_at(head_at + lead);
+    for (text, at) in rest {
+        sql.push('\n');
+        map.push(sql.len(), *at);
+        sql.push_str(text);
+    }
+    sql.truncate(sql.trim_end().len());
+    Some(ExtractedSql::placed_in(
+        sql,
+        file_path,
+        host,
+        &map,
+        SqlEmbedding::DatabricksMagicSql,
+        false,
+    ))
 }
 
 #[cfg(test)]
@@ -180,7 +204,54 @@ x = 1
             .contains("SELECT * FROM catalog.schema.events"));
         assert!(results[0].sql.contains("WHERE date > '2024-01-01'"));
         assert_eq!(results[0].embedding, SqlEmbedding::DatabricksMagicSql);
-        assert_eq!(results[0].dialect_hint.as_deref(), Some("databricks"));
+    }
+
+    #[test]
+    fn a_python_cells_sql_calls_are_extracted_in_file_order() {
+        let source = r#"# Databricks notebook source
+
+spark.sql("CREATE TABLE t1 (id INT)")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC INSERT INTO t1 VALUES (1)
+
+# COMMAND ----------
+
+query = "DROP TABLE t1"
+spark.sql(sqlQuery=query)
+"#;
+        let results = extract_sql(
+            source,
+            &PathBuf::from("notebook.py"),
+            &SqlCallPattern::spark_defaults(),
+        );
+        let found: Vec<(&str, usize, SqlEmbedding)> = results
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.sql.as_str(),
+                    fragment.origin.line,
+                    fragment.embedding,
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("CREATE TABLE t1 (id INT)", 3, SqlEmbedding::SparkSqlCall),
+                // A cell is placed where its SQL begins, the line after its
+                // `%sql` line.
+                (
+                    "INSERT INTO t1 VALUES (1)",
+                    8,
+                    SqlEmbedding::DatabricksMagicSql
+                ),
+                // A variable's string is placed where it is assigned.
+                ("DROP TABLE t1", 12, SqlEmbedding::SparkSqlCall),
+            ]
+        );
     }
 
     #[test]
@@ -247,6 +318,72 @@ y = x + 2
         let source = "# Regular Python file\nimport os\n";
         let results = extract_sql(source, &PathBuf::from("script.py"), &[]);
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn every_sql_cell_is_placed_at_the_line_its_sql_begins_on() {
+        let source = "# Databricks notebook source\n# MAGIC %sql SELECT 1\n\n# COMMAND ----------\n\n# MAGIC %sql SELECT 2\n\n# COMMAND ----------\n# MAGIC %sql\n# MAGIC SELECT 3\n";
+        let lines: Vec<(String, usize)> = extract_sql(source, &PathBuf::from("notebook.py"), &[])
+            .into_iter()
+            .map(|fragment| (fragment.sql, fragment.origin.line))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("SELECT 1".to_string(), 2),
+                ("SELECT 2".to_string(), 6),
+                ("SELECT 3".to_string(), 10),
+            ]
+        );
+    }
+
+    // A cell's SQL is placed at the line and column where it begins, behind
+    // the `# MAGIC ` prefix, past a blank magic line; a Python string's
+    // column counts characters.
+    #[test]
+    fn a_cells_sql_is_placed_where_it_begins_behind_its_magic_prefix() {
+        let source = "# Databricks notebook source\n# MAGIC %sql\n# MAGIC DELETE FROM main.sales.nb\n\n# COMMAND ----------\n\n# MAGIC %sql DELETE FROM main.sales.inl\n\n# COMMAND ----------\n\n# MAGIC %sql\n# MAGIC\n# MAGIC SELECT 1;\n# MAGIC   DELETE FROM main.sales.third\n\n# COMMAND ----------\n\nñ = 1; spark.sql(\"DELETE FROM main.sales.py\")\n";
+        let fragments = extract_sql(
+            source,
+            &PathBuf::from("notebook.py"),
+            &SqlCallPattern::spark_defaults(),
+        );
+        // The third cell's second line, column 3 (`DELETE`), is the file's
+        // line 14, column 11.
+        let place = |sql_offset: usize| {
+            fragments
+                .get(2)
+                .map(|third| third.place(sql_offset))
+                .map(|at| (at.line, at.column))
+        };
+        assert_eq!(place(12), Some((14, 11)));
+        assert_eq!(place(0), Some((13, 9)));
+        let found: Vec<(String, usize, usize)> = fragments
+            .into_iter()
+            .map(|fragment| (fragment.sql, fragment.origin.line, fragment.origin.column))
+            .collect();
+        let at = |sql: &str, line: usize, col: usize| (sql.to_string(), line, col);
+        assert_eq!(
+            found,
+            [
+                at("DELETE FROM main.sales.nb", 3, 9),
+                at("DELETE FROM main.sales.inl", 7, 14),
+                at("SELECT 1;\n  DELETE FROM main.sales.third", 13, 9),
+                at("DELETE FROM main.sales.py", 18, 19),
+            ]
+        );
+    }
+
+    // A column in a cell's SQL counts the characters before it on the
+    // file's line, and its UTF-16 units, inside the SQL as before it.
+    #[test]
+    fn a_column_in_a_cells_sql_counts_characters_not_bytes() {
+        let source = "# Databricks notebook source\n# MAGIC %sql\n# MAGIC SELECT 'ñ€' AS a;\n# MAGIC SELECT '😀中' AS b; DELETE FROM main.sales.c\n";
+        let fragments = extract_sql(source, &PathBuf::from("notebook.py"), &[]);
+        let cell = fragments.first().expect("the cell");
+        let delete = cell.sql.find("DELETE").expect("delete");
+        let at = cell.place(delete);
+        assert_eq!((at.line, at.column, at.utf16_column), (4, 27, 28));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use crate::ast::types::{AstPgRefreshMatview, AstStmt};
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::lexer::{Keyword, Span, TokenKind};
 use crate::parser::core::Parser;
 use crate::syntax::SyntaxPgRefreshMatviewStmt;
 
@@ -72,7 +72,7 @@ impl<'a> Parser<'a> {
         }
 
         // Parse view name (possibly schema-qualified: schema.name or catalog.schema.name)
-        let name_span = self.parse_pg_refresh_matview_name()?;
+        let name_span = self.parse_object_name_span()?;
         let mut end = name_span.end;
 
         // Check for optional WITH [ NO ] DATA
@@ -166,45 +166,5 @@ impl<'a> Parser<'a> {
         };
 
         Ok(AstStmt::PgRefreshMatview(Box::new(ast)))
-    }
-
-    /// Parse a possibly schema-qualified view name (dotted identifiers)
-    fn parse_pg_refresh_matview_name(&mut self) -> ParseResult<Span> {
-        let first = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["view name".to_string()])?;
-
-        if !matches!(
-            first.kind,
-            TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-        ) {
-            return Err(ParseError::new(
-                first.span,
-                ParseErrorKind::InvalidSyntax {
-                    message: format!("Expected view name, found '{}'", first.lexeme(self.source)),
-                },
-            ));
-        }
-
-        let start = first.span.start;
-        let mut end = first.span.end;
-
-        // Check for dot-separated qualifiers
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                let _dot = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec![".".to_string()])?;
-                let part = self.advance().ok_or_eof(
-                    self.current_span(),
-                    vec!["identifier after '.'".to_string()],
-                )?;
-                end = part.span.end;
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span { start, end })
     }
 }

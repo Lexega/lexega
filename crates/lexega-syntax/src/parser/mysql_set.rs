@@ -21,13 +21,14 @@
 //! - SESSION/NAMES/CHARACTER/CHARSET/PASSWORD/ROLE → identifiers
 
 use crate::ast::types::{
-    AstMysqlRoleSpec, AstMysqlSet, AstMysqlSetAssignment, AstMysqlSetCharacterSet,
-    AstMysqlSetDefaultRole, AstMysqlSetKind, AstMysqlSetNames, AstMysqlSetPassword,
-    AstMysqlSetRole, AstMysqlSetTarget, AstMysqlSetTransaction, AstStmt,
+    AstExpr, AstLiteral, AstMysqlRoleSpec, AstMysqlSet, AstMysqlSetAssignment,
+    AstMysqlSetCharacterSet, AstMysqlSetDefaultRole, AstMysqlSetKind, AstMysqlSetNames,
+    AstMysqlSetPassword, AstMysqlSetRole, AstMysqlSetTarget, AstMysqlSetTransaction, AstStmt,
 };
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::principal::LiteralSpelling;
 
 impl<'a> Parser<'a> {
     pub(crate) fn try_parse_mysql_set_stmt(&mut self) -> ParseResult<AstStmt> {
@@ -163,6 +164,17 @@ impl<'a> Parser<'a> {
         self.advance(); // consume operator
 
         let value = crate::parser::scripting::try_parse_expr_scripting(self)?;
+        self.record_assigned_secret(mysql_set_target_span(&target), &value);
+        // A user variable names no setting; a system variable is one, by
+        // its name without `@@` and the scope written before it.
+        let setting = match &target {
+            AstMysqlSetTarget::UserVar { .. } => None,
+            AstMysqlSetTarget::SystemAtAt { name_span } => {
+                Some(system_variable_name(*name_span, self.source))
+            }
+            AstMysqlSetTarget::System { name_span, .. } => Some(*name_span),
+        };
+        self.record_setting_expression(setting, value.span());
         let end = crate::parser::scripting::expr_span_end(&value);
 
         Ok(AstMysqlSetAssignment {
@@ -207,7 +219,7 @@ impl<'a> Parser<'a> {
 
         // `@@...` system variable vs `@user` variable: both lex as
         // AtVariable; distinguish on the `@@` prefix.
-        if matches!(tok.kind, TokenKind::Identifier { kind } if kind == crate::lexer::IdentifierKind::AtVariable)
+        if matches!(tok.kind, TokenKind::Identifier { kind, .. } if kind == crate::lexer::IdentifierKind::AtVariable)
         {
             let is_system = tok.lexeme(self.source).starts_with("@@");
             let name_span = self.consume_dotted_name_span();
@@ -369,6 +381,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_set_password(&mut self) -> ParseResult<AstMysqlSetPassword> {
+        let start_idx = self.idx;
         let password_span = self
             .advance()
             .map(|t| t.span)
@@ -423,7 +436,36 @@ impl<'a> Parser<'a> {
         let assign_op_span = op_tok.span;
         self.advance(); // =
 
-        let value = crate::parser::scripting::try_parse_expr_scripting(self)?;
+        // A literal written over more than one token (`_utf8mb4'…'`, `N'…'`,
+        // `X'…'`, `0x…`, `'…' '…'`, a string a template writes into) is the
+        // value whole, `StringWithJinja` where a template writes into any of
+        // its strings; the expression parser does not read `0x…` lexed as `0`
+        // and a word as one value, and joins strings written one after
+        // another (`AstLiteral::Adjacent`) only where no template writes into
+        // one of them.
+        let first = self.peek_non_trivia().map(|_| self.idx);
+        let value =
+            match first.and_then(|f| self.literal_at(f).filter(|literal| literal.past > f + 1)) {
+                Some(literal) => {
+                    let span = Span {
+                        start: self.tokens[self.idx].span.start,
+                        end: self.tokens[literal.past - 1].span.end,
+                    };
+                    self.idx = literal.past;
+                    let literal = if literal.spelling == LiteralSpelling::Templated {
+                        AstLiteral::StringWithJinja { span }
+                    } else {
+                        AstLiteral::String { span }
+                    };
+                    AstExpr::Literal {
+                        node_id: self.id_gen.next(),
+                        literal,
+                    }
+                }
+                None => crate::parser::scripting::try_parse_expr_scripting(self)?,
+            };
+        // `PASSWORD [FOR user] = '…'`.
+        self.record_secret_literals(start_idx, self.idx);
 
         Ok(AstMysqlSetPassword {
             password_span,
@@ -569,6 +611,7 @@ impl<'a> Parser<'a> {
     /// semicolon or EOF, returning the end position of the last consumed
     /// token. Parenthesised content is consumed wholesale.
     fn consume_to_stmt_end(&mut self, start: u32) -> u32 {
+        let from = self.idx;
         let mut end = start;
         let mut depth: i32 = 0;
         while let Some(tok) = self.peek_non_trivia() {
@@ -585,6 +628,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         end
     }
 
@@ -627,6 +672,30 @@ pub fn mysql_set_target_name_span(target: &AstMysqlSetTarget) -> Span {
         AstMysqlSetTarget::UserVar { name_span }
         | AstMysqlSetTarget::SystemAtAt { name_span }
         | AstMysqlSetTarget::System { name_span, .. } => *name_span,
+    }
+}
+
+/// The name of the system variable `@@[scope.]name` written at `span`:
+/// without its `@@` and the `GLOBAL`, `SESSION`, `LOCAL`, `PERSIST` or
+/// `PERSIST_ONLY` scope written before it ("Using System Variables").
+fn system_variable_name(span: Span, source: &str) -> Span {
+    let Some(written) = source.get(span.start as usize..span.end as usize) else {
+        return span;
+    };
+    let mut skip = written.len() - written.trim_start_matches('@').len();
+    let rest = &written[skip..];
+    if let Some(scope) = ["global.", "session.", "local.", "persist.", "persist_only."]
+        .iter()
+        .find(|scope| {
+            rest.get(..scope.len())
+                .is_some_and(|written| written.eq_ignore_ascii_case(scope))
+        })
+    {
+        skip += scope.len();
+    }
+    Span {
+        start: span.start + skip as u32,
+        end: span.end,
     }
 }
 

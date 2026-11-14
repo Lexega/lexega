@@ -30,13 +30,14 @@ use crate::lexer::token::Span;
 
 use super::catalog::CatalogTag;
 use super::ddl::DdlAction;
-use super::expr::WindowFunctionName;
+use super::expr::{FuncCallExpr, WindowFunctionName};
 use super::identity::{ColumnRef, IdentName, ObjectRef, PrincipalRef, TableRef};
 use super::literal::{DataType, LiteralValue};
 use super::policy::PolicyBodySemantics;
 use super::privilege::Privilege;
 use super::query::{
-    AggregateEvent, AggregateFunction, JoinEvent, JoinKind, PredicateEvent, SetOpKind, WindowEvent,
+    AggregateEvent, AggregateFunction, JoinEvent, JoinKind, MergeBranchKind, PredicateEvent,
+    SetOpKind, WindowEvent,
 };
 use super::statement::StatementKind;
 
@@ -94,20 +95,48 @@ pub enum DiffEvent {
         schemas: Vec<IdentName>,
     },
 
+    // ───────────── Table functions ─────────────
+    /// A table-valued function the head reads from that the baseline
+    /// does not. Calls of one function pair in the order they are
+    /// written.
+    TableFunctionAdded {
+        call: FuncCallExpr,
+    },
+    /// A table-valued function the baseline reads from that the head
+    /// does not.
+    TableFunctionRemoved {
+        call: FuncCallExpr,
+    },
+    /// A table-valued function both sides read from, called with
+    /// changed arguments. `node_deltas` locates each change in the call
+    /// (`func_call_arg` paths); it is empty where only an argument
+    /// written in a grammar no expression has changed (BigQuery's `MODEL
+    /// d.m`).
+    TableFunctionArgumentChanged {
+        function: IdentName,
+        node_deltas: Vec<ExpressionDelta>,
+    },
+
     // ───────────── WHERE clause ─────────────
     WhereAdded {
         table: TableRef,
         added_columns: Vec<ColumnRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     WhereRemoved {
         table: TableRef,
         removed_columns: Vec<ColumnRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     WhereConditionChanged {
         table: TableRef,
         column: ColumnRef,
         baseline_op: Option<super::expr::BinaryOp>,
         head_op: Option<super::expr::BinaryOp>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     /// Write-statement boundedness flipped (UPDATE/DELETE gained or
     /// lost a WHERE clause).
@@ -121,6 +150,9 @@ pub enum DiffEvent {
         left: TableRef,
         right: TableRef,
         join_kind: JoinKind,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
     JoinRemoved {
         left: TableRef,
@@ -132,20 +164,37 @@ pub enum DiffEvent {
         right: TableRef,
         baseline_kind: JoinKind,
         head_kind: JoinKind,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
     JoinConditionChanged {
         left: TableRef,
         right: TableRef,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
 
     // ───────────── Projection ─────────────
+    /// A column the head's result has that the baseline's has under no
+    /// name and with no equal value. `table` is the relation the
+    /// statement makes, empty for a query.
     ColumnProjected {
         table: TableRef,
         column: ColumnRef,
     },
+    /// A column the baseline's result has that the head's has under no
+    /// name and with no equal value.
     ColumnUnprojected {
         table: TableRef,
         column: ColumnRef,
+    },
+    /// A result column the head gives another name, its value unchanged.
+    ColumnRenamed {
+        table: TableRef,
+        baseline: ColumnRef,
+        head: ColumnRef,
     },
     StarProjectionAdded {
         table: Option<TableRef>,
@@ -153,31 +202,44 @@ pub enum DiffEvent {
     StarProjectionRemoved {
         table: Option<TableRef>,
     },
-    /// Content of a paired SELECT projection slot changed (e.g.
-    /// `SELECT 1 → SELECT 2`, `SELECT a → SELECT a + 1`,
-    /// `SELECT UPPER(x) → SELECT LOWER(x)`). One event per output
-    /// slot whose content differs. `output` is the head-side column
-    /// identity (shared with `nullability_changed` / `lineage_changed`
-    /// / `taint_changed`); omitted when the head slot is a star
-    /// projection.
+    /// A result column both sides have by name whose value is computed
+    /// differently (e.g. `SELECT 1 → SELECT 2`, `SELECT a → SELECT a + 1`,
+    /// `SELECT UPPER(x) → SELECT LOWER(x)`), however deep in the
+    /// statement the change is. Reading the same computation from another
+    /// source is `lineage_changed`. `output` is the head's column.
     ProjectionItemChanged {
         output: Option<ColumnRef>,
         baseline_kind: ProjectionItemKindTag,
         head_kind: ProjectionItemKindTag,
+        /// The `MERGE` branch writing the value, where a branch does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
 
     // ───────────── Clause presence — split per (clause × direction) ─────────────
     DistinctAdded {
         scope: SelectScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     DistinctRemoved {
         scope: SelectScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     QualifyAdded {
         window_functions: Vec<WindowFunctionName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     QualifyRemoved {
         window_functions: Vec<WindowFunctionName>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
+    },
+    QualifyChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     CteAdded {
         name: IdentName,
@@ -191,14 +253,27 @@ pub enum DiffEvent {
     SampleRemoved {
         tables: Vec<TableRef>,
     },
-    HavingAdded,
-    HavingRemoved,
-    HavingChanged,
+    HavingAdded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
+    },
+    HavingRemoved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
+    },
+    HavingChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
+    },
     GroupByAdded {
         columns: Vec<ColumnRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     GroupByRemoved {
         columns: Vec<ColumnRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
     OrderByAdded {
         columns: Vec<ColumnRef>,
@@ -257,6 +332,9 @@ pub enum DiffEvent {
     // ───────────── Window ─────────────
     WindowFunctionAdded {
         function: WindowFunctionName,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
     WindowFunctionRemoved {
         function: WindowFunctionName,
@@ -265,13 +343,22 @@ pub enum DiffEvent {
         function: WindowFunctionName,
         baseline_partition: Vec<ColumnRef>,
         head_partition: Vec<ColumnRef>,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
     WindowPartitionRemoved {
         function: WindowFunctionName,
         removed_partition: Vec<ColumnRef>,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
     WindowFrameChanged {
         function: WindowFunctionName,
+        /// Where the head writes it; absent for what only the baseline has.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_span: Option<Span>,
     },
 
     // ───────────── Subquery ─────────────
@@ -288,13 +375,20 @@ pub enum DiffEvent {
     // ───────────── LIMIT ─────────────
     LimitAdded {
         limit: Option<LiteralValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
-    LimitRemoved,
+    LimitRemoved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
+    },
     /// LIMIT value changed (both sides have a LIMIT, magnitude moved).
     LimitValueChanged {
         baseline: Option<LiteralValue>,
         head: Option<LiteralValue>,
         direction: LimitDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        within: Option<QueryBlock>,
     },
 
     // ───────────── DDL ─────────────
@@ -361,10 +455,13 @@ pub enum DiffEvent {
     },
 
     // ───────────── Output-column semantic deltas ─────────────
+    /// An output column whose nullability differs between the sides: each
+    /// side's `nullable` as its output column states it, absent where the
+    /// side does not show whether the column may be NULL.
     NullabilityChanged {
         output: ColumnRef,
-        baseline_nullable: bool,
-        head_nullable: bool,
+        baseline_nullable: Option<bool>,
+        head_nullable: Option<bool>,
     },
     LineageChanged {
         output: ColumnRef,
@@ -382,12 +479,221 @@ pub enum DiffEvent {
         head: ConstraintFactSet,
     },
 
+    // ───────────── Model configuration ─────────────
+    /// A configuration value of the model a file defines (a dbt model's
+    /// `materialized`, `incremental_strategy`, `unique_key`, …) that
+    /// differs between the sides; absent on the side that does not set it.
+    ModelConfigChanged {
+        key: String,
+        baseline: Option<String>,
+        head: Option<String>,
+    },
+
+    /// The object a write, a load or a `CREATE … AS` writes or defines is
+    /// another one.
+    WriteTargetChanged {
+        baseline: TableRef,
+        head: TableRef,
+        /// What the head's target is: a table, a view, a materialized view
+        /// or a dynamic table.
+        object: super::identity::ObjectKind,
+        /// `object` as a reader names it: "table", "view", "materialized
+        /// view", "dynamic table".
+        object_noun: String,
+    },
+
     // ───────────── Opaque ─────────────
     Opaque {
         reason: OpaqueDiffReason,
         baseline_span: Option<Span>,
         head_span: Option<Span>,
     },
+}
+
+impl DiffEvent {
+    /// The nested query block a clause change is in; `None` for a change
+    /// to the statement's outermost block and for any other change.
+    pub fn within(&self) -> Option<&QueryBlock> {
+        match self {
+            DiffEvent::WhereAdded { within, .. }
+            | DiffEvent::WhereRemoved { within, .. }
+            | DiffEvent::WhereConditionChanged { within, .. }
+            | DiffEvent::DistinctAdded { within, .. }
+            | DiffEvent::DistinctRemoved { within, .. }
+            | DiffEvent::QualifyAdded { within, .. }
+            | DiffEvent::QualifyRemoved { within, .. }
+            | DiffEvent::QualifyChanged { within }
+            | DiffEvent::HavingAdded { within }
+            | DiffEvent::HavingRemoved { within }
+            | DiffEvent::HavingChanged { within }
+            | DiffEvent::GroupByAdded { within, .. }
+            | DiffEvent::GroupByRemoved { within, .. }
+            | DiffEvent::LimitAdded { within, .. }
+            | DiffEvent::LimitRemoved { within }
+            | DiffEvent::LimitValueChanged { within, .. }
+            | DiffEvent::ProjectionItemChanged { within, .. } => within.as_ref(),
+            DiffEvent::StatementKindChanged { .. }
+            | DiffEvent::StatementAdded { .. }
+            | DiffEvent::StatementRemoved { .. }
+            | DiffEvent::TableAdded { .. }
+            | DiffEvent::TableRemoved { .. }
+            | DiffEvent::CrossSchemaIntroduced { .. }
+            | DiffEvent::TableFunctionAdded { .. }
+            | DiffEvent::TableFunctionRemoved { .. }
+            | DiffEvent::TableFunctionArgumentChanged { .. }
+            | DiffEvent::WriteBoundednessChanged { .. }
+            | DiffEvent::JoinAdded { .. }
+            | DiffEvent::JoinRemoved { .. }
+            | DiffEvent::JoinTypeChanged { .. }
+            | DiffEvent::JoinConditionChanged { .. }
+            | DiffEvent::ColumnProjected { .. }
+            | DiffEvent::ColumnUnprojected { .. }
+            | DiffEvent::ColumnRenamed { .. }
+            | DiffEvent::StarProjectionAdded { .. }
+            | DiffEvent::StarProjectionRemoved { .. }
+            | DiffEvent::CteAdded { .. }
+            | DiffEvent::CteRemoved { .. }
+            | DiffEvent::SampleAdded { .. }
+            | DiffEvent::SampleRemoved { .. }
+            | DiffEvent::OrderByAdded { .. }
+            | DiffEvent::OrderByRemoved { .. }
+            | DiffEvent::OrderByDirectionChanged { .. }
+            | DiffEvent::SetOperationAdded { .. }
+            | DiffEvent::SetOperationRemoved { .. }
+            | DiffEvent::SetOperationChanged { .. }
+            | DiffEvent::AggregateAdded { .. }
+            | DiffEvent::AggregateRemoved { .. }
+            | DiffEvent::AggregateFunctionChanged { .. }
+            | DiffEvent::AggregateDistinctChanged { .. }
+            | DiffEvent::AggregateArgumentChanged { .. }
+            | DiffEvent::WindowFunctionAdded { .. }
+            | DiffEvent::WindowFunctionRemoved { .. }
+            | DiffEvent::WindowPartitionChanged { .. }
+            | DiffEvent::WindowPartitionRemoved { .. }
+            | DiffEvent::WindowFrameChanged { .. }
+            | DiffEvent::SubqueryPredicateChanged { .. }
+            | DiffEvent::SubqueryScopeChanged { .. }
+            | DiffEvent::DdlActionChanged { .. }
+            | DiffEvent::TableDdlAdded { .. }
+            | DiffEvent::TableDdlRemoved { .. }
+            | DiffEvent::DdlColumnAdded { .. }
+            | DiffEvent::DdlColumnRemoved { .. }
+            | DiffEvent::PrivilegeGranted { .. }
+            | DiffEvent::PrivilegeRevoked { .. }
+            | DiffEvent::PolicyAttached { .. }
+            | DiffEvent::PolicyDetached { .. }
+            | DiffEvent::PolicyBodyChanged { .. }
+            | DiffEvent::CatalogTagAdded { .. }
+            | DiffEvent::CatalogTagRemoved { .. }
+            | DiffEvent::NullabilityChanged { .. }
+            | DiffEvent::LineageChanged { .. }
+            | DiffEvent::TaintChanged { .. }
+            | DiffEvent::ConstraintChanged { .. }
+            | DiffEvent::ModelConfigChanged { .. }
+            | DiffEvent::WriteTargetChanged { .. }
+            | DiffEvent::Opaque { .. } => None,
+        }
+    }
+
+    /// Where the head writes what the change names: the column, the join,
+    /// the table, the window or aggregate call, the nested block a clause
+    /// change is in. `None` where the head has no text of its own for it
+    /// (what only the baseline has, a change to the outermost block's
+    /// clauses): such a change is placed at its statement.
+    pub fn head_place(&self) -> Option<Span> {
+        if let Some(block) = self.within() {
+            return block.source_span;
+        }
+        match self {
+            DiffEvent::ColumnProjected { column, .. } => column.source_span,
+            DiffEvent::ColumnRenamed { head, .. } => head.source_span,
+            DiffEvent::ProjectionItemChanged { output, .. } => {
+                output.as_ref().and_then(|output| output.source_span)
+            }
+            DiffEvent::NullabilityChanged { output, .. }
+            | DiffEvent::LineageChanged { output, .. }
+            | DiffEvent::TaintChanged { output, .. } => output.source_span,
+            DiffEvent::ConstraintChanged { target, .. } => target.source_span,
+            DiffEvent::JoinAdded {
+                right, source_span, ..
+            }
+            | DiffEvent::JoinTypeChanged {
+                right, source_span, ..
+            }
+            | DiffEvent::JoinConditionChanged {
+                right, source_span, ..
+            } => right.source_span.or(*source_span),
+            DiffEvent::TableAdded { table } => table.source_span,
+            DiffEvent::WriteTargetChanged { head, .. } => head.source_span,
+            DiffEvent::WindowFunctionAdded { source_span, .. }
+            | DiffEvent::WindowPartitionChanged { source_span, .. }
+            | DiffEvent::WindowPartitionRemoved { source_span, .. }
+            | DiffEvent::WindowFrameChanged { source_span, .. } => *source_span,
+            DiffEvent::AggregateAdded { on, .. }
+            | DiffEvent::AggregateFunctionChanged { on, .. }
+            | DiffEvent::AggregateDistinctChanged { on, .. }
+            | DiffEvent::AggregateArgumentChanged { on, .. } => {
+                on.as_ref().and_then(|on| on.source_span)
+            }
+            DiffEvent::StatementKindChanged { .. }
+            | DiffEvent::StatementAdded { .. }
+            | DiffEvent::StatementRemoved { .. }
+            | DiffEvent::TableRemoved { .. }
+            | DiffEvent::CrossSchemaIntroduced { .. }
+            | DiffEvent::TableFunctionAdded { .. }
+            | DiffEvent::TableFunctionRemoved { .. }
+            | DiffEvent::TableFunctionArgumentChanged { .. }
+            | DiffEvent::WhereAdded { .. }
+            | DiffEvent::WhereRemoved { .. }
+            | DiffEvent::WhereConditionChanged { .. }
+            | DiffEvent::WriteBoundednessChanged { .. }
+            | DiffEvent::JoinRemoved { .. }
+            | DiffEvent::ColumnUnprojected { .. }
+            | DiffEvent::StarProjectionAdded { .. }
+            | DiffEvent::StarProjectionRemoved { .. }
+            | DiffEvent::DistinctAdded { .. }
+            | DiffEvent::DistinctRemoved { .. }
+            | DiffEvent::QualifyAdded { .. }
+            | DiffEvent::QualifyRemoved { .. }
+            | DiffEvent::QualifyChanged { .. }
+            | DiffEvent::CteAdded { .. }
+            | DiffEvent::CteRemoved { .. }
+            | DiffEvent::SampleAdded { .. }
+            | DiffEvent::SampleRemoved { .. }
+            | DiffEvent::HavingAdded { .. }
+            | DiffEvent::HavingRemoved { .. }
+            | DiffEvent::HavingChanged { .. }
+            | DiffEvent::GroupByAdded { .. }
+            | DiffEvent::GroupByRemoved { .. }
+            | DiffEvent::OrderByAdded { .. }
+            | DiffEvent::OrderByRemoved { .. }
+            | DiffEvent::OrderByDirectionChanged { .. }
+            | DiffEvent::SetOperationAdded { .. }
+            | DiffEvent::SetOperationRemoved { .. }
+            | DiffEvent::SetOperationChanged { .. }
+            | DiffEvent::AggregateRemoved { .. }
+            | DiffEvent::WindowFunctionRemoved { .. }
+            | DiffEvent::SubqueryPredicateChanged { .. }
+            | DiffEvent::SubqueryScopeChanged { .. }
+            | DiffEvent::LimitAdded { .. }
+            | DiffEvent::LimitRemoved { .. }
+            | DiffEvent::LimitValueChanged { .. }
+            | DiffEvent::DdlActionChanged { .. }
+            | DiffEvent::TableDdlAdded { .. }
+            | DiffEvent::TableDdlRemoved { .. }
+            | DiffEvent::DdlColumnAdded { .. }
+            | DiffEvent::DdlColumnRemoved { .. }
+            | DiffEvent::PrivilegeGranted { .. }
+            | DiffEvent::PrivilegeRevoked { .. }
+            | DiffEvent::PolicyAttached { .. }
+            | DiffEvent::PolicyDetached { .. }
+            | DiffEvent::PolicyBodyChanged { .. }
+            | DiffEvent::CatalogTagAdded { .. }
+            | DiffEvent::CatalogTagRemoved { .. }
+            | DiffEvent::ModelConfigChanged { .. }
+            | DiffEvent::Opaque { .. } => None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -500,20 +806,27 @@ pub struct CteFact {
     pub recursive: bool,
 }
 
-/// Structural state of one output column on a single side of the diff.
+/// One column of the relation a query returns, or a view, materialized
+/// view or `CREATE TABLE … AS` makes, with what analysis shows of it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "schema", schemars(rename = "OutputColumn"))]
 pub struct OutputColumnFact {
+    /// The column, by the name the relation gives it.
     pub column: ColumnRef,
+    /// `true` when the column may hold NULL, `false` when it never does;
+    /// absent where analysis does not show which (a column read from a
+    /// table whose nullability no catalog states).
     pub nullable: Option<bool>,
-    /// Upstream source columns contributing to this output (lineage).
-    pub sources: Vec<ColumnRef>,
-    /// Sensitivity tags inherited from upstream sources.
+    /// The table columns the column's value is drawn from (lineage), each
+    /// once; empty for a value drawn from none (a literal). Absent where
+    /// lineage is not analysed.
+    pub sources: Option<Vec<ColumnRef>>,
+    /// The catalog tags whose values reach the column.
     pub taint_tags: Vec<CatalogTag>,
-    /// Structural constraints derivable for this column (Eq, Range,
-    /// IsNotNull, …).
+    /// The constraints the query shows the column's values meet: a value
+    /// or set a filter fixes, a range, `IS NOT NULL`, uniqueness.
     pub constraints: ConstraintFactSet,
 }
 
@@ -603,6 +916,34 @@ pub enum SubqueryShape {
     All,
 }
 
+/// The query block nested in a statement that a clause change is in: a
+/// CTE body, a derived table or a `MERGE` branch. A change to the
+/// statement's outermost query block names none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct QueryBlock {
+    pub kind: QueryBlockKind,
+    /// The CTE's name, or the derived table's alias where it has one.
+    pub name: Option<IdentName>,
+    /// Where the head writes the block.
+    pub source_span: Option<Span>,
+}
+
+/// What a nested query block is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryBlockKind {
+    Cte,
+    DerivedTable,
+    /// A `WHEN` branch of a `MERGE`, the `ordinal`th (from 1) of its kind.
+    MergeBranch {
+        when: MergeBranchKind,
+        ordinal: u32,
+    },
+}
+
 /// Scope-path descriptor for clauses (`DISTINCT`, `QUALIFY`) whose
 /// effect varies by which SELECT they live on (outer vs. specific
 /// nested scope). `primary_table` identifies the dominant table the
@@ -659,6 +1000,11 @@ pub enum ExpressionPathStep {
     BinOpRight,
     /// Position of an operand within an `AND` / `OR` chain.
     LogicalChainOperand {
+        index: usize,
+    },
+    /// Position of an operand within a run of arithmetic, concatenation
+    /// or bitwise operators (`a + b - c`).
+    OperatorChainOperand {
         index: usize,
     },
     UnaryOperand,
@@ -770,6 +1116,9 @@ pub enum ExpressionVariant {
     BinaryOp,
     /// An `AND` / `OR` chain over two or more operands.
     LogicalChain,
+    /// A run of arithmetic, concatenation or bitwise operators over three
+    /// or more operands.
+    OperatorChain,
     UnaryOp,
     FunctionCall,
     Case,
@@ -846,6 +1195,9 @@ pub enum ConstraintFactArm {
         values: Vec<LiteralValue>,
     },
     IsNotNull,
+    /// No two rows of the relation hold the same value in the column: a
+    /// `DISTINCT`, a `GROUP BY` key, a key the catalog declares.
+    Unique,
     Opaque,
 }
 
@@ -859,6 +1211,28 @@ pub struct ConstraintFactSet {
 }
 
 impl ConstraintFactSet {
+    /// Visit the text of each value an arm holds.
+    pub(crate) fn for_each_literal_text_mut(&mut self, f: &mut dyn FnMut(&mut String)) {
+        for arm in &mut self.arms {
+            match arm {
+                ConstraintFactArm::Eq { literal } => literal.for_each_written_text_mut(f),
+                ConstraintFactArm::Range { low, high } => {
+                    for bound in [low, high].into_iter().flatten() {
+                        bound.for_each_written_text_mut(f);
+                    }
+                }
+                ConstraintFactArm::InSet { values } => {
+                    for value in values {
+                        value.for_each_written_text_mut(f);
+                    }
+                }
+                ConstraintFactArm::IsNotNull
+                | ConstraintFactArm::Unique
+                | ConstraintFactArm::Opaque => {}
+            }
+        }
+    }
+
     /// True iff this set contributes no structural arms.
     pub fn is_empty(&self) -> bool {
         self.arms.is_empty()

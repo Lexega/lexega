@@ -690,8 +690,8 @@ fn test_alter_table_preserves_spans() {
     if let Some(AstStmt::AlterTable(alter)) = result {
         // Verify spans are contiguous
         assert!(alter.span.start < alter.span.end);
-        assert!(alter.name_span.start >= alter.table_span.end);
-        assert!(alter.actions_span.start >= alter.name_span.end);
+        assert!(alter.name.span.start >= alter.table_span.end);
+        assert!(alter.actions_span.start >= alter.name.span.end);
     }
 }
 
@@ -1482,4 +1482,937 @@ fn test_alter_table_rls_schema_qualified_name() {
         rls_mode("ALTER TABLE myschema.t DISABLE ROW LEVEL SECURITY;"),
         M::Disable
     );
+}
+
+/// The text `span` covers in `sql`.
+fn spanned(sql: &str, span: lexega_core::lexer::Span) -> &str {
+    &sql[span.start as usize..span.end as usize]
+}
+
+/// Format `sql` under `dialect` and check no token is lost.
+fn formats_safely(sql: &str, dialect: lexega_core::dialect::DialectRef) {
+    let config = lexega_core::FormatterConfig {
+        dialect,
+        ..Default::default()
+    };
+    let out = lexega_core::format_sql_with_config(sql, &config).expect("should format");
+    lexega_core::verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
+        .expect("should preserve tokens");
+}
+
+#[test]
+fn a_rename_of_a_column_without_the_column_keyword_is_a_column_rename() {
+    let sql = "ALTER TABLE users RENAME email TO \"Mail\";";
+    let Some(AstStmt::AlterTable(alter)) = parse_stmt_from_str(sql) else {
+        panic!("ALTER TABLE expected: {sql}");
+    };
+    let AstAlterTableActionKind::RenameColumn {
+        column_span,
+        old_name_span,
+        new_name_span,
+        ..
+    } = &alter.actions[0].kind
+    else {
+        panic!("RENAME COLUMN expected: {:?}", alter.actions[0].kind);
+    };
+    assert!(column_span.is_none());
+    assert_eq!(spanned(sql, *old_name_span), "email");
+    assert_eq!(spanned(sql, *new_name_span), "\"Mail\"");
+    formats_safely(sql, lexega_core::dialect::postgres());
+    // An index, a key or a constraint renamed, and the table renamed, are not.
+    for sql in [
+        "ALTER TABLE users RENAME INDEX a TO b;",
+        "ALTER TABLE users RENAME CONSTRAINT a TO b;",
+        "ALTER TABLE users RENAME TO people;",
+    ] {
+        let Some(AstStmt::AlterTable(alter)) = parse_stmt_from_str(sql) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        assert!(
+            !matches!(
+                alter.actions[0].kind,
+                AstAlterTableActionKind::RenameColumn { .. }
+            ),
+            "{sql}: {:?}",
+            alter.actions[0].kind
+        );
+    }
+}
+
+#[test]
+fn a_change_of_a_column_reads_both_names_and_keeps_the_definition() {
+    let cases = [
+        (
+            "ALTER TABLE users CHANGE COLUMN a b BIGINT;",
+            true,
+            "a",
+            "b",
+            "BIGINT",
+        ),
+        (
+            "ALTER TABLE users CHANGE email mail VARCHAR(100) NOT NULL AFTER id, ADD COLUMN c INT;",
+            false,
+            "email",
+            "mail",
+            "VARCHAR(100) NOT NULL AFTER id",
+        ),
+    ];
+    for (sql, column, old, new, definition) in cases {
+        let Some(AstStmt::AlterTable(alter)) = parse_stmt_from_str(sql) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::ChangeColumn {
+            column_span,
+            old_name_span,
+            new_name_span,
+            definition_span,
+            ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("CHANGE expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert_eq!(column_span.is_some(), column, "{sql}");
+        assert_eq!(spanned(sql, *old_name_span), old, "{sql}");
+        assert_eq!(spanned(sql, *new_name_span), new, "{sql}");
+        assert_eq!(spanned(sql, *definition_span), definition, "{sql}");
+        formats_safely(sql, lexega_core::dialect::mysql());
+        formats_safely(sql, lexega_core::dialect::databricks());
+    }
+}
+
+/// The first statement of `sql`, parsed under `dialect`.
+fn first_statement(sql: &str, dialect: &lexega_core::dialect::DialectRef) -> Option<AstStmt> {
+    lexega_core::parse_sql_with_dialect(sql, dialect.as_ref())
+        .ok()?
+        .stmts
+        .into_iter()
+        .next()
+}
+
+#[test]
+fn an_action_kept_as_written_is_named_by_its_leading_words() {
+    use lexega_core::ast::AstNamedTableAction as N;
+    use lexega_core::dialect::{databricks, mssql, mysql, postgres, redshift, snowflake};
+    let cases = [
+        (
+            "DROP CONSTRAINT IF EXISTS c1",
+            N::DropConstraint,
+            postgres(),
+        ),
+        ("DROP CONSTRAINT c1 CASCADE", N::DropConstraint, postgres()),
+        ("DROP INDEX i1", N::DropIndex, mysql()),
+        ("DROP FOREIGN KEY fk1", N::DropForeignKey, mysql()),
+        ("DROP CHECK c1", N::DropCheck, mysql()),
+        ("ADD INDEX i1 (email)", N::AddIndex, mysql()),
+        ("ADD DEFAULT 0 FOR id", N::AddDefault, mssql()),
+        (
+            "WITH CHECK CHECK CONSTRAINT ALL",
+            N::CheckConstraint,
+            mssql(),
+        ),
+        ("NOCHECK CONSTRAINT fk1", N::NocheckConstraint, mssql()),
+        ("REBUILD", N::Rebuild, mssql()),
+        ("RENAME INDEX i1 TO i2", N::RenameIndex, mysql()),
+        (
+            "RENAME CONSTRAINT c1 TO c2",
+            N::RenameConstraint,
+            postgres(),
+        ),
+        ("ALTER INDEX i1 INVISIBLE", N::AlterIndex, mysql()),
+        (
+            "ALTER CONSTRAINT c1 DEFERRABLE",
+            N::AlterConstraint,
+            postgres(),
+        ),
+        ("VALIDATE CONSTRAINT c1", N::ValidateConstraint, postgres()),
+        ("ENGINE = InnoDB", N::TableOption, mysql()),
+        ("CONVERT TO CHARACTER SET utf8mb4", N::TableOption, mysql()),
+        ("COMMENT = 'x'", N::TableOption, mysql()),
+        ("INHERIT parent", N::Inherit, postgres()),
+        ("NO INHERIT public.parent", N::NoInherit, postgres()),
+        ("REPLICA IDENTITY FULL", N::ReplicaIdentity, postgres()),
+        ("FORCE", N::TableOption, mysql()),
+        ("ORDER BY id", N::TableOption, mysql()),
+        ("TRUNCATE PARTITION p0", N::PartitionMaintenance, mysql()),
+        ("ALTER DISTKEY id", N::Distribution, redshift()),
+        ("ALTER SORTKEY (id)", N::Distribution, redshift()),
+        ("ENABLE RULE r1", N::RuleState, postgres()),
+        ("RECOVER PARTITIONS", N::PartitionMaintenance, databricks()),
+        (
+            "ADD SEARCH OPTIMIZATION",
+            N::SearchOptimization,
+            snowflake(),
+        ),
+        (
+            "ADD SEARCH OPTIMIZATION ON EQUALITY(email)",
+            N::SearchOptimization,
+            snowflake(),
+        ),
+        (
+            "DROP SEARCH OPTIMIZATION",
+            N::SearchOptimization,
+            snowflake(),
+        ),
+        ("DROP UNIQUE (email)", N::DropUnique, snowflake()),
+        ("RESET (fillfactor)", N::ResetOptions, postgres()),
+        ("ROW LEVEL SECURITY ON", N::RowLevelSecurity, redshift()),
+        (
+            "ROW LEVEL SECURITY OFF FOR DATASHARES",
+            N::RowLevelSecurity,
+            redshift(),
+        ),
+        ("ENABLE KEYS", N::KeysState, mysql()),
+        ("DISABLE KEYS", N::KeysState, mysql()),
+        ("DROP FEATURE deletionVectors", N::DropFeature, databricks()),
+        (
+            "ENABLE PREDICTIVE OPTIMIZATION",
+            N::PredictiveOptimization,
+            databricks(),
+        ),
+        (
+            "INHERIT PREDICTIVE OPTIMIZATION",
+            N::PredictiveOptimization,
+            databricks(),
+        ),
+        (
+            "PREDICTIVE OPTIMIZATION ENABLE",
+            N::PredictiveOptimization,
+            databricks(),
+        ),
+    ];
+    for (action, named, dialect) in cases {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &dialect) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::NamedAction { kind, span, .. } = &alter.actions[0].kind else {
+            panic!(
+                "a named action expected: {sql}: {:?}",
+                alter.actions[0].kind
+            );
+        };
+        assert_eq!(*kind, named, "{sql}");
+        assert_eq!(spanned(&sql, *span), action, "{sql}");
+        formats_safely(&sql, dialect);
+    }
+    // A key added without `CONSTRAINT` is read as the constraint it is.
+    for (sql, dialect, unique, name, column) in [
+        (
+            "ALTER TABLE users ADD PRIMARY KEY (id);",
+            mysql(),
+            false,
+            None,
+            "id",
+        ),
+        (
+            "ALTER TABLE users ADD UNIQUE (email);",
+            mysql(),
+            true,
+            None,
+            "email",
+        ),
+        (
+            "ALTER TABLE users ADD UNIQUE KEY uq_email (email);",
+            mysql(),
+            true,
+            Some("uq_email"),
+            "email",
+        ),
+        (
+            "ALTER TABLE dbo.users ADD UNIQUE NONCLUSTERED (email);",
+            mssql(),
+            true,
+            None,
+            "email",
+        ),
+    ] {
+        let Some(AstStmt::AlterTable(alter)) = first_statement(sql, &dialect) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AddConstraint {
+            details: Some(details),
+            ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("a constraint expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        let columns = match &details.kind {
+            lexega_core::ast::AstConstraintKind::Unique { columns } => {
+                assert!(unique, "{sql}");
+                columns
+            }
+            lexega_core::ast::AstConstraintKind::PrimaryKey { columns } => {
+                assert!(!unique, "{sql}");
+                columns
+            }
+            lexega_core::ast::AstConstraintKind::ForeignKey { .. } => panic!("{sql}"),
+        };
+        assert_eq!(details.name.map(|span| spanned(sql, span)), name, "{sql}");
+        assert_eq!(columns.len(), 1, "{sql}");
+        assert_eq!(spanned(sql, columns[0]), column, "{sql}");
+        formats_safely(sql, dialect);
+    }
+    // `[NO] INHERIT` names its parent table.
+    for (sql, parent) in [
+        ("ALTER TABLE c INHERIT p;", "p"),
+        ("ALTER TABLE c NO INHERIT app.p;", "app.p"),
+    ] {
+        let Some(AstStmt::AlterTable(alter)) = first_statement(sql, &postgres()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::NamedAction {
+            name_span: Some(name),
+            ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("a parent expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert_eq!(spanned(sql, *name), parent, "{sql}");
+    }
+    // `{ENABLE | DISABLE} TRIGGER` on a table is a statement of its own.
+    for sql in [
+        "ALTER TABLE users ENABLE TRIGGER ALL;",
+        "ALTER TABLE users DISABLE TRIGGER t1;",
+    ] {
+        assert!(
+            matches!(
+                first_statement(sql, &mssql()),
+                Some(AstStmt::PgAlterTableTriggerState(_))
+            ),
+            "{sql}"
+        );
+    }
+    // A column, `COLUMN` left out, is an altered column.
+    for (sql, column) in [
+        ("ALTER TABLE users ALTER email TYPE TEXT;", "email"),
+        ("ALTER TABLE users MODIFY email TEXT NOT NULL;", "email"),
+    ] {
+        let Some(AstStmt::AlterTable(alter)) = parse_stmt_from_str(sql) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AlterColumn {
+            column_span,
+            column_name_span,
+            ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("ALTER COLUMN expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert!(column_span.is_none(), "{sql}");
+        assert_eq!(spanned(sql, *column_name_span), column, "{sql}");
+        formats_safely(sql, postgres());
+    }
+    // A later `COLUMN` item of a T-SQL `DROP` list is a dropped column.
+    let sql = "ALTER TABLE users DROP CONSTRAINT IF EXISTS df1, COLUMN IF EXISTS c, d;";
+    let Some(AstStmt::AlterTable(alter)) = first_statement(sql, &mssql()) else {
+        panic!("ALTER TABLE expected: {sql}");
+    };
+    let AstAlterTableActionKind::DropColumn {
+        drop_span, columns, ..
+    } = &alter.actions[1].kind
+    else {
+        panic!("DROP COLUMN expected: {sql}: {:?}", alter.actions[1].kind);
+    };
+    assert!(drop_span.is_none());
+    let names: Vec<&str> = columns.iter().map(|c| spanned(sql, *c)).collect();
+    assert_eq!(names, ["c", "d"]);
+    formats_safely(sql, mssql());
+}
+
+/// Format `sql` under `dialect`, check no token is lost, and check that
+/// formatting the output again changes nothing; the output.
+fn formats_stably(sql: &str, dialect: lexega_core::dialect::DialectRef) -> String {
+    let config = lexega_core::FormatterConfig {
+        dialect,
+        ..Default::default()
+    };
+    let once = lexega_core::format_sql_with_config(sql, &config).expect("should format");
+    lexega_core::verify_formatting_safe_with_dialect(sql, &once, config.dialect.as_ref())
+        .expect("should preserve tokens");
+    let twice = lexega_core::format_sql_with_config(&once, &config).expect("should format");
+    assert_eq!(once, twice, "formatting twice changes {sql:?}");
+    once
+}
+
+#[test]
+fn a_column_altered_or_dropped_formats_the_same_twice() {
+    use lexega_core::dialect::{bigquery, databricks, mssql, mysql, postgres, redshift, snowflake};
+    let forms = [
+        "ALTER TABLE users MODIFY email text;",
+        "ALTER TABLE users ALTER email TYPE text;",
+        "ALTER TABLE users ALTER email SET DEFAULT 'x';",
+        "ALTER TABLE users ALTER email DROP NOT NULL;",
+        "ALTER TABLE users ALTER COLUMN email TYPE text;",
+        "ALTER TABLE users DROP COLUMN a;",
+        "ALTER TABLE users DROP COLUMN IF EXISTS a;",
+        "ALTER TABLE users DROP COLUMN a, COLUMN b;",
+        "ALTER TABLE users DROP CONSTRAINT IF EXISTS df_c, COLUMN IF EXISTS c;",
+    ];
+    for dialect in [
+        snowflake(),
+        postgres(),
+        mysql(),
+        mssql(),
+        databricks(),
+        redshift(),
+        bigquery(),
+    ] {
+        for sql in forms {
+            formats_stably(sql, dialect.clone());
+        }
+        // Formatted text is formatted already.
+        for formatted in [
+            "ALTER TABLE users\n    MODIFY email text;",
+            "ALTER TABLE users\n    ALTER email TYPE text;",
+            "ALTER TABLE users\n    ALTER email SET DEFAULT 'x';",
+            "ALTER TABLE users\n    ALTER email DROP NOT NULL;",
+        ] {
+            assert_eq!(
+                formats_stably(formatted, dialect.clone()),
+                formatted,
+                "{}",
+                dialect.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_table_action_formats_the_same_twice() {
+    use lexega_core::dialect::{bigquery, databricks, mssql, mysql, postgres, redshift, snowflake};
+    let forms = [
+        "ALTER TABLE users ADD CONSTRAINT c UNIQUE (a);",
+        "ALTER TABLE users ADD CONSTRAINT pk PRIMARY KEY (id);",
+        "ALTER TABLE users ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES t (b);",
+        "ALTER TABLE users ADD CONSTRAINT c CHECK (a > 0), ADD CONSTRAINT d UNIQUE (b);",
+        "ALTER TABLE users ADD FOREIGN KEY (a) REFERENCES t (b);",
+        "ALTER TABLE dbo.zz_t ADD CONSTRAINT df DEFAULT (getdate()) FOR c;",
+        "ALTER TABLE dbo.zz_t ADD CONSTRAINT uq UNIQUE NONCLUSTERED (a ASC, b DESC);",
+        "ALTER TABLE dbo.zz_t WITH NOCHECK ADD CONSTRAINT ck_a CHECK (a > 0);",
+        "ALTER TABLE [dbo].[zz_t] WITH CHECK ADD CONSTRAINT [fk_c] FOREIGN KEY([a]) REFERENCES [dbo].[zz_p] ([id]);",
+        "ALTER TABLE users SET COMMENT = 'x';",
+        "ALTER TABLE events SET DATA_RETENTION_TIME_IN_DAYS = 90, CHANGE_TRACKING = TRUE;",
+        "ALTER TABLE dbo.zz_t SET (LOCK_ESCALATION = AUTO);",
+        "ALTER TABLE users SET SCHEMA s2;",
+        "ALTER TABLE crm.o SET SCHEMA \"ARCHIVE X\";",
+        "ALTER TABLE crm.c DROP COLUMN a, DROP COLUMN b, SET SCHEMA archive;",
+        "ALTER TABLE crm.o SET SCHEMA;",
+        "ALTER TABLE users SET TBLPROPERTIES ('a' = 'b');",
+        "ALTER TABLE users SET OPTIONS (description = 'x');",
+        "ALTER TABLE users SET TAG t = 'v';",
+        "ALTER TABLE users UNSET COMMENT;",
+        "ALTER TABLE users UNSET DATA_RETENTION_TIME_IN_DAYS, COMMENT;",
+        "ALTER TABLE users UNSET TAG t;",
+        "ALTER TABLE users UNSET TBLPROPERTIES IF EXISTS ('a');",
+        "ALTER TABLE users CLUSTER BY (a, b);",
+        "ALTER TABLE sales CLUSTER BY (year, FLOOR(amount / 1000), category);",
+        "ALTER TABLE users CLUSTER BY NONE;",
+        "ALTER TABLE users CHANGE COLUMN email mail text;",
+        "ALTER TABLE users CHANGE COLUMN email COMMENT 'x';",
+        "ALTER TABLE users RENAME email TO mail;",
+        "ALTER TABLE users DROP CONSTRAINT c1 CASCADE;",
+        "ALTER TABLE users NOCHECK CONSTRAINT ALL;",
+        "ALTER TABLE users ADD INDEX i1 (email);",
+        "ALTER TABLE users ENGINE = InnoDB;",
+        "ALTER TABLE users REPLICA IDENTITY FULL;",
+        "ALTER TABLE users ALTER DISTKEY id;",
+        "ALTER TABLE users VALIDATE CONSTRAINT c1;",
+        "ALTER TABLE users WITH CHECK CHECK CONSTRAINT ALL;",
+        "ALTER TABLE users TRUNCATE PARTITION p0;",
+    ];
+    for dialect in [
+        snowflake(),
+        postgres(),
+        mysql(),
+        mssql(),
+        databricks(),
+        redshift(),
+        bigquery(),
+    ] {
+        for sql in forms {
+            formats_stably(sql, dialect.clone());
+        }
+        // Formatted text is formatted already.
+        for formatted in [
+            "ALTER TABLE users\n    ADD CONSTRAINT c UNIQUE (a);",
+            "ALTER TABLE users\n    SET COMMENT = 'x';",
+            "ALTER TABLE users\n    SET SCHEMA s2;",
+            "ALTER TABLE users\n    UNSET COMMENT;",
+            "ALTER TABLE users\n    CLUSTER BY (a, b);",
+        ] {
+            assert_eq!(
+                formats_stably(formatted, dialect.clone()),
+                formatted,
+                "{}",
+                dialect.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_databricks_change_of_a_column_clause_alters_the_column() {
+    use lexega_core::dialect::databricks;
+    let altered = [
+        (
+            "CHANGE COLUMN email COMMENT 'Customer e-mail'",
+            "email",
+            "COMMENT 'Customer e-mail'",
+        ),
+        ("CHANGE email COMMENT 'x'", "email", "COMMENT 'x'"),
+        (
+            "CHANGE COLUMN `email` COMMENT 'x'",
+            "`email`",
+            "COMMENT 'x'",
+        ),
+        ("CHANGE COLUMN email FIRST", "email", "FIRST"),
+        ("CHANGE COLUMN email AFTER id", "email", "AFTER id"),
+        ("CHANGE COLUMN email TYPE STRING", "email", "TYPE STRING"),
+        ("CHANGE COLUMN email SET NOT NULL", "email", "SET NOT NULL"),
+        (
+            "CHANGE COLUMN email DROP NOT NULL",
+            "email",
+            "DROP NOT NULL",
+        ),
+        (
+            "CHANGE COLUMN email SET DEFAULT 'x'",
+            "email",
+            "SET DEFAULT 'x'",
+        ),
+        ("CHANGE COLUMN email DROP DEFAULT", "email", "DROP DEFAULT"),
+        ("CHANGE COLUMN email SET MASK m", "email", "SET MASK m"),
+        ("CHANGE COLUMN email DROP MASK", "email", "DROP MASK"),
+        ("CHANGE COLUMN id SYNC IDENTITY", "id", "SYNC IDENTITY"),
+    ];
+    for (action, column, operation) in altered {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &databricks()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AlterColumn {
+            column_name_span,
+            operation_span,
+            ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("ALTER COLUMN expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert_eq!(spanned(&sql, *column_name_span), column, "{sql}");
+        assert_eq!(spanned(&sql, *operation_span), operation, "{sql}");
+        formats_stably(&sql, databricks());
+    }
+    // Two names and a definition rename the column.
+    for (action, new) in [
+        ("CHANGE a b BIGINT", "b"),
+        ("CHANGE a comment VARCHAR(10)", "comment"),
+        ("CHANGE a first INT", "first"),
+    ] {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &databricks()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::ChangeColumn { new_name_span, .. } = &alter.actions[0].kind
+        else {
+            panic!("CHANGE expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert_eq!(spanned(&sql, *new_name_span), new, "{sql}");
+    }
+}
+
+#[test]
+fn a_column_added_if_not_exists_or_in_parentheses_is_read() {
+    use lexega_core::dialect::{bigquery, databricks, mysql, postgres, snowflake};
+    let cases = [
+        (
+            "ADD COLUMN IF NOT EXISTS phone STRING",
+            snowflake(),
+            vec!["phone"],
+        ),
+        (
+            "ADD COLUMN IF NOT EXISTS phone TEXT",
+            postgres(),
+            vec!["phone"],
+        ),
+        ("ADD IF NOT EXISTS phone TEXT", postgres(), vec!["phone"]),
+        (
+            "ADD COLUMN IF NOT EXISTS phone TEXT",
+            mysql(),
+            vec!["phone"],
+        ),
+        (
+            "ADD COLUMN IF NOT EXISTS phone STRING",
+            databricks(),
+            vec!["phone"],
+        ),
+        (
+            "ADD COLUMN IF NOT EXISTS phone STRING",
+            bigquery(),
+            vec!["phone"],
+        ),
+        (
+            "ADD COLUMNS (phone STRING, fax INT)",
+            databricks(),
+            vec!["phone", "fax"],
+        ),
+        (
+            "ADD COLUMNS (phone STRING COMMENT 'p')",
+            databricks(),
+            vec!["phone"],
+        ),
+    ];
+    for (action, dialect, names) in cases {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &dialect) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AddColumn { columns, .. } = &alter.actions[0].kind else {
+            panic!("ADD COLUMN expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        let read: Vec<&str> = columns
+            .iter()
+            .filter_map(|c| c.name_span.map(|span| spanned(&sql, span)))
+            .collect();
+        assert_eq!(read, names, "{sql}");
+        formats_stably(&sql, dialect);
+    }
+    // The statements after a parenthesised list are each read.
+    let sql = "ALTER TABLE users ADD COLUMNS (phone STRING, fax INT);\n\
+               SELECT 1;\nSELECT 2;\nSELECT 3;";
+    let script = lexega_core::parse_sql_with_dialect(sql, databricks().as_ref()).expect("parses");
+    assert_eq!(script.stmts.len(), 4, "{:?}", script.stmts);
+    assert!(
+        !script
+            .stmts
+            .iter()
+            .any(|s| matches!(s, AstStmt::OpaqueContent { .. })),
+        "{:?}",
+        script.stmts
+    );
+}
+
+/// The column an action that alters one names.
+fn altered_column(kind: &AstAlterTableActionKind) -> Option<lexega_core::lexer::Span> {
+    use AstAlterTableActionKind as K;
+    if let K::AlterColumn {
+        column_name_span, ..
+    }
+    | K::AlterColumnDropNotNull {
+        column_name_span, ..
+    }
+    | K::AlterColumnSetDataType {
+        column_name_span, ..
+    }
+    | K::AlterColumnSetDefault {
+        column_name_span, ..
+    }
+    | K::AlterColumnDropDefault {
+        column_name_span, ..
+    } = kind
+    {
+        return Some(*column_name_span);
+    }
+    None
+}
+
+#[test]
+fn a_column_alteration_lists_each_column() {
+    use lexega_core::dialect::{databricks, snowflake};
+    // Bare `ALTER col <clause>`.
+    for (action, dialect) in [
+        ("ALTER email COMMENT 'x'", snowflake()),
+        ("ALTER email UNSET COMMENT", snowflake()),
+        ("ALTER email FIRST", databricks()),
+        ("ALTER email AFTER id", databricks()),
+        ("ALTER email VARCHAR(100)", snowflake()),
+    ] {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &dialect) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AlterColumn {
+            column_name_span, ..
+        } = &alter.actions[0].kind
+        else {
+            panic!("ALTER COLUMN expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        assert_eq!(spanned(&sql, *column_name_span), "email", "{sql}");
+        formats_stably(&sql, dialect);
+    }
+    // A comma list alters a column per item.
+    for action in [
+        "ALTER email COMMENT 'x', name SET NOT NULL",
+        "ALTER COLUMN email SET NOT NULL, COLUMN name DROP NOT NULL",
+        "MODIFY COLUMN email SET NOT NULL, name DROP NOT NULL",
+        "ALTER email SET DATA TYPE VARCHAR(100), name VARCHAR(50)",
+    ] {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &snowflake()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let names: Vec<&str> = alter
+            .actions
+            .iter()
+            .map(|action| {
+                let column = altered_column(&action.kind);
+                spanned(
+                    &sql,
+                    column.unwrap_or_else(|| panic!("{sql}: {:?}", action.kind)),
+                )
+            })
+            .collect();
+        assert_eq!(names, ["email", "name"], "{sql}");
+        formats_stably(&sql, snowflake());
+    }
+    // So does a parenthesised one.
+    for action in [
+        "ALTER (COLUMN email SET NOT NULL, COLUMN name DROP NOT NULL)",
+        "MODIFY (email DROP DEFAULT, name SET NOT NULL)",
+        "ALTER (email VARCHAR(100), name SET NOT NULL)",
+    ] {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &snowflake()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let AstAlterTableActionKind::AlterColumnList { columns, .. } = &alter.actions[0].kind
+        else {
+            panic!("a column list expected: {sql}: {:?}", alter.actions[0].kind);
+        };
+        let names: Vec<&str> = columns.iter().map(|c| spanned(&sql, *c)).collect();
+        assert_eq!(names, ["email", "name"], "{sql}");
+        formats_stably(&sql, snowflake());
+    }
+}
+
+/// A Snowflake column tag list ends before the next item of a list of
+/// column alterations, which tags or untags its own column.
+#[test]
+fn a_column_tag_list_ends_before_the_next_column_item() {
+    use lexega_core::dialect::snowflake;
+    for (action, expected) in [
+        (
+            "MODIFY COLUMN email SET TAG pii = 'a', COLUMN name SET TAG pii = 'b'",
+            [("email", "SET", "pii"), ("name", "SET", "pii")],
+        ),
+        (
+            "ALTER COLUMN email SET TAG pii = 'a', COLUMN name UNSET TAG pii",
+            [("email", "SET", "pii"), ("name", "UNSET", "pii")],
+        ),
+        (
+            "MODIFY COLUMN email UNSET TAG pii, COLUMN name UNSET TAG pii",
+            [("email", "UNSET", "pii"), ("name", "UNSET", "pii")],
+        ),
+        (
+            "MODIFY COLUMN email UNSET TAG pii, name UNSET TAG pii",
+            [("email", "UNSET", "pii"), ("name", "UNSET", "pii")],
+        ),
+        (
+            "ALTER email SET TAG a.b.pii = 'a', t2 = 'c', name UNSET TAG pii, t2",
+            [("email", "SET", "a.b.pii"), ("name", "UNSET", "pii")],
+        ),
+    ] {
+        let sql = format!("ALTER TABLE users {action};");
+        let Some(AstStmt::AlterTable(alter)) = first_statement(&sql, &snowflake()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        let items: Vec<(&str, &str, &str)> = alter
+            .actions
+            .iter()
+            .map(|action| match &action.kind {
+                AstAlterTableActionKind::SetColumnTag {
+                    column_name_span,
+                    tags,
+                    ..
+                } => (
+                    spanned(&sql, *column_name_span),
+                    "SET",
+                    spanned(&sql, tags[0].name.span),
+                ),
+                AstAlterTableActionKind::UnsetColumnTag {
+                    column_name_span,
+                    tags,
+                    ..
+                } => (
+                    spanned(&sql, *column_name_span),
+                    "UNSET",
+                    spanned(&sql, tags[0].name.span),
+                ),
+                other => panic!("{sql}: a column tag action expected: {other:?}"),
+            })
+            .collect();
+        assert_eq!(items, expected, "{sql}");
+        formats_stably(&sql, snowflake());
+    }
+}
+
+/// The variant of `kind` and the column it names, as written.
+fn column_action<'s>(
+    sql: &'s str,
+    kind: &AstAlterTableActionKind,
+) -> (std::mem::Discriminant<AstAlterTableActionKind>, &'s str) {
+    let variant = std::mem::discriminant(kind);
+    let debug = format!("{kind:?}");
+    let at = debug
+        .find("column_name_span: Span { start: ")
+        .unwrap_or_else(|| panic!("{sql}: no column name: {debug}"));
+    let numbers: Vec<u32> = debug[at..]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|n| !n.is_empty())
+        .take(2)
+        .map(|n| n.parse().expect("a number"))
+        .collect();
+    let span = lexega_core::lexer::Span {
+        start: numbers[0],
+        end: numbers[1],
+    };
+    (variant, spanned(sql, span))
+}
+
+/// A column alteration written without `COLUMN` is the action its `COLUMN`
+/// form is, alone or as an item of a list.
+#[test]
+fn a_column_alteration_without_the_column_keyword_is_the_same_action() {
+    use lexega_core::dialect::{databricks, mysql, snowflake};
+    let operations = [
+        ("SET MASKING POLICY gov.p.mask_email", snowflake()),
+        (
+            "SET MASKING POLICY gov.p.mask_email USING (email, id) FORCE",
+            snowflake(),
+        ),
+        ("UNSET MASKING POLICY", snowflake()),
+        ("SET PROJECTION POLICY gov.p.pp", snowflake()),
+        ("SET PROJECTION POLICY gov.p.pp FORCE", snowflake()),
+        ("UNSET PROJECTION POLICY", snowflake()),
+        ("SET TAG pii = 'a'", snowflake()),
+        ("SET TAG pii = 'a', t2 = 'b'", snowflake()),
+        ("UNSET TAG pii", snowflake()),
+        ("UNSET TAG pii, t2", snowflake()),
+        ("SET NOT NULL", snowflake()),
+        ("DROP NOT NULL", snowflake()),
+        ("SET DEFAULT 1", snowflake()),
+        ("DROP DEFAULT", mysql()),
+        ("SET DATA TYPE VARCHAR(100)", snowflake()),
+        ("SET MASK gov.p.mask_fn", databricks()),
+        ("DROP MASK", databricks()),
+        ("COMMENT 'x'", snowflake()),
+    ];
+    for (operation, dialect) in operations {
+        for verb in ["ALTER", "MODIFY"] {
+            let with = format!("ALTER TABLE users {verb} COLUMN email {operation};");
+            let without = format!("ALTER TABLE users {verb} email {operation};");
+            let actions = |sql: &str| {
+                let Some(AstStmt::AlterTable(alter)) = first_statement(sql, &dialect) else {
+                    panic!("ALTER TABLE expected: {sql}");
+                };
+                alter.actions
+            };
+            let (with_actions, without_actions) = (actions(&with), actions(&without));
+            assert_eq!(with_actions.len(), 1, "{with}: {with_actions:?}");
+            assert_eq!(without_actions.len(), 1, "{without}: {without_actions:?}");
+            assert_eq!(
+                column_action(&with, &with_actions[0].kind),
+                column_action(&without, &without_actions[0].kind),
+                "{with} / {without}"
+            );
+            formats_stably(&without, dialect.clone());
+        }
+    }
+    // Later items of a list, with and without `COLUMN`.
+    let with = "ALTER TABLE users ALTER COLUMN email UNSET MASKING POLICY, \
+                COLUMN name SET PROJECTION POLICY gov.p.pp, COLUMN id UNSET TAG pii;";
+    let without = "ALTER TABLE users ALTER email UNSET MASKING POLICY, \
+                   name SET PROJECTION POLICY gov.p.pp, id UNSET TAG pii;";
+    let items = |sql: &'static str| -> Vec<(
+        std::mem::Discriminant<AstAlterTableActionKind>,
+        &'static str,
+    )> {
+        let Some(AstStmt::AlterTable(alter)) = first_statement(sql, &snowflake()) else {
+            panic!("ALTER TABLE expected: {sql}");
+        };
+        alter
+            .actions
+            .iter()
+            .map(|action| column_action(sql, &action.kind))
+            .collect()
+    };
+    assert_eq!(items(with), items(without));
+    assert_eq!(items(with).len(), 3, "{with}");
+    // Each item starts its own line at the actions' indentation.
+    for sql in [with, without] {
+        let out = formats_stably(sql, snowflake());
+        assert!(
+            out.lines().skip(1).all(|line| line.starts_with("    ")),
+            "{out}"
+        );
+    }
+}
+
+/// A conditional masking policy (`USING (…)`) formats, with `COLUMN` or
+/// without, in every dialect.
+#[test]
+fn a_conditional_masking_policy_formats_in_either_form() {
+    use lexega_core::dialect::{bigquery, databricks, mssql, mysql, postgres, redshift, snowflake};
+    for dialect in [
+        snowflake(),
+        bigquery(),
+        postgres(),
+        databricks(),
+        mysql(),
+        mssql(),
+        redshift(),
+    ] {
+        for lead in ["ALTER COLUMN email", "ALTER email", "MODIFY email"] {
+            for tail in ["", " FORCE"] {
+                let sql = format!(
+                    "ALTER TABLE users {lead} SET MASKING POLICY p USING (email, id){tail};"
+                );
+                let out = formats_stably(&sql, dialect.clone());
+                assert!(out.contains("USING (email, id)"), "{sql}: {out}");
+            }
+        }
+    }
+}
+
+/// A line comment after a column's name keeps the next line indented.
+#[test]
+fn a_line_comment_after_a_column_name_keeps_the_next_line_indented() {
+    for sql in [
+        "ALTER TABLE users ALTER email -- why\n  SET TAG pii = 'a';",
+        "ALTER TABLE users ALTER COLUMN email -- why\n  SET MASKING POLICY p;",
+        "ALTER TABLE users ALTER email -- why\n  UNSET PROJECTION POLICY;",
+    ] {
+        let out = formats_stably(sql, lexega_core::dialect::snowflake());
+        let after = out
+            .split_once(" -- why\n")
+            .map(|(_, rest)| rest)
+            .expect("the comment is kept");
+        assert!(after.starts_with(' '), "{out}");
+    }
+}
+
+#[test]
+fn a_line_comment_after_if_not_exists_or_set_keeps_the_next_line_indented() {
+    for sql in [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS -- why\n  phone STRING;",
+        "ALTER TABLE users SET -- c\n  COMMENT = 'x';",
+        "ALTER TABLE users UNSET -- c\n  COMMENT;",
+    ] {
+        let out = formats_stably(sql, lexega_core::dialect::snowflake());
+        let after = out
+            .split_once(" -- ")
+            .and_then(|(_, rest)| rest.split_once('\n'))
+            .map(|(_, rest)| rest)
+            .expect("the comment is kept");
+        assert!(after.starts_with(' '), "{out}");
+    }
+}
+
+#[test]
+fn a_comment_inside_a_change_keeps_the_next_line_indented() {
+    let sql = "alter table users change email -- why\n  mail text, add index i (mail);";
+    let out = formats_stably(sql, lexega_core::dialect::mysql());
+    let after = out
+        .split_once("-- why\n")
+        .map(|(_, rest)| rest)
+        .expect("the comment is kept");
+    assert!(after.starts_with(' '), "{out}");
 }

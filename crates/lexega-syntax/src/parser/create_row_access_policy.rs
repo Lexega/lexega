@@ -203,10 +203,9 @@ impl<'a> Parser<'a> {
         }
 
         // Parse policy name (required)
-        let name_tok = self
-            .peek_non_trivia()
+        self.peek_non_trivia()
             .ok_or_eof(span, vec!["policy_name".to_string()])?;
-        let policy_name_span = self.parse_policy_name_row_access(name_tok.span)?;
+        let policy_name_span = self.parse_object_name_span()?;
         span.end = policy_name_span.end;
 
         // =====================================================================
@@ -425,76 +424,6 @@ impl<'a> Parser<'a> {
         Ok(AstStmt::CreateRowAccessPolicy(Box::new(ast)))
     }
 
-    /// Parse policy/table name (qualified or unqualified identifier).
-    ///
-    /// Consumes a dotted identifier chain: `name`, `schema.name`, `db.schema.name`.
-    /// The first part must be an Identifier or non-reserved keyword.
-    /// After a dot, any keyword is allowed (e.g., `dataset.table`).
-    /// Stops at the first non-dot, non-identifier boundary to avoid consuming
-    /// clause keywords like FILTER that happen to be Identifier tokens.
-    fn parse_policy_name_row_access(&mut self, start_span: Span) -> ParseResult<Span> {
-        let mut span = start_span;
-        let name_start_idx = self.idx;
-
-        // Consume first name part (identifier or non-reserved keyword)
-        if let Some(tok) = self.peek_non_trivia() {
-            match tok.kind {
-                TokenKind::Identifier { .. } => {
-                    let t = self
-                        .advance()
-                        .expect_invariant("Name token should be available after peek");
-                    span.end = t.span.end;
-                }
-                TokenKind::Keyword(_) if self.can_be_identifier_token(tok) => {
-                    let t = self
-                        .advance()
-                        .expect_invariant("Keyword-as-name should be available after peek");
-                    span.end = t.span.end;
-                }
-                _ => {}
-            }
-        }
-
-        if self.idx == name_start_idx {
-            return Err(ParseError::new(
-                span,
-                ParseErrorKind::InvalidSyntax {
-                    message: "Expected policy name".to_string(),
-                },
-            ));
-        }
-
-        // Consume dot-separated parts: .part1.part2...
-        // After a dot, ANY keyword is valid (e.g., dataset.table, schema.data).
-        while let Some(tok) = self.peek_non_trivia() {
-            if !matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            // Consume the dot
-            let dot = self
-                .advance()
-                .expect_invariant("Dot should be available after peek");
-            span.end = dot.span.end;
-
-            // Consume the identifier after the dot
-            if let Some(next) = self.peek_non_trivia() {
-                match next.kind {
-                    TokenKind::Identifier { .. } => {
-                        let t = self.advance().expect_invariant("Identifier after dot");
-                        span.end = t.span.end;
-                    }
-                    TokenKind::Keyword(_) if self.can_be_identifier_after_dot_token(next) => {
-                        let t = self.advance().expect_invariant("Keyword after dot");
-                        span.end = t.span.end;
-                    }
-                    _ => break, // Dot with no valid identifier after it
-                }
-            }
-        }
-
-        Ok(span)
-    }
-
     /// Parse policy signature: (arg_name type, arg_name type, ...)
     fn parse_row_access_signature(
         &mut self,
@@ -669,10 +598,9 @@ impl<'a> Parser<'a> {
         span.end = on_tok.span.end;
 
         // Parse table name (may be qualified: project.dataset.table or `backtick-quoted`)
-        let table_tok = self
-            .peek_non_trivia()
+        self.peek_non_trivia()
             .ok_or_eof(span, vec!["table_name".to_string()])?;
-        let table_name_span = self.parse_policy_name_row_access(table_tok.span)?;
+        let table_name_span = self.parse_object_name_span()?;
         span.end = table_name_span.end;
 
         // Optional GRANT TO clause
@@ -996,31 +924,7 @@ impl<'a> Parser<'a> {
         }
 
         // Policy name (may be qualified: db.schema.name)
-        let policy_name_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["policy_name".to_string()])?;
-        let mut policy_name_span = policy_name_tok.span;
-
-        // Consume any dots and identifiers for qualified names
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                if let Some(ident_tok) = self.peek_non_trivia() {
-                    if matches!(ident_tok.kind, TokenKind::Identifier { .. }) {
-                        let ident = self.advance().expect_invariant(
-                            "Identifier for qualified policy name should be available after peek",
-                        );
-                        policy_name_span.end = ident.span.end;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        let policy_name_span = self.parse_object_name_span()?;
 
         // Optional ON table clause (BigQuery: DROP ROW ACCESS POLICY name ON table)
         let mut on_table_span: Option<Span> = None;
@@ -1034,10 +938,9 @@ impl<'a> Parser<'a> {
                 on_table_span = Some(on_tok.span);
 
                 // Parse table name (may be qualified: project.dataset.table)
-                let tbl_tok = self
-                    .peek_non_trivia()
+                self.peek_non_trivia()
                     .ok_or_eof(on_tok.span, vec!["table_name".to_string()])?;
-                let tbl_span = self.parse_policy_name_row_access(tbl_tok.span)?;
+                let tbl_span = self.parse_object_name_span()?;
                 table_name_span = Some(tbl_span);
             }
         }
@@ -1197,10 +1100,9 @@ impl<'a> Parser<'a> {
         let on_token_id = self.last_token_id();
 
         // Parse table name (may be qualified: project.dataset.table)
-        let table_tok = self
-            .peek_non_trivia()
+        self.peek_non_trivia()
             .ok_or_eof(on_span, vec!["table_name".to_string()])?;
-        let table_name_span = self.parse_policy_name_row_access(table_tok.span)?;
+        let table_name_span = self.parse_object_name_span()?;
 
         // Calculate full statement span
         let stmt_span = Span {

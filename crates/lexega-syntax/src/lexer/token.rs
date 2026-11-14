@@ -16,6 +16,14 @@ pub struct Span {
     pub end: u32,
 }
 
+impl Span {
+    /// Whether the two ranges share a byte. A zero-width span overlaps a
+    /// range it falls strictly inside.
+    pub fn overlaps(self, other: Span) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
 /// SQL and Snowflake Scripting keywords.
 ///
 /// Represents all reserved and non-reserved keywords recognized by the lexer.
@@ -321,16 +329,24 @@ pub enum Operator {
     // Cast / namespace
     ColonColon,
 
-    // PostgreSQL-specific operators
-    /// Exponentiation: ^
+    // Bitwise and dialect-specific operators
+    /// Bitwise XOR: ^ (exponentiation where the dialect reads it so: `Power`)
     Caret,
+    /// Exponentiation: ^ where the dialect reads it so (PostgreSQL)
+    Power,
+    /// Bitwise AND: &
+    Amp,
+    /// Compound bitwise AND assignment: &= (T-SQL)
+    AmpEq,
+    /// Bitwise OR: |
+    Bar,
     /// Bitwise XOR: #
     Hash,
     /// JSON path extraction (object): #>
     HashGt,
     /// JSON path extraction (text): #>>
     HashGtGt,
-    /// Bitwise NOT / regex match (context-dependent): ~
+    /// Bitwise NOT as a prefix, regex match as an infix operator: ~
     Tilde,
     /// Bitwise left shift: <<
     LtLt,
@@ -342,6 +358,8 @@ pub enum Operator {
     LtAt,
     /// Array overlap: &&
     AmpAmp,
+    /// Logical AND: && (MySQL)
+    AmpAmpAnd,
     /// JSON extract path (text): ->>
     MinusGtGt,
     /// JSON extract path (object): ->
@@ -368,6 +386,22 @@ pub enum Operator {
     PipeGt,
     /// Compound bitwise OR assignment: |= (T-SQL)
     PipeEq,
+    /// Text-search or JSON path match: @@ (PostgreSQL)
+    AtAt,
+    /// Starts with: ^@ (PostgreSQL)
+    CaretAt,
+    /// Square root, as a prefix: |/ (PostgreSQL)
+    BarSlash,
+    /// Any of the keys exists: ?| (PostgreSQL)
+    QuestionBar,
+    /// All of the keys exist: ?& (PostgreSQL)
+    QuestionAmp,
+    /// Logical NOT as a prefix: ! (MySQL)
+    Bang,
+    /// Not less than: !< (T-SQL)
+    BangLt,
+    /// Not greater than: !> (T-SQL)
+    BangGt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -391,7 +425,12 @@ pub enum LiteralKind {
     /// Used when Jinja expressions are embedded inside SQL string literals.
     StringFragment,
     Number,
+    /// `$<n>` where the dialect reads it as a column by position.
     Position,
+    /// `$<n>` where the dialect reads it as a bind parameter.
+    Parameter,
+    /// `$<n>` or `$<n>.<m>` where the dialect reads it as a money literal.
+    Money,
     Boolean,
     Null,
 }
@@ -404,6 +443,12 @@ pub enum IdentifierKind {
     AtVariable,
     /// T-SQL #temp_table or ##global_temp_table (e.g., #users, ##cache)
     TempTable,
+    /// A dollar-quote delimiter: the `$$` or `$tag$` that opens or closes a
+    /// dollar-quoted string, where the dialect's lexer reads them
+    /// (PostgreSQL, Redshift), or the `$$` that opens or closes a string the
+    /// dialect writes as words (Snowflake). The string's content between a
+    /// pair is lexed as tokens.
+    DollarQuoteDelimiter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +456,11 @@ pub enum TokenKind {
     Keyword(Keyword),
     Identifier {
         kind: IdentifierKind,
+        /// The operator the lexer's dialect also writes with this word
+        /// (MySQL `a MOD b`). The token is a name wherever a name is read;
+        /// only the expression parser, where it looks for an operator,
+        /// reads this.
+        word_operator: Option<crate::dialect::WordOperator>,
     },
     Literal(LiteralKind),
     Operator(Operator),
@@ -479,6 +529,14 @@ pub enum TokenKind {
     JinjaDocs,
     /// Jinja `enddocs` keyword (dbt)
     JinjaEndDocs,
+    /// Jinja `filter`, written as a `{% %}` tag's first word
+    JinjaFilter,
+    /// Jinja `endfilter`, written as a `{% %}` tag's first word
+    JinjaEndFilter,
+    /// Jinja `call`, written as a `{% %}` tag's first word
+    JinjaCall,
+    /// Jinja `endcall`, written as a `{% %}` tag's first word
+    JinjaEndCall,
 
     /// Placeholder for bind parameters: ?
     Placeholder,
@@ -512,6 +570,28 @@ pub enum TriviaKind {
     /// These contain executable SQL in MySQL but are comments in other dialects.
     /// Preserved as distinct trivia so downstream tools can handle them specially.
     MysqlVersionComment,
+    /// A psql command that sends the query written before it, to the end
+    /// of its line. The `;` of no width after it ends the statement.
+    PsqlMetaCommand(PsqlMetaCommand),
+    /// The client's `DELIMITER x` command, to the end of its line: `x`
+    /// ends each statement until the next one, lexed as a `;` of its width.
+    ClientDelimiter,
+    /// The rows a `COPY … FROM STDIN` (or psql's `\copy … from stdin`)
+    /// reads, written after it: from the line after its terminator to the
+    /// end of the line `\.` that ends them, or of the source. Trailing
+    /// trivia of the `;` that ends the statement; no token is read in it.
+    CopyData,
+}
+
+/// A psql command that sends the query written before it
+/// ([`TriviaKind::PsqlMetaCommand`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PsqlMetaCommand {
+    /// `\g [arguments]`: runs the query, as `;` does.
+    Go,
+    /// `\gexec`: runs the query, then each value of each row it returns as
+    /// a statement.
+    Gexec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

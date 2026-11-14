@@ -26,6 +26,55 @@ use crate::formatter::printer::Printer;
 use crate::lexer::tokenize_with_dialect;
 use std::fmt;
 
+/// The lines that start with a T-SQL `GO` that one tool may read as a batch
+/// separator and another may not, each from its `GO` to the end of the last
+/// token that starts on its line. `fmt` keeps each as written:
+/// - a line that is no separator (`GO;`, `GO 5 x`);
+/// - a line whose `GO` follows the end of a comment opened on an earlier
+///   line, which sqlcmd reads as the rest of that line. Such a line's span
+///   starts at the comment.
+fn go_lines(
+    source: &str,
+    tokens: &[crate::lexer::Token],
+    dialect: &dyn crate::dialect::Dialect,
+) -> Vec<crate::lexer::Span> {
+    tokens
+        .iter()
+        .filter_map(|tok| {
+            let at = crate::parser::go_line_start(source, tokens, tok, dialect)?;
+            let line_start = source
+                .get(..tok.span.start as usize)?
+                .rfind('\n')
+                .map_or(0, |nl| nl + 1) as u32;
+            let before = tokens[..at].last().map(|t| &t.trailing_trivia);
+            let comment_from_earlier_line = before
+                .into_iter()
+                .flatten()
+                .chain(&tok.leading_trivia)
+                .find(|trivia| trivia.span.start < line_start && line_start < trivia.span.end)
+                .map(|comment| comment.span.start);
+            if comment_from_earlier_line.is_none()
+                && crate::parser::is_batch_separator(source, tokens, tok, dialect)
+            {
+                return None;
+            }
+            let line_end = source
+                .get(tok.span.end as usize..)?
+                .find('\n')
+                .map_or(source.len(), |nl| tok.span.end as usize + nl);
+            let end = tokens[at..]
+                .iter()
+                .take_while(|t| (t.span.start as usize) < line_end)
+                .map(|t| t.span.end)
+                .max()?;
+            Some(crate::lexer::Span {
+                start: comment_from_earlier_line.unwrap_or(tok.span.start),
+                end,
+            })
+        })
+        .collect()
+}
+
 /// Formatter errors
 #[derive(Debug)]
 pub enum FormatterError {
@@ -130,6 +179,16 @@ impl Formatter {
             return printer.finish(context, has_template);
         }
 
+        // A statement that a line starting with `GO` crosses is printed as
+        // written, and so is the text between two statements on that line.
+        let go_lines = go_lines(&source, &cst.tokens, self.config.dialect.as_ref());
+        let on_go_line = |span: crate::lexer::Span| {
+            go_lines
+                .iter()
+                .any(|line| span.start < line.end && line.start < span.end)
+        };
+        let inside_go_line = |at: u32| go_lines.iter().any(|line| line.start < at && at < line.end);
+
         // Format each top-level statement
         // ARCHITECTURE: Each statement's source span extends from its start to the NEXT statement's start
         // (or EOF for the last statement). This ensures inter-statement gaps (comments, whitespace)
@@ -163,6 +222,14 @@ impl Formatter {
             // For subsequent statements: the inter-statement gap handler (emit_raw_span)
             // will collect and emit leading trivia as part of the gap
             if is_first {
+                // Tokens before the first statement (empty statements' `;`,
+                // as after MySQL's `/*!… */` lines) on their own lines, then
+                // its comments.
+                let before = printer.output_string().len();
+                printer.emit_all_tokens_until(stmt_span.start);
+                if printer.output_string().len() > before {
+                    printer.newline_if_needed();
+                }
                 printer.emit_comments_before(stmt_span.start);
             }
             // NOTE: We don't call mark_leading_trivia_emitted_at here anymore.
@@ -170,9 +237,19 @@ impl Formatter {
             // as part of the gap, then marks it as emitted. This ensures section
             // comments between statements are preserved.
 
+            // The next statement starts on the line, starting with `GO`,
+            // this one ends on.
+            let shares_go_line = !is_last && inside_go_line(statements[idx + 1].span().start);
+
             // Format the statement
-            statements::format_scripting_statement(&mut printer, stmt)
-                .or_else(|_| self.format_stmt(&mut printer, stmt))?;
+            if on_go_line(stmt_span) {
+                printer.push_span_as_written(stmt_span);
+                if !shares_go_line {
+                    printer.emit_trivia_until(stmt_span.end, true);
+                }
+            } else {
+                statements::format_scripting_statement(&mut printer, stmt)?;
+            }
 
             // CRITICAL: Ensure token cursor is positioned at statement end for proper inter-statement trivia emission.
             // Some formatters (like CREATE STAGE) use extract_span which doesn't advance the cursor.
@@ -194,16 +271,32 @@ impl Formatter {
                 // Inter-statement gap: emit raw source from after semicolon to next statement
                 let next_stmt = &statements[idx + 1];
                 let gap_end = next_stmt.span().start;
-                printer.emit_all_tokens_until(gap_end);
-                // Ensure blank line between statements, but only a single newline before OpaqueContent
-                // (parse error fallback should preserve original spacing, not add extra blank lines)
-                if matches!(
-                    next_stmt,
-                    AstStmt::OpaqueContent { .. } | AstStmt::GoBatchSeparator { .. }
-                ) {
-                    printer.newline_if_needed();
+                if shares_go_line {
+                    // Two statements on a line starting with `GO`: the text
+                    // between them as written.
+                    printer.push_source_until(gap_end);
                 } else {
-                    printer.ensure_blank_line();
+                    printer.emit_all_tokens_until(gap_end);
+                    // Ensure blank line between statements, but only a single newline before OpaqueContent
+                    // (parse error fallback should preserve original spacing, not add extra blank lines)
+                    if printer.go_name_within_line(gap_end) {
+                        // A `go` the source writes after other text on its
+                        // line stays there: at a line's start it would read
+                        // as a batch separator.
+                        printer.space();
+                    } else if matches!(stmt, AstStmt::SqlcmdCommand { .. })
+                        && matches!(next_stmt, AstStmt::SqlcmdCommand { .. })
+                    {
+                        // A run of sqlcmd lines keeps the line breaks it is written with.
+                        printer.break_lines_as_written(gap_end);
+                    } else if matches!(
+                        next_stmt,
+                        AstStmt::OpaqueContent { .. } | AstStmt::GoBatchSeparator { .. }
+                    ) {
+                        printer.newline_if_needed();
+                    } else {
+                        printer.ensure_blank_line();
+                    }
                 }
             }
 
@@ -215,7 +308,9 @@ impl Formatter {
         printer.finish(context, has_template)
     }
 
-    /// Format a single statement (internal dispatcher)
+    /// Format a statement that is not a scripting construct; the scripting
+    /// formatter ([`statements::format_scripting_statement`]), which every
+    /// statement goes through, hands each such statement here.
     ///
     /// ARCHITECTURAL NOTE: This does NOT call begin_span/end_span.
     /// Span tracking happens at statement level in format_script().
@@ -223,7 +318,7 @@ impl Formatter {
     /// Node-level tracking happens via:
     /// - Explicit: set_formatted_span() during formatting (future)
     /// - Proportional: update_formatted_spans() in Printer::finish()
-    fn format_stmt(&self, printer: &mut Printer, stmt: &AstStmt) -> Result<(), FormatterError> {
+    pub(crate) fn format_stmt(printer: &mut Printer, stmt: &AstStmt) -> Result<(), FormatterError> {
         match stmt {
             // ─── Span-only: struct variants (no special formatting yet) ───
             // These emit the original source span verbatim. When a proper
@@ -256,6 +351,7 @@ impl Formatter {
             | AstStmt::PgUnlisten(_)
             | AstStmt::PgLockTable(_)
             | AstStmt::PgCreateRule(_)
+            | AstStmt::MssqlCreateRule(_)
             | AstStmt::PgCreateAggregate(_)
             | AstStmt::PgCreateOperator(_)
             | AstStmt::PgAlterSystem(_)
@@ -337,6 +433,7 @@ impl Formatter {
             | AstStmt::UncacheTable(_)
             | AstStmt::RepairTable(_)
             | AstStmt::Reconfigure { .. }
+            | AstStmt::MssqlServerCommand { .. }
             | AstStmt::MssqlExec(_)
             | AstStmt::MssqlTryCatch(_)
             | AstStmt::MssqlIf(_)
@@ -346,11 +443,14 @@ impl Formatter {
             | AstStmt::MssqlRaiserror(_)
             | AstStmt::MssqlSetOption(_)
             | AstStmt::MysqlSet(_)
+            | AstStmt::MysqlUnlockTables(_)
             | AstStmt::MssqlWaitfor(_)
             | AstStmt::MssqlGoto(_)
             | AstStmt::MssqlLabel(_)
             | AstStmt::CreateMssqlTrigger(_)
             | AstStmt::DropMssqlTrigger(_)
+            | AstStmt::MssqlTriggerState(_)
+            | AstStmt::Savepoint(_)
             | AstStmt::MssqlBulkInsert(_)
             | AstStmt::MssqlCreateExternalDataSource(_)
             | AstStmt::MssqlAlterExternalDataSource(_)
@@ -424,7 +524,8 @@ impl Formatter {
             | AstStmt::AlterJoinPolicy(_)
             | AstStmt::DropJoinPolicy(_)
             | AstStmt::CreateDataMetricFunction(_)
-            | AstStmt::CreateReplicationFailoverGroup(_) => {
+            | AstStmt::CreateReplicationFailoverGroup(_)
+            | AstStmt::Perform(_) => {
                 printer.push_span(stmt.span());
                 Ok(())
             }
@@ -446,6 +547,11 @@ impl Formatter {
             | AstStmt::GoBatchSeparator { span, .. }
             | AstStmt::Error { span, .. } => {
                 printer.push_span(*span);
+                Ok(())
+            }
+            AstStmt::SqlcmdCommand { span, .. } => {
+                printer.push_span_as_written(*span);
+                printer.emit_trivia_until(span.end, true);
                 Ok(())
             }
 
@@ -590,6 +696,7 @@ impl Formatter {
                 s.name_span,
                 s.params_span,
                 s.returns_span,
+                &s.language,
                 s.body_span,
                 s.body_stmt.as_deref(),
                 s.opening_delimiter_token,
@@ -609,7 +716,7 @@ impl Formatter {
                 s.if_not_exists_span,
                 s.name_span,
                 s.params_span,
-                s.returns_span,
+                s.returns,
                 s.body_span,
                 s.body_stmt.as_deref(),
                 s.opening_delimiter_token,
@@ -631,16 +738,17 @@ impl Formatter {
 
             // ─── Format-function delegations: data loading ───
             AstStmt::CopyIntoTable {
-                table_name_span,
+                table_name,
                 from_span,
                 options_span,
                 ..
-            } => statements::format_copy_into_table(
-                printer,
-                *table_name_span,
-                *from_span,
-                *options_span,
-            ),
+            } => {
+                // The target with the column list written after it.
+                let target = printer
+                    .tokens_span_within(table_name.span.start, from_span.start)
+                    .unwrap_or(table_name.span);
+                statements::format_copy_into_table(printer, target, *from_span, *options_span)
+            }
 
             AstStmt::CopyIntoLocation {
                 into_span,
@@ -661,7 +769,7 @@ impl Formatter {
             }
 
             // ─── Format-function delegations: Jinja ───
-            AstStmt::JinjaConditionalStmt(block) => self.format_jinja_stmt_block(printer, block),
+            AstStmt::JinjaConditionalStmt(block) => Self::format_jinja_stmt_block(printer, block),
 
             // ─── Grant/Revoke: span + optional semicolon token ───
             AstStmt::Grant(g) => {
@@ -690,7 +798,7 @@ impl Formatter {
 
             // ─── ClauseFragment ───
             AstStmt::ClauseFragment { fragment, .. } => {
-                self.format_clause_fragment(fragment.as_ref(), printer)?;
+                Self::format_clause_fragment(fragment.as_ref(), printer)?;
                 Ok(())
             }
 
@@ -702,7 +810,26 @@ impl Formatter {
                     printer.push_span(opts_span);
                 }
                 printer.space();
-                self.format_stmt(printer, &explain.inner_stmt)?;
+                Self::format_stmt(printer, &explain.inner_stmt)?;
+                Ok(())
+            }
+
+            // A query psql's `\gexec` sends: the command is in the `;` after it.
+            AstStmt::PsqlGexec(gexec) => Self::format_stmt(printer, &gexec.query),
+            AstStmt::MysqlDo(mysql_do) => {
+                printer.push_span(mysql_do.span);
+                Ok(())
+            }
+            AstStmt::ExecuteTask(execute) => {
+                printer.push_span(execute.span);
+                Ok(())
+            }
+            AstStmt::MysqlCreateLoadableFunction(function) => {
+                printer.push_span(function.span);
+                Ok(())
+            }
+            AstStmt::MysqlAdmin(admin) => {
+                printer.push_span(admin.span);
                 Ok(())
             }
 
@@ -773,7 +900,6 @@ impl Formatter {
 
     /// Format a Jinja conditional block that wraps full SQL statements
     fn format_jinja_stmt_block(
-        &self,
         printer: &mut Printer,
         block: &crate::ast::JinjaStmtBlock,
     ) -> Result<(), FormatterError> {
@@ -786,9 +912,7 @@ impl Formatter {
             if i > 0 {
                 printer.newline();
             }
-            // Try scripting first, fall back to regular statement formatting
-            statements::format_scripting_statement(printer, stmt)
-                .or_else(|_| self.format_stmt(printer, stmt))?;
+            statements::format_scripting_statement(printer, stmt)?;
         }
         printer.newline();
 
@@ -800,8 +924,7 @@ impl Formatter {
                 if i > 0 {
                     printer.newline();
                 }
-                statements::format_scripting_statement(printer, stmt)
-                    .or_else(|_| self.format_stmt(printer, stmt))?;
+                statements::format_scripting_statement(printer, stmt)?;
             }
             printer.newline();
         }
@@ -814,8 +937,7 @@ impl Formatter {
                 if i > 0 {
                     printer.newline();
                 }
-                statements::format_scripting_statement(printer, stmt)
-                    .or_else(|_| self.format_stmt(printer, stmt))?;
+                statements::format_scripting_statement(printer, stmt)?;
             }
             printer.newline();
         }
@@ -832,53 +954,9 @@ impl Default for Formatter {
     }
 }
 
-#[cfg(test)]
-mod inline_tests {
-    use super::*;
-    use crate::ast::NodeId;
-
-    #[test]
-    fn test_formatter_creation() {
-        let formatter = Formatter::new();
-        assert_eq!(
-            formatter.config.keyword_case,
-            crate::formatter::config::KeywordCase::Upper
-        );
-    }
-
-    #[test]
-    fn test_formatter_with_config() {
-        let mut config = FormatterConfig::default();
-        config.keyword_case = crate::formatter::config::KeywordCase::Lower;
-
-        let formatter = Formatter::with_config(config);
-        assert_eq!(
-            formatter.config.keyword_case,
-            crate::formatter::config::KeywordCase::Lower
-        );
-    }
-
-    #[test]
-    fn test_formatter_empty_script() {
-        let formatter = Formatter::new();
-        let context = RenderContext::from_source("".to_string());
-        let script = AstScript {
-            node_id: NodeId::new(0),
-            stmts: vec![],
-            syntax_arena: crate::syntax::SyntaxArena::new(),
-            redaction_spans: vec![],
-        };
-
-        // Empty script should format to empty output
-        let result = formatter.format_script(context, &script);
-        assert!(result.is_ok());
-    }
-}
-
 impl Formatter {
     /// Format a clause fragment (WHERE, JOIN, HAVING) from inside a Jinja block
     fn format_clause_fragment(
-        &self,
         fragment: &crate::ast::StatementFragment,
         printer: &mut crate::formatter::printer::Printer,
     ) -> Result<(), FormatterError> {
@@ -1007,5 +1085,56 @@ impl Formatter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+    use crate::ast::NodeId;
+
+    #[test]
+    fn test_formatter_creation() {
+        let formatter = Formatter::new();
+        assert_eq!(
+            formatter.config.keyword_case,
+            crate::formatter::config::KeywordCase::Upper
+        );
+    }
+
+    #[test]
+    fn test_formatter_with_config() {
+        let mut config = FormatterConfig::default();
+        config.keyword_case = crate::formatter::config::KeywordCase::Lower;
+
+        let formatter = Formatter::with_config(config);
+        assert_eq!(
+            formatter.config.keyword_case,
+            crate::formatter::config::KeywordCase::Lower
+        );
+    }
+
+    #[test]
+    fn test_formatter_empty_script() {
+        let formatter = Formatter::new();
+        let context = RenderContext::from_source("".to_string());
+        let script = AstScript {
+            node_id: NodeId::new(0),
+            stmts: vec![],
+            syntax_arena: crate::syntax::SyntaxArena::new(),
+            redaction_spans: vec![],
+            secret_places: vec![],
+            template_blocks: vec![],
+            comment_spans: vec![],
+            read_bodies: vec![],
+            setting_values: vec![],
+            bulk_options: vec![],
+            held_names: vec![],
+            cut_statements: vec![],
+        };
+
+        // Empty script should format to empty output
+        let result = formatter.format_script(context, &script);
+        assert!(result.is_ok());
     }
 }

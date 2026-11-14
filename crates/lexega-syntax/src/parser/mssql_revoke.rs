@@ -17,16 +17,18 @@
 //! Mirrors `mssql_grant.rs`: optional `ON` clause (server-tier permissions
 //! yield an empty `objects` vec), `<class>::securable` qualifiers, and
 //! multi-principal lists. T-SQL admits both `TO` and `FROM` before the
-//! principal list. The trailing `AS <principal>` delegation clause is
-//! consumed-and-discarded (parity with `mssql_grant.rs`).
+//! principal list. The trailing `AS <principal>` delegation clause is kept
+//! as [`AstDenyAs`], as `mssql_grant.rs` keeps it.
 //!
 //! ## Failure semantics
 //!
 //! Typed-parse failure rolls back to just past `REVOKE [GRANT OPTION FOR]`,
 //! consumes to the next semicolon, and emits `AstRevokeShape::Unparsed`.
 
-use crate::ast::{AstCascadeMode, AstPrivilegeRevokeBody, AstRevoke, AstRevokeShape, AstStmt};
-use crate::error::{ExpectInvariant, ParseResult};
+use crate::ast::{
+    AstCascadeMode, AstDenyAs, AstPrivilegeRevokeBody, AstRevoke, AstRevokeShape, AstStmt,
+};
+use crate::error::{ExpectInvariant, ParseResult, ParseResultExt};
 use crate::lexer::token::{Span, TokenKind};
 use crate::lexer::{Keyword, Punctuation};
 use crate::parser::core::Parser;
@@ -122,18 +124,26 @@ fn try_parse_privilege_body(
 
     let cascade_mode = consume_cascade_mode(p);
 
-    // Optional trailing `AS <principal>`. Consumed-and-discarded —
-    // parity with `mssql_grant.rs`.
-    if peek_token_kind(p, TokenKind::Keyword(Keyword::As)) {
-        let _ = p.advance(); // AS
-        let _ = p.parse_qualified_name_span()?;
-    }
+    // Optional trailing `AS <principal>`.
+    let as_principal = if peek_token_kind(p, TokenKind::Keyword(Keyword::As)) {
+        let as_tok = p
+            .advance()
+            .ok_or_eof(p.current_span(), vec!["AS".to_string()])?;
+        let principal_name_span = p.parse_qualified_name_span()?;
+        Some(AstDenyAs {
+            keyword_span: as_tok.span,
+            principal_name_span,
+        })
+    } else {
+        None
+    };
 
     Ok((
         AstPrivilegeRevokeBody {
             privileges,
             objects,
             grantees,
+            as_principal,
         },
         cascade_mode,
     ))

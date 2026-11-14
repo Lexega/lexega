@@ -8,7 +8,7 @@
 //! Why typed entries (`pub(crate)`) instead of writing strings directly
 //! into [`RuleExplanation`]: per the schema-as-contract discipline,
 //! `RuleExplanation` carries `#[derive(JsonSchema)]` and is part of the
-//! customer-visible `Signal.explanation` JSON shape. Promoting typed
+//! customer-visible `Finding.explanation` JSON shape. Promoting typed
 //! rejection variants directly onto that surface would commit them to
 //! the public JSON schema forever. Instead the engine collects rich
 //! typed entries here, then renders to `Vec<String>` at the projection
@@ -16,7 +16,7 @@
 //! contract is exposed to customers, this is where the new public
 //! types are introduced; nothing else changes.
 
-use super::signal::RuleExplanation;
+use super::finding::RuleExplanation;
 
 /// One step the predicate evaluator took, with the path it was at and
 /// the outcome (matched / didn't match, plus the reason).
@@ -112,12 +112,50 @@ pub(crate) enum UnmatchReason {
 }
 
 /// Buffer of trace entries collected during one predicate evaluation.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ExplainTrace {
+#[derive(Clone, Default)]
+pub(crate) struct ExplainTrace<'m> {
     pub(crate) entries: Vec<TraceEntry>,
+    /// The strings of the facts evaluated that quote a secret, masked
+    /// where an entry renders them.
+    pub(crate) quoting: Option<&'m crate::facts::secrets::QuotingStrings>,
 }
 
-impl ExplainTrace {
+impl ExplainTrace<'_> {
+    /// `v`, a value of the facts evaluated, as an entry's `actual` renders
+    /// it: a string, or the name an identifier object holds, quoted and
+    /// masked where it quotes a secret; the variant a tagged object names;
+    /// the size of an array or another object.
+    pub(crate) fn render_actual(&self, v: &serde_json::Value) -> String {
+        use serde_json::Value;
+        let quoted = |node: &Value, text: &str| {
+            let masked = self.quoting.and_then(|quoting| quoting.masked(node));
+            format!("\"{}\"", masked.unwrap_or(text))
+        };
+        match v {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => format!("{}", b),
+            Value::Number(n) => match self.quoting.and_then(|quoting| quoting.masked(v)) {
+                Some(masked) => format!("\"{masked}\""),
+                None => n.to_string(),
+            },
+            Value::String(s) => quoted(v, s),
+            Value::Array(items) => format!("<array len={}>", items.len()),
+            Value::Object(map) => {
+                // Two common tagged shapes get specialized rendering so
+                // the trace reads naturally:
+                //   - tagged enum: `{ "kind": "...", ... }` → render kind
+                //   - IdentName: `{ "normalized": "...", "raw": "..." }`
+                if let Some(k) = map.get("kind").and_then(Value::as_str) {
+                    return format!("\"{}\"", k);
+                }
+                if let Some(node @ Value::String(n)) = map.get("normalized") {
+                    return quoted(node, n);
+                }
+                format!("<object keys={}>", map.len())
+            }
+        }
+    }
+
     pub(crate) fn record_matched(&mut self, path: &str, reason: MatchReason) {
         self.entries.push(TraceEntry {
             path: path.to_string(),

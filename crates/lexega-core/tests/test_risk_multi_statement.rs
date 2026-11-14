@@ -178,27 +178,27 @@ fn test_summary_counts_recalculated_correctly() {
     let sql = "
         GRANT USAGE ON DATABASE prod TO ROLE PUBLIC;
         GRANT USAGE ON DATABASE prod TO ROLE PUBLIC;  -- Duplicate
-        SELECT * FROM large_table;  -- Cost signal
-        UPDATE important_table SET x = 1;  -- Blast radius signal
+        SELECT * FROM large_table;  -- Cost finding
+        UPDATE important_table SET x = 1;  -- Blast radius finding
     ";
 
     let report = analyze_risk(sql).expect("Should parse and analyze");
 
-    // Validate invariant: sum of severity counts == total signals
+    // Validate invariant: sum of severity counts == total findings
     let sum_of_severities = report.summary.critical_count
         + report.summary.high_count
         + report.summary.medium_count
         + report.summary.low_count;
 
     assert_eq!(
-        report.summary.total_reported_signals, sum_of_severities,
-        "Sum of severity counts must equal total_signals"
+        report.summary.total_reported_findings, sum_of_severities,
+        "Sum of severity counts must equal total_findings"
     );
 
     assert_eq!(
-        report.summary.total_reported_signals,
-        report.signals.len(),
-        "total_signals must match actual signals.len()"
+        report.summary.total_reported_findings,
+        report.findings.len(),
+        "total_findings must match actual findings.len()"
     );
 }
 

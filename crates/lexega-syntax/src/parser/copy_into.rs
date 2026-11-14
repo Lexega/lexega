@@ -10,10 +10,11 @@
 //! Reference: <https://docs.snowflake.com/en/sql-reference/sql/copy-into-table>
 
 use crate::ast::{AstCopyOption, AstStageCredentialOption};
-use crate::lexer::{Keyword, LiteralKind, Operator, Punctuation, TokenKind};
-use crate::parser::core::Parser;
-use crate::parser::create_stage::{try_parse_credential_option, unquote_sql_string};
-use crate::parser::sql_stmt::build_copy_into_span;
+use crate::lexer::{decode_string_literal, Keyword, LiteralKind, Operator, Punctuation, TokenKind};
+use crate::parser::core::{NamePosition, Parser};
+use crate::parser::create_stage::try_parse_credential_option;
+use crate::parser::set_operations::star_over_table;
+use crate::parser::sql_stmt::{build_copy_into_span, build_select, build_table_ref};
 
 /// Parse COPY INTO statement.
 ///
@@ -105,13 +106,14 @@ fn parse_copy_into_table(
     }
     let table_end_idx = p.idx;
 
-    let table_name_span = if table_end_idx > table_start_idx {
-        let first = &p.tokens[table_start_idx];
-        let last = &p.tokens[table_end_idx - 1];
-        crate::lexer::Span {
-            start: first.span.start,
-            end: last.span.end,
-        }
+    let table_name = if table_end_idx > table_start_idx {
+        let node_id = p.id_gen.next();
+        // `name [(column, …)]`: the name, then the column list after it.
+        let name_end = p
+            .object_name_end(table_start_idx)
+            .filter(|&end| end == table_end_idx || p.parens_end(end) == Some(table_end_idx))
+            .unwrap_or(table_end_idx);
+        p.object_ref_of_range(table_start_idx, name_end, node_id)
     } else {
         return Err(ParseError::new(
             p.current_span(),
@@ -150,20 +152,33 @@ fn parse_copy_into_table(
 
     // Capture the load source URL if the first non-trivia token after FROM
     // is a string literal (COPY INTO t FROM 's3://…' — external location).
-    let from_location_url = match p.peek_non_trivia() {
-        Some(tok) if matches!(tok.kind, TokenKind::Literal(LiteralKind::String)) => {
-            Some(unquote_sql_string(tok.lexeme(p.source)))
-        }
-        _ => None,
+    let (from_location_url, from_location_url_span) = match p.peek_non_trivia() {
+        Some(tok) if matches!(tok.kind, TokenKind::Literal(LiteralKind::String)) => (
+            decode_string_literal(tok.lexeme(p.source), p.dialect).map(|d| d.value),
+            Some(tok.span),
+        ),
+        _ => (None, None),
     };
 
     // Parse FROM clause (stage/location and all options)
     // This includes: stage/location, FILES, PATTERN, FILE_FORMAT, copy options, VALIDATION_MODE
     let from_start_idx = p.idx;
+    let from_stage = p.stage_ref_at(from_start_idx);
+    let mut file_format_name = None;
     let mut credentials: Vec<AstStageCredentialOption> = Vec::new();
     let mut copy_options: Vec<AstCopyOption> = Vec::new();
     let mut depth: i32 = 0;
     while let Some(tok) = p.peek_non_trivia() {
+        if depth == 0 && file_format_name.is_none() {
+            file_format_name = file_format_name_at(p, p.idx);
+        }
+        // Databricks' `CREDENTIAL (…)`, `FORMAT_OPTIONS (…)`, `COPY_OPTIONS (…)`.
+        if ["CREDENTIAL", "FORMAT_OPTIONS", "COPY_OPTIONS"]
+            .iter()
+            .any(|w| tok.lexeme(p.source).eq_ignore_ascii_case(w))
+        {
+            p.record_option_list_secrets(p.idx + 1);
+        }
         match tok.kind {
             TokenKind::Eof
             | TokenKind::Punctuation(Punctuation::Semi)
@@ -223,13 +238,32 @@ fn parse_copy_into_table(
     Ok(crate::ast::AstStmt::CopyIntoTable {
         node_id: p.id_gen.next(),
         span,
-        table_name_span,
+        table_name,
         from_span,
         options_span,
         copy_options,
         from_location_url,
+        from_location_url_span,
+        from_stage: from_stage.map(Box::new),
+        file_format_name: file_format_name.map(Box::new),
         credentials,
     })
+}
+
+/// The file format named by `FILE_FORMAT = (FORMAT_NAME = name)` written at
+/// token `at`.
+fn file_format_name_at(p: &Parser<'_>, at: usize) -> Option<crate::ast::AstObjectRef> {
+    let assigns = p
+        .tokens
+        .get(at + 1)
+        .is_some_and(|t| t.kind == TokenKind::Operator(Operator::Eq))
+        && p.tokens
+            .get(at + 2)
+            .is_some_and(|t| t.kind == TokenKind::Punctuation(Punctuation::LParen));
+    if !(assigns && p.word_at(at, "FILE_FORMAT")) {
+        return None;
+    }
+    p.format_name_in(at + 2)
 }
 
 /// Parse COPY INTO <location> FROM <table/query> variant.
@@ -245,15 +279,17 @@ fn parse_copy_into_location(
 
     // Capture the location URL if the first non-trivia token after INTO
     // is a string literal (e.g. COPY INTO 's3://bucket/...').
-    let location_url = match p.peek_non_trivia() {
-        Some(tok) if matches!(tok.kind, TokenKind::Literal(LiteralKind::String)) => {
-            Some(unquote_sql_string(tok.lexeme(p.source)))
-        }
-        _ => None,
+    let (location_url, location_url_span) = match p.peek_non_trivia() {
+        Some(tok) if matches!(tok.kind, TokenKind::Literal(LiteralKind::String)) => (
+            decode_string_literal(tok.lexeme(p.source), p.dialect).map(|d| d.value),
+            Some(tok.span),
+        ),
+        _ => (None, None),
     };
 
     // Parse location (stage or external location)
     let into_start_idx = p.idx;
+    let into_stage = p.stage_ref_at(into_start_idx);
     while let Some(tok) = p.peek_non_trivia() {
         if tok.lexeme(p.source).eq_ignore_ascii_case("FROM") {
             break;
@@ -328,10 +364,14 @@ fn parse_copy_into_location(
     // `source` is None and behavior is unchanged (bytes remain in `from_span`).
     let source = parse_unload_source(p);
 
+    let mut file_format_name = None;
     let mut credentials: Vec<AstStageCredentialOption> = Vec::new();
     let mut copy_options: Vec<AstCopyOption> = Vec::new();
     let mut depth: i32 = 0;
     while let Some(tok) = p.peek_non_trivia() {
+        if depth == 0 && file_format_name.is_none() {
+            file_format_name = file_format_name_at(p, p.idx);
+        }
         match tok.kind {
             TokenKind::Eof
             | TokenKind::Punctuation(Punctuation::Semi)
@@ -389,9 +429,12 @@ fn parse_copy_into_location(
         node_id: p.id_gen.next(),
         span,
         into_span,
+        into_stage: into_stage.map(Box::new),
+        file_format_name: file_format_name.map(Box::new),
         from_span,
         options_span,
         location_url,
+        location_url_span,
         credentials,
         copy_options,
         source,
@@ -417,8 +460,65 @@ fn parse_unload_source(p: &mut Parser<'_>) -> Option<crate::ast::AstUnloadSource
         }
         Some(crate::ast::AstUnloadSource::Subquery(Box::new(stmt)))
     } else {
-        let name_span = p.parse_qualified_name_span().ok()?;
-        Some(crate::ast::AstUnloadSource::Table { name_span })
+        let name = p.parse_object_ref_with_argument(NamePosition::Object)?;
+        let name_span = name.span;
+        let table = Box::new(build_table_ref(
+            p.id_gen.next(),
+            name_span,
+            name,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let (star, from) = star_over_table(p, table);
+        let query = build_select(
+            p.id_gen.next(),
+            name_span,
+            name_span,
+            None,
+            None,
+            None,
+            None,
+            star,
+            from,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Some(crate::ast::AstUnloadSource::Table {
+            name_span,
+            query: Box::new(crate::ast::AstStmt::Select(Box::new(query))),
+        })
     }
 }
 

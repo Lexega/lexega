@@ -5,28 +5,28 @@
 //!
 //! Rule: Search Index Dropped
 //! ID: BQ-SEARCHIDX-DROP
-//! Risk: Medium
+//! Risk: Low
 //!
 //! Validates that DROP SEARCH INDEX statements emit the correct governance
-//! signal and that the YAML rule matches with the correct risk level.
+//! finding and that the YAML rule matches with the correct risk level.
 
 use lexega_core::analyzer::RuleMatch;
 
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             panic!("Parse/analysis failed for SQL: {}\nError: {:?}", sql, e);
         }
@@ -82,24 +82,24 @@ fn test_bq_searchidx_drop_fully_qualified_table() {
 }
 
 // =============================================================================
-// Risk Level and Signal Metadata
+// Risk Level and Finding Metadata
 // =============================================================================
 
 #[test]
-fn test_bq_searchidx_drop_risk_level_is_medium() {
+fn test_bq_searchidx_drop_risk_level_is_low() {
     let sql = "DROP SEARCH INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SEARCHIDX-DROP"))
-        .expect("BQ-SEARCHIDX-DROP signal should be present");
+        .expect("BQ-SEARCHIDX-DROP finding should be present");
 
     assert_eq!(
-        signal.risk_level(),
-        lexega_core::analyzer::RiskLevel::Medium,
-        "BQ-SEARCHIDX-DROP should be Medium risk"
+        finding.risk_level(),
+        lexega_core::analyzer::RiskLevel::Low,
+        "BQ-SEARCHIDX-DROP should be Low risk"
     );
 }
 
@@ -108,16 +108,16 @@ fn test_bq_searchidx_drop_message_content() {
     let sql = "DROP SEARCH INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SEARCHIDX-DROP"))
-        .expect("BQ-SEARCHIDX-DROP signal should be present");
+        .expect("BQ-SEARCHIDX-DROP finding should be present");
 
     assert!(
-        signal.message().contains("Search index dropped"),
+        finding.message().contains("Search index dropped"),
         "Message should mention 'Search index dropped'. Got: {}",
-        signal.message()
+        finding.message()
     );
 }
 
@@ -127,14 +127,14 @@ fn test_bq_searchidx_drop_summary_counts() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     assert_eq!(
-        report.summary.medium_count, 1,
-        "Should have exactly 1 medium signal"
+        report.summary.low_count, 1,
+        "Should have exactly 1 low finding"
     );
     assert_eq!(
         report.summary.critical_count, 0,
-        "Should have no critical signals"
+        "Should have no critical findings"
     );
-    assert_eq!(report.summary.high_count, 0, "Should have no high signals");
+    assert_eq!(report.summary.high_count, 0, "Should have no high findings");
     assert_eq!(
         report.summary.statements_analyzed, 1,
         "Should have analyzed 1 statement"
@@ -154,9 +154,9 @@ fn test_bq_searchidx_drop_multi_statement_evidence() {
     let sql = "DROP SEARCH INDEX idx1 ON t1;\nDROP SEARCH INDEX idx2 ON t2;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    // Signals may be deduplicated by rule, but evidence_count tracks all occurrences
+    // Findings may be deduplicated by rule, but evidence_count tracks all occurrences
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SEARCHIDX-DROP"))
         .map(|s| match s {
@@ -201,7 +201,8 @@ fn test_bq_searchidx_drop_not_triggered_by_create() {
 fn test_bq_searchidx_new_triggered_by_create() {
     // Companion rule: verify CREATE triggers the correct rule instead
     let sql = "CREATE SEARCH INDEX my_idx ON my_table(col1);";
-    let rules = analyze_and_get_rules(sql);
+    let report = analyze_risk(sql).expect("analysis should succeed");
+    let rules = extract_rule_ids(&report.context);
     assert!(
         rules.contains("BQ-SEARCHIDX-NEW"),
         "CREATE SEARCH INDEX should trigger BQ-SEARCHIDX-NEW (not DROP). Got: {:?}",
@@ -232,24 +233,24 @@ fn test_bq_searchidx_drop_not_triggered_by_drop_vector_index() {
 }
 
 // =============================================================================
-// Signal Details (Table Name in Details)
+// Finding Details (Table Name in Details)
 // =============================================================================
 
 #[test]
-fn test_bq_searchidx_drop_signal_details_contain_table_name() {
+fn test_bq_searchidx_drop_finding_details_contain_table_name() {
     let sql = "DROP SEARCH INDEX my_idx ON inventory_data;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SEARCHIDX-DROP"));
 
-    assert!(signal.is_some(), "BQ-SEARCHIDX-DROP should fire");
+    assert!(finding.is_some(), "BQ-SEARCHIDX-DROP should fire");
 
     // Validate that evidence contains table context
-    let evidence = signal.unwrap().evidence();
-    assert!(!evidence.is_empty(), "Signal should have evidence entries");
+    let evidence = finding.unwrap().evidence();
+    assert!(!evidence.is_empty(), "Finding should have evidence entries");
 }
 
 #[test]
@@ -259,15 +260,15 @@ fn test_bq_searchidx_drop_distinct_details_prevent_dedup() {
     let sql = "DROP SEARCH INDEX idx1 ON table_a;\nDROP SEARCH INDEX idx2 ON table_b;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    // The medium count should reflect both (either as 1 signal with evidence_count=2,
-    // or as separate signals)
+    // The low count should reflect both (either as 1 finding with evidence_count=2,
+    // or as separate findings)
     assert!(
-        report.summary.medium_count >= 1,
-        "Should have at least 1 medium signal"
+        report.summary.low_count >= 1,
+        "Should have at least 1 low finding"
     );
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SEARCHIDX-DROP"))
         .map(|s| match s {

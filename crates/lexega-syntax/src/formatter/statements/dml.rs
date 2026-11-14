@@ -53,10 +53,16 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
         printer.push_keyword_span(into_span);
     }
 
-    // Target table - use push_identifier_span_v2 for identifier casing
-    if let Some(table_span) = insert.target_table_span {
+    // Databricks: TABLE before the target
+    if let Some(table_span) = insert.table_keyword_span {
         printer.space();
-        printer.push_identifier_span_v2(table_span);
+        printer.push_keyword_span(table_span);
+    }
+
+    // Target table - use push_identifier_span_v2 for identifier casing
+    if let Some(target) = &insert.target_table {
+        printer.space();
+        printer.push_identifier_span_v2(written_target(target, insert.target_alias_span));
     }
 
     // MySQL: PARTITION (p, ...) selection
@@ -81,6 +87,12 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
     if let Some(ov_span) = insert.overriding_value_span {
         printer.newline();
         printer.push_span(ov_span);
+    }
+
+    // OUTPUT clause (MSSQL), written before the source.
+    if let Some(ref output) = insert.output {
+        printer.newline();
+        printer.push_span(output.span);
     }
 
     // Source data
@@ -142,8 +154,12 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
                             printer.space();
                         }
 
-                        // Format the parenthesized row
-                        printer.push_char('(');
+                        // The row's parentheses, from the source.
+                        let row_span = insert.values_rows_spans.get(idx).copied();
+                        match row_span.and_then(|row| printer.token_span_from(row.start)) {
+                            Some(open) => printer.push_span(open),
+                            None => printer.push_char('('),
+                        }
 
                         match paren_style {
                             ParenthesizedExprStyle::Expanded if row_exprs.len() > 1 => {
@@ -160,8 +176,12 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
                                     if !leading_comma && expr_idx < row_exprs.len() - 1 {
                                         printer.push_char(',');
                                     }
-                                    if expr_idx < row_exprs.len() - 1 {
-                                        printer.newline();
+                                    match row_exprs.get(expr_idx + 1) {
+                                        Some(next) if !leading_comma => {
+                                            printer.break_before_item(next.span())
+                                        }
+                                        Some(_) => printer.break_before_comma(),
+                                        None => {}
                                     }
                                 }
                                 printer.indent_down();
@@ -181,7 +201,10 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
                             }
                         }
 
-                        printer.push_char(')');
+                        match row_span.and_then(|row| printer.token_span_ending_at(row.end)) {
+                            Some(close) => printer.push_span(close),
+                            None => printer.push_char(')'),
+                        }
 
                         if !leading_comma && idx < insert.values_rows.len() - 1 {
                             printer.push_char(',');
@@ -245,7 +268,8 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
                 printer.push_span(body_span);
             }
         }
-        AstInsertSourceKind::Unknown => {
+        // The EXEC statement is printed as written.
+        AstInsertSourceKind::Execute | AstInsertSourceKind::Unknown => {
             // Fallback: extract body as-is
             if let Some(body_span) = insert.body_span {
                 printer.newline();
@@ -270,12 +294,6 @@ pub fn format_insert(printer: &mut Printer, insert: &AstInsert) -> Result<(), Fo
     if let Some(ref odku) = insert.on_duplicate_key_update {
         printer.newline();
         printer.push_span(odku.span);
-    }
-
-    // OUTPUT clause (MSSQL)
-    if let Some(ref output) = insert.output {
-        printer.newline();
-        printer.push_span(output.span);
     }
 
     // RETURNING clause (PostgreSQL)
@@ -353,8 +371,17 @@ fn format_update_assignment(
     printer.push_span(assignment.equals_span);
     printer.space();
 
-    // Format value expression
-    format_expression(printer, &assignment.value)?;
+    // Format value expression; a compound assignment's (`col |= 4`) is read
+    // as `col | 4`, of which the right operand is written.
+    let value = match assignment.value.as_ref() {
+        crate::ast::AstExpr::BinaryOp { left, right, .. }
+            if left.span() == assignment.column.span() =>
+        {
+            right.as_ref()
+        }
+        other => other,
+    };
+    format_expression(printer, value)?;
 
     Ok(())
 }
@@ -484,6 +511,12 @@ pub fn format_update(printer: &mut Printer, update: &AstUpdate) -> Result<(), Fo
         }
     }
 
+    // OUTPUT clause (MSSQL), written after SET and before FROM / WHERE.
+    if let Some(ref output) = update.output {
+        printer.newline_if_needed();
+        printer.push_span(output.span);
+    }
+
     // FROM clause (if present)
     if !update.from.is_empty() {
         printer.newline_if_needed();
@@ -529,15 +562,15 @@ pub fn format_update(printer: &mut Printer, update: &AstUpdate) -> Result<(), Fo
         update.limit_keyword_span,
     )?;
 
-    // OUTPUT clause (MSSQL)
-    if let Some(ref output) = update.output {
-        printer.newline_if_needed();
-        printer.push_span(output.span);
-    }
-
     // RETURNING clause (PostgreSQL)
     if let Some(ref returning) = update.returning {
         format_returning(printer, returning)?;
+    }
+
+    // OPTION (…) query hints (MSSQL)
+    for clause in &update.option_clauses {
+        printer.newline_if_needed();
+        printer.push_span(clause.span);
     }
 
     // Emit semicolon if present (scripting context)
@@ -579,23 +612,39 @@ pub fn format_delete(printer: &mut Printer, delete: &AstDelete) -> Result<(), Fo
         super::select::format_top_clause(printer, top)?;
     }
 
-    // MySQL multi-table target list before FROM (`DELETE t1, t2 FROM ...`).
-    for (idx, tgt) in delete.targets.iter().enumerate() {
-        if idx == 0 {
-            printer.space();
-        } else {
-            printer.push_char(',');
-            printer.space();
+    // The targets (MySQL `DELETE t1, t2 FROM ...`, T-SQL `DELETE d FROM
+    // ...`), written before FROM, or between FROM and USING.
+    let push_targets = |printer: &mut Printer| {
+        for (idx, tgt) in delete.targets.iter().enumerate() {
+            if idx == 0 {
+                printer.space();
+            } else {
+                printer.push_char(',');
+                printer.space();
+            }
+            printer.push_span(tgt.span);
         }
-        printer.push_span(tgt.span);
+    };
+    if !delete.targets_follow_from {
+        push_targets(printer);
     }
 
-    // FROM keyword (always present in Snowflake)
-    printer.space();
+    // FROM keyword, which a lone target may stand without (T-SQL,
+    // BigQuery: `DELETE t WHERE …`).
     if let Some(from_kw_span) = delete.from_keyword_span {
+        printer.space();
         printer.push_keyword_span(from_kw_span);
-    } else {
-        printer.push_keyword("FROM");
+    }
+
+    // MySQL `DELETE FROM t1, t2 USING <list>`: the list follows USING.
+    if delete.targets_follow_from {
+        push_targets(printer);
+        printer.newline();
+        if let Some(using_kw_span) = delete.using_keyword_span {
+            printer.push_keyword_span(using_kw_span);
+        } else {
+            printer.push_keyword("USING");
+        }
     }
 
     // Target table. The span already includes any attached join chain and
@@ -607,6 +656,19 @@ pub fn format_delete(printer: &mut Printer, delete: &AstDelete) -> Result<(), Fo
             printer.space();
         }
         printer.push_span(target.span);
+    }
+    // MySQL's FROM list after the first item, with its commas.
+    for table_ref in &delete.from_rest {
+        printer.push_char(',');
+        printer.space();
+        crate::formatter::statements::format_table_ref(printer, table_ref)?;
+    }
+
+    // OUTPUT clause (MSSQL), written after the target and before a further
+    // FROM list and WHERE.
+    if let Some(ref output) = delete.output {
+        printer.newline();
+        printer.push_span(output.span);
     }
 
     // USING clause (if present)
@@ -658,15 +720,15 @@ pub fn format_delete(printer: &mut Printer, delete: &AstDelete) -> Result<(), Fo
         delete.limit_keyword_span,
     )?;
 
-    // OUTPUT clause (MSSQL)
-    if let Some(ref output) = delete.output {
-        printer.newline_if_needed();
-        printer.push_span(output.span);
-    }
-
     // RETURNING clause (PostgreSQL)
     if let Some(ref returning) = delete.returning {
         format_returning(printer, returning)?;
+    }
+
+    // OPTION (…) query hints (MSSQL)
+    for clause in &delete.option_clauses {
+        printer.newline_if_needed();
+        printer.push_span(clause.span);
     }
 
     // Emit semicolon if present (scripting context)
@@ -675,6 +737,14 @@ pub fn format_delete(printer: &mut Printer, delete: &AstDelete) -> Result<(), Fo
     }
 
     Ok(())
+}
+
+/// The source of a DML target as written: its name through its alias.
+fn written_target(target: &crate::ast::AstObjectRef, alias: Option<Span>) -> Span {
+    Span {
+        start: target.span.start,
+        end: alias.map_or(target.span.end, |alias| alias.end.max(target.span.end)),
+    }
 }
 
 /// Format MERGE statement
@@ -694,16 +764,28 @@ pub fn format_merge(printer: &mut Printer, merge: &AstMerge) -> Result<(), Forma
         printer.push_span(with_schema_span);
     }
 
-    // INTO target_table. `target_table_span` covers only the table
-    // reference tokens; the INTO keyword (when present in the source)
-    // is carried separately via `into_span`.
+    // INTO target_table [AS alias]; the INTO keyword (when present in the
+    // source) is carried separately via `into_span`.
     if let Some(into_span) = merge.into_span {
         printer.space();
         printer.push_keyword_span(into_span);
     }
-    if let Some(target_span) = merge.target_table_span {
+    if let Some(only) = merge.only_span {
         printer.space();
-        printer.push_span(target_span);
+        printer.push_keyword_span(only);
+    }
+    if let Some(target) = &merge.target_table {
+        printer.space();
+        let written = written_target(target, merge.target_alias_span);
+        printer.push_span(written);
+        // T-SQL table hints written after a target with no alias.
+        if let Some(hints) = merge
+            .using_span
+            .and_then(|using| printer.tokens_span_within(written.end, using.start))
+        {
+            printer.space();
+            printer.push_span(hints);
+        }
     }
 
     // USING source - check if we have a parsed subquery
@@ -770,13 +852,18 @@ pub fn format_merge(printer: &mut Printer, merge: &AstMerge) -> Result<(), Forma
             source.len()
         };
 
+        // The alias's column list ends the USING clause.
+        let alias_end = |alias_span: Span| match merge.using_alias_columns.is_empty() {
+            true => alias_span.end,
+            false => merge.using_span.map_or(alias_span.end, |using| using.end),
+        };
         if let Some(rparen_rel) = source[search_start..search_end].find(')') {
             let rparen_pos = search_start as u32 + rparen_rel as u32;
             // Emit closing paren and everything after it (AS keyword, alias) up to target
             if let Some(alias_span) = merge.using_alias_span {
                 printer.push_span(Span {
                     start: rparen_pos,
-                    end: alias_span.end,
+                    end: alias_end(alias_span),
                 });
             } else {
                 printer.push_span(Span {
@@ -789,7 +876,10 @@ pub fn format_merge(printer: &mut Printer, merge: &AstMerge) -> Result<(), Forma
             printer.push_char(')');
             if let Some(alias_span) = merge.using_alias_span {
                 printer.space();
-                printer.push_identifier_span_v2(alias_span);
+                printer.push_span(Span {
+                    start: alias_span.start,
+                    end: alias_end(alias_span),
+                });
             }
         }
     } else if let Some(using_span) = merge.using_span {
@@ -813,6 +903,17 @@ pub fn format_merge(printer: &mut Printer, merge: &AstMerge) -> Result<(), Forma
     if let Some(ref output) = merge.output {
         printer.newline();
         printer.push_span(output.span);
+    }
+
+    // RETURNING clause (PostgreSQL)
+    if let Some(ref returning) = merge.returning {
+        format_returning(printer, returning)?;
+    }
+
+    // OPTION (…) query hints (MSSQL)
+    for clause in &merge.option_clauses {
+        printer.newline_if_needed();
+        printer.push_span(clause.span);
     }
 
     // Emit semicolon if present (scripting context)
@@ -900,6 +1001,10 @@ fn format_merge_action(
             // set_span covers "UPDATE SET col = val, ..." - emit entire range with trivia
             printer.push_span(*set_span);
         }
+        AstMergeActionKind::DoNothing { span } => {
+            printer.newline();
+            printer.push_keyword_span(*span);
+        }
         AstMergeActionKind::Delete { delete_span } => {
             printer.newline();
             printer.push_keyword_span(*delete_span);
@@ -919,7 +1024,8 @@ fn format_merge_action(
             printer.space();
             printer.push_keyword_span(*name_span);
         }
-        AstMergeActionKind::InsertStar { insert_span } => {
+        AstMergeActionKind::InsertStar { insert_span }
+        | AstMergeActionKind::InsertRow { insert_span } => {
             printer.newline();
             printer.push_span(*insert_span);
         }
@@ -1001,6 +1107,10 @@ fn format_returning(
             // Emit RETURNING keyword token
             printer.push_keyword_token_id(syntax.returning_token);
             printer.space();
+            if let Some(aliases) = &returning.with_aliases {
+                printer.push_span(aliases.span);
+                printer.space();
+            }
 
             // Format item list (expr [AS alias], ...)
             for (idx, item) in returning.items.iter().enumerate() {
@@ -1020,6 +1130,10 @@ fn format_returning(
     // Fallback: emit RETURNING keyword from AST span
     printer.push_keyword_span(returning.returning_span);
     printer.space();
+    if let Some(aliases) = &returning.with_aliases {
+        printer.push_span(aliases.span);
+        printer.space();
+    }
 
     // Format item list
     for (idx, item) in returning.items.iter().enumerate() {

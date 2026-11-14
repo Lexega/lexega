@@ -91,7 +91,7 @@ pub fn lower_create_dynamic_table_to_dynamic_table_plan(
 ) -> DynamicTablePlan {
     DynamicTablePlan {
         action: DynamicTableAction::Create,
-        target: Some(target_from_span(source, s.name_span)),
+        target: Some(target_from_span(source, s.name.span)),
         options: DynamicTableOptions {
             or_replace: s.or_replace_span.is_some(),
             or_alter: s.or_alter_span.is_some(),
@@ -158,7 +158,10 @@ pub fn lower_drop_dynamic_table_to_dynamic_table_plan(
     if normalized != "DYNAMIC TABLE" {
         return None;
     }
-    let target = s.target_name_span.map(|sp| target_from_span(source, sp));
+    let target = s
+        .target_name
+        .as_ref()
+        .map(|name| target_from_name(source, name));
     let cascade =
         matches!(s.cascade_restrict_span, Some(span) if matches_keyword(source, span, "CASCADE"));
     let restrict =
@@ -223,6 +226,20 @@ fn classify_alter_action(
         | K::SuspendSearchOptimization { .. }
         | K::ResumeSearchOptimization { .. }
         | K::Unknown { .. } => {}
+    }
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> DynamicTableTarget {
+    let Some((db, schema, name_text)) = crate::ir::utils::written_name_parts(source, name) else {
+        return target_from_span(source, name.span);
+    };
+    DynamicTableTarget {
+        name: name_text,
+        schema,
+        db,
+        span: name.span,
     }
 }
 

@@ -99,3 +99,12 @@ fn catalog_loads_schema_v2_with_stats_and_constraints() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_utf8_byte_order_mark_does_not_stop_a_snapshot_loading() {
+    let json = "\u{FEFF}{\"schema_version\": 2, \"generated_at\": \"2026-01-01T00:00:00Z\", \"source\": \"unit-test\", \"databases\": []}";
+    let path = write_temp_catalog_snapshot(json);
+    let snapshot = CatalogSnapshot::load_from_path(&path).expect("a marked snapshot loads");
+    assert_eq!(snapshot.schema_version, 2);
+    let _ = std::fs::remove_file(&path);
+}

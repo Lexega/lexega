@@ -46,6 +46,14 @@ pub fn handle_ci_command(args: &[String], ext: &dyn Extension) {
                     eprintln!("Error: --range requires a value (BASE..HEAD)");
                     process::exit(1);
                 }
+                if let Some(first) = forced_range.as_ref().filter(|first| **first != rest[i + 1]) {
+                    eprintln!(
+                        "Error: --range is given twice, as '{}' and as '{}'; give it once",
+                        first,
+                        rest[i + 1]
+                    );
+                    process::exit(1);
+                }
                 forced_range = Some(rest[i + 1].clone());
                 i += 2;
             }
@@ -60,7 +68,8 @@ pub fn handle_ci_command(args: &[String], ext: &dyn Extension) {
         process::exit(1);
     }
 
-    let (paths, options, defaulted) = split_paths_and_options(&remaining);
+    let (paths, options) = split_paths_and_options(&remaining);
+    let recursion = recursion_flag(&options);
 
     // A path after the options started would be forwarded as an EXTRA
     // positional and double-analyze the tree — refuse instead of guessing.
@@ -110,9 +119,7 @@ pub fn handle_ci_command(args: &[String], ext: &dyn Extension) {
             eprintln!("ci: {} → reviewing {}", detail, range);
             let mut forwarded = vec![args[0].clone(), "review".to_string(), range];
             forwarded.extend(paths);
-            if defaulted {
-                forwarded.push("-r".to_string());
-            }
+            forwarded.extend(recursion);
             forwarded.extend(options);
             crate::dispatch(&forwarded, ext);
         }
@@ -120,9 +127,7 @@ pub fn handle_ci_command(args: &[String], ext: &dyn Extension) {
             eprintln!("ci: {} → analyzing current state", detail);
             let mut forwarded = vec![args[0].clone(), "analyze".to_string()];
             forwarded.extend(paths);
-            if defaulted {
-                forwarded.push("-r".to_string());
-            }
+            forwarded.extend(recursion);
             let (options, dropped) = strip_review_only_options(options);
             for flag in dropped {
                 eprintln!("ci: no pull request on this run — ignoring {}", flag);
@@ -154,20 +159,32 @@ fn strip_review_only_options(options: Vec<String>) -> (Vec<String>, Vec<&'static
     (kept, dropped)
 }
 
+/// `-r` unless the options already ask for recursion: a directory `ci` is
+/// given is read with everything under it, on a change and a snapshot run
+/// alike.
+fn recursion_flag(options: &[String]) -> Option<String> {
+    let given = options.iter().any(|o| o == "-r" || o == "--recursive");
+    (!given).then(|| "-r".to_string())
+}
+
 /// Leading non-flag arguments are paths; everything from the first flag
 /// onward is forwarded verbatim, so flag VALUES are never misread as
-/// paths. With no paths given, default to the whole tree recursively
-/// (returned bool = defaults were injected).
-fn split_paths_and_options(args: &[String]) -> (Vec<String>, Vec<String>, bool) {
+/// paths. With no paths given, the whole tree.
+fn split_paths_and_options(args: &[String]) -> (Vec<String>, Vec<String>) {
     let split = args
         .iter()
         .position(|a| a.starts_with('-'))
         .unwrap_or(args.len());
     let (paths, options) = args.split_at(split);
-    if paths.is_empty() {
-        (vec![".".to_string()], options.to_vec(), true)
+    // Paths after `--` are explicit; nothing is defaulted around them.
+    let explicit_after_dashes = options
+        .iter()
+        .position(|a| a == "--")
+        .is_some_and(|at| at + 1 < options.len());
+    if paths.is_empty() && !explicit_after_dashes {
+        (vec![".".to_string()], options.to_vec())
     } else {
-        (paths.to_vec(), options.to_vec(), false)
+        (paths.to_vec(), options.to_vec())
     }
 }
 
@@ -176,7 +193,11 @@ fn split_paths_and_options(args: &[String]) -> (Vec<String>, Vec<String>, bool) 
 /// option in `analyze`/`review` takes exactly one value, so a legitimate
 /// value always has a `-`-leading predecessor.)
 fn find_misplaced_positional(options: &[String]) -> Option<&str> {
-    options.windows(2).find_map(|w| {
+    let end = options
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(options.len());
+    options[..end].windows(2).find_map(|w| {
         if !w[0].starts_with('-') && !w[1].starts_with('-') {
             Some(w[1].as_str())
         } else {
@@ -197,21 +218,54 @@ fn detect_ci_mode() -> Option<CiMode> {
         CiPlatform::GitHub => {
             let event = var("GITHUB_EVENT_NAME").unwrap_or_else(|| "push".to_string());
             if event == "pull_request" || event == "pull_request_target" {
-                let base = github_base_sha()
+                let pull_request = github_pull_request();
+                let base = pull_request
+                    .as_ref()
+                    .and_then(|pr| pull_request_sha(pr, "base"))
                     .or_else(|| var("GITHUB_BASE_REF").map(|b| format!("origin/{}", b)));
-                return match base {
-                    Some(base) => Some(CiMode::Change {
-                        range: format!("{}..HEAD", base),
-                        detail: format!("GitHub Actions {} event", event),
-                    }),
-                    None => {
-                        eprintln!(
+                let Some(base) = base else {
+                    eprintln!(
                         "Error: GitHub Actions {} event but neither the event payload nor GITHUB_BASE_REF provides a base ref.",
                         event
                     );
+                    process::exit(1);
+                };
+                // On `pull_request_target` the workflow checks out the base
+                // branch: the pull request's head is the commit the event
+                // names, read from git whatever is checked out.
+                let head = if event == "pull_request_target" {
+                    let Some(pr) = pull_request.as_ref() else {
+                        refuse_target_without_head();
+                    };
+                    let Some(head) = pull_request_sha(pr, "head") else {
+                        refuse_target_without_head();
+                    };
+                    // A fork's head is fetched by no checkout of the base
+                    // repository's branches: it is under the pull request's
+                    // own ref.
+                    let held = super::git::holds_commit(&head).unwrap_or_else(|e| {
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    });
+                    if !held {
+                        let fetch = pr
+                            .get("number")
+                            .and_then(|n| n.as_u64())
+                            .map_or_else(|| head.clone(), |n| format!("pull/{}/head", n));
+                        eprintln!(
+                            "Error: the pull request's head commit {} is not in this clone: on pull_request_target the checkout is the base branch. Fetch the head before `ci`: `git fetch origin {}`.",
+                            head, fetch
+                        );
                         process::exit(1);
                     }
+                    head
+                } else {
+                    "HEAD".to_string()
                 };
+                return Some(CiMode::Change {
+                    range: format!("{}..{}", base, head),
+                    detail: format!("GitHub Actions {} event", event),
+                });
             }
             Some(CiMode::Snapshot {
                 detail: format!("GitHub Actions {} event", event),
@@ -281,19 +335,31 @@ fn detect_ci_mode() -> Option<CiMode> {
     }
 }
 
-/// Exact base commit of the PR from the GitHub event payload — more
-/// precise than `origin/<base-branch>`, which may have advanced past the
-/// recorded merge base since the event fired.
-fn github_base_sha() -> Option<String> {
+/// The `pull_request` object of the GitHub event payload.
+fn github_pull_request() -> Option<serde_json::Value> {
     let event_path = var("GITHUB_EVENT_PATH")?;
     let content = std::fs::read_to_string(&event_path).ok()?;
-    let event: serde_json::Value = serde_json::from_str(&content).ok()?;
-    event
-        .get("pull_request")
-        .and_then(|pr| pr.get("base"))
+    let mut event: serde_json::Value = serde_json::from_str(&content).ok()?;
+    Some(event.get_mut("pull_request")?.take())
+}
+
+/// The commit of the pull request's `side` (`base` or `head`). Its base is
+/// more precise than `origin/<base-branch>`, which may have advanced past
+/// the recorded merge base since the event fired.
+fn pull_request_sha(pull_request: &serde_json::Value, side: &str) -> Option<String> {
+    pull_request
+        .get(side)
         .and_then(|b| b.get("sha"))
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
+}
+
+/// Stop a `pull_request_target` run whose payload names no head commit.
+fn refuse_target_without_head() -> ! {
+    eprintln!(
+        "Error: GitHub Actions pull_request_target event but the event payload gives no pull_request.head.sha: on this event the checkout is the base branch, and the pull request's head is the commit the payload names."
+    );
+    process::exit(1);
 }
 
 /// `refs/heads/main` → `main`; already-bare branch names pass through.
@@ -310,30 +376,36 @@ mod tests {
     }
 
     #[test]
-    fn split_defaults_to_recursive_whole_tree() {
-        let (paths, options, defaulted) = split_paths_and_options(&v(&["--policy", "p.yml"]));
+    fn split_defaults_to_the_whole_tree() {
+        let (paths, options) = split_paths_and_options(&v(&["--policy", "p.yml"]));
         assert_eq!(paths, v(&["."]));
         assert_eq!(options, v(&["--policy", "p.yml"]));
-        assert!(defaulted);
+    }
+
+    #[test]
+    fn every_path_is_read_recursively_unless_the_options_say_so() {
+        assert_eq!(
+            recursion_flag(&v(&["--env", "prod"])),
+            Some("-r".to_string())
+        );
+        assert_eq!(recursion_flag(&v(&["-r", "--env", "prod"])), None);
+        assert_eq!(recursion_flag(&v(&["--recursive"])), None);
     }
 
     #[test]
     fn split_keeps_leading_paths_and_forwards_flag_values_untouched() {
-        let (paths, options, defaulted) =
+        let (paths, options) =
             split_paths_and_options(&v(&["models/", "macros/", "--env", "prod"]));
         assert_eq!(paths, v(&["models/", "macros/"]));
         assert_eq!(options, v(&["--env", "prod"]));
-        assert!(!defaulted);
     }
 
     #[test]
     fn split_never_reads_flag_values_as_paths() {
         // `prod` is --env's value; it must stay in the forwarded options.
-        let (paths, options, defaulted) =
-            split_paths_and_options(&v(&["--env", "prod", "models/"]));
+        let (paths, options) = split_paths_and_options(&v(&["--env", "prod", "models/"]));
         assert_eq!(paths, v(&["."]));
         assert_eq!(options, v(&["--env", "prod", "models/"]));
-        assert!(defaulted);
     }
 
     #[test]

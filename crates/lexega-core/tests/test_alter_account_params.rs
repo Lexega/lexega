@@ -12,25 +12,25 @@ use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
-        .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+fn extract_rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> HashSet<String> {
+    findings
+        .into_iter()
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(report.entries())
 }
 
 #[test]
 fn test_unload_to_inline_url_is_critical() {
     let report = analyze_risk("ALTER ACCOUNT SET PREVENT_UNLOAD_TO_INLINE_URL = FALSE;")
         .expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(report.entries());
     assert!(rules.contains("SNW-ACCT-UNLOAD-INLINE"), "got {rules:?}");
     assert!(rules.contains("INFO-SNW-ACCT-PARAM-CHG"), "got {rules:?}");
     assert!(

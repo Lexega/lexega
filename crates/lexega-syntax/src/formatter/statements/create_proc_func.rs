@@ -7,6 +7,7 @@
 //! - CREATE [OR REPLACE] PROCEDURE
 //! - CREATE [OR REPLACE] FUNCTION
 
+use crate::ast::{AstRoutineLanguage, AstStmt};
 use crate::error::ExpectInvariant;
 use crate::formatter::config::ParamListStyle;
 use crate::formatter::printer::Printer;
@@ -37,8 +38,9 @@ pub fn format_create_procedure(
     name_span: Span,
     params_span: Span,
     returns_span: Span,
+    language: &AstRoutineLanguage,
     body_span: Span,
-    body_stmt: Option<&crate::ast::AstStmt>,
+    body_stmt: Option<&AstStmt>,
     opening_delimiter_token: Option<crate::cst::TokenId>,
     closing_delimiter_token: Option<crate::cst::TokenId>,
 ) -> Result<(), FormatterError> {
@@ -102,15 +104,6 @@ pub fn format_create_procedure(
         end: opening_delim_start,
     };
 
-    // Determine if the body should be formatted with recursive descent.
-    // If body_stmt is Some, the parser already successfully parsed it as SQL scripting —
-    // that's authoritative regardless of where LANGUAGE appears (before or after the body).
-    // Fall back to text scan for cases where LANGUAGE SQL is declared but body didn't parse.
-    let returns_text = printer.extract_span(returns_clause_span).to_string();
-    let normalized = returns_text.to_uppercase();
-    let is_language_sql =
-        body_stmt.is_some() || (normalized.contains("LANGUAGE") && normalized.contains("SQL"));
-
     // Emit the RETURNS clause (without opening delimiter)
     printer.push_raw_source(returns_clause_span);
 
@@ -135,16 +128,10 @@ pub fn format_create_procedure(
         false
     };
 
-    // Format the body using recursive descent only for LANGUAGE SQL (Snowflake Scripting)
-    // For other languages (JavaScript, Python, Java, Scala), preserve as-is
-    if is_language_sql {
-        printer.newline();
-
-        if let Some(stmt) = body_stmt {
-            // Use recursive descent formatting with shared context for Snowflake Scripting
-            // body_stmt contains the parsed BEGIN...END or DECLARE...BEGIN...END block
-            // No extra indentation - the Block formatter handles its own indentation
-
+    match formatted_body(language, body_stmt) {
+        Some(stmt) => {
+            // The block's own layout; the Block formatter indents it.
+            printer.newline();
             crate::formatter::statements::format_scripting_statement(printer, stmt)?;
 
             // After body formatting, emit everything from the closing $$ through span.end
@@ -170,77 +157,50 @@ pub fn format_create_procedure(
             } else {
                 printer.emit_all_tokens_until(span.end);
             }
-        } else {
-            // Body content without a parsed stmt - preserve as-is
-            // body_span now contains just the SQL content (delimiters already excluded by parser)
-
-            // Extract and emit body content line by line
-            // We can't use push_span here because it would advance source_position
-            // and emit trailing trivia, which would interfere with the closing $$ emission
-            let body_text = printer.extract_span(body_span).to_string();
-
-            if printer.config().create_proc_func_body_indent {
-                printer.indent_up();
-            }
-
-            for line in body_text.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    printer.push(trimmed);
+        }
+        None => {
+            // A body the formatter does not lay out is copied as written
+            // through the end of the statement: its bytes, the break and
+            // indentation before its closing delimiter, and a clause after
+            // it (`$$ LANGUAGE plv8`) are the source's whatever line break
+            // the file is written with.
+            let copied_end = match closing_delimiter_token {
+                Some(closing_token_id) => Some(
+                    printer
+                        .get_token_by_id(closing_token_id)
+                        .expect_invariant("closing delimiter token should exist")
+                        .span
+                        .end,
+                ),
+                None => (!has_dollar_delimiters).then_some(body_span.end),
+            };
+            match copied_end {
+                Some(end) => printer.push_raw_source(Span {
+                    start: body_span.start,
+                    end: end.max(span.end),
+                }),
+                None => {
+                    printer.push_raw_source(body_span);
                     printer.newline();
+                    printer.emit_all_tokens_until(span.end);
                 }
             }
-
-            if printer.config().create_proc_func_body_indent {
-                printer.indent_down();
-            }
-
-            // Manually advance source_position to body_span.end
-            // This skips over the body content we just emitted
-            printer.set_source_position(body_span.end);
-
-            // Handle closing $$ only if original had delimiters
-            if has_dollar_delimiters {
-                printer.newline();
-
-                // Emit the closing delimiter via its CST token (handles `$$` and
-                // tagged `$tag$` alike). If absent (unterminated/opaque body), the
-                // trailing emit_all_tokens_until(span.end) below picks up any
-                // remaining tokens.
-                if let Some(closing_token_id) = closing_delimiter_token {
-                    printer.push_token_id(closing_token_id);
-                }
-            }
-
-            // Emit any remaining tokens and trivia (including semicolon) until end of statement
-            printer.emit_all_tokens_until(span.end);
         }
-    } else {
-        // For non-SQL languages (JavaScript, Python, etc.), preserve body as-is
-        // We need to emit the body span directly and advance source_position correctly
-        // to prevent double-emission when emit_all_tokens_until is called later
-
-        // body_span contains the content between $$ delimiters (excluding delimiters)
-        // Use push_raw_source which handles source_position advancement
-        printer.push_raw_source(body_span);
-
-        if has_dollar_delimiters {
-            printer.newline();
-
-            // Emit the closing delimiter via its CST token (handles `$$` and
-            // tagged `$tag$` alike). If absent (unterminated/opaque body), the
-            // trailing emit_all_tokens_until(span.end) below picks up any
-            // remaining tokens.
-            if let Some(closing_token_id) = closing_delimiter_token {
-                printer.push_token_id(closing_token_id);
-            }
-        }
-
-        // Emit any remaining tokens and trivia (including semicolon) until end of statement
-        printer.emit_all_tokens_until(span.end);
     }
 
     Ok(())
+}
+
+/// The body the formatter lays out as SQL statements: one in SQL
+/// (`language`) that the parser read as a block. `None` for any other body,
+/// which is copied as written: one in another language, or SQL the parser
+/// did not read (a string, a T-SQL statement list, a dollar-quoted body that
+/// is not one block).
+pub(crate) fn formatted_body<'s>(
+    language: &AstRoutineLanguage,
+    body_stmt: Option<&'s AstStmt>,
+) -> Option<&'s AstStmt> {
+    body_stmt.filter(|_| *language == AstRoutineLanguage::Sql)
 }
 
 /// Format CREATE FUNCTION statement
@@ -271,7 +231,7 @@ pub fn format_create_function(
     if_not_exists_span: Option<Span>,
     name_span: Span,
     params_span: Span,
-    _returns_span: Span,
+    _returns: Option<crate::ast::AstReturnsClause>,
     _body_span: Span,
     _body_stmt: Option<&crate::ast::AstStmt>,
     _opening_delimiter_token: Option<crate::cst::TokenId>,

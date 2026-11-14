@@ -13,8 +13,7 @@
 //! - `cascade: Option<Span>` — the `CASCADE` option.
 //! - `as_principal: Option<AstDenyAs>` — the `AS <principal>` clause.
 //!
-//! The `ON [class::]securable` clause is captured span-only. Promote it
-//! to typed fields when the first consumer needs the class or name.
+//! The `ON [class::]securable` clause is kept typed as a GRANT's object is.
 //!
 //! Grammar (MSSQL T-SQL):
 //! ```text
@@ -33,7 +32,7 @@
 //! permissive: malformed DENY never aborts the script.
 
 use crate::ast::{AstDeny, AstDenyAs, AstDenyObject, AstGrantee, AstPrivilegeList, AstStmt};
-use crate::error::ParseResult;
+use crate::error::{ParseResult, ParseResultExt};
 use crate::lexer::token::{Span, TokenKind};
 use crate::lexer::{Keyword, Punctuation};
 use crate::parser::core::Parser;
@@ -41,6 +40,7 @@ use crate::parser::grant::{
     body_start_pos_after, consume_to_terminator, current_position, expect_keyword, parse_grantee,
     parse_privilege_list, peek_lexeme_eq,
 };
+use crate::parser::mssql_grant::parse_mssql_grant_object;
 
 /// Parse a `DENY ...` statement. Always succeeds: typed-parse failure
 /// degrades to an [`AstDeny`] with empty `privileges` / `grantees`, so
@@ -112,13 +112,36 @@ fn try_parse_deny_body(
     let privileges = parse_privilege_list(p)?;
 
     // 2) Optional `ON [class::]securable`. MSSQL uses `::` as a scope
-    //    qualifier; we capture everything between `ON` and `TO` (the
-    //    next mandatory keyword) into `target_span`.
+    //    qualifier; the securable is typed as a GRANT types it, and
+    //    everything between `ON` and `TO` (the next mandatory keyword) is
+    //    `target_span`.
     let object_span = if peek_token_kind(p, TokenKind::Keyword(Keyword::On)) {
-        let on_kw = p.advance().expect("peek confirmed");
+        let on_kw = p
+            .advance()
+            .ok_or_eof(p.current_span(), vec!["ON".to_string()])?;
         let on_span = on_kw.span;
         let target_start = on_span.end;
         let mut target_end = target_start;
+        let before_object = p.idx;
+        let names_object = p.peek_non_trivia().is_some_and(|t| {
+            !matches!(
+                t.kind,
+                TokenKind::Keyword(Keyword::To)
+                    | TokenKind::Punctuation(Punctuation::Semi)
+                    | TokenKind::Eof
+            )
+        });
+        let object = match names_object.then(|| parse_mssql_grant_object(p)) {
+            Some(Ok(object)) => {
+                target_end = current_position(p);
+                Some(object)
+            }
+            Some(Err(_)) => {
+                p.idx = before_object;
+                None
+            }
+            None => None,
+        };
         while let Some(tok) = p.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Keyword(Keyword::To)) {
                 break;
@@ -129,7 +152,9 @@ fn try_parse_deny_body(
             ) {
                 break;
             }
-            let consumed = p.advance().expect("peek confirmed");
+            let consumed = p
+                .advance()
+                .ok_or_eof(p.current_span(), vec!["securable".to_string()])?;
             target_end = consumed.span.end;
         }
         Some(AstDenyObject {
@@ -138,6 +163,7 @@ fn try_parse_deny_body(
                 start: target_start,
                 end: target_end,
             },
+            object,
         })
     } else {
         None
@@ -157,7 +183,9 @@ fn try_parse_deny_body(
     //    `Keyword::Cascade` for some dialects and an unquoted
     //    identifier for others. Match by uppercased lexeme for safety.
     let cascade = if peek_lexeme_eq(p, "CASCADE") {
-        let tok = p.advance().expect("peek confirmed");
+        let tok = p
+            .advance()
+            .ok_or_eof(p.current_span(), vec!["CASCADE".to_string()])?;
         Some(tok.span)
     } else {
         None
@@ -165,7 +193,9 @@ fn try_parse_deny_body(
 
     // 5) Trailing `AS <principal>` (optional).
     let as_principal = if peek_token_kind(p, TokenKind::Keyword(Keyword::As)) {
-        let as_tok = p.advance().expect("peek confirmed");
+        let as_tok = p
+            .advance()
+            .ok_or_eof(p.current_span(), vec!["AS".to_string()])?;
         let principal_name_span = p.parse_qualified_name_span()?;
         Some(AstDenyAs {
             keyword_span: as_tok.span,

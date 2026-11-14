@@ -37,7 +37,7 @@ fn parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -531,4 +531,63 @@ fn test_do_block_idempotent() {
     let first = format_and_verify(sql);
     let second = format_and_verify(&first);
     assert_eq!(first, second, "Formatting should be idempotent");
+}
+
+#[test]
+fn an_index_column_list_is_read_as_key_expressions() {
+    use lexega_syntax::dialect::{mssql, mysql, postgres};
+    use lexega_syntax::parse_sql_with_dialect;
+    // (dialect, statement, the key of each element, in order). A MySQL
+    // prefix length is no call; modifiers are no part of a key; a list
+    // that does not read is kept as its span alone.
+    let cases = [
+        (postgres(), "CREATE INDEX i ON t (name)", vec!["name"]),
+        (
+            postgres(),
+            "CREATE INDEX i ON t (a, b DESC NULLS LAST, c ASC)",
+            vec!["a", "b", "c"],
+        ),
+        (
+            postgres(),
+            "CREATE INDEX i ON t USING gin (lower(name) text_pattern_ops, (a + b), f('x'), body gin_trgm_ops(siglen = 32))",
+            vec!["lower(name)", "(a + b)", "f('x')", "body"],
+        ),
+        (
+            postgres(),
+            "CREATE INDEX i ON t ((a ->> 'k'), s.f(b) DESC) INCLUDE (c) WHERE g(d)",
+            vec!["(a ->> 'k')", "s.f(b)"],
+        ),
+        (
+            mysql(),
+            "CREATE INDEX i ON t (name(10), `body`(20) DESC, ((a + b)), c)",
+            vec!["name", "`body`", "((a + b))", "c"],
+        ),
+        (
+            mssql(),
+            "CREATE NONCLUSTERED INDEX i ON t (a ASC, [b] DESC) INCLUDE (c)",
+            vec!["a", "[b]"],
+        ),
+        (
+            postgres(),
+            "CREATE INDEX i ON t (c COLLATE \"C\" DESC, d)",
+            vec!["c", "d"],
+        ),
+        (postgres(), "CREATE INDEX i ON t (a +, b)", vec![]),
+        (postgres(), "CREATE INDEX i ON t (a b + c)", vec![]),
+    ];
+    for (dialect, sql, keys) in cases {
+        let script = parse_sql_with_dialect(sql, dialect.as_ref()).expect("should parse");
+        assert_eq!(script.stmts.len(), 1, "{sql}");
+        let AstStmt::CreateIndex(index) = &script.stmts[0] else {
+            panic!("an index: {:?}", script.stmts[0]);
+        };
+        let text = |s: lexega_syntax::lexer::Span| &sql[s.start as usize..s.end as usize];
+        let read: Vec<&str> = index.column_exprs.iter().map(|e| text(e.span())).collect();
+        assert_eq!(read, keys, "{sql}");
+        let columns = text(index.columns_span);
+        assert!(
+            columns.starts_with('(') && columns.ends_with(')'),
+            "{sql}: {columns}"
+        );
+    }
 }

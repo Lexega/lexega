@@ -12,8 +12,10 @@ use lexega_syntax::{
 };
 
 fn roundtrip_sf(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::snowflake();
+    let config = FormatterConfig {
+        dialect: dialect::snowflake(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens (no stray paren)");

@@ -6,12 +6,14 @@
 use crate::dialect::Dialect;
 use crate::facts::reasoning::{Reasoning, RecognitionOnly};
 use crate::{
-    analyze_risk_core, analyzer, apply_dialect_normalization, ast, build_script_context_fold,
-    builtin_load_failure_to_parse_error, error, evaluate_ddl_rules_for_script,
-    evaluate_policy_attachment_rules_for_script, evaluate_privilege_rules_for_script,
-    evaluate_query_rules_for_script, facts, ir, parse_sql, parse_sql_with_dialect,
-    parse_with_optional_dialect, prepare_and_parse_for_analysis,
-    prepare_sql_for_analysis_with_context, rules, template, PreparedScript,
+    adopt_dialect, analyze_carrying, analyze_for_comparison, analyze_reading_last,
+    analyze_risk_core, analyzer, ast, build_script_context_fold,
+    builtin_load_failure_to_parse_error, ddl_facts, error, evaluate_statements, facts,
+    flat_stmts_for_rules, ir, parse_sql, parse_sql_with_dialect, parse_with_optional_dialect,
+    policy_attachment_facts, prepare_and_parse_for_analysis, prepare_sql_for_analysis_with_context,
+    privilege_facts, query_facts, reported_unwalked, rules, script_relations, template,
+    CarriedRelations, DdlReading, DialectScope, LastStatement, PreparedScript, QueryReading,
+    ScriptAnalysis,
 };
 
 /// Runs analysis with the semantic depth its reasoning provider supplies.
@@ -41,8 +43,9 @@ impl<'r> Engine<'r> {
         self.reasoning
     }
 
-    /// Substitution pre-passes, template render, dialect-aware parse and
-    /// ambient dialect setup for one source, in that order.
+    /// Substitution pre-passes, template render and dialect-aware parse
+    /// for one source, in that order. Adopts no dialect: the analysis of
+    /// the result does.
     pub fn prepare_and_parse(
         &self,
         src: &str,
@@ -63,13 +66,22 @@ impl<'r> Engine<'r> {
         prepare_sql_for_analysis_with_context(src, file_path, self.reasoning)
     }
 
-    /// Adopt `dialect` for the current thread. Must run before lowering:
-    /// identifier normalization reads the ambient dialect.
-    pub fn apply_dialect(&self, dialect: &Option<crate::dialect::DialectRef>) {
-        apply_dialect_normalization(dialect, self.reasoning);
+    /// Adopt `dialect` (Snowflake when `None`) for the current thread until
+    /// the returned scope is dropped, then give the thread back what it had
+    /// before. Keep the scope alive across everything that lowers a
+    /// statement or folds a name outside [`Self::analyze_script`]: with no
+    /// scope alive, a debug build panics at the first name folded and a
+    /// release build folds it as Snowflake does, whatever the thread
+    /// analysed earlier; a provider's hold dropped as its scope ends is the
+    /// one exception (see [`crate::facts::reasoning::DialectHold`]). Scopes
+    /// are dropped innermost first, on the thread that opened them: see
+    /// [`DialectScope`].
+    pub fn apply_dialect(&self, dialect: &Option<crate::dialect::DialectRef>) -> DialectScope {
+        adopt_dialect(dialect.as_deref(), self.reasoning)
     }
 
-    /// Analyze a parsed script. `render.sql` must be the exact text
+    /// Analyze a parsed script under `policy_config`'s dialect, which it
+    /// adopts for its own length. `render.sql` must be the exact text
     /// `script` was parsed from — redaction spans, the line index and
     /// the script-context fold all index it.
     #[allow(clippy::too_many_arguments)] // mirrors the analysis inputs one-to-one
@@ -91,6 +103,66 @@ impl<'r> Engine<'r> {
             catalog_path,
             source_file,
             model_catalog,
+            self.reasoning,
+        )
+    }
+
+    /// [`Self::analyze_script`], `read_last` called with the script's last
+    /// statement as the analysis lowers it to read it as a query
+    /// ([`LastStatement`]); not called where the analysis lowers no such
+    /// statement (one that does not lower, or a corpus of no rule).
+    #[allow(clippy::too_many_arguments)] // mirrors `analyze_script`, and the reader
+    pub fn analyze_script_reading_last(
+        &self,
+        render: &template::RenderArtifacts,
+        script: &ast::AstScript,
+        policy_config: &analyzer::AnalysisConfig,
+        catalog_index: Option<&crate::catalog::CatalogIndex>,
+        catalog_path: Option<&str>,
+        source_file: Option<&str>,
+        model_catalog: Option<&ir::model_catalog::ModelCatalog>,
+        read_last: &mut dyn FnMut(LastStatement<'_>),
+    ) -> Result<analyzer::AnalysisReport, analyzer::RiskError> {
+        analyze_reading_last(
+            render,
+            script,
+            policy_config,
+            catalog_index,
+            catalog_path,
+            source_file,
+            model_catalog,
+            self.reasoning,
+            read_last,
+        )
+    }
+
+    /// [`Self::analyze_script`] as one of a set of scripts run in order:
+    /// `carried` holds the relations the scripts run before it leave
+    /// ([`CarriedRelations`]), which its statements find before they change
+    /// them, and afterwards those it leaves for the script run after it,
+    /// the very ones its own analysis read. Unchanged where the analysis
+    /// fails.
+    #[allow(clippy::too_many_arguments)] // mirrors `analyze_script`, and the carried relations
+    pub fn analyze_script_carrying(
+        &self,
+        render: &template::RenderArtifacts,
+        script: &ast::AstScript,
+        policy_config: &analyzer::AnalysisConfig,
+        catalog_index: Option<&crate::catalog::CatalogIndex>,
+        catalog_path: Option<&str>,
+        source_file: Option<&str>,
+        model_catalog: Option<&ir::model_catalog::ModelCatalog>,
+        carried: &mut CarriedRelations,
+    ) -> Result<analyzer::AnalysisReport, analyzer::RiskError> {
+        analyze_carrying(
+            render,
+            script,
+            policy_config,
+            catalog_index,
+            catalog_path,
+            source_file,
+            model_catalog,
+            carried,
             self.reasoning,
         )
     }
@@ -193,58 +265,33 @@ impl<'r> Engine<'r> {
         catalog_index: Option<&crate::catalog::CatalogIndex>,
         source_file: Option<&str>,
     ) -> Result<analyzer::AnalysisReport, analyzer::RiskError> {
-        // Deployment-variable and SnowSQL `&var` substitution on already-rendered
-        // SQL (e.g. the CLI renders Jinja then defers substitution here);
-        // line-preserving so the source map stays valid. Unresolved-marker
-        // placeholders fold into the artifacts' counts so confidence reflects
-        // them (a no-op when the caller already substituted).
-        let deploy = template::deployvars::preprocess(
-            &render.sql,
-            &policy_config.dialect,
-            &template::SubstitutionConfig::default(),
-            None,
-        );
-        let prepared = template::snowsql::preprocess(&deploy.sql, &policy_config.dialect, None);
-        let untouched = deploy.placeholders.is_empty()
-            && prepared.placeholders.is_empty()
-            && matches!(deploy.sql, std::borrow::Cow::Borrowed(_))
-            && matches!(prepared.sql, std::borrow::Cow::Borrowed(_));
-        let adjusted;
-        let render: &template::RenderArtifacts = if untouched {
-            render
-        } else {
-            let deploy_stats =
-                analyzer::compute_placeholder_stats(&deploy.sql, &deploy.placeholders);
-            let snow_stats =
-                analyzer::compute_placeholder_stats(&prepared.sql, &prepared.placeholders);
-            let mut folded = render.clone();
-            // A rewrite moves byte offsets: the caller's placeholder spans are
-            // stale in the substituted text, so drop them (their counts are
-            // already in the stats); each stage's own records attach below iff
-            // their offsets index the final text.
-            if prepared.sql != folded.sql {
-                folded.placeholder_spans.clear();
-            }
-            folded.sql = prepared.sql.into_owned();
-            // SnowSQL records index its output — the final text — by construction.
-            folded.attach_placeholder_spans(&prepared.placeholders);
-            // Deploy records index deploy.sql; valid only if the SnowSQL stage
-            // was an identity pass.
-            folded.extend_placeholder_spans_if_current(&deploy.sql, &deploy.placeholders);
-            folded.placeholders.absorb(&snow_stats);
-            folded.placeholders.absorb(&deploy_stats);
-            adjusted = folded;
-            &adjusted
-        };
-        let script = parse_with_optional_dialect(
-            &render.sql,
-            &policy_config.dialect,
-            &render.placeholder_spans,
-        )?;
-        apply_dialect_normalization(&policy_config.dialect, self.reasoning);
-
+        let (render, script) = substituted_and_parsed(render, policy_config)?;
         analyze_risk_core(
-            render,
+            &render,
+            &script,
+            policy_config,
+            catalog_index,
+            None,
+            source_file,
+            None, // no model catalog
+            self.reasoning,
+        )
+    }
+
+    /// [`Self::analyze_risk_with_source_map`], keeping what comparing the
+    /// script with another reads: the text analysed, each statement's facts
+    /// and the report's findings occurrence by occurrence
+    /// ([`ScriptAnalysis::findings_of`]).
+    pub fn analyze_for_comparison(
+        &self,
+        render: &template::RenderArtifacts,
+        policy_config: &analyzer::AnalysisConfig,
+        catalog_index: Option<&crate::catalog::CatalogIndex>,
+        source_file: Option<&str>,
+    ) -> Result<ScriptAnalysis, analyzer::RiskError> {
+        let (render, script) = substituted_and_parsed(render, policy_config)?;
+        analyze_for_comparison(
+            &render,
             &script,
             policy_config,
             catalog_index,
@@ -258,7 +305,7 @@ impl<'r> Engine<'r> {
     /// Customer-facing entry point for the v1 fact-based pipeline.
     /// Parses `sql`, lowers every `GRANT` / `REVOKE` statement to a typed
     /// `PrivilegePlan`, projects to public `PrivilegeFacts`, and evaluates
-    /// the built-in privilege-rule corpus. Returns one `Signal` per rule
+    /// the built-in privilege-rule corpus. Returns one `Finding` per rule
     /// match.
     ///
     /// Scope: privilege statements only — non-Grant/Revoke statements are
@@ -266,19 +313,23 @@ impl<'r> Engine<'r> {
     pub fn analyze_privilege_facts(
         &self,
         sql: &str,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         let script = parse_sql(sql)?;
+        let _dialect = adopt_dialect(None, self.reasoning);
         let fold = build_script_context_fold(&script, sql);
         let corpus = rules::all_builtin_rules().map_err(builtin_load_failure_to_parse_error)?;
-        Ok(evaluate_privilege_rules_for_script(
-            &script,
-            sql,
+        Ok(evaluate_statements(
+            &flat_stmts_for_rules(&script),
             &fold,
-            None,
+            &reported_unwalked(&script, sql, None),
             corpus,
-            self.reasoning,
             None,
             None,
+            |_, stmt, _, readings| {
+                readings
+                    .families
+                    .extend(privilege_facts(stmt, sql, None, self.reasoning));
+            },
         ))
     }
 
@@ -294,19 +345,23 @@ impl<'r> Engine<'r> {
         &self,
         sql: &str,
         catalog: &crate::catalog::CatalogIndex,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         let script = parse_sql(sql)?;
+        let _dialect = adopt_dialect(None, self.reasoning);
         let fold = build_script_context_fold(&script, sql);
         let corpus = rules::all_builtin_rules().map_err(builtin_load_failure_to_parse_error)?;
-        Ok(evaluate_privilege_rules_for_script(
-            &script,
-            sql,
+        Ok(evaluate_statements(
+            &flat_stmts_for_rules(&script),
             &fold,
-            Some(catalog),
+            &reported_unwalked(&script, sql, None),
             corpus,
-            self.reasoning,
             None,
             None,
+            |_, stmt, _, readings| {
+                readings
+                    .families
+                    .extend(privilege_facts(stmt, sql, Some(catalog), self.reasoning));
+            },
         ))
     }
 
@@ -317,10 +372,10 @@ impl<'r> Engine<'r> {
     /// `ddl.stage`), and evaluates the loaded built-in rule corpus against
     /// each statement's facts.
     ///
-    /// Returns one `Signal` per rule match across all statements in the
+    /// Returns one `Finding` per rule match across all statements in the
     /// input. Statements outside the supported family are skipped silently
     /// — the customer pipeline is permissive by design so a single
-    /// un-handled fragment doesn't suppress signals on the rest of the
+    /// un-handled fragment doesn't suppress findings on the rest of the
     /// script.
     ///
     /// Current scope: `CREATE STAGE`, `ALTER STAGE`, `COPY INTO <location>`,
@@ -329,7 +384,7 @@ impl<'r> Engine<'r> {
     /// `derive_facts_from_stage_plan`; the storage-credential family
     /// dispatches through `derive_facts_from_storage_credential_plan`.
     /// Both feed the same `evaluate_rules` corpus.
-    pub fn analyze_ddl_facts(&self, sql: &str) -> Result<Vec<rules::Signal>, error::ParseError> {
+    pub fn analyze_ddl_facts(&self, sql: &str) -> Result<Vec<rules::Finding>, error::ParseError> {
         self.analyze_ddl_facts_inner(sql, None)
     }
 
@@ -343,7 +398,7 @@ impl<'r> Engine<'r> {
         &self,
         sql: &str,
         dialect: &dyn Dialect,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         self.analyze_ddl_facts_inner(sql, Some(dialect))
     }
 
@@ -351,15 +406,43 @@ impl<'r> Engine<'r> {
         &self,
         sql: &str,
         dialect: Option<&dyn Dialect>,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         let script = match dialect {
             Some(d) => parse_sql_with_dialect(sql, d)?,
             None => parse_sql(sql)?,
         };
+        let _dialect = adopt_dialect(dialect, self.reasoning);
         let dialect_name = dialect.map(|d| d.name()).unwrap_or("snowflake");
         let fold = build_script_context_fold(&script, sql);
         let corpus = rules::all_builtin_rules().map_err(builtin_load_failure_to_parse_error)?;
         let reasoning = self.reasoning;
+        let functions = crate::ir::ScriptFunctions::new(
+            crate::ir::CatalogDialect::from_dialect_name(dialect_name),
+            &fold,
+        );
+        // The dialect read, and what it states its syntax means.
+        let snowflake = crate::dialect::snowflake();
+        let read_in = dialect.unwrap_or(snowflake.as_ref());
+        let meaning = read_in.syntax_meaning();
+        let bodies_dialect = run_bodies_dialect(dialect_name);
+        let (relations, bodies) = script_relations(
+            &script,
+            sql,
+            &[],
+            &fold,
+            &functions,
+            read_in,
+            None,
+            reasoning,
+            None,
+            None,
+            &[],
+            crate::RunTexts::Read {
+                dialect: &bodies_dialect,
+                analysed: false,
+            },
+        );
+        let bodies = bodies.unwrap_or_else(|| crate::DynamicBodies::lending(&bodies_dialect));
         let script_reasoning = reasoning.for_script(facts::reasoning::ScriptInputs {
             script: &script,
             source: sql,
@@ -367,16 +450,51 @@ impl<'r> Engine<'r> {
             fold: &fold,
             catalog: None,
             model_catalog: None,
+            bodies: &bodies,
+            functions: &functions,
+            earlier: facts::reasoning::EarlierRemovals::none(),
+            temporary_drops: relations.relations.temporary_drops(),
         });
-        Ok(evaluate_ddl_rules_for_script(
+        let query = QueryReading {
+            sql,
+            placeholders: &[],
+            fold: &fold,
+            functions: &functions,
+            meaning,
+            catalog: None,
+            relations: &relations,
+            model_catalog: None,
+            reasoning,
+            output_columns: false,
+            last: None,
+            shown_tags: &[],
+        };
+        let ddl = DdlReading::new(
             &script,
             sql,
+            &[],
             &fold,
-            corpus,
+            &functions,
             reasoning,
+            &query,
             script_reasoning.as_ref(),
+        );
+        Ok(evaluate_statements(
+            &flat_stmts_for_rules(&script),
+            &fold,
+            &reported_unwalked(&script, sql, dialect),
+            corpus,
             None,
             None,
+            |_, stmt, sink, readings| {
+                ddl_facts(
+                    stmt,
+                    &ddl,
+                    script_reasoning.as_ref(),
+                    sink,
+                    &mut readings.families,
+                );
+            },
         ))
     }
 
@@ -387,20 +505,20 @@ impl<'r> Engine<'r> {
     /// typed `RelPlan`, projects to public `QueryFacts`, and evaluates the
     /// loaded built-in rule corpus against each statement's facts.
     ///
-    /// Returns one `Signal` per rule match across all statements in the
-    /// input. Statement order is preserved; within a statement, signal
+    /// Returns one `Finding` per rule match across all statements in the
+    /// input. Statement order is preserved; within a statement, finding
     /// order follows the rule corpus's source order (per
     /// `src/rules/loader.rs`).
     ///
     /// Statements that fail to lower or that are non-query (pure DDL,
     /// session statements) are skipped silently; the customer pipeline is
     /// permissive by design so a single un-handled fragment doesn't
-    /// suppress signals on the rest of the script.
+    /// suppress findings on the rest of the script.
     ///
     /// The loaded rule corpus is the unified built-in YAML
     /// (`rules::all_builtin_rules`); rules predicate on `kind: <variant>`
     /// to scope themselves to the statement family they target.
-    pub fn analyze_query_facts(&self, sql: &str) -> Result<Vec<rules::Signal>, error::ParseError> {
+    pub fn analyze_query_facts(&self, sql: &str) -> Result<Vec<rules::Finding>, error::ParseError> {
         self.analyze_query_facts_inner(sql, None, None)
     }
 
@@ -418,7 +536,7 @@ impl<'r> Engine<'r> {
         &self,
         sql: &str,
         catalog: &crate::catalog::CatalogIndex,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         self.analyze_query_facts_inner(sql, Some(catalog), None)
     }
 
@@ -432,7 +550,7 @@ impl<'r> Engine<'r> {
         &self,
         sql: &str,
         dialect: &dyn Dialect,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         self.analyze_query_facts_inner(sql, None, Some(dialect))
     }
 
@@ -441,33 +559,86 @@ impl<'r> Engine<'r> {
         sql: &str,
         catalog: Option<&crate::catalog::CatalogIndex>,
         dialect: Option<&dyn Dialect>,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         let script = match dialect {
             Some(d) => parse_sql_with_dialect(sql, d)?,
             None => parse_sql(sql)?,
         };
+        let _dialect = adopt_dialect(dialect, self.reasoning);
+        let dialect_name = dialect.map(|d| d.name()).unwrap_or("snowflake");
         let fold = build_script_context_fold(&script, sql);
         let corpus = rules::all_builtin_rules().map_err(builtin_load_failure_to_parse_error)?;
         let reasoning = self.reasoning;
+        let functions = crate::ir::ScriptFunctions::new(
+            crate::ir::CatalogDialect::from_dialect_name(dialect_name),
+            &fold,
+        );
+        // The dialect read, and what it states its syntax means.
+        let snowflake = crate::dialect::snowflake();
+        let read_in = dialect.unwrap_or(snowflake.as_ref());
+        let meaning = read_in.syntax_meaning();
+        let bodies_dialect = run_bodies_dialect(dialect_name);
+        let (relations, bodies) = script_relations(
+            &script,
+            sql,
+            &[],
+            &fold,
+            &functions,
+            read_in,
+            catalog,
+            reasoning,
+            None,
+            None,
+            &[],
+            crate::RunTexts::Read {
+                dialect: &bodies_dialect,
+                analysed: false,
+            },
+        );
+        let bodies = bodies.unwrap_or_else(|| crate::DynamicBodies::lending(&bodies_dialect));
         let mut script_reasoning = reasoning.for_script(facts::reasoning::ScriptInputs {
             script: &script,
             source: sql,
-            dialect_name: dialect.map(|d| d.name()).unwrap_or("snowflake"),
+            dialect_name,
             fold: &fold,
             catalog,
             model_catalog: None,
+            bodies: &bodies,
+            functions: &functions,
+            earlier: facts::reasoning::EarlierRemovals::none(),
+            temporary_drops: relations.relations.temporary_drops(),
         });
-        Ok(evaluate_query_rules_for_script(
-            &script,
+        let query = QueryReading {
             sql,
-            &fold,
+            placeholders: &[],
+            fold: &fold,
+            functions: &functions,
+            meaning,
             catalog,
-            None,
-            corpus,
+            relations: &relations,
+            model_catalog: None,
             reasoning,
-            script_reasoning.as_mut(),
+            output_columns: false,
+            last: None,
+            shown_tags: &[],
+        };
+        Ok(evaluate_statements(
+            &flat_stmts_for_rules(&script),
+            &fold,
+            &reported_unwalked(&script, sql, dialect),
+            corpus,
             None,
             None,
+            |position, stmt, sink, readings| {
+                readings.query = query_facts(
+                    position,
+                    stmt,
+                    &query,
+                    script_reasoning.as_mut(),
+                    sink,
+                    None,
+                );
+            },
         ))
     }
 
@@ -482,10 +653,10 @@ impl<'r> Engine<'r> {
     /// populated `policy_attachment`), and evaluates the loaded built-in
     /// rule corpus against each statement's facts.
     ///
-    /// Returns one `Signal` per rule match across all statements in the
+    /// Returns one `Finding` per rule match across all statements in the
     /// input. Statements outside the AUTHPOL-attachment family are skipped
     /// silently — the customer pipeline is permissive by design so a single
-    /// un-handled fragment doesn't suppress signals on the rest of the
+    /// un-handled fragment doesn't suppress findings on the rest of the
     /// script.
     ///
     /// Current scope: the Snowflake AUTHPOL attachment forms
@@ -496,12 +667,87 @@ impl<'r> Engine<'r> {
     pub fn analyze_policy_attachment_facts(
         &self,
         sql: &str,
-    ) -> Result<Vec<rules::Signal>, error::ParseError> {
+    ) -> Result<Vec<rules::Finding>, error::ParseError> {
         let script = parse_sql(sql)?;
+        let _dialect = adopt_dialect(None, self.reasoning);
         let fold = build_script_context_fold(&script, sql);
         let corpus = rules::all_builtin_rules().map_err(builtin_load_failure_to_parse_error)?;
-        Ok(evaluate_policy_attachment_rules_for_script(
-            &script, sql, &fold, corpus, None, None,
+        Ok(evaluate_statements(
+            &flat_stmts_for_rules(&script),
+            &fold,
+            &reported_unwalked(&script, sql, None),
+            corpus,
+            None,
+            None,
+            |_, stmt, _, readings| {
+                readings.families.extend(policy_attachment_facts(stmt, sql));
+            },
         ))
     }
+}
+
+/// The dialect an entry point that analyses none of the SQL text a script
+/// runs reads that text as: the dialect named `dialect_name`, Snowflake
+/// where the name is not one.
+fn run_bodies_dialect(dialect_name: &str) -> crate::dialect::DialectRef {
+    crate::dialect::dialect_from_name(dialect_name).unwrap_or_else(crate::dialect::snowflake)
+}
+
+/// `render` with its deployment variables and SnowSQL `&var`s substituted
+/// as `policy_config`'s dialect writes them, and the script parsed from it.
+fn substituted_and_parsed<'a>(
+    render: &'a template::RenderArtifacts,
+    policy_config: &analyzer::AnalysisConfig,
+) -> Result<
+    (
+        std::borrow::Cow<'a, template::RenderArtifacts>,
+        ast::AstScript,
+    ),
+    analyzer::RiskError,
+> {
+    // Deployment-variable and SnowSQL `&var` substitution on already-rendered
+    // SQL (e.g. the CLI renders Jinja then defers substitution here);
+    // line-preserving so the source map stays valid. Unresolved-marker
+    // placeholders fold into the artifacts' counts so confidence reflects
+    // them (a no-op when the caller already substituted).
+    let deploy = template::deployvars::preprocess(
+        &render.sql,
+        &policy_config.dialect,
+        &template::SubstitutionConfig::default(),
+        None,
+    );
+    let prepared = template::snowsql::preprocess(&deploy.sql, &policy_config.dialect, None);
+    let untouched = deploy.placeholders.is_empty()
+        && prepared.placeholders.is_empty()
+        && matches!(deploy.sql, std::borrow::Cow::Borrowed(_))
+        && matches!(prepared.sql, std::borrow::Cow::Borrowed(_));
+    let render = if untouched {
+        std::borrow::Cow::Borrowed(render)
+    } else {
+        let deploy_stats = analyzer::compute_placeholder_stats(&deploy.sql, &deploy.placeholders);
+        let snow_stats = analyzer::compute_placeholder_stats(&prepared.sql, &prepared.placeholders);
+        let mut folded = render.clone();
+        // A rewrite moves byte offsets: the caller's placeholder spans are
+        // stale in the substituted text, so drop them (their counts are
+        // already in the stats); each stage's own records attach below iff
+        // their offsets index the final text.
+        if prepared.sql != folded.sql {
+            folded.placeholder_spans.clear();
+        }
+        folded.sql = prepared.sql.into_owned();
+        // SnowSQL records index its output — the final text — by construction.
+        folded.attach_placeholder_spans(&prepared.placeholders);
+        // Deploy records index deploy.sql; valid only if the SnowSQL stage
+        // was an identity pass.
+        folded.extend_placeholder_spans_if_current(&deploy.sql, &deploy.placeholders);
+        folded.placeholders.absorb(&snow_stats);
+        folded.placeholders.absorb(&deploy_stats);
+        std::borrow::Cow::Owned(folded)
+    };
+    let script = parse_with_optional_dialect(
+        &render.sql,
+        &policy_config.dialect,
+        &render.placeholder_spans,
+    )?;
+    Ok((render, script))
 }

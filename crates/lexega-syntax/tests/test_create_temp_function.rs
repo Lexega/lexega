@@ -545,11 +545,8 @@ fn test_pg_create_aggregate_not_broken_by_bq_aggregate_function() {
     let script = parse_sql(sql).expect("PG CREATE AGGREGATE should still parse");
     assert_eq!(script.stmts.len(), 1);
     // Must NOT be CreateFunction — that would mean dispatch routed wrong
-    match &script.stmts[0] {
-        AstStmt::CreateFunction(_) => {
-            panic!("PG CREATE AGGREGATE should NOT become CreateFunction — dispatch is broken!");
-        }
-        _ => {} // Any other variant (PgCreateAggregate, OpaqueContent, etc.) is acceptable
+    if let AstStmt::CreateFunction(_) = &script.stmts[0] {
+        panic!("PG CREATE AGGREGATE should NOT become CreateFunction — dispatch is broken!");
     }
     format_roundtrip(sql);
 }
@@ -560,11 +557,8 @@ fn test_pg_create_aggregate_with_order_by() {
     let sql = "CREATE AGGREGATE my_percentile (float8 ORDER BY float8) (sfunc = ordered_set_transition, stype = internal);";
     let script = parse_sql(sql).expect("PG CREATE AGGREGATE with ORDER BY should parse");
     assert_eq!(script.stmts.len(), 1);
-    match &script.stmts[0] {
-        AstStmt::CreateFunction(_) => {
-            panic!("PG CREATE AGGREGATE with ORDER BY should NOT become CreateFunction");
-        }
-        _ => {}
+    if let AstStmt::CreateFunction(_) = &script.stmts[0] {
+        panic!("PG CREATE AGGREGATE with ORDER BY should NOT become CreateFunction");
     }
 }
 

@@ -141,25 +141,28 @@ fn bench_format_with_alignment(c: &mut Criterion) {
 
     // Config WITHOUT alignment
     let config_no_align = {
-        let mut cfg = FormatterConfig::default();
-        cfg.align_select_aliases = false;
-        cfg
+        FormatterConfig {
+            align_select_aliases: false,
+            ..Default::default()
+        }
     };
 
     // Config WITH alignment (default max width)
     let config_with_align = {
-        let mut cfg = FormatterConfig::default();
-        cfg.align_select_aliases = true;
-        cfg.alias_align_max_width = 60;
-        cfg
+        FormatterConfig {
+            align_select_aliases: true,
+            alias_align_max_width: 60,
+            ..Default::default()
+        }
     };
 
     // Config WITH alignment (high max width - more work)
     let config_with_align_wide = {
-        let mut cfg = FormatterConfig::default();
-        cfg.align_select_aliases = true;
-        cfg.alias_align_max_width = 100;
-        cfg
+        FormatterConfig {
+            align_select_aliases: true,
+            alias_align_max_width: 100,
+            ..Default::default()
+        }
     };
 
     // Benchmark: Stress test SQL

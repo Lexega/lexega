@@ -15,9 +15,10 @@ use lexega_syntax::{format_sql_with_config, parse_sql_with_dialect, FormatterCon
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn parse_mssql(sql: &str) -> Vec<AstStmt> {

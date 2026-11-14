@@ -144,8 +144,9 @@ pub fn lower_drop_semantic_view_to_semantic_view_plan(
     SemanticViewPlan {
         action: SemanticViewAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: SemanticViewOptions {
             or_replace: false,
             if_not_exists: false,

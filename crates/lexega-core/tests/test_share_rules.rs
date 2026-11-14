@@ -15,18 +15,23 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -55,7 +60,7 @@ fn test_share_formatting_variants() {
 
 #[test]
 fn test_share_create_and_drop() {
-    let rules = analyze_and_get_rules("CREATE SHARE sales_share;");
+    let rules = analyze_and_get_context("CREATE SHARE sales_share;");
     assert!(rules.contains("SNW-SHARE-NEW"), "got {rules:?}");
 
     let rules = analyze_and_get_rules("DROP SHARE IF EXISTS sales_share;");
@@ -66,7 +71,7 @@ fn test_share_create_and_drop() {
 fn test_share_account_changes() {
     let report =
         analyze_risk("ALTER SHARE s ADD ACCOUNTS = org1.partner_acct;").expect("should analyze");
-    let rules = extract_rule_ids(&report.signals);
+    let rules = extract_rule_ids(&report.findings);
     assert!(rules.contains("SNW-SHARE-ACCOUNTS-ADD"), "got {rules:?}");
     assert!(
         report.summary.critical_count >= 1,

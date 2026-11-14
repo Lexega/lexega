@@ -110,8 +110,111 @@ fn test_pivot_unpivot_combination() {
         let ast = parse_stmt_from_str(sql);
         assert!(ast.is_some(), "Failed to parse: {}", sql);
 
-        let formatted = format_sql(sql).expect(&format!("Failed to format: {}", sql));
+        let formatted = format_sql(sql).unwrap_or_else(|_| panic!("Failed to format: {}", sql));
         println!("Input:  {}", sql);
         println!("Output: {}\n", formatted);
     }
+}
+
+/// Formats `sql` in `dialect` with the default and the compact style and
+/// checks each output: the same significant tokens as the source (case
+/// aside), formatting it again changes nothing, and the formatter's own
+/// safety check passes it.
+fn assert_formats_to_source_tokens(sql: &str, dialect: lexega_syntax::DialectRef) {
+    use lexega_syntax::lexer::tokenize_with_dialect;
+    use lexega_syntax::{
+        format_sql_with_config, verify_formatting_safe_with_dialect, FormatterConfig,
+    };
+    let lexemes = |text: &str| -> Vec<String> {
+        tokenize_with_dialect(text, dialect.as_ref())
+            .tokens
+            .iter()
+            .map(|t| t.lexeme(text).to_ascii_uppercase())
+            .collect()
+    };
+    for base in [FormatterConfig::default(), FormatterConfig::compact()] {
+        let config = FormatterConfig {
+            dialect: dialect.clone(),
+            ..base
+        };
+        let formatted = format_sql_with_config(sql, &config)
+            .unwrap_or_else(|e| panic!("format failed for {sql:?}: {e:?}"));
+        assert_eq!(
+            lexemes(&formatted),
+            lexemes(sql),
+            "formatted text holds other tokens than the source:\n{formatted}"
+        );
+        let again = format_sql_with_config(&formatted, &config)
+            .unwrap_or_else(|e| panic!("reformat failed for {formatted:?}: {e:?}"));
+        assert_eq!(again, formatted, "formatting is not idempotent");
+        verify_formatting_safe_with_dialect(sql, &formatted, dialect.as_ref())
+            .unwrap_or_else(|e| panic!("safety check refused {formatted:?}: {e}"));
+    }
+}
+
+#[test]
+fn unpivot_prints_only_the_null_handling_written() {
+    use lexega_syntax::dialect;
+    let bare = "SELECT * FROM t UNPIVOT (v FOR n IN (a, b));";
+    let include = "SELECT * FROM t UNPIVOT INCLUDE NULLS (v FOR n IN (a, b));";
+    let exclude = "SELECT * FROM t UNPIVOT EXCLUDE NULLS (v FOR n IN (a, b));";
+    for d in [
+        dialect::snowflake(),
+        dialect::bigquery(),
+        dialect::databricks(),
+    ] {
+        for sql in [bare, include, exclude] {
+            assert_formats_to_source_tokens(sql, d.clone());
+        }
+    }
+    let tsql = "SELECT CustomerID, Phone\n\
+                FROM (SELECT CustomerID, Phone1, Phone2 FROM dbo.Customers) AS cp\n\
+                UNPIVOT (Phone FOR Phones IN (Phone1, Phone2)) AS up;";
+    assert_formats_to_source_tokens(tsql, dialect::mssql());
+    assert_formats_to_source_tokens(bare, dialect::mssql());
+}
+
+#[test]
+fn safety_check_refuses_an_added_null_handling_clause() {
+    let original = "SELECT * FROM t UNPIVOT (v FOR n IN (a, b));";
+    let changed = "SELECT * FROM t UNPIVOT EXCLUDE NULLS (v FOR n IN (a, b));";
+    for d in [
+        lexega_syntax::dialect::snowflake(),
+        lexega_syntax::dialect::mssql(),
+    ] {
+        assert!(
+            lexega_syntax::verify_formatting_safe_with_dialect(original, changed, d.as_ref())
+                .is_err(),
+            "the safety check passed words the source does not have"
+        );
+    }
+}
+
+#[test]
+fn pivot_prints_only_the_clauses_written() {
+    use lexega_syntax::dialect;
+    let forms = [
+        "SELECT * FROM s PIVOT (SUM(amount) FOR q IN ('Q1', 'Q2'));",
+        "SELECT * FROM s PIVOT (SUM(amount) AS total FOR q IN ('Q1' AS q1, 'Q2'));",
+    ];
+    for d in [
+        dialect::snowflake(),
+        dialect::bigquery(),
+        dialect::databricks(),
+    ] {
+        for sql in forms {
+            assert_formats_to_source_tokens(sql, d.clone());
+        }
+    }
+    let snowflake_only = [
+        "SELECT * FROM s PIVOT (SUM(amount) FOR q IN (ANY ORDER BY q DESC));",
+        "SELECT * FROM s PIVOT (SUM(amount) FOR q IN (ANY) DEFAULT ON NULL (0));",
+    ];
+    for sql in snowflake_only {
+        assert_formats_to_source_tokens(sql, dialect::snowflake());
+    }
+    assert_formats_to_source_tokens(
+        "SELECT * FROM s PIVOT (SUM(amount) FOR q IN ([Q1], [Q2])) AS p;",
+        dialect::mssql(),
+    );
 }

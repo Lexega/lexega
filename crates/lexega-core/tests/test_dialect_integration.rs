@@ -24,15 +24,17 @@ use lexega_core::{format_sql_with_config, Dialect, FormatterConfig, TokenKind};
 // ============================================================================
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = postgres();
-    config
+    FormatterConfig {
+        dialect: postgres(),
+        ..Default::default()
+    }
 }
 
 fn mysql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mysql();
-    config
+    FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    }
 }
 
 fn sf_config() -> FormatterConfig {
@@ -44,7 +46,7 @@ fn format_and_verify(sql: &str, config: &FormatterConfig) {
     let formatted = format_sql_with_config(sql, config)
         .unwrap_or_else(|e| panic!("Format failed for {}: {}", config.dialect.name(), e));
 
-    lexega_core::verify_formatting_safe_with_dialect(&sql, &formatted, config.dialect.as_ref())
+    lexega_core::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
         .unwrap_or_else(|e| {
             panic!(
                 "{} formatting verification failed: {}",
@@ -486,7 +488,8 @@ fn test_mysql_backtick_with_special_chars() {
             matches!(
                 k,
                 TokenKind::Identifier {
-                    kind: lexega_core::IdentifierKind::Quoted
+                    kind: lexega_core::IdentifierKind::Quoted,
+                    ..
                 }
             )
         })
@@ -548,8 +551,10 @@ fn test_pg_dollar_tag_with_numbers() {
 
     // Value/opacity is unchanged at the parser level: at expression position the
     // run reassembles to a single string literal that round-trips verbatim.
-    let mut cfg = FormatterConfig::default();
-    cfg.dialect = postgres();
+    let cfg = FormatterConfig {
+        dialect: postgres(),
+        ..Default::default()
+    };
     let out = format_sql_with_config("SELECT $tag1$content$tag1$ AS c;", &cfg)
         .expect("dollar-quoted literal should format");
     assert!(
@@ -715,39 +720,45 @@ SELECT * FROM raw WHERE body IS NOT NULL";
 // ============================================================================
 
 fn pg_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(postgres());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(postgres()),
+        ..Default::default()
+    }
 }
 
 fn mysql_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mysql());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mysql()),
+        ..Default::default()
+    }
 }
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn bq_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = bigquery();
-    config
+    FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    }
 }
 
 fn mssql_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mssql());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    }
 }
 
 fn bq_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(bigquery());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(bigquery()),
+        ..Default::default()
+    }
 }
 
 #[test]

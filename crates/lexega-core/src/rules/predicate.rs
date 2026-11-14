@@ -61,6 +61,16 @@ pub enum ScalarOp {
     ContainsAny(Vec<PredicateLiteral>),
     /// `path: { contains_all: [<literal>, ...] }`.
     ContainsAll(Vec<PredicateLiteral>),
+    /// `path: { in_list: <name> | [<name>, ...] }` — the string at `path`
+    /// is held by one of the named lists.
+    InList(ListRef),
+    /// `path: { not_in_list: <name> | [<name>, ...] }` — the string at
+    /// `path` is held by none of the named lists.
+    NotInList(ListRef),
+    /// `path: { all_in_field: <path> }` — every item of the list at `path`
+    /// is an item of the list at the named field, resolved against the
+    /// same value `path` is.
+    AllInField(FieldPath),
     /// `path: { exists: <bool> }` for `Option<T>` fields.
     Exists(bool),
     /// `path: { is_null: <bool> }` — same as `Exists` but for nullable scalar.
@@ -72,6 +82,40 @@ pub enum ScalarOp {
         low_inclusive: bool,
         high_inclusive: bool,
     },
+}
+
+/// The lists an `in_list` / `not_in_list` operator names, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListRef {
+    pub names: Vec<String>,
+}
+
+impl ScalarOp {
+    /// The field this operator compares its path's value with, where it
+    /// compares with a field rather than literals.
+    pub(crate) fn compared_field(&self) -> Option<&FieldPath> {
+        match self {
+            Self::AllInField(field) => Some(field),
+            Self::Eq(_)
+            | Self::EqExplicit(_)
+            | Self::Neq(_)
+            | Self::Gt(_)
+            | Self::Lt(_)
+            | Self::Gte(_)
+            | Self::Lte(_)
+            | Self::Matches(_)
+            | Self::In(_)
+            | Self::NotIn(_)
+            | Self::Contains(_)
+            | Self::ContainsAny(_)
+            | Self::ContainsAll(_)
+            | Self::InList(_)
+            | Self::NotInList(_)
+            | Self::Exists(_)
+            | Self::IsNull(_)
+            | Self::Range { .. } => None,
+        }
+    }
 }
 
 /// `<path>: { quantifier: ... }` against a relation field.
@@ -106,6 +150,42 @@ pub enum NumericOp {
     Lt(u64),
     Gte(u64),
     Lte(u64),
+}
+
+/// True when an `in_list` / `not_in_list` operator appears anywhere in
+/// `p`, quantifier bodies included.
+pub(crate) fn names_a_list(p: &Predicate) -> bool {
+    match p {
+        Predicate::AllOf(preds) | Predicate::AnyOf(preds) => preds.iter().any(names_a_list),
+        Predicate::Not(inner) => names_a_list(inner),
+        Predicate::Scalar(ScalarMatch { op, .. }) => match op {
+            ScalarOp::InList(_) | ScalarOp::NotInList(_) => true,
+            ScalarOp::Eq(_)
+            | ScalarOp::EqExplicit(_)
+            | ScalarOp::Neq(_)
+            | ScalarOp::Gt(_)
+            | ScalarOp::Lt(_)
+            | ScalarOp::Gte(_)
+            | ScalarOp::Lte(_)
+            | ScalarOp::Matches(_)
+            | ScalarOp::In(_)
+            | ScalarOp::NotIn(_)
+            | ScalarOp::Contains(_)
+            | ScalarOp::ContainsAny(_)
+            | ScalarOp::ContainsAll(_)
+            | ScalarOp::AllInField(_)
+            | ScalarOp::Exists(_)
+            | ScalarOp::IsNull(_)
+            | ScalarOp::Range { .. } => false,
+        },
+        Predicate::Relational(RelationalMatch { quantifier, .. }) => match quantifier {
+            Quantifier::Exists(inner)
+            | Quantifier::All(inner)
+            | Quantifier::None(inner)
+            | Quantifier::Each(inner) => names_a_list(inner),
+            Quantifier::Count(_) => false,
+        },
+    }
 }
 
 /// Literal values usable in predicate op-blocks. Maps to a subset of
@@ -443,6 +523,12 @@ fn parse_scalar_op(
     if let Some(v) = get!("not_in") {
         return Ok(ScalarOp::NotIn(parse_literal_list(v)?));
     }
+    if let Some(v) = get!("in_list") {
+        return Ok(ScalarOp::InList(parse_list_ref("in_list", v)?));
+    }
+    if let Some(v) = get!("not_in_list") {
+        return Ok(ScalarOp::NotInList(parse_list_ref("not_in_list", v)?));
+    }
     if let Some(v) = get!("contains") {
         return Ok(ScalarOp::Contains(parse_literal(v)?));
     }
@@ -451,6 +537,9 @@ fn parse_scalar_op(
     }
     if let Some(v) = get!("contains_all") {
         return Ok(ScalarOp::ContainsAll(parse_literal_list(v)?));
+    }
+    if let Some(v) = get!("all_in_field") {
+        return Ok(ScalarOp::AllInField(parse_field_reference(v)?));
     }
     if let Some(v) = get!("is_null") {
         let b = match v {
@@ -577,6 +666,39 @@ fn parse_literal(value: &serde_json::Value) -> Result<PredicateLiteral, ParseErr
             })
         }
     })
+}
+
+/// The field path an operator compares against: a string of non-empty
+/// dotted segments, never a literal.
+fn parse_field_reference(value: &serde_json::Value) -> Result<FieldPath, ParseError> {
+    let serde_json::Value::String(path) = value else {
+        return Err(ParseError::InvalidLiteral {
+            context: "all_in_field: requires a field path, not a literal".to_string(),
+        });
+    };
+    if path.split('.').any(str::is_empty) {
+        return Err(ParseError::EmptyPath);
+    }
+    Ok(FieldPath::parse(path))
+}
+
+fn parse_list_ref(op: &str, value: &serde_json::Value) -> Result<ListRef, ParseError> {
+    let invalid = || ParseError::InvalidLiteral {
+        context: format!("{op}: requires a list name or a non-empty array of list names"),
+    };
+    let names = match value {
+        serde_json::Value::String(name) => vec![name.clone()],
+        serde_json::Value::Array(items) if !items.is_empty() => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned).ok_or_else(invalid))
+            .collect::<Result<_, _>>()?,
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => return Err(invalid()),
+    };
+    Ok(ListRef { names })
 }
 
 fn parse_literal_list(value: &serde_json::Value) -> Result<Vec<PredicateLiteral>, ParseError> {
@@ -722,6 +844,45 @@ not:
     }
 
     #[test]
+    fn all_in_field_takes_a_field_path() {
+        use serde_json::json;
+        let parse = |field: serde_json::Value| {
+            parse_predicate(&json!({ "left": { "all_in_field": field } }))
+        };
+        assert!(parse(json!("right")).is_ok());
+        assert_eq!(
+            parse(json!("inner.right")),
+            Ok(Predicate::Scalar(ScalarMatch {
+                path: FieldPath::parse("left"),
+                op: ScalarOp::AllInField(FieldPath::parse("inner.right")),
+            }))
+        );
+        assert!(parse(json!("items.0.right")).is_ok());
+        // Never a literal.
+        for literal in [
+            json!(["a"]),
+            json!(1),
+            json!(true),
+            json!(null),
+            json!({ "field": "right" }),
+        ] {
+            assert!(
+                matches!(
+                    parse(literal.clone()),
+                    Err(ParseError::InvalidLiteral { .. })
+                ),
+                "{literal}"
+            );
+        }
+        for empty in ["", ".", "a..b", ".a", "a."] {
+            assert!(
+                matches!(parse(json!(empty)), Err(ParseError::EmptyPath)),
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_combinator_is_error() {
         let v = serde_json::json!({
             "all_of": [],
@@ -731,5 +892,17 @@ not:
             parse_predicate(&v),
             Err(ParseError::AmbiguousCombinator { .. })
         ));
+    }
+
+    #[test]
+    fn names_a_list_reads_quantifier_bodies() {
+        for quantifier in ["exists", "all", "none", "each"] {
+            let yaml = format!("query.items: {{ {quantifier}: {{ value: {{ in_list: refs }} }} }}");
+            assert!(names_a_list(&p(&yaml)), "{quantifier}");
+        }
+        assert!(!names_a_list(&p(
+            "query.items: { exists: { value: { in: [a] } } }"
+        )));
+        assert!(!names_a_list(&p("query.items: { count: { gt: 1 } }")));
     }
 }

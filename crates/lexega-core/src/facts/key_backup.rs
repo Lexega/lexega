@@ -13,8 +13,8 @@
 //! whether an inline password protects/unlocks it. Which combination is
 //! dangerous is a YAML verdict — backing up the service / database master key
 //! exports the root of the encryption hierarchy, restoring re-keys the
-//! instance, and a hardcoded password is a credential in source. The password
-//! value is redacted at parse time and never appears here.
+//! instance, and a hardcoded password is a credential in source. Each
+//! password's value is in the facts and is masked in every report.
 //!
 //! Predicate example:
 //! ```yaml
@@ -27,6 +27,8 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+
+use super::PasswordLiteral;
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
@@ -67,7 +69,13 @@ pub struct MssqlKeyBackupFacts {
     /// Which key object is moved.
     pub key_object: BackupKeyObject,
     /// True when an inline `{ENCRYPTION | DECRYPTION} BY PASSWORD = '…'`
-    /// protects/unlocks the material — a hardcoded credential. The value is
-    /// redacted.
+    /// protects/unlocks the material — a hardcoded credential.
     pub password_present: bool,
+    /// Each password literal written, decoded: doubled quotes undone and any
+    /// `N` prefix dropped. A value the engine rendered from a template or
+    /// substituted for a deploy variable is not listed. The value is masked
+    /// in every report; a custom rule message that interpolates it shows it
+    /// unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub password_literals: Vec<PasswordLiteral>,
 }

@@ -17,7 +17,7 @@ use ruff_python_parser::parse_module;
 
 #[cfg(test)]
 use super::SqlEmbedding;
-use super::{ExtractedSql, SqlCallPattern};
+use super::{ExtractedSql, OffsetMap, SqlCallPattern};
 
 /// Extract SQL fragments from a Python source file using full AST parsing.
 ///
@@ -41,14 +41,17 @@ pub fn extract_sql(
 
     let module = parsed.into_syntax();
 
-    // Build a line-start index for byte offset → (line, col) conversion.
-    let line_index = LineIndex::new(source);
+    // Where each line of the source starts, to place what is found.
+    let line_index = SourceLines {
+        source,
+        lines: crate::analyzer::LineIndex::new(source),
+    };
 
-    // Phase 1: Collect string constant assignments for simple propagation.
+    // String constant assignments, for simple propagation.
     // e.g., `query = "SELECT * FROM table"` → { "query": "SELECT * FROM table" }
     let string_vars = collect_string_assignments(&module.body);
 
-    // Phase 2: Walk the AST to find SQL execution calls.
+    // The SQL execution calls, found by walking the AST.
     let mut results = Vec::new();
     visit_stmts(
         &module.body,
@@ -62,51 +65,36 @@ pub fn extract_sql(
     results
 }
 
-/// Pre-computed index for O(log n) byte-offset → line-number conversion.
-struct LineIndex {
-    /// Byte offsets of each line start (0-indexed).
-    line_starts: Vec<u32>,
-}
-
-impl LineIndex {
-    fn new(source: &str) -> Self {
-        let mut line_starts = vec![0u32];
-        for (i, byte) in source.bytes().enumerate() {
-            if byte == b'\n' {
-                line_starts.push((i + 1) as u32);
-            }
-        }
-        LineIndex { line_starts }
-    }
-
-    /// Convert a byte offset to a 1-based (line, col) pair.
-    fn offset_to_location(&self, offset: u32) -> (u32, u32) {
-        let line_idx = match self.line_starts.binary_search(&offset) {
-            Ok(exact) => exact,
-            Err(insert_point) => insert_point.saturating_sub(1),
-        };
-        let col = offset - self.line_starts[line_idx];
-        ((line_idx as u32) + 1, col)
-    }
+/// The source being read, and where each of its lines starts.
+struct SourceLines<'a> {
+    source: &'a str,
+    lines: crate::analyzer::LineIndex,
 }
 
 /// Simple constant propagation: collect `name = "string"` assignments.
-fn collect_string_assignments(body: &[Stmt]) -> Vec<(String, String, u32)> {
+fn collect_string_assignments(body: &[Stmt]) -> Vec<StringAssignment> {
     let mut vars = Vec::new();
     collect_string_assignments_recursive(body, &mut vars);
     vars
 }
 
-fn collect_string_assignments_recursive(body: &[Stmt], vars: &mut Vec<(String, String, u32)>) {
+fn collect_string_assignments_recursive(body: &[Stmt], vars: &mut Vec<StringAssignment>) {
     for stmt in body {
         match stmt {
             Stmt::Assign(assign) => {
                 // query = "SELECT ..."
                 if assign.targets.len() == 1 {
                     if let Expr::Name(name) = &assign.targets[0] {
-                        if let Some(sql) = extract_string_value(&assign.value) {
-                            let offset = assign.range.start().to_u32();
-                            vars.push((name.id.to_string(), sql, offset));
+                        if let (Some(sql), Some(text_at)) = (
+                            extract_string_value(&assign.value),
+                            content_start(&assign.value),
+                        ) {
+                            vars.push(StringAssignment {
+                                name: name.id.to_string(),
+                                value: sql,
+                                assigned_at: assign.range.start().to_u32(),
+                                text_at,
+                            });
                         }
                     }
                 }
@@ -148,6 +136,26 @@ fn collect_string_assignments_recursive(body: &[Stmt], vars: &mut Vec<(String, S
 }
 
 /// Extract a plain string value from an expression, if it is a string literal.
+/// A variable assigned a string literal: its name, the string, where the
+/// assignment begins and where the string's text begins.
+struct StringAssignment {
+    name: String,
+    value: String,
+    assigned_at: u32,
+    text_at: u32,
+}
+
+/// Where the text of the string literal or f-string `expr` begins in the
+/// source: after the prefix and opening quotes of its first part. None for
+/// an expression that is no string.
+fn content_start(expr: &Expr) -> Option<u32> {
+    ast::StringLike::try_from(expr)
+        .ok()?
+        .parts()
+        .next()
+        .map(|part| part.content_range().start().to_u32())
+}
+
 fn extract_string_value(expr: &Expr) -> Option<String> {
     match expr {
         Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
@@ -197,8 +205,8 @@ fn visit_stmts(
     file_path: &Path,
     source: &str,
     patterns: &[SqlCallPattern],
-    string_vars: &[(String, String, u32)],
-    line_index: &LineIndex,
+    string_vars: &[StringAssignment],
+    line_index: &SourceLines,
     results: &mut Vec<ExtractedSql>,
 ) {
     for stmt in body {
@@ -219,8 +227,8 @@ fn visit_stmt(
     file_path: &Path,
     source: &str,
     patterns: &[SqlCallPattern],
-    string_vars: &[(String, String, u32)],
-    line_index: &LineIndex,
+    string_vars: &[StringAssignment],
+    line_index: &SourceLines,
     results: &mut Vec<ExtractedSql>,
 ) {
     // Check if this statement is an expression containing a SQL call.
@@ -402,8 +410,8 @@ fn try_extract_sql_call(
     file_path: &Path,
     _source: &str,
     patterns: &[SqlCallPattern],
-    string_vars: &[(String, String, u32)],
-    line_index: &LineIndex,
+    string_vars: &[StringAssignment],
+    line_index: &SourceLines,
     results: &mut Vec<ExtractedSql>,
 ) {
     // Determine the method name from the call.
@@ -425,25 +433,23 @@ fn try_extract_sql_call(
         return;
     };
 
-    let (line, col) = line_index.offset_to_location(arg_offset);
-
-    results.push(ExtractedSql {
-        sql: sql_text,
-        origin_file: file_path.to_path_buf(),
-        origin_line: line,
-        origin_col: col,
-        embedding: pattern.embedding,
-        dialect_hint: Some("databricks".to_string()),
+    // The string's text runs on from where it begins, its lines the file's.
+    results.push(ExtractedSql::placed_in(
+        sql_text,
+        file_path,
+        (line_index.source, &line_index.lines),
+        &OffsetMap::starting_at(arg_offset as usize),
+        pattern.embedding,
         has_interpolation,
-    });
+    ));
 }
 
 /// Get the SQL string from a call's arguments.
-/// Returns (sql_text, has_interpolation, byte_offset_of_arg).
+/// Returns (sql_text, has_interpolation, byte_offset_of_the_sql_text).
 fn get_sql_argument(
     call: &ast::ExprCall,
     pattern: &SqlCallPattern,
-    string_vars: &[(String, String, u32)],
+    string_vars: &[StringAssignment],
 ) -> Option<(String, bool, u32)> {
     // Try positional argument first.
     if let Some(arg) = call.arguments.args.get(pattern.sql_arg_position) {
@@ -470,10 +476,11 @@ fn get_sql_argument(
 }
 
 /// Extract SQL text from an expression node.
-/// Returns (sql_text, has_interpolation, byte_offset).
+/// Returns (sql_text, has_interpolation, byte offset where the SQL text
+/// begins, after any string prefix and opening quotes).
 fn extract_sql_from_expr(
     expr: &Expr,
-    string_vars: &[(String, String, u32)],
+    string_vars: &[StringAssignment],
 ) -> Option<(String, bool, u32)> {
     use ruff_text_size::Ranged;
 
@@ -484,27 +491,28 @@ fn extract_sql_from_expr(
             if sql.trim().is_empty() {
                 None
             } else {
-                Some((sql, false, s.range().start().to_u32()))
+                Some((sql, false, content_start(expr)?))
             }
         }
 
         // F-string: spark.sql(f"SELECT * FROM {schema}.events")
         Expr::FString(f) => {
             let (skeleton, has_interp) = extract_fstring_skeleton(f)?;
-            Some((skeleton, has_interp, f.range().start().to_u32()))
+            Some((skeleton, has_interp, content_start(expr)?))
         }
 
         // Variable reference: spark.sql(query) where query = "SELECT ..."
         Expr::Name(name) => {
             let var_name = name.id.as_str();
-            // Find the most recent assignment to this variable name.
-            // (Last assignment wins, which is a reasonable approximation.)
-            for (vname, vvalue, voffset) in string_vars.iter().rev() {
-                if vname == var_name {
-                    return Some((vvalue.clone(), false, *voffset));
-                }
-            }
-            None
+            let used_at = name.range().start().to_u32();
+            // The nearest assignment written before the use; with none, the
+            // last one (a function reading a module name assigned below it).
+            let mut assigned = string_vars.iter().filter(|var| var.name == var_name);
+            let var = assigned
+                .clone()
+                .rfind(|var| var.assigned_at < used_at)
+                .or_else(|| assigned.next_back())?;
+            Some((var.value.clone(), false, var.text_at))
         }
 
         _ => None,
@@ -572,6 +580,47 @@ spark.sql(query)
     }
 
     #[test]
+    fn a_reassigned_variable_runs_the_value_written_before_each_call() {
+        let source = r#"
+q = "DROP TABLE a.first"
+spark.sql(q)
+q = "DROP TABLE b.second"
+spark.sql(q)
+
+def later():
+    spark.sql(tail)
+
+tail = "DROP TABLE c.third"
+"#;
+        let results = extract_sql(source, &PathBuf::from("test.py"), &default_patterns());
+        let sql: Vec<&str> = results.iter().map(|r| r.sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            [
+                "DROP TABLE a.first",
+                "DROP TABLE b.second",
+                "DROP TABLE c.third"
+            ]
+        );
+        assert_eq!(results[0].origin.line, 2);
+        assert_eq!(results[1].origin.line, 4);
+    }
+
+    #[test]
+    fn spark_sql_by_its_keyword_argument() {
+        let source = r#"
+spark.sql(sqlQuery="SELECT * FROM events")
+spark.sql(args={"x": 1}, sqlQuery=f"SELECT * FROM {schema}.events")
+"#;
+        let results = extract_sql(source, &PathBuf::from("test.py"), &default_patterns());
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].sql, "SELECT * FROM events");
+        assert_eq!(results[0].embedding, SqlEmbedding::SparkSqlCall);
+        assert!(results[1].has_interpolation);
+        assert!(results[1].sql.contains(".events"));
+    }
+
+    #[test]
     fn test_cursor_execute() {
         let source = r#"
 cursor.execute("GRANT SELECT ON TABLE events TO analysts")
@@ -630,7 +679,26 @@ spark.sql("   ")
         let source = "line1\nline2\nspark.sql(\"SELECT 1\")\nline4\n";
         let results = extract_sql(source, &PathBuf::from("test.py"), &default_patterns());
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].origin_line, 3);
+        assert_eq!(results[0].origin.line, 3);
+    }
+
+    // The column where a string's SQL begins counts the characters before
+    // it on its line, and its UTF-16 units, not their bytes.
+    #[test]
+    fn the_column_where_the_sql_begins_counts_characters() {
+        let source = "ñame = 1; spark.sql(\"DELETE FROM main.sales.b\")\nñ = 1; spark.sql(f\"DELETE FROM main.sales.{t}\")\nx = '😀'; spark.sql(\"DELETE FROM main.sales.c\")\n";
+        let found: Vec<(usize, usize, usize)> =
+            extract_sql(source, &PathBuf::from("test.py"), &default_patterns())
+                .iter()
+                .map(|fragment| {
+                    (
+                        fragment.origin.line,
+                        fragment.origin.column,
+                        fragment.origin.utf16_column,
+                    )
+                })
+                .collect();
+        assert_eq!(found, [(1, 22, 22), (2, 20, 20), (3, 21, 22)]);
     }
 
     #[test]

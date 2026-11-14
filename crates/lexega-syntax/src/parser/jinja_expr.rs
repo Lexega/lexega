@@ -43,8 +43,7 @@ impl<'a> Parser<'a> {
     /// Returns `None` if parsing fails (expression is malformed or empty).
     pub(crate) fn parse_jinja_expr(&mut self) -> ParseResult<Option<JinjaExpr>> {
         let _depth = self.track_depth("jinja_expr")?;
-        let result = self.parse_jinja_or_expr()?;
-        Ok(result)
+        self.parse_jinja_or_expr()
     }
 
     #[inline]

@@ -5,13 +5,14 @@
 //!
 //! Per-statement flow: `derive_facts → evaluate_rules → drop facts`.
 //! Each rule's compiled predicate runs against `StatementFacts`;
-//! matches become `Signal` records.
+//! matches become `Finding` records.
 
+use crate::facts::secrets::{PrintedAt, QuotingStrings};
 use crate::facts::{RiskLevel, StatementFacts};
 use crate::lexer::token::Span;
 
 use super::compile::{CompiledPredicate, EvalResult, WitnessCandidate};
-use super::signal::{EmissionMode, FactWitness, RuleExplanation, Signal, SignalEvidence};
+use super::finding::{EmissionMode, FactWitness, Finding, FindingEvidence, RuleExplanation};
 
 /// A loaded, compiled rule. Cloneable; shares the underlying predicate
 /// closure across clones via `Arc` (inside `CompiledPredicate`).
@@ -31,7 +32,7 @@ pub struct Rule {
     pub message_template: Option<MessageTemplate>,
     pub emission: EmissionMode,
     /// When `true`, the analyzer's deduplication pass keeps each
-    /// emitted signal as its own entry instead of merging signals from
+    /// emitted finding as its own entry instead of merging findings from
     /// the same rule. Customer-facing compliance/review rules that
     /// produce per-occurrence artifacts (`SNW-UNKNOWN`) set this; most
     /// rules leave it `false` so dedup collapses duplicates.
@@ -59,19 +60,101 @@ impl MessageTemplate {
         facts_value: &serde_json::Value,
         witness: Option<&serde_json::Value>,
     ) -> String {
-        render_template(&self.raw, facts_value, witness)
+        render_template(&self.raw, facts_value, witness, &Quoted::none())
+    }
+}
+
+/// The strings of one statement's serialized facts that a report masks
+/// ([`PrintedAt::quoting_strings`]), read the first time they are asked
+/// for.
+struct Quoted<'a> {
+    read: Option<(PrintedAt<'a>, &'a StatementFacts, &'a serde_json::Value)>,
+    strings: std::cell::OnceCell<QuotingStrings>,
+}
+
+impl<'a> Quoted<'a> {
+    /// The strings of `facts`, serialized as `facts_value`, that a report
+    /// printing them from `printed` masks; none where no report prints
+    /// them.
+    fn new(
+        printed: Option<PrintedAt<'a>>,
+        facts: &'a StatementFacts,
+        facts_value: &'a serde_json::Value,
+    ) -> Self {
+        Self {
+            read: printed.map(|printed| (printed, facts, facts_value)),
+            strings: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// No string quotes a secret.
+    fn none() -> Self {
+        Self {
+            read: None,
+            strings: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn strings(&self) -> &QuotingStrings {
+        self.strings.get_or_init(|| match self.read {
+            Some((printed, facts, facts_value)) => printed.quoting_strings(facts, facts_value),
+            None => QuotingStrings::default(),
+        })
     }
 }
 
 /// Evaluate every rule against one statement's facts. Returns the
-/// signals that fired (one per matching rule with `emission: once`,
+/// findings that fired (one per matching rule with `emission: once`,
 /// or one per witness with `emission: per_witness`).
-pub fn evaluate_rules(facts: &StatementFacts, rules: &[Rule]) -> Vec<Signal> {
+pub fn evaluate_rules(facts: &StatementFacts, rules: &[Rule]) -> Vec<Finding> {
+    evaluate_rules_masking(facts, rules, None)
+}
+
+/// Whether `rule`'s predicate holds of one statement's facts, whatever the
+/// rule's `enabled` state: the verdict another rule follows, which turning
+/// the rule's own finding off does not turn off.
+pub fn rule_holds(facts: &StatementFacts, rule: &Rule) -> bool {
     let facts_value = serde_json::to_value(facts).unwrap_or(serde_json::Value::Null);
-    // Fact-family dispatch: skip rules whose required families are
-    // absent from this statement. A rule's `root_mask` is a sound
-    // over-approximation, so a disjoint intersection proves NoMatch
-    // (see `compile::predicate_root_mask`).
+    let present_mask = super::compile::facts_present_mask(&facts_value);
+    match rule_matches(rule, &facts_value, facts.kind as usize, present_mask) {
+        EvalResult::NoMatch => false,
+        EvalResult::Match { .. } => true,
+    }
+}
+
+/// What `rule`'s predicate says of one statement's facts, `facts_value`,
+/// of the statement kind `kind_idx` with the fact families
+/// `present_mask`: the statement-kind gate first (typed `facts.kind`, no
+/// serialization), then the fact-family mask, either proving no match,
+/// then the predicate. A rule's `root_mask` is a sound
+/// over-approximation, so a disjoint intersection proves no match (see
+/// `compile::predicate_root_mask`).
+fn rule_matches<'v>(
+    rule: &Rule,
+    facts_value: &'v serde_json::Value,
+    kind_idx: usize,
+    present_mask: u32,
+) -> EvalResult<'v> {
+    if rule.triggers.kind_gate().skips(kind_idx) {
+        return EvalResult::NoMatch;
+    }
+    let mask = rule.triggers.root_mask();
+    if mask != 0 && mask & present_mask == 0 {
+        return EvalResult::NoMatch;
+    }
+    rule.triggers.evaluate_value(facts_value)
+}
+
+/// [`evaluate_rules`], each value a message's `{path}` placeholder puts
+/// in it printed as a report printing the facts from `printed` prints it:
+/// the message's own text is never masked.
+pub(crate) fn evaluate_rules_masking(
+    facts: &StatementFacts,
+    rules: &[Rule],
+    printed: Option<PrintedAt<'_>>,
+) -> Vec<Finding> {
+    let facts_value = serde_json::to_value(facts).unwrap_or(serde_json::Value::Null);
+    let quoted = Quoted::new(printed, facts, &facts_value);
     let present_mask = super::compile::facts_present_mask(&facts_value);
     let kind_idx = facts.kind as usize;
     let mut out = Vec::new();
@@ -79,19 +162,10 @@ pub fn evaluate_rules(facts: &StatementFacts, rules: &[Rule]) -> Vec<Signal> {
         if !rule.enabled {
             continue;
         }
-        // Statement-kind gate first (typed `facts.kind`, no serialization),
-        // then the fact-family mask. Either proving NoMatch skips the rule.
-        if rule.triggers.kind_gate().skips(kind_idx) {
-            continue;
-        }
-        let mask = rule.triggers.root_mask();
-        if mask != 0 && mask & present_mask == 0 {
-            continue;
-        }
-        match rule.triggers.evaluate_value(&facts_value) {
+        match rule_matches(rule, &facts_value, kind_idx, present_mask) {
             EvalResult::NoMatch => {}
             EvalResult::Match { witnesses } => {
-                emit_for_match(rule, &facts_value, witnesses, None, &mut out);
+                emit_for_match(rule, &facts_value, witnesses, None, &quoted, &mut out);
             }
         }
     }
@@ -101,17 +175,17 @@ pub fn evaluate_rules(facts: &StatementFacts, rules: &[Rule]) -> Vec<Signal> {
 /// Per-rule explain-mode evaluation outcome. Produced by
 /// [`evaluate_rules_with_explain`] for every enabled rule —
 /// including the ones that didn't fire — so callers wiring
-/// `--explain-signals` / verbose / trace mode can render rejection
+/// `--explain-findings` / verbose / trace mode can render rejection
 /// reasons against the same surface they render matches.
 #[derive(Debug, Clone)]
 pub struct EvaluatedRule {
     pub rule_id: String,
     pub matched: bool,
     pub explanation: RuleExplanation,
-    /// One signal per emission this rule produced (zero when
+    /// One finding per emission this rule produced (zero when
     /// `matched == false`, one when emission is `Once` and the rule
     /// matched, possibly many when emission is `PerWitness`).
-    pub signals: Vec<Signal>,
+    pub findings: Vec<Finding>,
 }
 
 /// Evaluate every rule with introspection enabled. Returns one
@@ -122,17 +196,32 @@ pub struct EvaluatedRule {
 /// This is the explain-mode counterpart to [`evaluate_rules`]. Hot
 /// path callers should keep using [`evaluate_rules`]; this one runs
 /// the explain trace under every rule and is intended for `--verbose`
-/// / `--trace` / `--explain-signals` flows where extra evaluation
+/// / `--trace` / `--explain-findings` flows where extra evaluation
 /// work is acceptable.
 pub fn evaluate_rules_with_explain(facts: &StatementFacts, rules: &[Rule]) -> Vec<EvaluatedRule> {
+    evaluate_rules_with_explain_masking(facts, rules, None)
+}
+
+/// [`evaluate_rules_with_explain`], each fact string an explanation
+/// quotes and each value a message's `{path}` placeholder puts in it
+/// printed as a report printing the facts from `printed` prints it: the
+/// rule's own text is never masked.
+pub(crate) fn evaluate_rules_with_explain_masking(
+    facts: &StatementFacts,
+    rules: &[Rule],
+    printed: Option<PrintedAt<'_>>,
+) -> Vec<EvaluatedRule> {
     let facts_value = serde_json::to_value(facts).unwrap_or(serde_json::Value::Null);
+    let quoted = Quoted::new(printed, facts, &facts_value);
     let mut out = Vec::new();
     for rule in rules {
         if !rule.enabled {
             continue;
         }
-        let (result, explanation) = rule.triggers.evaluate_value_with_explain(&facts_value);
-        let mut signals = Vec::new();
+        let (result, explanation) = rule
+            .triggers
+            .evaluate_value_with_explain_masking(&facts_value, Some(quoted.strings()));
+        let mut findings = Vec::new();
         let matched = match result {
             EvalResult::NoMatch => false,
             EvalResult::Match { witnesses } => {
@@ -141,7 +230,8 @@ pub fn evaluate_rules_with_explain(facts: &StatementFacts, rules: &[Rule]) -> Ve
                     &facts_value,
                     witnesses,
                     Some(&explanation),
-                    &mut signals,
+                    &quoted,
+                    &mut findings,
                 );
                 true
             }
@@ -150,7 +240,7 @@ pub fn evaluate_rules_with_explain(facts: &StatementFacts, rules: &[Rule]) -> Ve
             rule_id: rule.id.clone(),
             matched,
             explanation,
-            signals,
+            findings,
         });
     }
     out
@@ -159,20 +249,21 @@ pub fn evaluate_rules_with_explain(facts: &StatementFacts, rules: &[Rule]) -> Ve
 fn emit_for_match(
     rule: &Rule,
     facts_value: &serde_json::Value,
-    candidates: Vec<WitnessCandidate>,
+    candidates: Vec<WitnessCandidate<'_>>,
     explanation: Option<&RuleExplanation>,
-    out: &mut Vec<Signal>,
+    quoted: &Quoted<'_>,
+    out: &mut Vec<Finding>,
 ) {
     match rule.emission {
         EmissionMode::Once => {
-            let first_value = candidates.first().map(|c| c.value.clone());
-            let message = render_message(rule, facts_value, first_value.as_ref());
-            out.push(Signal {
+            let first_value = candidates.first().map(|c| c.value);
+            let message = render_message(rule, facts_value, first_value, quoted);
+            out.push(Finding {
                 rule_id: rule.id.clone(),
-                evidence: SignalEvidence {
+                evidence: FindingEvidence {
                     witnesses: candidates.iter().map(project_witness).collect(),
                 },
-                source_span: signal_span(facts_value, candidates.first()),
+                source_span: finding_span(facts_value, candidates.first()),
                 risk_level: rule.risk_level,
                 message,
                 explanation: explanation.cloned(),
@@ -182,7 +273,7 @@ fn emit_for_match(
             // Per-witness emission fans out only on `each:`-tagged
             // candidates. Intermediate `exists:` quantifiers along
             // the predicate path also contribute candidates (so the
-            // customer-facing `signal.evidence` renders the full
+            // customer-facing `finding.evidence` renders the full
             // match trail), but they MUST NOT multiply the emission
             // count.
             //
@@ -199,7 +290,7 @@ fn emit_for_match(
             //
             // If no `each:`-tagged candidate exists (rule shape
             // uses `exists:` only but is configured `per_witness`),
-            // fall back to emitting one signal anchored at the
+            // fall back to emitting one finding anchored at the
             // first collected candidate so the rule still fires.
             let from_each_paths: Vec<&str> = candidates
                 .iter()
@@ -212,13 +303,13 @@ fn emit_for_match(
                 .collect();
             if each_candidates.is_empty() {
                 let anchor = candidates.first();
-                let message = render_message(rule, facts_value, anchor.map(|c| &c.value));
-                out.push(Signal {
+                let message = render_message(rule, facts_value, anchor.map(|c| c.value), quoted);
+                out.push(Finding {
                     rule_id: rule.id.clone(),
-                    evidence: SignalEvidence {
+                    evidence: FindingEvidence {
                         witnesses: candidates.iter().map(project_witness).collect(),
                     },
-                    source_span: anchor.and_then(|c| extract_span(&c.value)),
+                    source_span: anchor.and_then(|c| extract_span(c.value)),
                     risk_level: rule.risk_level,
                     message,
                     explanation: explanation.cloned(),
@@ -226,13 +317,13 @@ fn emit_for_match(
                 return;
             }
             for candidate in each_candidates {
-                let message = render_message(rule, facts_value, Some(&candidate.value));
-                out.push(Signal {
+                let message = render_message(rule, facts_value, Some(candidate.value), quoted);
+                out.push(Finding {
                     rule_id: rule.id.clone(),
-                    evidence: SignalEvidence {
+                    evidence: FindingEvidence {
                         witnesses: vec![project_witness(candidate)],
                     },
-                    source_span: extract_span(&candidate.value),
+                    source_span: extract_span(candidate.value),
                     risk_level: rule.risk_level,
                     message,
                     explanation: explanation.cloned(),
@@ -258,7 +349,7 @@ fn emit_for_match(
 /// `each: ... any_of: [each: ...]` the compiler inserts `@any_of[N]`
 /// directly after the parent path without a leading `.`, so checking
 /// `.`-prefix alone wrongly treats the outer `each:` candidate as a
-/// leaf and emits a duplicate signal anchored at its (outer) span.
+/// leaf and emits a duplicate finding anchored at its (outer) span.
 fn is_leaf_each_path(path: &str, all_each_paths: &[&str]) -> bool {
     let dot_prefix = format!("{}.", path);
     let any_of_prefix = format!("{}@", path);
@@ -271,8 +362,8 @@ fn is_leaf_each_path(path: &str, all_each_paths: &[&str]) -> bool {
 /// schema-stable [`FactWitness`]. Drops engine-only bookkeeping
 /// (`from_each`) so it never reaches the customer surface — the
 /// boundary where internal evaluation state ends and the public
-/// `Signal` payload begins.
-fn project_witness(candidate: &WitnessCandidate) -> FactWitness {
+/// `Finding` payload begins.
+fn project_witness(candidate: &WitnessCandidate<'_>) -> FactWitness {
     FactWitness {
         path: candidate.path.clone(),
         value: candidate.value.clone(),
@@ -283,19 +374,20 @@ fn render_message(
     rule: &Rule,
     facts_value: &serde_json::Value,
     witness: Option<&serde_json::Value>,
+    quoted: &Quoted<'_>,
 ) -> String {
     match &rule.message_template {
-        Some(tmpl) => tmpl.render(facts_value, witness),
+        Some(tmpl) => render_template(&tmpl.raw, facts_value, witness, quoted),
         None => rule.description.clone(),
     }
 }
 
-fn signal_span(
+fn finding_span(
     facts_value: &serde_json::Value,
-    first_candidate: Option<&WitnessCandidate>,
+    first_candidate: Option<&WitnessCandidate<'_>>,
 ) -> Option<Span> {
     if let Some(c) = first_candidate {
-        if let Some(sp) = extract_span(&c.value) {
+        if let Some(sp) = extract_span(c.value) {
             return Some(sp);
         }
     }
@@ -318,10 +410,13 @@ fn extract_span(v: &serde_json::Value) -> Option<Span> {
 // Template rendering — `{path.to.field}` interpolation.
 // ─────────────────────────────────────────────────────────────────────
 
+/// `raw` with each `{path}` replaced by the value at `path`, masked where
+/// it quotes a secret ([`Quoted`]).
 fn render_template(
     raw: &str,
     facts_value: &serde_json::Value,
     witness: Option<&serde_json::Value>,
+    quoted: &Quoted<'_>,
 ) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -337,8 +432,10 @@ fn render_template(
                 // Flush literal text verbatim (preserves multi-byte UTF-8).
                 out.push_str(&raw[literal_start..i]);
                 let path_str = &raw[i + 1..i + 1 + end];
-                let resolved = resolve(facts_value, witness, path_str);
-                out.push_str(&render_value(resolved.as_ref()));
+                out.push_str(&render_value(
+                    resolve(facts_value, witness, path_str),
+                    quoted,
+                ));
                 i += end + 2;
                 literal_start = i;
                 continue;
@@ -354,7 +451,7 @@ fn resolve<'a>(
     facts: &'a serde_json::Value,
     witness: Option<&'a serde_json::Value>,
     path: &str,
-) -> Option<serde_json::Value> {
+) -> Option<&'a serde_json::Value> {
     let mut segments = path.split('.');
     let head = segments.next()?;
     let mut current: &serde_json::Value = if head == "witness" {
@@ -369,17 +466,79 @@ fn resolve<'a>(
             current = current.as_object().and_then(|m| m.get(seg))?;
         }
     }
-    Some(current.clone())
+    Some(current)
 }
 
-fn render_value(v: Option<&serde_json::Value>) -> String {
+fn render_value(v: Option<&serde_json::Value>, quoted: &Quoted<'_>) -> String {
     match v {
         None => String::new(),
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(node @ serde_json::Value::String(s)) => {
+            quoted.strings().masked(node).unwrap_or(s).to_string()
+        }
         Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::Bool(b)) => b.to_string(),
         Some(serde_json::Value::Null) => String::new(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        Some(other) => display_text(other, quoted).unwrap_or_else(|| {
+            serde_json::to_string(&quoted.strings().masked_value(other)).unwrap_or_default()
+        }),
+    }
+}
+
+/// A fact value as a reader names it, where it is a name: an identifier
+/// by its text, a table as written, a column as `table.name`, a tag as
+/// `key=value`, a variant holding one of those by what it holds, a list
+/// by its items. `None` for any other shape.
+fn display_text(value: &serde_json::Value, quoted: &Quoted<'_>) -> Option<String> {
+    use serde_json::Value;
+    let text = |node: &Value| -> Option<String> {
+        let shown = node.as_str()?;
+        Some(quoted.strings().masked(node).unwrap_or(shown).to_string())
+    };
+    match value {
+        Value::String(_) => text(value),
+        Value::Array(items) => {
+            let shown: Option<Vec<String>> = items
+                .iter()
+                .map(|item| display_text(item, quoted))
+                .collect();
+            Some(shown?.join(", "))
+        }
+        Value::Object(fields) => {
+            if let Some(written) = fields.get("written").and_then(text) {
+                if !written.is_empty() {
+                    return Some(written);
+                }
+                return fields.get("canonical").and_then(text);
+            }
+            if let Some(raw) = fields.get("raw") {
+                return text(raw);
+            }
+            if let Some(name) = fields.get("name") {
+                let name = display_text(name, quoted)?;
+                let table = fields
+                    .get("table")
+                    .and_then(|table| display_text(table, quoted))
+                    .filter(|table| !table.is_empty());
+                return Some(match table {
+                    Some(table) => format!("{table}.{name}"),
+                    None => name,
+                });
+            }
+            if let Some(key) = fields.get("key") {
+                let key = display_text(key, quoted)?;
+                return Some(
+                    match fields.get("value").and_then(|v| display_text(v, quoted)) {
+                        Some(value) if !value.is_empty() => format!("{key}={value}"),
+                        Some(_) | None => key,
+                    },
+                );
+            }
+            match fields.iter().next() {
+                Some((_, held)) if fields.len() == 1 => display_text(held, quoted),
+                Some(_) | None => None,
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
 }
 
@@ -387,7 +546,7 @@ fn render_value(v: Option<&serde_json::Value>) -> String {
 // Used externally — re-export so callers see one engine surface.
 // ─────────────────────────────────────────────────────────────────────
 
-pub use super::signal::Signal as EngineSignal;
+pub use super::finding::Finding as EngineFinding;
 
 #[allow(dead_code)]
 fn _ru_explanation_smoke(_e: RuleExplanation) {}
@@ -458,9 +617,9 @@ mod tests {
     fn rule_fires_on_match() {
         let facts = empty_facts(StatementKind::Grant);
         let r = rule("R1", "kind: grant");
-        let signals = evaluate_rules(&facts, &[r]);
-        assert_eq!(signals.len(), 1);
-        assert_eq!(signals[0].rule_id, "R1");
+        let findings = evaluate_rules(&facts, &[r]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "R1");
     }
 
     #[test]
@@ -483,8 +642,21 @@ mod tests {
         let facts = empty_facts(StatementKind::Grant);
         let mut r = rule("R1", "kind: grant");
         r.message_template = Some(MessageTemplate::new("statement: {kind}"));
-        let signals = evaluate_rules(&facts, &[r]);
-        assert_eq!(signals[0].message, "statement: grant");
+        let findings = evaluate_rules(&facts, &[r]);
+        assert_eq!(findings[0].message, "statement: grant");
+    }
+
+    // Facts that hold no secret and no credential value print as they are
+    // written: a message quoting them reads no masked copy of them.
+    #[test]
+    fn a_message_over_facts_holding_no_secret_reads_no_masked_copy() {
+        let facts = empty_facts(StatementKind::Grant);
+        let mut r = rule("R1", "kind: grant");
+        r.message_template = Some(MessageTemplate::new("statement: {kind}"));
+        let copies = crate::facts::secrets::masked_copies_serialized();
+        let findings = evaluate_rules(&facts, &[r]);
+        assert_eq!(findings[0].message, "statement: grant");
+        assert_eq!(crate::facts::secrets::masked_copies_serialized(), copies);
     }
 
     #[test]
@@ -496,8 +668,8 @@ mod tests {
         let mut r = rule("R1", "kind: grant");
         let msg = "risk — “quoted” café";
         r.message_template = Some(MessageTemplate::new(msg));
-        let signals = evaluate_rules(&facts, &[r]);
-        assert_eq!(signals[0].message, msg);
+        let findings = evaluate_rules(&facts, &[r]);
+        assert_eq!(findings[0].message, msg);
     }
 
     #[test]
@@ -507,8 +679,8 @@ mod tests {
         let facts = empty_facts(StatementKind::Grant);
         let mut r = rule("R1", "kind: grant");
         r.message_template = Some(MessageTemplate::new("café — {kind} — ☕"));
-        let signals = evaluate_rules(&facts, &[r]);
-        assert_eq!(signals[0].message, "café — grant — ☕");
+        let findings = evaluate_rules(&facts, &[r]);
+        assert_eq!(findings[0].message, "café — grant — ☕");
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -579,14 +751,14 @@ mod tests {
 
         let matched = results.iter().find(|r| r.rule_id == "MATCH").unwrap();
         assert!(matched.matched);
-        assert_eq!(matched.signals.len(), 1);
-        assert_eq!(matched.signals[0].rule_id, "MATCH");
-        // Signal carries the explanation populated by the engine.
-        assert!(matched.signals[0].explanation.is_some());
+        assert_eq!(matched.findings.len(), 1);
+        assert_eq!(matched.findings[0].rule_id, "MATCH");
+        // Finding carries the explanation populated by the engine.
+        assert!(matched.findings[0].explanation.is_some());
 
         let rejected = results.iter().find(|r| r.rule_id == "REJECT").unwrap();
         assert!(!rejected.matched);
-        assert!(rejected.signals.is_empty());
+        assert!(rejected.findings.is_empty());
         assert!(rejected
             .explanation
             .unmatched_paths
@@ -612,24 +784,24 @@ mod tests {
     }
 
     #[test]
-    fn signal_explanation_only_populated_in_explain_mode() {
+    fn finding_explanation_only_populated_in_explain_mode() {
         let facts = empty_facts(StatementKind::Grant);
         let r = rule("X", "kind: grant");
         // Hot-path entry point never sets explanation.
-        let signals = evaluate_rules(&facts, &[r.clone()]);
-        assert_eq!(signals.len(), 1);
-        assert!(signals[0].explanation.is_none());
+        let findings = evaluate_rules(&facts, std::slice::from_ref(&r));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].explanation.is_none());
         // Explain-mode entry point sets it.
         let results = evaluate_rules_with_explain(&facts, &[r]);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].signals.len(), 1);
-        assert!(results[0].signals[0].explanation.is_some());
+        assert_eq!(results[0].findings.len(), 1);
+        assert!(results[0].findings[0].explanation.is_some());
     }
 
     /// Parity guarantee for the fact-family dispatch index: across the
     /// full builtin corpus over a broad statement battery, every rule
     /// the index SKIPS must genuinely be `NoMatch`. If this holds, the
-    /// indexed hot path emits exactly the signals the unindexed path
+    /// indexed hot path emits exactly the findings the unindexed path
     /// would — skipping never drops a finding.
     /// Collect real `StatementFacts` across fact families by running each
     /// family driver (with fact capture) over a broad statement battery.
@@ -718,62 +890,54 @@ mod tests {
                 None => crate::parse_sql(sql),
             };
             let Ok(script) = script else { continue };
-            // Run every family driver with a retaining fact sink; each
-            // records facts only for the statements it recognizes.
+            // Run every family with a retaining fact sink: one record per
+            // statement any family reads.
             let fold = crate::build_script_context_fold(&script, sql);
             let reasoning = crate::facts::reasoning::RecognitionOnly;
+            let read_dialect = dialect.unwrap_or_else(crate::dialect::snowflake);
+            let bodies = crate::DynamicBodies::read(sql, &fold, &read_dialect, false, None);
+            let functions = crate::ir::ScriptFunctions::new(
+                crate::ir::CatalogDialect::from_dialect_name(dname),
+                &fold,
+            );
+            let render = crate::template::RenderArtifacts::raw(sql.to_string());
+            let relations = crate::ReadRelations::default();
+            let mut metrics = crate::analyzer::MetricsCollector::new();
+            let mut sink = crate::StatementFactsSink::new(&mut metrics, &[], true);
             let mut script_reasoning = crate::facts::reasoning::Reasoning::for_script(
                 &reasoning,
                 crate::facts::reasoning::ScriptInputs {
                     script: &script,
                     source: sql,
-                    dialect_name: dname,
+                    dialect_name: read_dialect.name(),
                     fold: &fold,
                     catalog: None,
                     model_catalog: None,
+                    bodies: &bodies,
+                    functions: &functions,
+                    earlier: crate::facts::reasoning::EarlierRemovals::none(),
+                    temporary_drops: relations.relations.temporary_drops(),
                 },
             );
-            let mut metrics = crate::analyzer::MetricsCollector::new();
-            let mut sink = crate::StatementFactsSink::new(&mut metrics, &[], true);
-            let _ = crate::evaluate_ddl_rules_for_script(
-                &script,
-                sql,
-                &fold,
-                corpus,
-                &reasoning,
-                script_reasoning.as_ref(),
-                Some(&mut sink),
-                None,
-            );
-            let _ = crate::evaluate_query_rules_for_script(
-                &script,
-                sql,
-                &fold,
-                None,
-                None,
+            let _ = crate::evaluate_script_families(
+                crate::ScriptRead {
+                    script: &script,
+                    render: &render,
+                    fold: &fold,
+                    dialect: read_dialect.as_ref(),
+                    functions: &functions,
+                    relations: &relations,
+                    catalog: None,
+                    model_catalog: None,
+                    last: None,
+                    shown_tags: &[],
+                },
                 corpus,
                 &reasoning,
                 script_reasoning.as_mut(),
-                Some(&mut sink),
+                &mut sink,
                 None,
-            );
-            let _ = crate::evaluate_privilege_rules_for_script(
-                &script,
-                sql,
-                &fold,
-                None,
-                corpus,
-                &reasoning,
-                Some(&mut sink),
-                None,
-            );
-            let _ = crate::evaluate_policy_attachment_rules_for_script(
-                &script,
-                sql,
-                &fold,
-                corpus,
-                Some(&mut sink),
-                None,
+                &crate::reported_unwalked(&script, sql, Some(read_dialect.as_ref())),
             );
             let (_, retained, _) = sink.finish();
             all_facts.extend(retained.unwrap_or_default());
@@ -786,6 +950,7 @@ mod tests {
     /// must genuinely be `NoMatch` — skipping never drops a finding.
     #[test]
     fn dispatch_index_never_skips_a_matching_rule() {
+        let _folding = crate::ir::normalize::default_folding();
         use crate::rules::compile::facts_present_mask;
 
         let corpus = crate::rules::all_builtin_rules().expect("builtin corpus loads");
@@ -823,6 +988,7 @@ mod tests {
     /// it. This is the soundness invariant, pinned against the real corpus.
     #[test]
     fn kind_gate_never_skips_a_matching_rule() {
+        let _folding = crate::ir::normalize::default_folding();
         let corpus = crate::rules::all_builtin_rules().expect("builtin corpus loads");
         let all_facts = collect_battery_facts();
         assert!(!all_facts.is_empty(), "battery collected no facts");
@@ -855,6 +1021,7 @@ mod tests {
     /// `NoMatch` on that statement.
     #[test]
     fn combined_dispatch_skip_implies_no_match() {
+        let _folding = crate::ir::normalize::default_folding();
         use crate::rules::compile::facts_present_mask;
 
         let corpus = crate::rules::all_builtin_rules().expect("builtin corpus loads");

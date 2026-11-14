@@ -22,8 +22,7 @@ fn rs_rule_ids(sql: &str) -> Vec<String> {
     };
     let report = analyze_risk_with_policy_config(sql, &cfg).expect("analysis should succeed");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(g)| g.matched_rule.clone())
         .collect()
 }
@@ -196,6 +195,50 @@ fn test_unload_iam_role_is_not_flagged() {
     assert!(!ids.contains(&"CRED-PWD-LEAK".to_string()), "ids={:?}", ids);
 }
 
+/// The tables `sql` reads, and how many statements it analysed, under the
+/// Redshift dialect.
+fn rs_reads(sql: &str) -> (Vec<String>, usize) {
+    let cfg = AnalysisConfig {
+        dialect: Some(redshift()),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config(sql, &cfg).expect("analysis should succeed");
+    let mut read: Vec<String> = report.summary.tables_read_names.into_iter().collect();
+    read.sort();
+    (read, report.summary.statements_analyzed)
+}
+
+#[test]
+fn test_unload_query_is_read_as_a_statement() {
+    let sql = "UNLOAD ('SELECT o.id FROM crm.orders o JOIN crm.users u ON u.id = o.user_id \
+               WHERE u.state = ''NV''') TO 's3://b/o/' IAM_ROLE 'arn:aws:iam::123456789012:role/MyRole';";
+    assert_no_opaque(sql);
+    format_and_verify(sql);
+    // The query is SQL text the UNLOAD runs, quoted with its own literals
+    // masked: the tables it reads are counted and named.
+    let (names, analysed) = rs_reads(sql);
+    assert_eq!(analysed, 2);
+    assert!(
+        names.iter().any(|name| name.contains("orders")),
+        "{names:?}"
+    );
+    assert!(names.iter().all(|name| !name.contains("****")), "{names:?}");
+    let cfg = AnalysisConfig {
+        dialect: Some(redshift()),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config(sql, &cfg).expect("analysis should succeed");
+    assert_eq!(report.summary.tables_read, 2, "{names:?}");
+}
+
+#[test]
+fn test_unload_query_that_does_not_parse_reads_nothing() {
+    let sql = "UNLOAD ('SELECT FROM WHERE (((') TO 's3://b/o/' IAM_ROLE 'arn:aws:iam::123456789012:role/MyRole';";
+    assert_no_opaque(sql);
+    format_and_verify(sql);
+    assert_eq!(rs_reads(sql), (Vec::new(), 1));
+}
+
 #[test]
 fn test_multi_statement_roundtrip() {
     let sql = "CREATE TABLE t (id INT) DISTSTYLE ALL;\nINSERT INTO t VALUES (1);\nSELECT * FROM t;";
@@ -298,6 +341,86 @@ fn test_grant_bare_object_to_public_flagged() {
     // Redshift/PG bare-object GRANT (no TABLE keyword) must fire GRT-TO-PUBLIC.
     let ids = rs_rule_ids("GRANT SELECT ON sales TO PUBLIC;");
     assert!(ids.contains(&"GRT-TO-PUBLIC".to_string()), "ids={:?}", ids);
+}
+
+#[test]
+fn test_grant_to_a_grantee_list_reads_every_grantee() {
+    // PUBLIC anywhere in the list fires; the list parses as one statement.
+    for sql in [
+        "GRANT SELECT ON sales TO alice, PUBLIC;",
+        "GRANT SELECT ON TABLE sales TO GROUP analysts, PUBLIC;",
+        "GRANT SELECT ON sales TO PUBLIC, alice;",
+    ] {
+        let ids = rs_rule_ids(sql);
+        assert!(
+            ids.contains(&"GRT-TO-PUBLIC".to_string()),
+            "{sql}: ids={ids:?}"
+        );
+    }
+    let ids = rs_rule_ids("GRANT SELECT ON sales TO alice, bob;");
+    assert!(!ids.contains(&"GRT-TO-PUBLIC".to_string()), "ids={ids:?}");
+
+    // Several objects of one kind before TO.
+    for sql in [
+        "GRANT SELECT ON t1, t2 TO PUBLIC;",
+        "GRANT SELECT ON TABLE s.t1, s.t2 TO alice, PUBLIC;",
+        "GRANT EXECUTE ON FUNCTION f(int), g(text) TO PUBLIC;",
+    ] {
+        let ids = rs_rule_ids(sql);
+        assert!(
+            ids.contains(&"GRT-TO-PUBLIC".to_string()),
+            "{sql}: ids={ids:?}"
+        );
+        let script = parse_sql_with_dialect(sql, &*redshift()).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{sql}: {:?}", script.stmts);
+        let AstStmt::Grant(g) = &script.stmts[0] else {
+            panic!("{sql}: {:?}", script.stmts[0]);
+        };
+        let lexega_core::ast::AstGrantShape::Privilege(body) = &g.shape else {
+            panic!("{sql}: {:?}", g.shape);
+        };
+        assert_eq!(body.objects.len(), 2, "{sql}");
+    }
+
+    for sql in [
+        "GRANT SELECT ON sales TO alice, bob, PUBLIC;",
+        "REVOKE SELECT ON sales FROM alice, PUBLIC;",
+    ] {
+        let script = parse_sql_with_dialect(sql, &*redshift()).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{sql}: {:?}", script.stmts);
+        let grantees = match &script.stmts[0] {
+            AstStmt::Grant(g) => match &g.shape {
+                lexega_core::ast::AstGrantShape::Privilege(body) => body.grantees.len(),
+                other => panic!("{sql}: {other:?}"),
+            },
+            AstStmt::Revoke(r) => match &r.shape {
+                lexega_core::ast::AstRevokeShape::Privilege(body) => body.grantees.len(),
+                other => panic!("{sql}: {other:?}"),
+            },
+            other => panic!("{sql}: {other:?}"),
+        };
+        assert_eq!(grantees, sql.matches(',').count() + 1, "{sql}");
+    }
+}
+
+#[test]
+fn test_iam_role_is_not_inline_auth() {
+    for sql in [
+        "COPY t FROM 's3://b/k' IAM_ROLE 'arn:aws:iam::123456789012:role/r' FORMAT AS PARQUET;",
+        "UNLOAD ('select 1') TO 's3://b/k' IAM_ROLE 'arn:aws:iam::123456789012:role/r';",
+        "COPY t FROM 's3://b/k' IAM_ROLE default;",
+        "COPY t FROM 's3://b/k' CREDENTIALS 'aws_iam_role=arn:aws:iam::123456789012:role/r';",
+    ] {
+        let ids = rs_rule_ids(sql);
+        assert!(
+            !ids.contains(&"CRED-INLINE-AUTH".to_string()),
+            "{sql}: ids={ids:?}"
+        );
+    }
+    let ids = rs_rule_ids(
+        "COPY t FROM 's3://b/k' CREDENTIALS 'aws_access_key_id=AKIAIOSFODNN7EXAMPLE;aws_secret_access_key=x';",
+    );
+    assert!(ids.contains(&"CRED-INLINE-AUTH".to_string()), "ids={ids:?}");
 }
 
 #[test]
@@ -458,7 +581,7 @@ fn test_spectrum_external_table_s3_fires_extstore() {
     );
     assert!(
         ids.contains(&"BQ-EXTTBL-EXTSTORE".to_string()),
-        "S3 LOCATION should fire external-storage signal; ids={:?}",
+        "S3 LOCATION should fire external-storage finding; ids={:?}",
         ids
     );
 }
@@ -836,4 +959,45 @@ fn test_projection_exclude_is_dialect_gated() {
             .any(|s| matches!(s, AstStmt::OpaqueContent { .. })),
         "PostgreSQL must not parse the Redshift trailing EXCLUDE clause"
     );
+}
+
+// ───────────────────────── UNLOAD unbounded export ─────────────────────────
+
+const ROLE: &str = "IAM_ROLE 'arn:aws:iam::123456789012:role/MyRole'";
+
+fn unload_unbounded(query: &str) -> bool {
+    let sql = format!("UNLOAD ('{query}') TO 's3://b/o/' {ROLE};");
+    rs_rule_ids(&sql).contains(&"RS-UNLOAD-UNBOUNDED".to_string())
+}
+
+#[test]
+fn test_unload_of_an_unfiltered_table_is_unbounded() {
+    assert!(unload_unbounded("SELECT * FROM sales"));
+    assert!(unload_unbounded(
+        "SELECT id, ssn FROM crm.users u JOIN crm.o o ON o.u = u.id"
+    ));
+}
+
+#[test]
+fn test_unload_with_a_where_is_not_unbounded() {
+    assert!(!unload_unbounded(
+        "SELECT * FROM sales WHERE day = ''2026-01-01''"
+    ));
+}
+
+#[test]
+fn test_unload_that_reads_no_table_is_not_unbounded() {
+    assert!(!unload_unbounded("SELECT 1"));
+}
+
+#[test]
+fn test_unload_query_not_parsed_is_judged_by_its_text() {
+    assert!(unload_unbounded("SELECT FROM sales((("));
+    assert!(!unload_unbounded("SELECT FROM sales WHERE((("));
+}
+
+#[test]
+fn test_unload_unbounded_does_not_fire_the_snowflake_rule() {
+    let sql = format!("UNLOAD ('SELECT * FROM sales') TO 's3://b/o/' {ROLE};");
+    assert!(!rs_rule_ids(&sql).contains(&"SNW-EXPORT-UNBOUNDED".to_string()));
 }

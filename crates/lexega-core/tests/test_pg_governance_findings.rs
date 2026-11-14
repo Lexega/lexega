@@ -1,14 +1,14 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Tests for PostgreSQL governance signals: anonymous code, extensions, roles.
+//! Tests for PostgreSQL governance findings: anonymous code, extensions, roles.
 //!
-//!   PG-ANON-EXEC  – DO $$ anonymous code block  (High)
-//!   PG-EXT-NEW  – CREATE EXTENSION            (High)
-//!   PG-EXT-CASCADE-NEW  – CREATE EXTENSION CASCADE    (Critical)
-//!   ROLE-NEW     – CREATE ROLE/USER            (Medium)
-//!   ROLE-CHG     – ALTER  ROLE/USER            (High)
-//!   ROLE-DROP     – DROP   ROLE/USER            (High)
+//!   PG-ANON-EXEC  – DO $$ anonymous code block  (Info)
+//!   PG-EXT-NEW  – CREATE EXTENSION            (Medium)
+//!   PG-EXT-CASCADE-NEW  – CREATE EXTENSION CASCADE    (Medium)
+//!   ROLE-NEW     – CREATE ROLE/USER            (Info)
+//!   ROLE-CHG     – ALTER  ROLE/USER            (Low)
+//!   ROLE-DROP     – DROP   ROLE/USER            (Medium)
 //!
 //! Covers: formatting roundtrip, rule firing, classification, analyzed-not-skipped,
 //!         multi-statement evidence counting, USER alias parity.
@@ -33,9 +33,20 @@ fn pg_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| match s {
+    report.findings.iter().any(|s| match s {
         RuleMatch::Analysis(g) => g.matched_rule == rule_id,
     })
+}
+
+fn has_context(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.context.iter().any(|s| match s {
+        RuleMatch::Analysis(g) => g.matched_rule == rule_id,
+    })
+}
+
+/// The rule is in the findings or in the context.
+fn has_entry(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    has_rule(report, rule_id) || has_context(report, rule_id)
 }
 
 fn pg_format(sql: &str) -> String {
@@ -48,10 +59,20 @@ fn pg_format(sql: &str) -> String {
 
 fn rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> Vec<&str> {
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.as_str()),
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => g.matched_rule.as_str(),
+        })
+        .collect()
+}
+
+fn context_rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> Vec<&str> {
+    report
+        .context
+        .iter()
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => g.matched_rule.as_str(),
         })
         .collect()
 }
@@ -96,16 +117,16 @@ $$;"#;
     verify_formatting_safe(sql, &formatted).expect("safe");
 }
 
-// ── Signal ──────────────────────────────────────────────────────────────
+// ── Finding ──────────────────────────────────────────────────────────────
 
 #[test]
 fn test_do_block_fires_pg_c042() {
     let sql = "DO $$ BEGIN NULL; END $$;";
     let report = pg_analyze(sql);
     assert!(
-        has_rule(&report, "PG-ANON-EXEC"),
+        has_context(&report, "PG-ANON-EXEC"),
         "PG-ANON-EXEC should fire for DO block. Got: {:?}",
-        rule_ids(&report)
+        context_rule_ids(&report)
     );
 }
 
@@ -114,9 +135,9 @@ fn test_do_block_with_language_fires_pg_c042() {
     let sql = "DO $$ BEGIN NULL; END $$ LANGUAGE plpgsql;";
     let report = pg_analyze(sql);
     assert!(
-        has_rule(&report, "PG-ANON-EXEC"),
+        has_context(&report, "PG-ANON-EXEC"),
         "PG-ANON-EXEC should fire even with LANGUAGE clause. Got: {:?}",
-        rule_ids(&report)
+        context_rule_ids(&report)
     );
 }
 
@@ -158,7 +179,7 @@ fn test_do_block_multi_statement() {
     );
 
     let evidence: usize = report
-        .signals
+        .context
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "PG-ANON-EXEC"))
         .map(|s| match s {
@@ -266,7 +287,7 @@ fn test_create_extension_full_syntax_formats() {
     verify_formatting_safe(sql, &formatted).expect("safe");
 }
 
-// ── Signals ─────────────────────────────────────────────────────────────
+// ── Findings ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_create_extension_fires_pg_ext_new() {
@@ -343,7 +364,7 @@ fn test_create_extension_multi_statement() {
 
     // PG-EXT-NEW should fire for all three
     let c043_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "PG-EXT-NEW"))
         .map(|s| match s {
@@ -404,16 +425,16 @@ fn test_create_user_formats() {
     verify_formatting_safe(sql, &formatted).expect("safe");
 }
 
-// ── Signals ─────────────────────────────────────────────────────────────
+// ── Findings ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_create_role_fires_pg_role_new() {
     let sql = "CREATE ROLE readonly;";
     let report = pg_analyze(sql);
     assert!(
-        has_rule(&report, "ROLE-NEW"),
+        has_context(&report, "ROLE-NEW"),
         "ROLE-NEW should fire for CREATE ROLE. Got: {:?}",
-        rule_ids(&report)
+        context_rule_ids(&report)
     );
 }
 
@@ -422,9 +443,9 @@ fn test_create_user_fires_pg_role_new() {
     let sql = "CREATE USER deploy_user PASSWORD 'deploy123';";
     let report = pg_analyze(sql);
     assert!(
-        has_rule(&report, "ROLE-NEW"),
+        has_context(&report, "ROLE-NEW"),
         "ROLE-NEW should fire for CREATE USER (alias). Got: {:?}",
-        rule_ids(&report)
+        context_rule_ids(&report)
     );
 }
 
@@ -484,7 +505,7 @@ fn test_alter_user_formats() {
     verify_formatting_safe(sql, &formatted).expect("safe");
 }
 
-// ── Signals ─────────────────────────────────────────────────────────────
+// ── Findings ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_alter_role_fires_pg_role_chg() {
@@ -550,7 +571,7 @@ fn test_drop_user_if_exists_formats() {
     verify_formatting_safe(sql, &formatted).expect("safe");
 }
 
-// ── Signals ─────────────────────────────────────────────────────────────
+// ── Findings ─────────────────────────────────────────────────────────────
 
 #[test]
 fn test_drop_role_fires_pg_role_drop() {
@@ -609,7 +630,7 @@ fn test_role_lifecycle_multi_statement() {
         report.summary.statements_analyzed, 3,
         "All 3 ROLE statements should be analyzed"
     );
-    assert!(has_rule(&report, "ROLE-NEW"), "ROLE-NEW for CREATE");
+    assert!(has_context(&report, "ROLE-NEW"), "ROLE-NEW for CREATE");
     assert!(has_rule(&report, "ROLE-CHG"), "ROLE-CHG for ALTER");
     assert!(has_rule(&report, "ROLE-DROP"), "ROLE-DROP for DROP");
 }
@@ -626,7 +647,7 @@ fn test_user_lifecycle_multi_statement() {
         report.summary.statements_analyzed, 3,
         "All 3 USER statements should be analyzed (USER is ROLE alias)"
     );
-    assert!(has_rule(&report, "ROLE-NEW"), "ROLE-NEW for CREATE USER");
+    assert!(has_context(&report, "ROLE-NEW"), "ROLE-NEW for CREATE USER");
     assert!(has_rule(&report, "ROLE-CHG"), "ROLE-CHG for ALTER USER");
     assert!(has_rule(&report, "ROLE-DROP"), "ROLE-DROP for DROP USER");
 }
@@ -642,7 +663,7 @@ fn test_multiple_create_roles_evidence_count() {
     assert_eq!(report.summary.statements_analyzed, 3);
 
     let evidence: usize = report
-        .signals
+        .context
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "ROLE-NEW"))
         .map(|s| match s {
@@ -673,11 +694,11 @@ fn test_mixed_governance_multi_statement() {
         "DO block (with its inner statement) and the four governance statements should be analyzed"
     );
 
-    assert!(has_rule(&report, "PG-ANON-EXEC"), "DO block signal");
-    assert!(has_rule(&report, "PG-EXT-NEW"), "CREATE EXTENSION signal");
-    assert!(has_rule(&report, "ROLE-NEW"), "CREATE ROLE signal");
-    assert!(has_rule(&report, "ROLE-CHG"), "ALTER ROLE signal");
-    assert!(has_rule(&report, "ROLE-DROP"), "DROP ROLE signal");
+    assert!(has_context(&report, "PG-ANON-EXEC"), "DO block finding");
+    assert!(has_rule(&report, "PG-EXT-NEW"), "CREATE EXTENSION finding");
+    assert!(has_context(&report, "ROLE-NEW"), "CREATE ROLE finding");
+    assert!(has_rule(&report, "ROLE-CHG"), "ALTER ROLE finding");
+    assert!(has_rule(&report, "ROLE-DROP"), "DROP ROLE finding");
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -703,7 +724,7 @@ fn test_alter_role_does_not_fire_create_or_drop() {
     let sql = "ALTER ROLE test_role NOLOGIN;";
     let report = pg_analyze(sql);
     assert!(
-        !has_rule(&report, "ROLE-NEW"),
+        !has_entry(&report, "ROLE-NEW"),
         "ALTER ROLE should NOT fire ROLE-NEW (CREATE)"
     );
     assert!(
@@ -717,7 +738,7 @@ fn test_drop_role_does_not_fire_create_or_alter() {
     let sql = "DROP ROLE test_role;";
     let report = pg_analyze(sql);
     assert!(
-        !has_rule(&report, "ROLE-NEW"),
+        !has_entry(&report, "ROLE-NEW"),
         "DROP ROLE should NOT fire ROLE-NEW (CREATE)"
     );
     assert!(
@@ -735,7 +756,7 @@ fn test_do_block_does_not_fire_extension_or_role_rules() {
         "DO should NOT fire extension rule"
     );
     assert!(
-        !has_rule(&report, "ROLE-NEW"),
+        !has_entry(&report, "ROLE-NEW"),
         "DO should NOT fire CREATE ROLE rule"
     );
 }

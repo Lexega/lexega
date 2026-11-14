@@ -8,7 +8,7 @@ use lexega_core::api::analyze_risk_with_policy_config;
 /// Tests cover:
 ///   1. Parsing produces AstDropMssqlTrigger (not OpaqueContent)
 ///   2. Formatting preserves semantic tokens
-///   3. Risk analysis emits TRIG-DROP signals
+///   3. Risk analysis emits TRIG-DROP findings
 use lexega_core::ast::AstStmt;
 use lexega_core::dialect::mssql;
 use lexega_core::{format_sql_with_config, parse_sql_with_dialect, FormatterConfig, MsSqlDialect};
@@ -20,9 +20,10 @@ use std::sync::Arc;
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn parse_mssql(sql: &str) -> Vec<AstStmt> {
@@ -63,20 +64,22 @@ fn format_verify_and_assert_variant(sql: &str, expected_variant: &str) {
         });
 }
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_mssql(sql: &str) -> HashSet<String> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(MsSqlDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(MsSqlDialect)),
+        ..Default::default()
+    };
     match analyze_risk_with_policy_config(sql, &config) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Risk analysis error (MSSQL dialect): {:?}", e);
             HashSet::new()
@@ -169,7 +172,7 @@ fn test_drop_trigger_comma_on_database() {
 }
 
 // ============================================================================
-// Risk analysis — TRIG-DROP signal
+// Risk analysis — TRIG-DROP finding
 // ============================================================================
 
 #[test]
@@ -218,13 +221,15 @@ fn test_drop_trigger_on_database_emits_trig_drop() {
 
 #[test]
 fn test_drop_trigger_multi_statement_evidence() {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(MsSqlDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(MsSqlDialect)),
+        ..Default::default()
+    };
     let sql = "DROP TRIGGER trg_a;\nDROP TRIGGER trg_b;";
     let report = analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed");
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|f| matches!(f, RuleMatch::Analysis(g) if g.matched_rule == "TRIG-DROP"))
         .map(|f| match f {

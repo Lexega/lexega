@@ -145,7 +145,8 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::Delete
         | K::Merge
         | K::MultiInsert
-        | K::BqAssert => C::Query,
+        | K::BqAssert
+        | K::Assert => C::Query,
 
         // Data leaving the warehouse.
         K::BqExportData
@@ -215,6 +216,7 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::DropRole
         | K::CreateUser
         | K::AlterUser
+        | K::RenameUser
         | K::DropUser
         | K::PgCreateRole
         | K::PgAlterRole
@@ -345,6 +347,7 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         K::CreateTask
         | K::AlterTask
         | K::DropTask
+        | K::ExecuteTask
         | K::CreateEvent
         | K::AlterEvent
         | K::CreateDynamicTable
@@ -367,6 +370,10 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::PgCluster
         | K::MssqlDbcc
         | K::AnalyzeStmt
+        | K::OptimizeTable
+        | K::CheckTable
+        | K::ChecksumTable
+        | K::RepairTable
         | K::DbxOptimize
         | K::DbxVacuum
         | K::DbxDescribeHistory
@@ -410,6 +417,11 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::PgDeallocate
         | K::MssqlSetOption
         | K::Reconfigure
+        | K::MssqlServerCommand
+        | K::Flush
+        | K::Kill
+        | K::AlterInstance
+        | K::XaTransaction
         | K::AlterSession
         | K::StageRemove
         | K::StageList => C::Operations,
@@ -485,6 +497,7 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::PgAlterTableTriggerState
         | K::CreateMysqlTrigger
         | K::MssqlDropTrigger
+        | K::MssqlTriggerState
         | K::PgCreateRule
         | K::PgAlterRule
         | K::PgDropRule

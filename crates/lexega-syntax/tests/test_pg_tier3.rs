@@ -130,6 +130,143 @@ fn test_create_rule_with_action() {
     );
 }
 
+#[test]
+fn test_create_rule_with_a_list_of_actions() {
+    roundtrip("CREATE RULE r AS ON INSERT TO t DO (DELETE FROM a; INSERT INTO b VALUES (NEW.id));");
+    roundtrip("CREATE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT * FROM t;");
+}
+
+#[test]
+fn a_create_rule_reads_its_header_condition_and_commands() {
+    use lexega_syntax::ast::AstStmt;
+    use lexega_syntax::dialect::postgres;
+    use lexega_syntax::parse_sql_with_dialect;
+    let text = |src: &str, span: lexega_syntax::lexer::Span| {
+        src[span.start as usize..span.end as usize].to_string()
+    };
+    // (rule, name, event, table, condition, instead, the commands' kinds)
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        bool,
+        &'a [&'a str],
+    );
+    let cases: [Case<'_>; 9] = [
+        ("CREATE RULE r AS ON INSERT TO t DO NOTHING;", "r", "INSERT", "t", None, false, &[]),
+        ("CREATE RULE r AS ON DELETE TO s.t DO INSTEAD NOTHING;", "r", "DELETE", "s.t", None, true, &[]),
+        (
+            "CREATE OR REPLACE RULE r AS ON UPDATE TO t WHERE NEW.id > 0 DO INSTEAD UPDATE a SET id = NEW.id WHERE a.id = OLD.id;",
+            "r",
+            "UPDATE",
+            "t",
+            Some("NEW.id > 0"),
+            true,
+            &["update"],
+        ),
+        ("CREATE RULE r AS ON INSERT TO t DO ALSO DELETE FROM a;", "r", "INSERT", "t", None, false, &["delete"]),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO (DELETE FROM a; ; INSERT INTO b VALUES (NEW.id));",
+            "r",
+            "INSERT",
+            "t",
+            None,
+            false,
+            &["delete", "insert"],
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO (DELETE FROM a; NOTIFY ch);",
+            "r",
+            "INSERT",
+            "t",
+            None,
+            false,
+            &["delete", "notify"],
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO (NOTIFY ch, 'a)'; NOTIFY ch2; DELETE FROM a);",
+            "r",
+            "INSERT",
+            "t",
+            None,
+            false,
+            &["notify", "notify", "delete"],
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO NOTIFY ch;",
+            "r",
+            "INSERT",
+            "t",
+            None,
+            false,
+            &["notify"],
+        ),
+        (
+            "CREATE RULE \"_RETURN\" AS ON SELECT TO v DO INSTEAD SELECT * FROM t;",
+            "\"_RETURN\"",
+            "SELECT",
+            "v",
+            None,
+            true,
+            &["select"],
+        ),
+    ];
+    let kind = |s: &AstStmt| {
+        [
+            (matches!(s, AstStmt::Delete(_)), "delete"),
+            (matches!(s, AstStmt::Insert(_)), "insert"),
+            (matches!(s, AstStmt::Update(_)), "update"),
+            (matches!(s, AstStmt::Select(_)), "select"),
+            (matches!(s, AstStmt::PgNotify(_)), "notify"),
+        ]
+        .into_iter()
+        .find_map(|(is, name)| is.then_some(name))
+        .unwrap_or_else(|| panic!("an unexpected command: {s:?}"))
+    };
+    for (src, name, event, table, condition, instead, commands) in cases {
+        let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{src}");
+        let AstStmt::PgCreateRule(r) = &script.stmts[0] else {
+            panic!("a rule: {:?}", script.stmts[0]);
+        };
+        assert_eq!(text(src, r.rule_name), name, "{src}");
+        assert_eq!(text(src, r.event), event, "{src}");
+        assert_eq!(text(src, r.table_name), table, "{src}");
+        assert_eq!(
+            r.condition.as_ref().map(|c| text(src, c.span())).as_deref(),
+            condition,
+            "{src}"
+        );
+        assert_eq!(r.instead, instead, "{src}");
+        assert_eq!(r.or_replace, src.starts_with("CREATE OR REPLACE"), "{src}");
+        assert_eq!(
+            r.actions.iter().map(kind).collect::<Vec<_>>(),
+            commands,
+            "{src}"
+        );
+        assert_eq!(text(src, r.span), src.trim_end_matches(';'), "{src}");
+    }
+    // A command that does not parse keeps the rule as written, its
+    // commands unread; the statement after it is read.
+    let src = "CREATE RULE r AS ON INSERT TO t DO ALSO FROB THE t; DELETE FROM a;";
+    let script = parse_sql_with_dialect(src, postgres().as_ref()).expect("parses");
+    let AstStmt::PgCreateRule(r) = &script.stmts[0] else {
+        panic!("a rule: {:?}", script.stmts[0]);
+    };
+    assert!(r.actions.is_empty());
+    assert_eq!(
+        text(src, r.span),
+        "CREATE RULE r AS ON INSERT TO t DO ALSO FROB THE t"
+    );
+    assert!(
+        matches!(script.stmts[1], AstStmt::Delete(_)),
+        "{:?}",
+        script.stmts
+    );
+}
+
 // ── CREATE AGGREGATE ───────────────────────────────────────────────────
 
 #[test]

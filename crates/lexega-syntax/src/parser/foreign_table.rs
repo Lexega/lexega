@@ -46,7 +46,10 @@ impl<'a> Parser<'a> {
             let if_not_exists = self.parse_optional_if_not_exists()?.is_some();
 
             // 3. Table name (possibly qualified).
+            let name_start_idx = self.idx;
             let name_span = self.parse_qualified_name_span()?;
+            let name_id = self.id_gen.next();
+            let name = self.object_ref_of_range(name_start_idx, self.idx, name_id);
 
             // 4. Scan to the depth-0 `SERVER` operand, tracking paren depth so
             //    the column list and a `FOR VALUES (…)` partition bound are
@@ -103,6 +106,7 @@ impl<'a> Parser<'a> {
                 options_present = true;
                 self.advance()
                     .ok_or_eof(self.current_span(), vec!["OPTIONS".to_string()])?;
+                self.record_option_list_secrets(self.idx);
                 let lparen = self
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["(".to_string()])?;
@@ -137,6 +141,7 @@ impl<'a> Parser<'a> {
                     span: Span { start, end },
                     create_span,
                     name_span,
+                    name,
                     if_not_exists,
                     is_partition,
                     server_span,

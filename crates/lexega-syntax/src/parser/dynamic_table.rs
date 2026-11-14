@@ -41,11 +41,13 @@
 
 use crate::ast::{
     AstAlterDynamicTable, AstAlterDynamicTableAction, AstAlterDynamicTableActionKind,
-    AstCreateDynamicTable, AstStmt, AstUnknownClause, UnknownKind,
+    AstCreateDynamicTable, AstObjectRef, AstStmt, AstTagRef, AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{parse_property_clause, Parser, PropertyValue};
+use crate::parser::create_table::PolicyClause;
+use crate::parser::tag::TagListShape;
 use crate::syntax::SyntaxAlterDynamicTableStmt;
 
 /// Parse CREATE DYNAMIC TABLE statement.
@@ -188,8 +190,8 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
     }
 
     // Table name (qualified identifier)
-    let name_span = p.parse_qualified_name_span()?;
-    span.end = name_span.end;
+    let name = p.parse_object_ref()?;
+    span.end = name.span.end;
 
     // Optional column definitions ( col1 TYPE, col2 TYPE, ... )
     let mut columns_span: Option<Span> = None;
@@ -209,7 +211,9 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
     // Parse options until AS keyword
     let mut target_lag_span: Option<Span> = None;
     let mut warehouse_span: Option<Span> = None;
+    let mut warehouse: Option<Span> = None;
     let mut init_warehouse_span: Option<Span> = None;
+    let mut init_warehouse: Option<Span> = None;
     let mut refresh_mode_span: Option<Span> = None;
     let mut initialize_span: Option<Span> = None;
     let mut cluster_by_span: Option<Span> = None;
@@ -218,8 +222,12 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
     let mut comment_span: Option<Span> = None;
     let mut copy_grants_span: Option<Span> = None;
     let mut row_access_policy_span: Option<Span> = None;
+    let mut row_access_policy: Option<AstObjectRef> = None;
+    let mut row_access_policy_columns: Vec<Span> = Vec::new();
     let mut aggregation_policy_span: Option<Span> = None;
+    let mut aggregation_policy: Option<AstObjectRef> = None;
     let mut tag_span: Option<Span> = None;
+    let mut tags: Vec<AstTagRef> = Vec::new();
     let mut require_user_span: Option<Span> = None;
     let mut immutable_where_span: Option<Span> = None;
     let mut backfill_from_span: Option<Span> = None;
@@ -244,11 +252,15 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
             target_lag_span = Some(parse_property_clause(p)?);
             span.end = target_lag_span.as_ref().unwrap().end;
         } else if lexeme.eq_ignore_ascii_case("WAREHOUSE") {
-            warehouse_span = Some(parse_property_clause(p)?);
-            span.end = warehouse_span.as_ref().unwrap().end;
+            let clause = p.parse_property(PropertyValue::Name)?;
+            warehouse_span = Some(clause.span);
+            warehouse = clause.name;
+            span.end = clause.span.end;
         } else if lexeme.eq_ignore_ascii_case("INITIALIZATION_WAREHOUSE") {
-            init_warehouse_span = Some(parse_property_clause(p)?);
-            span.end = init_warehouse_span.as_ref().unwrap().end;
+            let clause = p.parse_property(PropertyValue::Name)?;
+            init_warehouse_span = Some(clause.span);
+            init_warehouse = clause.name;
+            span.end = clause.span.end;
         } else if lexeme.eq_ignore_ascii_case("REFRESH_MODE") {
             refresh_mode_span = Some(parse_property_clause(p)?);
             span.end = refresh_mode_span.as_ref().unwrap().end;
@@ -272,18 +284,28 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
             // COPY GRANTS
             copy_grants_span = Some(parse_copy_grants(p)?);
             span.end = copy_grants_span.as_ref().unwrap().end;
-        } else if lexeme.eq_ignore_ascii_case("ROW") {
-            // ROW ACCESS POLICY
-            row_access_policy_span = Some(parse_row_access_policy_clause(p)?);
-            span.end = row_access_policy_span.as_ref().unwrap().end;
-        } else if lexeme.eq_ignore_ascii_case("AGGREGATION") {
-            // AGGREGATION POLICY
-            aggregation_policy_span = Some(parse_aggregation_policy_clause(p)?);
-            span.end = aggregation_policy_span.as_ref().unwrap().end;
+        } else if lexeme.eq_ignore_ascii_case("ROW")
+            || (lexeme.eq_ignore_ascii_case("WITH") && p.row_access_policy_at(p.idx).is_some())
+        {
+            // [WITH] ROW ACCESS POLICY
+            let (clause_span, clause) = parse_row_access_policy_clause(p)?;
+            row_access_policy_span = Some(clause_span);
+            (row_access_policy, row_access_policy_columns) = PolicyClause::parts(clause);
+            span.end = clause_span.end;
+        } else if lexeme.eq_ignore_ascii_case("AGGREGATION")
+            || (lexeme.eq_ignore_ascii_case("WITH") && p.aggregation_policy_at(p.idx).is_some())
+        {
+            // [WITH] AGGREGATION POLICY
+            let (clause_span, clause) = parse_aggregation_policy_clause(p)?;
+            aggregation_policy_span = Some(clause_span);
+            aggregation_policy = PolicyClause::parts(clause).0;
+            span.end = clause_span.end;
         } else if lexeme.eq_ignore_ascii_case("WITH") || lexeme.eq_ignore_ascii_case("TAG") {
             // [WITH] TAG (...)
-            tag_span = Some(parse_tag_clause(p)?);
-            span.end = tag_span.as_ref().unwrap().end;
+            let (clause, read) = parse_tag_clause(p)?;
+            tag_span = Some(clause);
+            tags = read;
+            span.end = clause.end;
         } else if lexeme.eq_ignore_ascii_case("REQUIRE") {
             // REQUIRE USER
             require_user_span = Some(parse_require_user(p)?);
@@ -374,11 +396,13 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
         iceberg_span,
         table_span,
         if_not_exists_span,
-        name_span,
+        name,
         columns_span,
         target_lag_span,
         warehouse_span,
+        warehouse,
         init_warehouse_span,
+        init_warehouse,
         refresh_mode_span,
         initialize_span,
         cluster_by_span,
@@ -387,8 +411,12 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
         comment_span,
         copy_grants_span,
         row_access_policy_span,
+        row_access_policy,
+        row_access_policy_columns,
         aggregation_policy_span,
+        aggregation_policy,
         tag_span,
+        tags,
         require_user_span,
         immutable_where_span,
         backfill_from_span,
@@ -402,6 +430,7 @@ pub(crate) fn try_parse_create_dynamic_table(p: &mut Parser<'_>) -> ParseResult<
 
 /// Skip to matching closing paren, return end position
 fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
+    let from = p.idx;
     let mut depth = 1;
     while let Some(tok) = p.advance() {
         match tok.kind {
@@ -409,7 +438,11 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             TokenKind::Punctuation(Punctuation::RParen) => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(tok.span.end);
+                    let end = tok.span.end;
+                    // The text is not read: its secrets are recorded as
+                    // unparsed text's are.
+                    p.record_unparsed_secrets(from, p.idx);
+                    return Ok(end);
                 }
             }
             _ => {}
@@ -421,41 +454,6 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             message: "Unmatched parenthesis".to_string(),
         },
     ))
-}
-
-/// Parse KEY = VALUE clause, return span covering entire clause
-fn parse_property_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let key_tok = p
-        .advance()
-        .ok_or_eof(p.current_span(), vec!["property".to_string()])?;
-    let start = key_tok.span.start;
-    let mut end = key_tok.span.end;
-
-    // Expect =
-    if let Some(tok) = p.peek_non_trivia() {
-        if matches!(tok.kind, TokenKind::Operator(crate::lexer::Operator::Eq)) {
-            let eq = p
-                .advance()
-                .expect_invariant("Eq operator consumed after match in property clause");
-            end = eq.span.end;
-
-            // Value (could be string, identifier, number, or DOWNSTREAM)
-            if let Some(val) = p.peek_non_trivia() {
-                // Handle parenthesized values like CLUSTER BY (...)
-                if matches!(val.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance();
-                    end = skip_to_matching_paren(p)?;
-                } else {
-                    let v = p
-                        .advance()
-                        .expect_invariant("property value consumed after peek in property clause");
-                    end = v.span.end;
-                }
-            }
-        }
-    }
-
-    Ok(Span { start, end })
 }
 
 /// Parse CLUSTER BY (...) clause
@@ -508,8 +506,25 @@ fn parse_copy_grants(p: &mut Parser<'_>) -> ParseResult<Span> {
     Ok(Span { start, end })
 }
 
-/// Parse ROW ACCESS POLICY clause
-fn parse_row_access_policy_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+/// Consumes the policy clause `clause` read at the current token, returning
+/// its span from the token that opens it.
+fn take_policy_clause(p: &mut Parser<'_>, clause: &PolicyClause) -> Span {
+    let start = p.tokens[p.idx].span.start;
+    p.idx = clause.next;
+    Span {
+        start,
+        end: p.tokens[clause.next - 1].span.end,
+    }
+}
+
+/// Parse ROW ACCESS POLICY clause: its span, and the policy and columns
+/// where the name is read.
+fn parse_row_access_policy_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Option<PolicyClause>)> {
+    p.skip_trivia();
+    if let Some(clause) = p.row_access_policy_at(p.idx) {
+        let span = take_policy_clause(p, &clause);
+        return Ok((span, Some(clause)));
+    }
     let row_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["ROW".to_string()])?;
@@ -535,9 +550,7 @@ fn parse_row_access_policy_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
                     // Policy name
                     if let Some(name) = p.peek_non_trivia() {
                         if !matches!(name.kind, TokenKind::Keyword(Keyword::On)) {
-                            let name_span = p.parse_qualified_name_span().expect_invariant(
-                                "policy name consumed after peek in ROW ACCESS POLICY",
-                            );
+                            let name_span = p.parse_qualified_name_span()?;
                             end = name_span.end;
                         }
                     }
@@ -566,11 +579,19 @@ fn parse_row_access_policy_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, None))
 }
 
-/// Parse AGGREGATION POLICY clause
-fn parse_aggregation_policy_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+/// Parse AGGREGATION POLICY clause: its span, and the policy where the name
+/// is read.
+fn parse_aggregation_policy_clause(
+    p: &mut Parser<'_>,
+) -> ParseResult<(Span, Option<PolicyClause>)> {
+    p.skip_trivia();
+    if let Some(clause) = p.aggregation_policy_at(p.idx) {
+        let span = take_policy_clause(p, &clause);
+        return Ok((span, Some(clause)));
+    }
     let agg_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["AGGREGATION".to_string()])?;
@@ -591,25 +612,24 @@ fn parse_aggregation_policy_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
                     && !matches!(name.kind, TokenKind::Punctuation(Punctuation::Semi))
                     && !matches!(name.kind, TokenKind::Keyword(Keyword::As))
                 {
-                    let name_span = p
-                        .parse_qualified_name_span()
-                        .expect_invariant("policy name consumed after peek in AGGREGATION POLICY");
+                    let name_span = p.parse_qualified_name_span()?;
                     end = name_span.end;
                 }
             }
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, None))
 }
 
 /// Parse [WITH] TAG (...) clause
-fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Vec<AstTagRef>)> {
     let first = p
         .peek_non_trivia()
         .ok_or_eof(p.current_span(), vec!["TAG".to_string()])?;
     let start = first.span.start;
     let mut end = first.span.end;
+    let mut tags = Vec::new();
 
     // Optional WITH
     if first.lexeme(p.source).eq_ignore_ascii_case("WITH") {
@@ -628,14 +648,13 @@ fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
             // Expect (...)
             if let Some(lparen) = p.peek_non_trivia() {
                 if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance();
-                    end = skip_to_matching_paren(p)?;
+                    (end, tags) = p.parse_tag_assignments_in_parens()?;
                 }
             }
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, tags))
 }
 
 /// Parse REQUIRE USER clause
@@ -750,6 +769,7 @@ fn is_dynamic_table_boundary(lexeme: &str) -> bool {
 
 /// Skip to end of statement (semicolon or EOF)
 fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = p.current_span().end;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -760,6 +780,8 @@ fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
             .expect_invariant("token consumed after peek in skip_to_statement_end");
         end = t.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }
 
@@ -1147,11 +1169,12 @@ fn parse_action_set_adt(p: &mut Parser<'_>) -> ParseResult<AstAlterDynamicTableA
         // SET TAG
         if lexeme.eq_ignore_ascii_case("TAG") {
             let tag_tok = p.advance().expect_invariant("TAG consumed");
-            let assignments_span = consume_tag_assignments_adt(p)?;
+            let (assignments_span, tags) = p.parse_tag_list(TagListShape::Assignments)?;
             return Ok(AstAlterDynamicTableActionKind::SetTag {
                 set_span: set_tok.span,
                 tag_span: tag_tok.span,
                 assignments_span,
+                tags,
             });
         }
 
@@ -1281,11 +1304,12 @@ fn parse_action_unset_adt(p: &mut Parser<'_>) -> ParseResult<AstAlterDynamicTabl
         // UNSET TAG
         if lexeme.eq_ignore_ascii_case("TAG") {
             let tag_tok = p.advance().expect_invariant("TAG consumed");
-            let tags_span = consume_tag_names_adt(p)?;
+            let (tags_span, tags) = p.parse_tag_list(TagListShape::Names)?;
             return Ok(AstAlterDynamicTableActionKind::UnsetTag {
                 unset_span: unset_tok.span,
                 tag_span: tag_tok.span,
                 tags_span,
+                tags,
             });
         }
 
@@ -1622,7 +1646,11 @@ fn parse_action_alter_column_adt(
             // SET TAG
             if what_lexeme.eq_ignore_ascii_case("TAG") {
                 let tag = p.advance().expect_invariant("TAG consumed");
-                let assignments_span = consume_tag_assignments_adt(p)?;
+                // The list ends before the next column's item.
+                let (assignments_span, tags) = p.parse_tag_list_until(
+                    TagListShape::Assignments,
+                    Parser::column_alteration_item_at,
+                )?;
                 return Ok(AstAlterDynamicTableActionKind::SetColumnTag {
                     alter_span,
                     column_keyword_span,
@@ -1630,6 +1658,7 @@ fn parse_action_alter_column_adt(
                     set_span: set_tok.span,
                     tag_span: tag.span,
                     assignments_span,
+                    tags,
                 });
             }
         }
@@ -1679,7 +1708,8 @@ fn parse_action_alter_column_adt(
             // UNSET TAG
             if what_lexeme.eq_ignore_ascii_case("TAG") {
                 let tag = p.advance().expect_invariant("TAG consumed");
-                let tags_span = consume_tag_names_adt(p)?;
+                let (tags_span, tags) =
+                    p.parse_tag_list_until(TagListShape::Names, Parser::column_alteration_item_at)?;
                 return Ok(AstAlterDynamicTableActionKind::UnsetColumnTag {
                     alter_span,
                     column_keyword_span,
@@ -1687,6 +1717,7 @@ fn parse_action_alter_column_adt(
                     unset_span: unset_tok.span,
                     tag_span: tag.span,
                     tags_span,
+                    tags,
                 });
             }
 
@@ -1802,6 +1833,7 @@ fn parse_search_optimization_after_keyword(
 
 /// Consume until semicolon or EOF, return span
 fn consume_until_semi_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
+    let from = p.idx;
     let start = p.current_span().start;
     let mut end = start;
 
@@ -1815,11 +1847,14 @@ fn consume_until_semi_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
         end = t.span.end;
     }
 
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     Ok(Span { start, end })
 }
 
 /// Consume balanced parentheses, return span including parens
 fn consume_balanced_parens_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
+    let from = p.idx;
     let lparen = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["(".to_string()])?;
@@ -1855,66 +1890,8 @@ fn consume_balanced_parens_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
         end = tok.span.end;
     }
 
-    Ok(Span { start, end })
-}
-
-/// Consume tag assignments (TAG name = 'value', ...)
-fn consume_tag_assignments_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let start = p.current_span().start;
-    let mut end;
-
-    loop {
-        // Tag name (possibly qualified: db.schema.tag_name)
-        let tag_name_span = p.parse_qualified_name_span()?;
-        end = tag_name_span.end;
-
-        // =
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Operator(crate::lexer::Operator::Eq)) {
-                let t = p.advance().expect_invariant("= consumed");
-                end = t.span.end;
-            }
-        }
-
-        // value
-        if let Some(_tok) = p.peek_non_trivia() {
-            let t = p.advance().expect_invariant("tag value consumed");
-            end = t.span.end;
-        }
-
-        // Check for comma (more assignments)
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                p.advance(); // comma
-                continue;
-            }
-        }
-        break;
-    }
-
-    Ok(Span { start, end })
-}
-
-/// Consume tag names (TAG name, name, ...)
-fn consume_tag_names_adt(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let start = p.current_span().start;
-    let mut end;
-
-    loop {
-        // Tag name (possibly qualified: db.schema.tag_name)
-        let tag_name_span = p.parse_qualified_name_span()?;
-        end = tag_name_span.end;
-
-        // Check for comma (more names)
-        if let Some(tok) = p.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                p.advance(); // comma
-                continue;
-            }
-        }
-        break;
-    }
-
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     Ok(Span { start, end })
 }
 

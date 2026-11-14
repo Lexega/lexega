@@ -12,19 +12,20 @@ use lexega_core::api::analyze_risk_with_policy_config;
 use std::collections::HashSet;
 
 fn databricks_config() -> AnalysisConfig {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(lexega_core::dialect::databricks());
-    config
+    AnalysisConfig {
+        dialect: Some(lexega_core::dialect::databricks()),
+        ..Default::default()
+    }
 }
 
 fn extract_rule_ids(sql: &str) -> HashSet<String> {
     let report = analyze_risk_with_policy_config(sql, &databricks_config())
         .expect("analysis should succeed");
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -49,7 +50,7 @@ fn test_silent_continue_handler_sqlexception() {
         .expect("analysis should succeed");
 
     // Debug: show all statement previews
-    for sig in &report.statement_signals {
+    for sig in &report.statement_traces {
         eprintln!("Stmt line {}: {:?}", sig.line_number, sig.statement_preview);
     }
     eprintln!(
@@ -60,8 +61,8 @@ fn test_silent_continue_handler_sqlexception() {
         report.summary.statements_in_bodies
     );
     eprintln!("Matched rules:");
-    for signal in &report.signals {
-        let RuleMatch::Analysis(g) = signal;
+    for finding in &report.findings {
+        let RuleMatch::Analysis(g) = finding;
         eprintln!(
             "  Rule: {} (parent: {:?}) - {}",
             g.matched_rule, g.parent_context, g.message
@@ -99,7 +100,7 @@ fn test_silent_handler_multi_statement() {
         .expect("analysis should succeed");
 
     let evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(
             |s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "SCRIPT-SILENT-HANDLER"),

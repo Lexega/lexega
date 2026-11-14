@@ -28,8 +28,11 @@ Rules that predicate on facts needing analysis across scopes, statements or
 scripts stay silent or report less precisely, and every report says how many
 rules that affects: the text and Markdown output carry a note, the JSON and
 YAML summary an `analysis_depth` object, a SARIF run a tool notification, and
-a GitLab SAST report a scan message. Jinja and dbt templates are analyzed as
-written and reported as not rendered.
+a GitLab SAST report a scan message. Jinja and dbt templates, a dbt project's
+models among them, are analyzed as written: every report says how many files
+were not rendered, the text and Markdown summaries never read as all clear
+for them, and a `review` says its change was not compared with its base (no
+`DIFF-*` rule runs).
 
 Options that need a capability this build does not have — a policy gate,
 template rendering, cross-script analysis — are refused with a message naming

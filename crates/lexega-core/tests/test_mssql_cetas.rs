@@ -31,7 +31,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
         .expect("merge against built-ins succeeds");
     AnalysisConfig {
         dialect: Some(dialect::mssql()),
-        custom_rules: Some(merged),
+        custom_rules: Some(merged.into()),
         ..Default::default()
     }
 }
@@ -39,8 +39,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
 fn rule_ids_with(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -57,8 +56,10 @@ AS SELECT id, secret FROM dbo.secrets;";
 
 #[test]
 fn test_cetas_is_one_byte_exact_statement() {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(CETAS, &config).expect("should format");
     // A fragmented parse would insert an inter-statement blank line between the
     // external-table head and the `AS SELECT`; a single statement round-trips
@@ -152,8 +153,10 @@ fn test_read_only_external_table_unaffected() {
     // statement and is not treated as CETAS.
     let read_only = "CREATE EXTERNAL TABLE ext.tbl \
         WITH (LOCATION = '/in/', DATA_SOURCE = ds, FILE_FORMAT = ff);";
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(read_only, &config).expect("should format");
     assert_eq!(
         out, read_only,

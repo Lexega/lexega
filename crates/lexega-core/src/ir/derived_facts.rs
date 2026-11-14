@@ -18,7 +18,7 @@
 //!   `select_output_columns`, `star_projections`).
 //! - **Any-scope (OR over the tree)** — true iff some node anywhere
 //!   in the plan satisfies the predicate (`has_implicit_cross_join`,
-//!   `has_join_predicate_filters`, `has_any_filter`, `has_sample`).
+//!   `has_join_predicate_filters`, `has_sample`).
 //! - **Per-scope-set (flat union)** — every contribution from every
 //!   scope (`tables_read`, `tables_written`, `aggregates`,
 //!   `window_functions`, `column_refs`, predicate facts, etc.).
@@ -37,7 +37,7 @@
 //! contributes. Without exhaustiveness, contract drift is silent.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::context::node_metadata::{
     AggregateFact, ColumnRef, GroupByFact, HavingFact, IdentKey, IdentName, JoinEdge,
@@ -49,9 +49,10 @@ use crate::ir::column::{BindingTable, ColumnId};
 use crate::ir::expression_fact::{build_scan_index, scalar_to_expression_fact, ScanIndex};
 use crate::ir::normalize_identifier;
 use crate::ir::plan::{
-    AggregateCall, ChangesClause, ChangesInformation, CteBody, FilterKind, FrameBound, FrameMode,
-    GroupKey, GroupingSpec, InsertSource, JoinKind, OriginHint, ProjectItem, ProjectStar, RelPlan,
-    ScanModifier, SetOpKind, StarQualifier, TimeTravel, WindowCall,
+    AggregateCall, AssignedValue, Assignment, ChangesClause, ChangesInformation, CteBody,
+    FilterKind, FrameBound, FrameMode, GroupKey, GroupingSpec, InsertSource, JoinKind, OriginHint,
+    ProjectItem, ProjectStar, RelPlan, ScanModifier, SetOpKind, StarQualifier, TimeTravel,
+    WindowCall,
 };
 use crate::ir::predicate_extraction::{column_id_to_ref, resolved_func_name, span_text};
 use crate::ir::scalar::{FieldStep, Lit, QuantifiedRhs, ScalarExpr};
@@ -76,6 +77,7 @@ use crate::lexer::Span;
 /// scopes.
 struct WalkCtx<'a> {
     bindings: &'a BindingTable,
+    func_catalog: &'a crate::ir::catalog::FunctionCatalog,
     scan_index: &'a ScanIndex,
     source: &'a str,
     agg_acc: RefCell<Vec<AggregateFact>>,
@@ -97,10 +99,8 @@ struct WalkCtx<'a> {
 ///   outermost owning node along the scope-preserving spine.
 ///   Sub-scopes (CTE bodies, derived tables, scalar subqueries,
 ///   set-op branches, DML sub-sources) do not contribute.
-/// - **Any-scope** booleans (`has_implicit_cross_join`,
-///   `has_tautology_where`) — true iff some node anywhere in the
-///   plan satisfies the predicate. `has_tautology_where` has a
-///   narrow form (top-level DML only).
+/// - **Any-scope** booleans (`has_implicit_cross_join`) — true iff some
+///   node anywhere in the plan satisfies the predicate.
 /// - **Per-scope-set** lists (`tables_read`, `tables_written`,
 ///   `cte_names`, `set_operations`, `join_edges`,
 ///   `where_predicates`, `having_predicates`, `scoped_predicates`,
@@ -129,7 +129,7 @@ pub struct DerivedFacts {
 
     /// True iff the query has a `QUALIFY` clause. `QUALIFY` shares the
     /// `RelPlan::Filter` relational shape with `WHERE`; the two are
-    /// disambiguated by `FilterKind` so signal rules can key on one vs
+    /// disambiguated by `FilterKind` so rules can key on one vs
     /// the other.
     pub has_qualify: bool,
 
@@ -185,15 +185,6 @@ pub struct DerivedFacts {
     /// scans from joins that carry real filtering. See
     /// `compute_combined_post_walk_facts`.
     pub has_join_predicate_filters: bool,
-
-    /// True iff the statement's outer-scope WHERE / ON predicate is a
-    /// syntactic tautology — `WHERE 1=1`, `WHERE TRUE`,
-    /// `WHERE x IS NOT NULL OR x IS NULL`, etc. Set for every
-    /// query-bearing kind: UPDATE / DELETE's `WHERE`, MERGE's `ON`,
-    /// and SELECT / INSERT…SELECT / CTAS / CVAS / CMVAS's outer
-    /// `Filter { kind: Where }`. Subqueries, CTE bodies, and
-    /// derived-table bodies are not considered.
-    pub has_tautology_where: bool,
 
     /// True iff the query contains any aggregate calls (either via an
     /// explicit `GROUP BY` or implicit aggregation like
@@ -283,7 +274,7 @@ pub struct DerivedFacts {
     /// level, CTE bodies, derived tables, set-op branches, DML
     /// sub-sources). **Per-scope-set** disposition. Used by the
     /// diff engine for alias-matched script-level changes — *not*
-    /// a "is this an aggregating query?" signal (that role is
+    /// a "is this an aggregating query?" indicator (that role is
     /// `immediate_has_aggregates`).
     ///
     /// `PartialEq` on [`AggregateFact`] compares the semantically
@@ -364,7 +355,7 @@ pub struct DerivedFacts {
     /// Output columns of the outer SELECT's projection items —
     /// not WHERE / JOIN / GROUP BY / etc. **Outer-only**
     /// disposition. Used by the diff engine for
-    /// `ColumnAdded` / `ColumnRemoved` signals.
+    /// `ColumnAdded` / `ColumnRemoved` findings.
     ///
     /// Star projection items expand against inner schemas
     /// (`RelPlan::CteRef.columns`, `DerivedTable.columns`,
@@ -388,7 +379,7 @@ pub struct DerivedFacts {
     /// what the outermost SELECT projects. Literal projections
     /// (`SELECT 1`), function-call projections (`SELECT now()`), and
     /// arbitrary expression projections (`SELECT a + b`) all flow
-    /// through here, giving the diff engine a structural signal for
+    /// through here, giving the diff engine a structural cue for
     /// the projection's content that the other two fields can't
     /// produce.
     pub projection_items: Vec<ProjectionItemFact>,
@@ -452,7 +443,6 @@ impl DerivedFacts {
             has_distinct: false,
             has_implicit_cross_join: false,
             has_join_predicate_filters: false,
-            has_tautology_where: false,
             has_aggregates: false,
             immediate_join_count: 0,
             cte_names: Vec::new(),
@@ -498,21 +488,37 @@ pub fn derive_facts_from_plan(
     plan: &RelPlan,
     bindings: &BindingTable,
     func_catalog: &crate::ir::catalog::FunctionCatalog,
-    catalog: Option<&dyn crate::ir::catalog_context::CatalogContext>,
-    reasoning: &dyn crate::facts::reasoning::Reasoning,
+) -> DerivedFacts {
+    derive_facts_from_indexed_plan(
+        source,
+        plan,
+        bindings,
+        func_catalog,
+        &build_scan_index(plan),
+    )
+}
+
+/// As [`derive_facts_from_plan`], read through `scan_index`, the scan
+/// index of `plan` ([`build_scan_index`]).
+pub(crate) fn derive_facts_from_indexed_plan(
+    source: &str,
+    plan: &RelPlan,
+    bindings: &BindingTable,
+    func_catalog: &crate::ir::catalog::FunctionCatalog,
+    scan_index: &ScanIndex,
 ) -> DerivedFacts {
     let mut out = DerivedFacts::empty();
-    let mut tables: BTreeSet<TableKey> = BTreeSet::new();
-    let mut tables_written: BTreeSet<TableKey> = BTreeSet::new();
+    let mut tables: TableSet = TableSet::default();
+    let mut tables_written: TableSet = TableSet::default();
     let mut cte_refs: HashSet<IdentKey> = HashSet::new();
     let mut cte_names: HashSet<IdentKey> = HashSet::new();
     let mut set_operations: Vec<SetOperationFact> = Vec::new();
     let mut join_edges: Vec<JoinEdge> = Vec::new();
-    let scan_index = build_scan_index(plan);
     let alias_map = build_alias_map(plan);
     let ctx = WalkCtx {
         bindings,
-        scan_index: &scan_index,
+        func_catalog,
+        scan_index,
         source,
         agg_acc: RefCell::new(Vec::new()),
         wf_acc: RefCell::new(Vec::new()),
@@ -544,7 +550,7 @@ pub fn derive_facts_from_plan(
         source,
         plan,
         bindings,
-        &scan_index,
+        scan_index,
         func_catalog,
     );
     out.where_predicates = preds.where_predicates;
@@ -552,7 +558,7 @@ pub fn derive_facts_from_plan(
     out.scoped_predicates = preds.scoped_predicates;
     out.aggregates = ctx.agg_acc.into_inner();
     out.window_functions = ctx.wf_acc.into_inner();
-    let (order_by, limit_offset) = project_outer_order_limit(source, plan, bindings, &scan_index);
+    let (order_by, limit_offset) = project_outer_order_limit(source, plan, bindings, scan_index);
     out.order_by = order_by;
     out.limit_offset = limit_offset.clone();
     out.limit_value = limit_offset.and_then(|lf| lf.limit_value);
@@ -560,14 +566,11 @@ pub fn derive_facts_from_plan(
     // `has_join_predicate_filters`, `nullable_tables`,
     // `columns_in_is_null`, and `columns_filtered_not_null`.
     compute_combined_post_walk_facts(plan, source, bindings, &mut out);
-    let proof = reasoning.non_null_proof(plan, bindings, catalog);
-    out.has_tautology_where =
-        super::always_true::has_tautology_where(plan, source, bindings, proof.as_deref());
     out.star_projections = compute_star_projections(plan, source);
-    out.column_refs = compute_column_refs(plan, bindings, &scan_index);
-    out.select_output_columns = compute_select_output_columns(plan, bindings, &scan_index);
+    out.column_refs = compute_column_refs(plan, bindings, scan_index);
+    out.select_output_columns = compute_select_output_columns(plan, bindings, scan_index);
     out.projection_items =
-        compute_projection_items(plan, source, bindings, &scan_index, func_catalog);
+        compute_projection_items(plan, source, bindings, scan_index, func_catalog);
     out.table_aliases = compute_table_aliases(plan);
     out
 }
@@ -585,8 +588,9 @@ pub fn derive_facts_from_plan(
 ///     `star_projections` does not propagate up across the union. The
 ///     combined statement therefore has empty `star_projections`.
 ///   - DML `source` / `from` / `using` sub-plans: INSERT / UPDATE /
-///     DELETE / MERGE / MultiInsert / CreateAsQuery all surface as
-///     empty at the top level even when the inner query has stars.
+///     DELETE / MERGE / MultiInsert all surface as empty at the top
+///     level even when the inner query has stars. A `CREATE … AS`
+///     surfaces its query's.
 ///   - `DerivedTable` inputs and scalar-subquery descents: scope
 ///     boundaries.
 fn compute_star_projections(plan: &RelPlan, source: &str) -> Vec<StarProjectionInfo> {
@@ -630,6 +634,7 @@ fn resolve_function_names_in_expression_fact(
         ExpressionFact::Function {
             name,
             args,
+            non_values,
             is_distinct,
         } => {
             let resolved_name = resolve_fn_placeholder(&name, catalog).unwrap_or(name);
@@ -639,6 +644,7 @@ fn resolve_function_names_in_expression_fact(
                     .into_iter()
                     .map(|a| resolve_function_names_in_expression_fact(a, catalog))
                     .collect(),
+                non_values,
                 is_distinct,
             }
         }
@@ -676,6 +682,16 @@ fn resolve_function_names_in_expression_fact(
         },
         ExpressionFact::LogicalChain { operator, operands } => ExpressionFact::LogicalChain {
             operator,
+            operands: operands
+                .into_iter()
+                .map(|o| resolve_function_names_in_expression_fact(o, catalog))
+                .collect(),
+        },
+        ExpressionFact::OperatorChain {
+            operators,
+            operands,
+        } => ExpressionFact::OperatorChain {
+            operators,
             operands: operands
                 .into_iter()
                 .map(|o| resolve_function_names_in_expression_fact(o, catalog))
@@ -748,11 +764,22 @@ fn compute_projection_items(
     let Some((items, scope_input)) = find_outer_project(plan) else {
         return Vec::new();
     };
+    let written = written_again_keys(plan);
+    let synthesized = collect_outer_scope_synthesized_outputs(scope_input);
+    let mut described_keys: HashSet<ColumnId> = HashSet::new();
     let mut out: Vec<ProjectionItemFact> = Vec::with_capacity(items.len());
     for item in items {
         match item {
             ProjectItem::Expr(e) => {
-                let expression = scalar_to_expression_fact(&e.expr, bindings, scan_index);
+                // The item a group key names is the key's expression.
+                let as_item = as_written(e.as_written(scope_input), &written);
+                let described = first_bare_key_read(
+                    as_item.as_ref(),
+                    &synthesized.key_exprs,
+                    &mut described_keys,
+                )
+                .unwrap_or(as_item.as_ref());
+                let expression = scalar_to_expression_fact(described, bindings, scan_index);
                 let expression =
                     resolve_function_names_in_expression_fact(expression, func_catalog);
                 out.push(ProjectionItemFact {
@@ -798,6 +825,8 @@ fn find_outer_project(plan: &RelPlan) -> Option<(&[ProjectItem], &RelPlan)> {
         | RelPlan::Unnest { input, .. } => find_outer_project(input),
         RelPlan::WithScope { body, .. } => find_outer_project(body),
         RelPlan::Explain { body, .. } => find_outer_project(body),
+        // The relation a `CREATE … AS` makes is its query's projection.
+        RelPlan::CreateAsQuery { body, .. } => body.as_deref().and_then(find_outer_project),
         // DerivedTable and Join are scope shapes that don't host a
         // top-level SELECT projection list directly. SetOp's branches
         // are independent scopes whose star_projections do not
@@ -818,8 +847,7 @@ fn find_outer_project(plan: &RelPlan) -> Option<(&[ProjectItem], &RelPlan)> {
         | RelPlan::Update { .. }
         | RelPlan::Delete { .. }
         | RelPlan::Merge { .. }
-        | RelPlan::MultiInsert { .. }
-        | RelPlan::CreateAsQuery { .. } => None,
+        | RelPlan::MultiInsert { .. } => None,
     }
 }
 
@@ -1189,8 +1217,9 @@ fn scalar_has_filter_predicate(expr: &ScalarExpr) -> bool {
         ScalarExpr::LogicalChain { operands, .. } => {
             operands.iter().any(scalar_has_filter_predicate)
         }
-        // A pattern match is not a column-vs-literal filter predicate.
-        ScalarExpr::Like { .. } => false,
+        // A pattern match is not a column-vs-literal filter predicate,
+        // nor is a run of arithmetic.
+        ScalarExpr::Like { .. } | ScalarExpr::OperatorChain { .. } => false,
         ScalarExpr::Column { .. }
         | ScalarExpr::OuterRef { .. }
         | ScalarExpr::Lit { .. }
@@ -1203,6 +1232,7 @@ fn scalar_has_filter_predicate(expr: &ScalarExpr) -> bool {
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::FieldAccess { .. }
         | ScalarExpr::Lambda { .. }
@@ -1240,6 +1270,7 @@ fn is_literal_scalar(expr: &ScalarExpr) -> bool {
         | ScalarExpr::OuterRef { .. }
         | ScalarExpr::BinOp { .. }
         | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
         | ScalarExpr::FuncCall { .. }
         | ScalarExpr::Case { .. }
         | ScalarExpr::Cast { .. }
@@ -1249,6 +1280,7 @@ fn is_literal_scalar(expr: &ScalarExpr) -> bool {
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::FieldAccess { .. }
         | ScalarExpr::Lambda { .. }
@@ -1305,17 +1337,32 @@ fn compute_select_output_columns(
     // synthesized aliases are *not* base-column reads and must be
     // filtered from the items walk; the calls' own inner exprs are
     // walked separately below to recover the real source-column
-    // reads (e.g., `id` from `ORDER BY id` in the OVER clause).
+    // reads (e.g., `id` from `ORDER BY id` in the OVER clause). An
+    // item that is the first bare read of a group key computing a column
+    // of its own takes its reads from the key's expression, under the
+    // item's alias. A later bare read is an alias of that item, and one
+    // that reads a key over a bare column is skipped, as an item of
+    // `GROUP BY col` is.
     let synthesized = collect_outer_scope_synthesized_outputs(scope_input);
+    // A read of a key the query wrote as the key's expression takes its
+    // reads from what was written there, like any item.
+    let written = written_again_keys(plan);
+    let mut walked_keys: HashSet<ColumnId> = HashSet::new();
     let mut out: Vec<ColumnRef> = Vec::new();
     for item in items {
         match item {
             ProjectItem::Expr(e) => {
-                if is_synthesized_column_ref(&e.expr, &synthesized) {
-                    continue;
-                }
+                let as_item = as_written(e.as_written(scope_input), &written);
+                let key_expr =
+                    first_bare_key_read(as_item.as_ref(), &synthesized.key_exprs, &mut walked_keys)
+                        .filter(|key_expr| !matches!(key_expr, ScalarExpr::Column { .. }));
+                let read = match key_expr {
+                    Some(key_expr) => key_expr,
+                    None if is_synthesized_column_ref(&as_item, &synthesized.outputs) => continue,
+                    None => as_item.as_ref(),
+                };
                 let start_idx = out.len();
-                collect_column_refs_in_scalar(&e.expr, bindings, scan_index, &mut out);
+                collect_column_refs_in_scalar(read, bindings, scan_index, &mut out);
                 if let Some(alias) = &e.alias {
                     let alias_text = alias.as_str().to_string();
                     for col in &mut out[start_idx..] {
@@ -1331,8 +1378,25 @@ fn compute_select_output_columns(
             }
         }
     }
-    walk_outer_scope_synthesizers_for_select(scope_input, bindings, scan_index, &mut out);
+    walk_outer_scope_synthesizers_for_select(scope_input, &written, bindings, scan_index, &mut out);
     out
+}
+
+/// The expression of the group key `item` reads bare, where `item` is
+/// the first select item of its block to read that key so: the item the
+/// key names by position, alias or `ALL`. A later bare read is an alias
+/// of that item. `item` is the select item as written: one that writes
+/// the key's expression out is no bare read, wherever it stands.
+fn first_bare_key_read<'p>(
+    item: &ScalarExpr,
+    key_exprs: &HashMap<ColumnId, &'p ScalarExpr>,
+    seen: &mut HashSet<ColumnId>,
+) -> Option<&'p ScalarExpr> {
+    let ScalarExpr::Column { column, .. } = item else {
+        return None;
+    };
+    let key_expr = key_exprs.get(column).copied()?;
+    seen.insert(*column).then_some(key_expr)
 }
 
 /// Returns `true` when `expr` is a top-level `Column` / `OuterRef` /
@@ -1350,6 +1414,7 @@ fn is_synthesized_column_ref(expr: &ScalarExpr, synthesized: &HashSet<ColumnId>)
         | ScalarExpr::Opaque { .. }
         | ScalarExpr::BinOp { .. }
         | ScalarExpr::LogicalChain { .. }
+        | ScalarExpr::OperatorChain { .. }
         | ScalarExpr::UnaryOp { .. }
         | ScalarExpr::Cast { .. }
         | ScalarExpr::FuncCall { .. }
@@ -1362,6 +1427,7 @@ fn is_synthesized_column_ref(expr: &ScalarExpr, synthesized: &HashSet<ColumnId>)
         | ScalarExpr::Exists { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
         | ScalarExpr::WindowFn { .. } => false,
     }
 }
@@ -1375,32 +1441,156 @@ fn is_synthesized_column_ref(expr: &ScalarExpr, synthesized: &HashSet<ColumnId>)
 /// synthesized sets.
 ///
 /// Closed-enum exhaustive over [`RelPlan`].
-fn collect_outer_scope_synthesized_outputs(plan: &RelPlan) -> HashSet<ColumnId> {
-    let mut out = HashSet::new();
+pub(crate) fn collect_outer_scope_synthesized_outputs(plan: &RelPlan) -> Synthesized<'_> {
+    let mut out = Synthesized::default();
     walk_collect_synthesized(plan, &mut out);
     out
 }
 
-fn walk_collect_synthesized(plan: &RelPlan, out: &mut HashSet<ColumnId>) {
+/// A read of a group key's output that the query wrote as the key's
+/// expression, by the column read and the read's span → the expression
+/// as written there.
+pub(crate) type WrittenAgainReads<'p> = HashMap<(ColumnId, Span), &'p ScalarExpr>;
+
+/// `expr` as the query wrote it: each read listed in `written` replaced
+/// by what was written there, at any depth. Borrowed where `expr` holds
+/// no such read.
+fn as_written<'e>(
+    expr: &'e ScalarExpr,
+    written: &WrittenAgainReads<'e>,
+) -> std::borrow::Cow<'e, ScalarExpr> {
+    use crate::ir::visitor::{
+        walk_scalar_expr_standalone, walk_scalar_expr_standalone_mut, ScalarExprMutator,
+        ScalarExprVisitor,
+    };
+
+    struct HoldsOne<'w, 'p> {
+        written: &'w WrittenAgainReads<'p>,
+        found: bool,
+    }
+
+    impl<'a> ScalarExprVisitor<'a> for HoldsOne<'_, '_> {
+        fn visit_scalar_expr(&mut self, expr: &'a ScalarExpr) {
+            if let ScalarExpr::Column { column, span } = expr {
+                self.found |= self.written.contains_key(&(*column, *span));
+            }
+            if !self.found {
+                walk_scalar_expr_standalone(self, expr);
+            }
+        }
+    }
+
+    struct WriteOut<'w, 'p>(&'w WrittenAgainReads<'p>);
+
+    impl ScalarExprMutator for WriteOut<'_, '_> {
+        fn visit_scalar_expr_mut(&mut self, expr: &mut ScalarExpr) {
+            if let ScalarExpr::Column { column, span } = expr {
+                if let Some(&occurrence) = self.0.get(&(*column, *span)) {
+                    *expr = occurrence.clone();
+                }
+            }
+            walk_scalar_expr_standalone_mut(self, expr);
+        }
+    }
+
+    if written.is_empty() {
+        return std::borrow::Cow::Borrowed(expr);
+    }
+    let mut holds = HoldsOne {
+        written,
+        found: false,
+    };
+    holds.visit_scalar_expr(expr);
+    if !holds.found {
+        return std::borrow::Cow::Borrowed(expr);
+    }
+    let mut owned = expr.clone();
+    WriteOut(written).visit_scalar_expr_mut(&mut owned);
+    std::borrow::Cow::Owned(owned)
+}
+
+/// Every [`WrittenAgainReads`] entry of the blocks of `plan`. Plans
+/// nested in expressions are not entered.
+pub(crate) fn written_again_keys(plan: &RelPlan) -> WrittenAgainReads<'_> {
+    struct WrittenAgain<'p>(WrittenAgainReads<'p>);
+
+    impl<'p> crate::ir::visitor::RelPlanVisitor<'p> for WrittenAgain<'p> {
+        fn visit_rel_plan(&mut self, plan: &'p RelPlan) {
+            if let RelPlan::Aggregate { grouping, .. } = plan {
+                for_each_grouping_key(grouping, |key| {
+                    for written in &key.written_again {
+                        self.0.insert((key.output, written.span()), written);
+                    }
+                });
+            }
+            crate::ir::visitor::walk_rel_plan(self, plan);
+        }
+
+        // An expression holds no block of this plan.
+        fn visit_scalar_expr(&mut self, _expr: &'p ScalarExpr) {}
+    }
+
+    let mut written = WrittenAgain(HashMap::new());
+    crate::ir::visitor::RelPlanVisitor::visit_rel_plan(&mut written, plan);
+    written.0
+}
+
+/// What [`collect_outer_scope_synthesized_outputs`] collects.
+#[derive(Default)]
+pub(crate) struct Synthesized<'p> {
+    pub(crate) outputs: HashSet<ColumnId>,
+    /// Output → expression of each group key that defines a column of
+    /// its own rather than passing its input column on. A select item
+    /// that is a bare read of such an output has that expression's value.
+    pub(crate) key_exprs: HashMap<ColumnId, &'p ScalarExpr>,
+}
+
+fn walk_collect_synthesized<'p>(plan: &'p RelPlan, out: &mut Synthesized<'p>) {
     match plan {
         RelPlan::Window {
             input,
             window_outputs,
+            computed,
             ..
         } => {
-            out.extend(window_outputs.iter().copied());
+            out.outputs.extend(window_outputs.iter().copied());
+            out.outputs.extend(computed.iter().map(|item| item.output));
             walk_collect_synthesized(input, out);
         }
         RelPlan::Aggregate {
             input,
+            grouping,
             output_columns,
+            computed,
             ..
         } => {
-            out.extend(output_columns.iter().copied());
+            out.outputs.extend(output_columns.iter().copied());
+            out.outputs.extend(computed.iter().map(|item| item.output));
+            for_each_grouping_key(grouping, |gk| {
+                let passes_input =
+                    matches!(gk.expr, ScalarExpr::Column { column, .. } if column == gk.output);
+                if !passes_input {
+                    out.key_exprs.insert(gk.output, &gk.expr);
+                }
+            });
             walk_collect_synthesized(input, out);
         }
-        RelPlan::Filter { input, .. }
-        | RelPlan::Sort { input, .. }
+        // What a filter computes before its predicate is no base column
+        // read, and a key over such a column has that column's expression.
+        RelPlan::Filter {
+            input, computed, ..
+        } => {
+            out.outputs.extend(computed.iter().map(|item| item.output));
+            for key_expr in out.key_exprs.values_mut() {
+                if let ScalarExpr::Column { column, .. } = *key_expr {
+                    if let Some(item) = computed.iter().find(|item| item.output == *column) {
+                        *key_expr = &item.expr;
+                    }
+                }
+            }
+            walk_collect_synthesized(input, out);
+        }
+        RelPlan::Sort { input, .. }
         | RelPlan::Limit { input, .. }
         | RelPlan::TableSample { input, .. }
         | RelPlan::Pivot { input, .. }
@@ -1452,6 +1642,7 @@ fn walk_collect_synthesized(plan: &RelPlan, out: &mut HashSet<ColumnId>) {
 /// Closed-enum exhaustive over [`RelPlan`].
 fn walk_outer_scope_synthesizers_for_select(
     plan: &RelPlan,
+    written: &WrittenAgainReads<'_>,
     bindings: &BindingTable,
     scan_index: &ScanIndex,
     acc: &mut Vec<ColumnRef>,
@@ -1459,9 +1650,9 @@ fn walk_outer_scope_synthesizers_for_select(
     match plan {
         RelPlan::Window { input, windows, .. } => {
             for call in windows {
-                collect_column_refs_in_window_call(call, bindings, scan_index, acc);
+                collect_column_refs_in_window_as_written(call, written, bindings, scan_index, acc);
             }
-            walk_outer_scope_synthesizers_for_select(input, bindings, scan_index, acc);
+            walk_outer_scope_synthesizers_for_select(input, written, bindings, scan_index, acc);
         }
         RelPlan::Aggregate {
             input,
@@ -1470,12 +1661,13 @@ fn walk_outer_scope_synthesizers_for_select(
             ..
         } => {
             for_each_grouping_key(grouping, |gk| {
-                collect_column_refs_in_scalar(&gk.expr, bindings, scan_index, acc);
+                let read = grouped_expr(plan, gk);
+                collect_column_refs_in_scalar(read, bindings, scan_index, acc);
             });
             for call in aggregates {
                 collect_column_refs_in_aggregate_call(call, bindings, scan_index, acc);
             }
-            walk_outer_scope_synthesizers_for_select(input, bindings, scan_index, acc);
+            walk_outer_scope_synthesizers_for_select(input, written, bindings, scan_index, acc);
         }
         RelPlan::Filter { input, .. }
         | RelPlan::Sort { input, .. }
@@ -1486,10 +1678,10 @@ fn walk_outer_scope_synthesizers_for_select(
         | RelPlan::MatchRecognize { input, .. }
         | RelPlan::ConnectBy { input, .. }
         | RelPlan::Unnest { input, .. } => {
-            walk_outer_scope_synthesizers_for_select(input, bindings, scan_index, acc);
+            walk_outer_scope_synthesizers_for_select(input, written, bindings, scan_index, acc);
         }
         RelPlan::WithScope { body, .. } | RelPlan::Explain { body, .. } => {
-            walk_outer_scope_synthesizers_for_select(body, bindings, scan_index, acc);
+            walk_outer_scope_synthesizers_for_select(body, written, bindings, scan_index, acc);
         }
         // Scope boundaries / leaves: stop.
         RelPlan::Project { .. }
@@ -1516,11 +1708,25 @@ fn walk_outer_scope_synthesizers_for_select(
 
 /// Walk every relational scope of `plan` and accumulate every column
 /// reference reachable through any clause-bearing position, including
-/// nested scopes' column_refs.
-///
-/// Closed-enum exhaustive: every [`RelPlan`] variant is listed.
+/// nested scopes' column_refs. A read of a group key the query wrote as
+/// the key's expression contributes that expression's references.
 fn visit_plan_for_column_refs(
     plan: &RelPlan,
+    bindings: &BindingTable,
+    scan_index: &ScanIndex,
+    acc: &mut Vec<ColumnRef>,
+) {
+    let written = written_again_keys(plan);
+    column_refs_in_plan(plan, &written, bindings, scan_index, acc);
+}
+
+/// [`visit_plan_for_column_refs`] over `plan`, a plan or a child plan of
+/// the one `written` was collected from.
+///
+/// Closed-enum exhaustive: every [`RelPlan`] variant is listed.
+fn column_refs_in_plan(
+    plan: &RelPlan,
+    written: &WrittenAgainReads<'_>,
     bindings: &BindingTable,
     scan_index: &ScanIndex,
     acc: &mut Vec<ColumnRef>,
@@ -1548,10 +1754,11 @@ fn visit_plan_for_column_refs(
             for item in items {
                 match item {
                     ProjectItem::Expr(e) => {
-                        if is_synthesized_column_ref(&e.expr, &synthesized) {
+                        let read = as_written(e.as_written(input), written);
+                        if is_synthesized_column_ref(&read, &synthesized.outputs) {
                             continue;
                         }
-                        collect_column_refs_in_scalar(&e.expr, bindings, scan_index, acc);
+                        collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
                     }
                     ProjectItem::Star(s) => {
                         // Star modifiers carry scalar subexpressions that
@@ -1560,8 +1767,20 @@ fn visit_plan_for_column_refs(
                         if let StarQualifier::FromExpr(e) = &s.qualifier {
                             collect_column_refs_in_scalar(e, bindings, scan_index, acc);
                         }
+                        // An entry whose expression an item took reads that
+                        // item's output; the item's walk has its reads.
                         for r in &s.replace {
-                            collect_column_refs_in_scalar(&r.expr, bindings, scan_index, acc);
+                            let held_by_item = matches!(
+                                &r.expr,
+                                ScalarExpr::Column { column, .. }
+                                    if items.iter().any(|i| matches!(
+                                        i,
+                                        ProjectItem::Expr(e) if e.output == *column
+                                    ))
+                            );
+                            if !held_by_item {
+                                collect_column_refs_in_scalar(&r.expr, bindings, scan_index, acc);
+                            }
                         }
                         // Pure star → push the `*` marker. Nested SELECTs
                         // each push their own marker, so the outer flat
@@ -1574,16 +1793,24 @@ fn visit_plan_for_column_refs(
                 }
             }
             for e in distinct_on {
-                collect_column_refs_in_scalar(e, bindings, scan_index, acc);
+                let read = as_written(e, written);
+                collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Filter {
-            input, predicate, ..
+            input,
+            computed,
+            predicate,
+            ..
         } => {
-            collect_column_refs_in_scalar(predicate, bindings, scan_index, acc);
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            for item in computed {
+                collect_column_refs_in_scalar(&item.expr, bindings, scan_index, acc);
+            }
+            let read = as_written(predicate, written);
+            collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Aggregate {
@@ -1600,16 +1827,17 @@ fn visit_plan_for_column_refs(
                 collect_column_refs_in_aggregate_call(call, bindings, scan_index, acc);
             }
             if let Some(h) = having {
-                collect_column_refs_in_scalar(h, bindings, scan_index, acc);
+                let read = as_written(h, written);
+                collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Window { input, windows, .. } => {
             for call in windows {
-                collect_column_refs_in_window_call(call, bindings, scan_index, acc);
+                collect_column_refs_in_window_as_written(call, written, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Join {
@@ -1625,21 +1853,22 @@ fn visit_plan_for_column_refs(
             if let Some(p) = match_condition {
                 collect_column_refs_in_scalar(p, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(left, bindings, scan_index, acc);
-            visit_plan_for_column_refs(right, bindings, scan_index, acc);
+            column_refs_in_plan(left, written, bindings, scan_index, acc);
+            column_refs_in_plan(right, written, bindings, scan_index, acc);
         }
 
         RelPlan::SetOp { inputs, .. } => {
             for branch in inputs {
-                visit_plan_for_column_refs(branch, bindings, scan_index, acc);
+                column_refs_in_plan(branch, written, bindings, scan_index, acc);
             }
         }
 
         RelPlan::Sort { input, keys, .. } => {
             for sk in keys {
-                collect_column_refs_in_scalar(&sk.expr, bindings, scan_index, acc);
+                let read = as_written(&sk.expr, written);
+                collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Limit {
@@ -1654,30 +1883,30 @@ fn visit_plan_for_column_refs(
             if let Some(e) = offset {
                 collect_column_refs_in_scalar(e, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::WithScope { ctes, body, .. } => {
             for cte in ctes {
                 match &cte.body {
                     CteBody::NonRecursive(b) => {
-                        visit_plan_for_column_refs(b, bindings, scan_index, acc);
+                        column_refs_in_plan(b, written, bindings, scan_index, acc);
                     }
                     CteBody::Recursive { anchor, step, .. } => {
-                        visit_plan_for_column_refs(anchor, bindings, scan_index, acc);
-                        visit_plan_for_column_refs(step, bindings, scan_index, acc);
+                        column_refs_in_plan(anchor, written, bindings, scan_index, acc);
+                        column_refs_in_plan(step, written, bindings, scan_index, acc);
                     }
                 }
             }
-            visit_plan_for_column_refs(body, bindings, scan_index, acc);
+            column_refs_in_plan(body, written, bindings, scan_index, acc);
         }
 
         RelPlan::DerivedTable { input, .. } => {
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Explain { body, .. } => {
-            visit_plan_for_column_refs(body, bindings, scan_index, acc);
+            column_refs_in_plan(body, written, bindings, scan_index, acc);
         }
 
         RelPlan::TableFunction { call, .. } => {
@@ -1686,7 +1915,7 @@ fn visit_plan_for_column_refs(
 
         RelPlan::Unnest { input, array, .. } => {
             collect_column_refs_in_scalar(array, bindings, scan_index, acc);
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Pivot {
@@ -1701,18 +1930,18 @@ fn visit_plan_for_column_refs(
             if let Some(e) = default_on_null {
                 collect_column_refs_in_scalar(e, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Unpivot { input, .. } => {
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::MatchRecognize { input, .. } => {
             // MATCH_RECOGNIZE body internals (measures / DEFINE
             // predicates) live behind a typed body; column_refs
             // inside it are not collected. Only the input is descended.
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::ConnectBy {
@@ -1725,7 +1954,7 @@ fn visit_plan_for_column_refs(
                 collect_column_refs_in_scalar(e, bindings, scan_index, acc);
             }
             collect_column_refs_in_scalar(connect, bindings, scan_index, acc);
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::TableSample { input, sample, .. } => {
@@ -1735,7 +1964,7 @@ fn visit_plan_for_column_refs(
             if let Some(e) = &sample.repeatable {
                 collect_column_refs_in_scalar(e, bindings, scan_index, acc);
             }
-            visit_plan_for_column_refs(input, bindings, scan_index, acc);
+            column_refs_in_plan(input, written, bindings, scan_index, acc);
         }
 
         RelPlan::Insert {
@@ -1746,7 +1975,7 @@ fn visit_plan_for_column_refs(
         } => {
             match insert_src {
                 InsertSource::Values(rows_plan) | InsertSource::Query(rows_plan) => {
-                    visit_plan_for_column_refs(rows_plan, bindings, scan_index, acc);
+                    column_refs_in_plan(rows_plan, written, bindings, scan_index, acc);
                 }
                 InsertSource::DefaultValues => {}
             }
@@ -1760,17 +1989,13 @@ fn visit_plan_for_column_refs(
                         assignments,
                         where_clause,
                     } => {
-                        for (_, e) in assignments {
-                            collect_column_refs_in_scalar(e, bindings, scan_index, acc);
-                        }
+                        collect_column_refs_in_assignments(assignments, bindings, scan_index, acc);
                         if let Some(p) = where_clause {
                             collect_column_refs_in_scalar(p, bindings, scan_index, acc);
                         }
                     }
                     crate::ir::plan::ConflictAction::MySqlDuplicateKeyUpdate { assignments } => {
-                        for (_, e) in assignments {
-                            collect_column_refs_in_scalar(e, bindings, scan_index, acc);
-                        }
+                        collect_column_refs_in_assignments(assignments, bindings, scan_index, acc);
                     }
                 }
             }
@@ -1784,11 +2009,9 @@ fn visit_plan_for_column_refs(
             returning,
             ..
         } => {
-            for (_, e) in assignments {
-                collect_column_refs_in_scalar(e, bindings, scan_index, acc);
-            }
+            collect_column_refs_in_assignments(assignments, bindings, scan_index, acc);
             if let Some(f) = from {
-                visit_plan_for_column_refs(f, bindings, scan_index, acc);
+                column_refs_in_plan(f, written, bindings, scan_index, acc);
             }
             if let Some(p) = predicate {
                 collect_column_refs_in_scalar(p, bindings, scan_index, acc);
@@ -1803,7 +2026,7 @@ fn visit_plan_for_column_refs(
             ..
         } => {
             if let Some(u) = using {
-                visit_plan_for_column_refs(u, bindings, scan_index, acc);
+                column_refs_in_plan(u, written, bindings, scan_index, acc);
             }
             if let Some(p) = predicate {
                 collect_column_refs_in_scalar(p, bindings, scan_index, acc);
@@ -1815,10 +2038,12 @@ fn visit_plan_for_column_refs(
             source: merge_src,
             on,
             branches,
+            returning,
             ..
         } => {
+            collect_column_refs_in_returning(returning.as_ref(), bindings, scan_index, acc);
             collect_column_refs_in_scalar(on, bindings, scan_index, acc);
-            visit_plan_for_column_refs(merge_src, bindings, scan_index, acc);
+            column_refs_in_plan(merge_src, written, bindings, scan_index, acc);
             for branch in branches {
                 if let Some(p) = &branch.predicate {
                     collect_column_refs_in_scalar(p, bindings, scan_index, acc);
@@ -1830,14 +2055,12 @@ fn visit_plan_for_column_refs(
                         }
                     }
                     crate::ir::plan::MergeAction::Update { assignments } => {
-                        for (_, e) in assignments {
-                            collect_column_refs_in_scalar(e, bindings, scan_index, acc);
-                        }
+                        collect_column_refs_in_assignments(assignments, bindings, scan_index, acc);
                     }
-                    crate::ir::plan::MergeAction::InsertStar
-                    | crate::ir::plan::MergeAction::InsertAllByName
-                    | crate::ir::plan::MergeAction::UpdateSetStar
-                    | crate::ir::plan::MergeAction::UpdateAllByName
+                    crate::ir::plan::MergeAction::InsertStar { .. }
+                    | crate::ir::plan::MergeAction::InsertAllByName { .. }
+                    | crate::ir::plan::MergeAction::UpdateSetStar { .. }
+                    | crate::ir::plan::MergeAction::UpdateAllByName { .. }
                     | crate::ir::plan::MergeAction::Delete
                     | crate::ir::plan::MergeAction::DoNothing => {}
                 }
@@ -1852,29 +2075,29 @@ fn visit_plan_for_column_refs(
             ..
         } => {
             for t in unconditional_clauses {
-                for v in &t.values {
+                for v in t.values.iter().flatten() {
                     collect_column_refs_in_scalar(v, bindings, scan_index, acc);
                 }
             }
             for w in when_clauses {
                 collect_column_refs_in_scalar(&w.condition, bindings, scan_index, acc);
                 for t in &w.targets {
-                    for v in &t.values {
+                    for v in t.values.iter().flatten() {
                         collect_column_refs_in_scalar(v, bindings, scan_index, acc);
                     }
                 }
             }
             for t in else_clauses {
-                for v in &t.values {
+                for v in t.values.iter().flatten() {
                     collect_column_refs_in_scalar(v, bindings, scan_index, acc);
                 }
             }
-            visit_plan_for_column_refs(mi_src, bindings, scan_index, acc);
+            column_refs_in_plan(mi_src, written, bindings, scan_index, acc);
         }
 
         RelPlan::CreateAsQuery { body, .. } => {
             if let Some(b) = body {
-                visit_plan_for_column_refs(b, bindings, scan_index, acc);
+                column_refs_in_plan(b, written, bindings, scan_index, acc);
             }
         }
 
@@ -1882,6 +2105,28 @@ fn visit_plan_for_column_refs(
         | RelPlan::ParseRecovery { .. }
         | RelPlan::Opaque { .. }
         | RelPlan::InvalidInput { .. } => {}
+    }
+}
+
+/// [`collect_column_refs_in_scalar`] over each assignment's value, a
+/// query's plan included.
+fn collect_column_refs_in_assignments(
+    assignments: &[Assignment],
+    bindings: &BindingTable,
+    scan_index: &ScanIndex,
+    acc: &mut Vec<ColumnRef>,
+) {
+    for assignment in assignments {
+        match &assignment.value {
+            AssignedValue::Row(exprs) => {
+                for expr in exprs {
+                    collect_column_refs_in_scalar(expr, bindings, scan_index, acc);
+                }
+            }
+            AssignedValue::Query { subquery, .. } => {
+                visit_plan_for_column_refs(subquery, bindings, scan_index, acc);
+            }
+        }
     }
 }
 
@@ -1920,7 +2165,7 @@ fn collect_column_refs_in_scalar(
             collect_column_refs_in_scalar(left, bindings, scan_index, acc);
             collect_column_refs_in_scalar(right, bindings, scan_index, acc);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 collect_column_refs_in_scalar(operand, bindings, scan_index, acc);
             }
@@ -1995,6 +2240,12 @@ fn collect_column_refs_in_scalar(
                 }
             }
         }
+        ScalarExpr::RowCmp { left, subquery, .. } => {
+            for e in left {
+                collect_column_refs_in_scalar(e, bindings, scan_index, acc);
+            }
+            visit_plan_for_column_refs(subquery, bindings, scan_index, acc);
+        }
         ScalarExpr::WindowFn { call, .. } => {
             collect_column_refs_in_window_call(call, bindings, scan_index, acc);
         }
@@ -2021,6 +2272,26 @@ fn collect_column_refs_in_aggregate_call(
     }
     for sk in &call.within_group_order {
         collect_column_refs_in_scalar(&sk.expr, bindings, scan_index, acc);
+    }
+}
+
+/// [`collect_column_refs_in_window_call`] for a call of a block's
+/// `Window` node, whose operands may read a key the query wrote out.
+fn collect_column_refs_in_window_as_written(
+    call: &WindowCall,
+    written: &WrittenAgainReads<'_>,
+    bindings: &BindingTable,
+    scan_index: &ScanIndex,
+    acc: &mut Vec<ColumnRef>,
+) {
+    let keys = call.order_by.iter().map(|key| &key.expr);
+    for operand in call.args.iter().chain(&call.partition_by).chain(keys) {
+        let read = as_written(operand, written);
+        collect_column_refs_in_scalar(&read, bindings, scan_index, acc);
+    }
+    if let Some(frame) = &call.frame {
+        collect_column_refs_in_frame_bound(&frame.start, bindings, scan_index, acc);
+        collect_column_refs_in_frame_bound(&frame.end, bindings, scan_index, acc);
     }
 }
 
@@ -2072,7 +2343,7 @@ fn collect_column_refs_in_returning(
     };
     for item in &r.items {
         match item {
-            crate::ir::plan::ReturningItem::Star => {}
+            crate::ir::plan::ReturningItem::Star(_) => {}
             crate::ir::plan::ReturningItem::Expr { expr, .. } => {
                 collect_column_refs_in_scalar(expr, bindings, scan_index, acc);
             }
@@ -2080,22 +2351,20 @@ fn collect_column_refs_in_returning(
     }
 }
 
-fn for_each_grouping_key(grouping: &GroupingSpec, mut f: impl FnMut(&GroupKey)) {
+fn for_each_grouping_key<'g>(grouping: &'g GroupingSpec, mut f: impl FnMut(&'g GroupKey)) {
     match grouping {
         GroupingSpec::None => {}
         GroupingSpec::Standard(keys)
         | GroupingSpec::Cube(keys)
         | GroupingSpec::Rollup(keys)
-        | GroupingSpec::All(keys) => {
+        | GroupingSpec::All { keys, .. } => {
             for k in keys {
                 f(k);
             }
         }
         GroupingSpec::GroupingSets(sets) => {
-            for set in sets {
-                for k in set {
-                    f(k);
-                }
+            for k in &sets.keys {
+                f(k);
             }
         }
     }
@@ -2435,6 +2704,8 @@ fn project_limit_fact(limit: Option<&ScalarExpr>, offset: Option<&ScalarExpr>) -
 ///   - the underlying base table at a [`RelPlan::Scan`];
 ///   - the CTE's name as a `TableRef` (no schema/db) at a
 ///     [`RelPlan::CteRef`];
+///   - the function's name as a `TableRef` at a [`RelPlan::TableFunction`]
+///     whose source is a call;
 ///   - the principal of the inner plan for scope-preserving
 ///     wrappers ([`Project`], [`Filter`], [`Aggregate`], [`Window`],
 ///     [`Sort`], [`Limit`], [`TableSample`], [`Pivot`], [`Unpivot`],
@@ -2447,8 +2718,8 @@ fn project_limit_fact(limit: Option<&ScalarExpr>, offset: Option<&ScalarExpr>) -
 ///   - the first input's principal at a [`RelPlan::SetOp`].
 ///
 /// Returns `None` for plans that have no single base-table
-/// representative (DML statements, table-valued functions,
-/// `VALUES`, `Opaque`, etc.). Callers MUST skip emitting an edge
+/// representative (DML statements, a function source that is no
+/// call, `VALUES`, `Opaque`, etc.). Callers MUST skip emitting an edge
 /// when either side resolves to `None` — join_edges are omitted
 /// for unresolvable references rather than emitting placeholder
 /// rows.
@@ -2466,13 +2737,21 @@ fn project_limit_fact(limit: Option<&ScalarExpr>, offset: Option<&ScalarExpr>) -
 /// [`ConnectBy`]: RelPlan::ConnectBy
 /// [`Unnest`]: RelPlan::Unnest
 /// [`DerivedTable`]: RelPlan::DerivedTable
-fn principal_table(plan: &RelPlan) -> Option<TableRef> {
+fn principal_table(
+    plan: &RelPlan,
+    functions: &crate::ir::catalog::FunctionCatalog,
+) -> Option<TableRef> {
     match plan {
         RelPlan::Scan { table, .. } => Some(table.clone()),
         RelPlan::CteRef { name, .. } => Some(TableRef::new(name.as_str().to_string())),
         RelPlan::ModelRef { model, .. } => model.base_tables.first().cloned(),
-        RelPlan::Join { right, .. } => principal_table(right),
-        RelPlan::SetOp { inputs, .. } => inputs.first().and_then(|p| principal_table(p)),
+        RelPlan::TableFunction { call, .. } => call.called_function().map(|func| {
+            TableRef::new(crate::facts::extract::resolved_func_canonical_name(
+                func, functions,
+            ))
+        }),
+        RelPlan::Join { right, .. } => principal_table(right, functions),
+        RelPlan::SetOp { inputs, .. } => inputs.first().and_then(|p| principal_table(p, functions)),
         RelPlan::Project { input, .. }
         | RelPlan::Filter { input, .. }
         | RelPlan::Aggregate { input, .. }
@@ -2485,12 +2764,13 @@ fn principal_table(plan: &RelPlan) -> Option<TableRef> {
         | RelPlan::MatchRecognize { input, .. }
         | RelPlan::ConnectBy { input, .. }
         | RelPlan::Unnest { input, .. }
-        | RelPlan::DerivedTable { input, .. } => principal_table(input),
-        RelPlan::Explain { body, .. } => principal_table(body),
-        RelPlan::CreateAsQuery { body, .. } => body.as_deref().and_then(principal_table),
-        RelPlan::WithScope { body, .. } => principal_table(body),
+        | RelPlan::DerivedTable { input, .. } => principal_table(input, functions),
+        RelPlan::Explain { body, .. } => principal_table(body, functions),
+        RelPlan::CreateAsQuery { body, .. } => {
+            body.as_deref().and_then(|b| principal_table(b, functions))
+        }
+        RelPlan::WithScope { body, .. } => principal_table(body, functions),
         RelPlan::Values { .. }
-        | RelPlan::TableFunction { .. }
         | RelPlan::CreateTableForm { .. }
         | RelPlan::Insert { .. }
         | RelPlan::Update { .. }
@@ -2539,18 +2819,47 @@ fn set_op_kind_to_operation(kind: SetOpKind) -> SetOperation {
 /// `tables_written` finalization so their normalization rules
 /// stay identical.
 /// Dedup key for a collected table reference: `(server, db, schema, name)`.
-/// `TableRef` lacks `Ord`, so a tuple keys the `BTreeSet`. The linked-server
+/// `TableRef` lacks `Ord`, so a tuple keys the collection. The linked-server
 /// component is included so four-part references survive collection.
 pub type TableKey = (Option<String>, Option<String>, Option<String>, String);
 
-fn finalize_table_set(set: BTreeSet<TableKey>) -> Vec<TableRef> {
+/// Tables collected by [`TableKey`], each with the span of its first
+/// reference in the source, where the plan says one.
+#[derive(Debug, Default)]
+struct TableSet(BTreeMap<TableKey, Option<Span>>);
+
+impl TableSet {
+    /// Add `table`, referenced at `at`.
+    fn insert(&mut self, table: TableKey, at: Option<Span>) {
+        let held = self.0.entry(table).or_insert(at);
+        if let (Some(first), Some(at)) = (held.as_mut(), at) {
+            if at.start < first.start {
+                *first = at;
+            }
+        }
+        if held.is_none() {
+            *held = at;
+        }
+    }
+
+    /// Add every table of `other`.
+    fn extend(&mut self, other: TableSet) {
+        for (table, at) in other.0 {
+            self.insert(table, at);
+        }
+    }
+}
+
+fn finalize_table_set(set: TableSet) -> Vec<TableRef> {
     let mut v: Vec<TableRef> = set
+        .0
         .into_iter()
-        .map(|(server, db, schema, name)| {
+        .map(|((server, db, schema, name), at)| {
             let mut t = TableRef::new(name);
             t.server = server;
             t.db = db;
             t.schema = schema;
+            t.span = at;
             t
         })
         .collect();
@@ -2630,7 +2939,7 @@ fn collect_agg_call_function_facts(
             collect_agg_call_function_facts(source, left, out);
             collect_agg_call_function_facts(source, right, out);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 collect_agg_call_function_facts(source, operand, out);
             }
@@ -2663,7 +2972,20 @@ fn collect_agg_call_function_facts(
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::Exists { .. }
-        | ScalarExpr::QuantifiedCmp { .. } => {}
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp {
+            quantifier: Some(_),
+            ..
+        } => {}
+        ScalarExpr::RowCmp {
+            quantifier: None,
+            left,
+            ..
+        } => {
+            for e in left {
+                collect_agg_call_function_facts(source, e, out);
+            }
+        }
         ScalarExpr::InList { expr, list, .. } => {
             collect_agg_call_function_facts(source, expr, out);
             for e in list {
@@ -2705,7 +3027,7 @@ fn collect_aliases(plan: &RelPlan, map: &mut HashMap<ColumnId, Option<String>>) 
                     // If this ProjectItem's expression is a direct Column
                     // reference, the ColumnId is an aggregate output whose
                     // alias should be recorded.
-                    if let ScalarExpr::Column { column, .. } = &e.expr {
+                    if let ScalarExpr::Column { column, .. } = e.as_written(input) {
                         map.insert(*column, e.alias.as_ref().map(|k| k.as_str().to_string()));
                     }
                 }
@@ -2920,19 +3242,29 @@ fn grouping_spec_keys(spec: &GroupingSpec) -> (Vec<&GroupKey>, bool, bool, bool,
         GroupingSpec::Standard(keys) => (keys.iter().collect(), false, false, false, false),
         GroupingSpec::Cube(keys) => (keys.iter().collect(), false, true, false, false),
         GroupingSpec::Rollup(keys) => (keys.iter().collect(), false, false, true, false),
-        GroupingSpec::GroupingSets(sets) => {
-            let flat: Vec<&GroupKey> = sets.iter().flat_map(|s| s.iter()).collect();
-            (flat, false, false, false, true)
-        }
-        GroupingSpec::All(keys) => (keys.iter().collect(), true, false, false, false),
+        GroupingSpec::GroupingSets(sets) => (sets.keys.iter().collect(), false, false, false, true),
+        GroupingSpec::All { keys, .. } => (keys.iter().collect(), true, false, false, false),
     }
 }
 
+/// What `key`, a key of `aggregate`, groups by: the definition of the
+/// column the block's `WHERE` computes, where the key reads one, else the
+/// key's own expression.
+fn grouped_expr<'p>(aggregate: &'p RelPlan, key: &'p GroupKey) -> &'p ScalarExpr {
+    if let ScalarExpr::Column { column, .. } = &key.expr {
+        if let Some((_, item)) = aggregate.computed_before_calls_at(*column) {
+            return &item.expr;
+        }
+    }
+    &key.expr
+}
+
 /// Project `GroupingSpec` + `AggregateCall` list to a metadata
-/// `GroupByFact`. Returns `None` for `GroupingSpec::None` (implicit
-/// aggregation has no GROUP BY clause).
+/// `GroupByFact`, `grouping` being `aggregate`'s. Returns `None` for
+/// `GroupingSpec::None` (implicit aggregation has no GROUP BY clause).
 fn project_group_by(
     source: &str,
+    aggregate: &RelPlan,
     grouping: &GroupingSpec,
     bindings: &BindingTable,
     scan_index: &ScanIndex,
@@ -2945,7 +3277,7 @@ fn project_group_by(
     let mut grouping_columns = Vec::new();
     let mut grouping_expressions = Vec::new();
     for key in keys {
-        match &key.expr {
+        match grouped_expr(aggregate, key) {
             ScalarExpr::Column { column, .. } => {
                 grouping_columns.push(column_id_to_ref(*column, bindings, scan_index));
             }
@@ -2964,6 +3296,7 @@ fn project_group_by(
             | ScalarExpr::Lit { span, .. }
             | ScalarExpr::BinOp { span, .. }
             | ScalarExpr::LogicalChain { span, .. }
+            | ScalarExpr::OperatorChain { span, .. }
             | ScalarExpr::UnaryOp { span, .. }
             | ScalarExpr::FuncCall { span, .. }
             | ScalarExpr::Case { span, .. }
@@ -2974,6 +3307,7 @@ fn project_group_by(
             | ScalarExpr::Exists { span, .. }
             | ScalarExpr::ScalarSubquery { span, .. }
             | ScalarExpr::QuantifiedCmp { span, .. }
+            | ScalarExpr::RowCmp { span, .. }
             | ScalarExpr::WindowFn { span, .. }
             | ScalarExpr::FieldAccess { span, .. }
             | ScalarExpr::Lambda { span, .. }
@@ -3036,7 +3370,7 @@ fn collect_column_ids(expr: &ScalarExpr, out: &mut Vec<ColumnId>) {
             collect_column_ids(left, out);
             collect_column_ids(right, out);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 collect_column_ids(operand, out);
             }
@@ -3086,12 +3420,25 @@ fn collect_column_ids(expr: &ScalarExpr, out: &mut Vec<ColumnId>) {
         ScalarExpr::FieldAccess { base, .. } => collect_column_ids(base, out),
         ScalarExpr::Lambda { body, .. } => collect_column_ids(body, out),
         ScalarExpr::PatternVarRef { column, .. } => out.push(*column),
+        ScalarExpr::RowCmp {
+            quantifier: None,
+            left,
+            ..
+        } => {
+            for e in left {
+                collect_column_ids(e, out);
+            }
+        }
         ScalarExpr::Lit { .. }
         | ScalarExpr::Opaque { .. }
         | ScalarExpr::WindowFn { .. }
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::Exists { .. }
-        | ScalarExpr::QuantifiedCmp { .. } => {}
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp {
+            quantifier: Some(_),
+            ..
+        } => {}
     }
 }
 
@@ -3143,8 +3490,8 @@ fn project_having(
 fn walk(
     plan: &RelPlan,
     facts: &mut DerivedFacts,
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     cte_names: &mut HashSet<IdentKey>,
     set_operations: &mut Vec<SetOperationFact>,
@@ -3153,16 +3500,21 @@ fn walk(
     ctx: &WalkCtx<'_>,
 ) {
     match plan {
-        RelPlan::Scan { table, .. } => {
+        RelPlan::Scan { table, span, .. } => {
             // Normalize to a (db, schema, name) triple so the set
             // dedupes case-variant spellings. We round-trip through
-            // the same normalization `TableRef` equality uses.
-            tables.insert((
-                table.server.clone(),
-                table.db.clone(),
-                table.schema.clone(),
-                table.name.clone(),
-            ));
+            // the same normalization `TableRef` equality uses. A table
+            // is referenced where its name is written; the scan's own
+            // span may hold the joins after it.
+            tables.insert(
+                (
+                    table.server.clone(),
+                    table.db.clone(),
+                    table.schema.clone(),
+                    table.name.clone(),
+                ),
+                Some(table.span.unwrap_or(*span)),
+            );
         }
         RelPlan::CteRef { name, .. } => {
             // The reference itself contributes no table; record the
@@ -3170,16 +3522,20 @@ fn walk(
             // the binding's `tables_read` should propagate.
             cte_refs.insert(name.clone());
         }
-        RelPlan::ModelRef { model, .. } => {
+        RelPlan::ModelRef { model, span, .. } => {
             // Expand the upstream physical base tables into the
-            // accumulator rather than the model's own relation name.
+            // accumulator rather than the model's own relation name,
+            // each at the reference to the model.
             for base in &model.base_tables {
-                tables.insert((
-                    base.server.clone(),
-                    base.db.clone(),
-                    base.schema.clone(),
-                    base.name.clone(),
-                ));
+                tables.insert(
+                    (
+                        base.server.clone(),
+                        base.db.clone(),
+                        base.schema.clone(),
+                        base.name.clone(),
+                    ),
+                    Some(*span),
+                );
             }
         }
         RelPlan::Project {
@@ -3198,7 +3554,7 @@ fn walk(
             for item in items {
                 match item {
                     crate::ir::plan::ProjectItem::Expr(e) => {
-                        walk_scalar(&e.expr, tables, tables_written, cte_refs, ctx);
+                        walk_scalar(e.as_written(input), tables, tables_written, cte_refs, ctx);
                     }
                     crate::ir::plan::ProjectItem::Star(s) => {
                         // Star items carry scalar subexpressions in
@@ -3317,7 +3673,7 @@ fn walk(
             // is then discarded).
             if facts.group_by.is_none() {
                 facts.group_by =
-                    project_group_by(ctx.source, grouping, ctx.bindings, ctx.scan_index);
+                    project_group_by(ctx.source, plan, grouping, ctx.bindings, ctx.scan_index);
             }
             if facts.having.is_none() {
                 if let Some(h) = having {
@@ -3376,16 +3732,17 @@ fn walk(
         } => {
             facts.immediate_join_count += 1;
             // Project a `JoinEdge` whenever both sides resolve to a
-            // single principal base-table reference. No edge is
+            // single principal source reference. No edge is
             // emitted when either side cannot be resolved (e.g.
-            // a TVF or `VALUES` source). `on_clause` is projected
+            // a `VALUES` source). `on_clause` is projected
             // through the `ScalarExpr → ExpressionFact` bridge in
             // `crate::ir::expression_fact`; `union_branch_index` has
             // no IR-side analog on the flattened `SetOp` spine and is
             // intentionally left `None`.
-            if let (Some(left_ref), Some(right_ref)) =
-                (principal_table(left), principal_table(right))
-            {
+            if let (Some(left_ref), Some(right_ref)) = (
+                principal_table(left, ctx.func_catalog),
+                principal_table(right, ctx.func_catalog),
+            ) {
                 join_edges.push(JoinEdge {
                     left: left_ref,
                     right: right_ref,
@@ -3552,13 +3909,18 @@ fn walk(
         }
         RelPlan::Insert {
             target,
+            target_node: _,
             target_columns: _,
+            unplaced_columns: _,
+            defaulted_columns: _,
+            target_read_columns: _,
             source,
             on_conflict,
             overwrite: _,
             replace_into: _,
             overriding: _,
             returning,
+            returned_merges: _,
             output,
             target_hints: _,
             node_id: _,
@@ -3566,12 +3928,15 @@ fn walk(
             hints: _,
         } => {
             // DML target → tables_written.
-            tables_written.insert((
-                target.server.clone(),
-                target.db.clone(),
-                target.schema.clone(),
-                target.name.clone(),
-            ));
+            tables_written.insert(
+                (
+                    target.server.clone(),
+                    target.db.clone(),
+                    target.schema.clone(),
+                    target.name.clone(),
+                ),
+                target.span,
+            );
             // INSERT is a DML root whose source is a sub-source
             // scope. Outer-only flat fields (`immediate_join_count`,
             // `has_group_by`, `has_aggregates`, `has_distinct`, ...)
@@ -3625,8 +3990,12 @@ fn walk(
         }
         RelPlan::Update {
             target,
+            target_node: _,
+            target_read_columns: _,
+            only: _,
             assignments,
             from,
+            target_row: _,
             predicate,
             top,
             returning,
@@ -3635,12 +4004,22 @@ fn walk(
             span: _,
             hints: _,
         } => {
-            tables_written.insert((
-                target.server.clone(),
-                target.db.clone(),
-                target.schema.clone(),
-                target.name.clone(),
-            ));
+            // The tables its assignments write: in a multi-table UPDATE,
+            // any table listed before `SET`.
+            let written = assignments
+                .iter()
+                .map(|assignment| ctx.scan_index.written_table(assignment, target));
+            for table in written {
+                tables_written.insert(
+                    (
+                        table.server.clone(),
+                        table.db.clone(),
+                        table.schema.clone(),
+                        table.name.clone(),
+                    ),
+                    table.span,
+                );
+            }
             // `has_where` reflects the UPDATE's own WHERE clause.
             // The other scalar flags are NOT set from the FROM
             // clause or assignments.
@@ -3651,9 +4030,7 @@ fn walk(
             // exprs — these contribute to `tables` / `cte_refs`
             // through nested subqueries (already scratch-scoped
             // inside `walk_scalar`).
-            for (_, rhs) in assignments {
-                walk_scalar(rhs, tables, tables_written, cte_refs, ctx);
-            }
+            walk_assignments(assignments, tables, tables_written, cte_refs, ctx);
             if let Some(p) = predicate {
                 walk_scalar(p, tables, tables_written, cte_refs, ctx);
             }
@@ -3691,7 +4068,11 @@ fn walk(
         }
         RelPlan::Delete {
             target,
+            target_node: _,
+            target_read_columns: _,
             using,
+            target_row: _,
+            deleted_sources,
             predicate,
             top,
             returning,
@@ -3700,12 +4081,22 @@ fn walk(
             span: _,
             hints: _,
         } => {
-            tables_written.insert((
-                target.server.clone(),
-                target.db.clone(),
-                target.schema.clone(),
-                target.name.clone(),
-            ));
+            // The target's table, and those of the further sources a
+            // multi-table DELETE names.
+            let further = deleted_sources
+                .iter()
+                .filter_map(|node| ctx.scan_index.get(node));
+            for table in std::iter::once(target).chain(further) {
+                tables_written.insert(
+                    (
+                        table.server.clone(),
+                        table.db.clone(),
+                        table.schema.clone(),
+                        table.name.clone(),
+                    ),
+                    table.span,
+                );
+            }
             // `has_where` reflects the DELETE's own WHERE clause.
             // Same scoping rules as UPDATE.
             if predicate.is_some() {
@@ -3746,21 +4137,29 @@ fn walk(
         }
         RelPlan::Merge {
             target,
+            target_node: _,
+            target_read_columns: _,
+            only: _,
             source,
             on,
             branches,
             with_schema_evolution: _,
             output,
+            returning,
+            returned_merges: _,
             node_id: _,
             span: _,
             hints: _,
         } => {
-            tables_written.insert((
-                target.server.clone(),
-                target.db.clone(),
-                target.schema.clone(),
-                target.name.clone(),
-            ));
+            tables_written.insert(
+                (
+                    target.server.clone(),
+                    target.db.clone(),
+                    target.schema.clone(),
+                    target.name.clone(),
+                ),
+                target.span,
+            );
             // `has_where` is set unconditionally: a MERGE always has
             // an ON condition, so the statement is treated as
             // bounded by definition.
@@ -3778,14 +4177,12 @@ fn walk(
                         }
                     }
                     MergeAction::Update { assignments } => {
-                        for (_, rhs) in assignments {
-                            walk_scalar(rhs, tables, tables_written, cte_refs, ctx);
-                        }
+                        walk_assignments(assignments, tables, tables_written, cte_refs, ctx);
                     }
-                    MergeAction::InsertStar
-                    | MergeAction::InsertAllByName
-                    | MergeAction::UpdateSetStar
-                    | MergeAction::UpdateAllByName
+                    MergeAction::InsertStar { .. }
+                    | MergeAction::InsertAllByName { .. }
+                    | MergeAction::UpdateSetStar { .. }
+                    | MergeAction::UpdateAllByName { .. }
                     | MergeAction::Delete
                     | MergeAction::DoNothing => {}
                 }
@@ -3809,6 +4206,9 @@ fn walk(
                 containing_cte,
                 ctx,
             );
+            if let Some(r) = returning {
+                walk_returning_items(&r.items, tables, tables_written, cte_refs, ctx);
+            }
             if let Some(o) = output {
                 walk_returning_items(&o.items, tables, tables_written, cte_refs, ctx);
             }
@@ -3825,38 +4225,47 @@ fn walk(
             // reachable target so that nested MultiInsert (e.g.
             // inside a CTE in some dialect) projects correctly.
             for clause in unconditional_clauses {
-                tables_written.insert((
-                    clause.target.server.clone(),
-                    clause.target.db.clone(),
-                    clause.target.schema.clone(),
-                    clause.target.name.clone(),
-                ));
-                for v in &clause.values {
+                tables_written.insert(
+                    (
+                        clause.target.server.clone(),
+                        clause.target.db.clone(),
+                        clause.target.schema.clone(),
+                        clause.target.name.clone(),
+                    ),
+                    clause.target.span,
+                );
+                for v in clause.values.iter().flatten() {
                     walk_scalar(v, tables, tables_written, cte_refs, ctx);
                 }
             }
             for when in when_clauses {
                 walk_scalar(&when.condition, tables, tables_written, cte_refs, ctx);
                 for clause in &when.targets {
-                    tables_written.insert((
-                        clause.target.server.clone(),
-                        clause.target.db.clone(),
-                        clause.target.schema.clone(),
-                        clause.target.name.clone(),
-                    ));
-                    for v in &clause.values {
+                    tables_written.insert(
+                        (
+                            clause.target.server.clone(),
+                            clause.target.db.clone(),
+                            clause.target.schema.clone(),
+                            clause.target.name.clone(),
+                        ),
+                        clause.target.span,
+                    );
+                    for v in clause.values.iter().flatten() {
                         walk_scalar(v, tables, tables_written, cte_refs, ctx);
                     }
                 }
             }
             for clause in else_clauses {
-                tables_written.insert((
-                    clause.target.server.clone(),
-                    clause.target.db.clone(),
-                    clause.target.schema.clone(),
-                    clause.target.name.clone(),
-                ));
-                for v in &clause.values {
+                tables_written.insert(
+                    (
+                        clause.target.server.clone(),
+                        clause.target.db.clone(),
+                        clause.target.schema.clone(),
+                        clause.target.name.clone(),
+                    ),
+                    clause.target.span,
+                );
+                for v in clause.values.iter().flatten() {
                     walk_scalar(v, tables, tables_written, cte_refs, ctx);
                 }
             }
@@ -3956,13 +4365,7 @@ fn walk(
             // discarded scratch instance — they belong to the CTE's
             // own scope, not the enclosing one. Store per-CTE
             // results for the reachability closure below.
-            type TableTriple = TableKey;
-            type CteInfo = (
-                IdentKey,
-                BTreeSet<TableTriple>,
-                BTreeSet<TableTriple>,
-                HashSet<IdentKey>,
-            );
+            type CteInfo = (IdentKey, TableSet, TableSet, HashSet<IdentKey>);
             let mut cte_infos: Vec<CteInfo> = Vec::with_capacity(ctes.len());
             // Index name → position in `cte_infos` so the reachability
             // fixpoint below can look up `own_refs` in O(1) instead of
@@ -3971,8 +4374,8 @@ fn walk(
             // CTE name appears twice (invalid SQL; first match wins).
             let mut cte_index: HashMap<IdentKey, usize> = HashMap::with_capacity(ctes.len());
             for binding in ctes {
-                let mut cte_tables: BTreeSet<TableTriple> = BTreeSet::new();
-                let mut cte_writes: BTreeSet<TableTriple> = BTreeSet::new();
+                let mut cte_tables: TableSet = TableSet::default();
+                let mut cte_writes: TableSet = TableSet::default();
                 let mut cte_own_refs: HashSet<IdentKey> = HashSet::new();
                 let mut scratch = DerivedFacts::empty();
                 // CTE bodies are scope boundaries for `cte_names`:
@@ -4057,12 +4460,8 @@ fn walk(
             }
             for (name, cte_tables, cte_writes, _) in cte_infos {
                 if reachable.contains(&name) {
-                    for t in cte_tables {
-                        tables.insert(t);
-                    }
-                    for t in cte_writes {
-                        tables_written.insert(t);
-                    }
+                    tables.extend(cte_tables);
+                    tables_written.extend(cte_writes);
                 }
             }
         }
@@ -4252,6 +4651,34 @@ fn walk(
     let _: fn(&JoinKind) = |_| {};
 }
 
+/// [`walk`] of a query nested in an expression or an assignment: its own
+/// query scope, whose flags are discarded and whose tables and CTE
+/// references are the outer statement's.
+fn walk_nested_query(
+    subquery: &RelPlan,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
+    cte_refs: &mut HashSet<IdentKey>,
+    ctx: &WalkCtx<'_>,
+) {
+    let mut scratch = DerivedFacts::empty();
+    let mut scratch_cte_names: HashSet<IdentKey> = HashSet::new();
+    let mut scratch_set_operations: Vec<SetOperationFact> = Vec::new();
+    let mut scratch_join_edges: Vec<JoinEdge> = Vec::new();
+    walk(
+        subquery,
+        &mut scratch,
+        tables,
+        tables_written,
+        cte_refs,
+        &mut scratch_cte_names,
+        &mut scratch_set_operations,
+        &mut scratch_join_edges,
+        None,
+        ctx,
+    );
+}
+
 /// Exhaustive walk over a [`ScalarExpr`], collecting any tables /
 /// CTE references reachable through embedded subqueries.
 ///
@@ -4277,8 +4704,8 @@ fn walk(
 /// discipline used by [`walk`].
 fn walk_scalar(
     expr: &ScalarExpr,
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     ctx: &WalkCtx<'_>,
 ) {
@@ -4306,7 +4733,7 @@ fn walk_scalar(
             walk_scalar(left, tables, tables_written, cte_refs, ctx);
             walk_scalar(right, tables, tables_written, cte_refs, ctx);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 walk_scalar(operand, tables, tables_written, cte_refs, ctx);
             }
@@ -4358,22 +4785,13 @@ fn walk_scalar(
             walk_scalar(high, tables, tables_written, cte_refs, ctx);
         }
         ScalarExpr::Exists { subquery, .. } | ScalarExpr::ScalarSubquery { subquery, .. } => {
-            let mut scratch = DerivedFacts::empty();
-            let mut scratch_cte_names: HashSet<IdentKey> = HashSet::new();
-            let mut scratch_set_operations: Vec<SetOperationFact> = Vec::new();
-            let mut scratch_join_edges: Vec<JoinEdge> = Vec::new();
-            walk(
-                subquery,
-                &mut scratch,
-                tables,
-                tables_written,
-                cte_refs,
-                &mut scratch_cte_names,
-                &mut scratch_set_operations,
-                &mut scratch_join_edges,
-                None,
-                ctx,
-            );
+            walk_nested_query(subquery, tables, tables_written, cte_refs, ctx);
+        }
+        ScalarExpr::RowCmp { left, subquery, .. } => {
+            for e in left {
+                walk_scalar(e, tables, tables_written, cte_refs, ctx);
+            }
+            walk_nested_query(subquery, tables, tables_written, cte_refs, ctx);
         }
         ScalarExpr::QuantifiedCmp { left, right, .. } => {
             walk_scalar(left, tables, tables_written, cte_refs, ctx);
@@ -4438,8 +4856,8 @@ fn walk_scalar(
 /// Walk a window-frame bound for embedded scalar expressions.
 fn walk_frame_bound(
     bound: &crate::ir::plan::FrameBound,
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     ctx: &WalkCtx<'_>,
 ) {
@@ -4457,8 +4875,8 @@ fn walk_frame_bound(
 /// Walk every [`ScalarExpr`] attached to an [`AggregateCall`].
 fn walk_aggregate_call(
     call: &crate::ir::plan::AggregateCall,
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     ctx: &WalkCtx<'_>,
 ) {
@@ -4486,15 +4904,15 @@ fn walk_aggregate_call(
 /// not tracked as additional writes.
 fn walk_returning_items(
     items: &[crate::ir::plan::ReturningItem],
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     ctx: &WalkCtx<'_>,
 ) {
     use crate::ir::plan::ReturningItem;
     for item in items {
         match item {
-            ReturningItem::Star => {}
+            ReturningItem::Star(_) => {}
             ReturningItem::Expr { expr, .. } => {
                 walk_scalar(expr, tables, tables_written, cte_refs, ctx);
             }
@@ -4511,8 +4929,8 @@ fn walk_returning_items(
 /// recursion into `Exists` / `ScalarSubquery`.
 fn walk_on_conflict(
     oc: &crate::ir::plan::OnConflict,
-    tables: &mut BTreeSet<TableKey>,
-    tables_written: &mut BTreeSet<TableKey>,
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
     cte_refs: &mut HashSet<IdentKey>,
     ctx: &WalkCtx<'_>,
 ) {
@@ -4536,16 +4954,35 @@ fn walk_on_conflict(
             assignments,
             where_clause,
         } => {
-            for (_, rhs) in assignments {
-                walk_scalar(rhs, tables, tables_written, cte_refs, ctx);
-            }
+            walk_assignments(assignments, tables, tables_written, cte_refs, ctx);
             if let Some(w) = where_clause {
                 walk_scalar(w, tables, tables_written, cte_refs, ctx);
             }
         }
         ConflictAction::MySqlDuplicateKeyUpdate { assignments } => {
-            for (_, rhs) in assignments {
-                walk_scalar(rhs, tables, tables_written, cte_refs, ctx);
+            walk_assignments(assignments, tables, tables_written, cte_refs, ctx);
+        }
+    }
+}
+
+/// [`walk_scalar`] over each assignment's value; a query is walked as a
+/// scalar subquery's plan is.
+fn walk_assignments(
+    assignments: &[Assignment],
+    tables: &mut TableSet,
+    tables_written: &mut TableSet,
+    cte_refs: &mut HashSet<IdentKey>,
+    ctx: &WalkCtx<'_>,
+) {
+    for assignment in assignments {
+        match &assignment.value {
+            AssignedValue::Row(exprs) => {
+                for expr in exprs {
+                    walk_scalar(expr, tables, tables_written, cte_refs, ctx);
+                }
+            }
+            AssignedValue::Query { subquery, .. } => {
+                walk_nested_query(subquery, tables, tables_written, cte_refs, ctx);
             }
         }
     }
@@ -4573,7 +5010,7 @@ fn walk_on_conflict(
 //
 // `ScanModifierFact` is intentionally **not** a field of
 // [`DerivedFacts`]. This projection lets downstream consumers (taint
-// stage seeding, semantic diff, hint signal re-emission) be wired
+// stage seeding, semantic diff, hint finding re-emission) be wired
 // against a typed contract rather than walking the plan ad-hoc.
 
 /// Per-`Scan` projection of [`ScanModifier`].
@@ -4909,7 +5346,7 @@ fn walk_predicate_for_isnull(
             walk_predicate_for_isnull(left, source, bindings, out);
             walk_predicate_for_isnull(right, source, bindings, out);
         }
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 walk_predicate_for_isnull(operand, source, bindings, out);
             }
@@ -4958,6 +5395,11 @@ fn collect_column_names_in_isnull_arg(
         ScalarExpr::BinOp { left, right, .. } => {
             collect_column_names_in_isnull_arg(left, source, bindings, out);
             collect_column_names_in_isnull_arg(right, source, bindings, out);
+        }
+        ScalarExpr::OperatorChain { operands, .. } => {
+            for operand in operands {
+                collect_column_names_in_isnull_arg(operand, source, bindings, out);
+            }
         }
         ScalarExpr::Like {
             expr,
@@ -5114,6 +5556,11 @@ fn collect_qualified_refs_for_isnotnull(
             collect_qualified_refs_for_isnotnull(left, source, bindings, out);
             collect_qualified_refs_for_isnotnull(right, source, bindings, out);
         }
+        ScalarExpr::OperatorChain { operands, .. } => {
+            for operand in operands {
+                collect_qualified_refs_for_isnotnull(operand, source, bindings, out);
+            }
+        }
         ScalarExpr::Like {
             expr,
             pattern,
@@ -5160,7 +5607,9 @@ pub fn visit_plan_for_scan_source(
                         // display_name can be aliased by the lowerer
                         // for SetOp unification etc.
                         ColumnOrigin::Table { column_name, .. } => column_name.clone(),
+                        ColumnOrigin::Unattributed { name, .. } => name.clone(),
                         ColumnOrigin::Computed { .. }
+                        | ColumnOrigin::Merged { .. }
                         | ColumnOrigin::SetOp { .. }
                         | ColumnOrigin::OuterRef { .. }
                         | ColumnOrigin::RecursiveRef { .. } => b.display_name.clone(),
@@ -5285,13 +5734,243 @@ mod tests {
             &plan,
             &bindings,
             &crate::ir::catalog::FunctionCatalog::empty(),
-            None,
-            &crate::facts::reasoning::RecognitionOnly,
         )
+    }
+
+    /// Each column reference as (name, table, output alias).
+    fn named(refs: &[ColumnRef]) -> Vec<(&str, Option<&str>, Option<&str>)> {
+        refs.iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.resolved_table.as_ref().map(|t| t.name.as_str()),
+                    c.output_alias.as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_group_key_written_out_again_reads_the_columns_written_there() {
+        let _folding = crate::ir::normalize::default_folding();
+        // A select item that writes a key's expression out, alone or in
+        // a larger one, reads the table's column under its own alias; the
+        // key's own reads follow, with no alias.
+        let users = Some("users");
+        let f = facts_for(
+            "SELECT LOWER(name) AS k, LOWER(name) AS k2, COUNT(*) AS n FROM users \
+             GROUP BY LOWER(name)",
+        );
+        assert_eq!(
+            named(&f.select_output_columns),
+            [
+                ("NAME", users, Some("K")),
+                ("NAME", users, Some("K2")),
+                ("NAME", users, None),
+            ]
+        );
+        assert_eq!(named(&f.column_refs), [("NAME", users, None); 3]);
+
+        let f = facts_for(
+            "SELECT COALESCE(LOWER(name), 'Total') AS k, COUNT(*) AS n FROM users \
+             GROUP BY ROLLUP(LOWER(name))",
+        );
+        assert_eq!(
+            named(&f.select_output_columns),
+            [("NAME", users, Some("K")), ("NAME", users, None)]
+        );
+        assert_eq!(named(&f.column_refs), [("NAME", users, None); 2]);
+
+        let events = Some("events");
+        let f = facts_for(
+            "SELECT DATE_TRUNC('day', ts) AS day, DATE_TRUNC('day', ts) + 1 AS next_day, \
+             COUNT(*) AS n FROM events GROUP BY DATE_TRUNC('day', ts)",
+        );
+        assert_eq!(
+            named(&f.select_output_columns),
+            [
+                ("TS", events, Some("DAY")),
+                ("TS", events, Some("NEXT_DAY")),
+                ("TS", events, None),
+            ]
+        );
+        assert_eq!(named(&f.column_refs), [("TS", events, None); 3]);
+
+        let f = facts_for(
+            "SELECT CONCAT(LOWER(name), email) AS k, COUNT(*) AS n FROM users \
+             GROUP BY LOWER(name), email",
+        );
+        assert_eq!(
+            named(&f.select_output_columns),
+            [
+                ("NAME", users, Some("K")),
+                ("EMAIL", users, Some("K")),
+                ("NAME", users, None),
+                ("EMAIL", users, None),
+            ]
+        );
+        assert_eq!(
+            named(&f.column_refs),
+            [
+                ("NAME", users, None),
+                ("EMAIL", users, None),
+                ("NAME", users, None),
+                ("EMAIL", users, None),
+            ]
+        );
+
+        // In HAVING and ORDER BY too.
+        let f = facts_for(
+            "SELECT COUNT(*) AS n FROM users GROUP BY LOWER(name) \
+             HAVING LOWER(name) <> 'x' ORDER BY LOWER(name)",
+        );
+        assert_eq!(named(&f.select_output_columns), [("NAME", users, None)]);
+        assert_eq!(named(&f.column_refs), [("NAME", users, None); 3]);
+
+        // A read by alias stays a read of the alias.
+        let f = facts_for(
+            "SELECT LOWER(name) AS k, CONCAT(k, 'x') AS k2, COUNT(*) AS n FROM users GROUP BY 1",
+        );
+        assert_eq!(
+            named(&f.select_output_columns),
+            [
+                ("NAME", users, Some("K")),
+                ("K", None, Some("K2")),
+                ("NAME", users, None),
+            ]
+        );
+        assert_eq!(
+            named(&f.column_refs),
+            [("K", None, None), ("NAME", users, None)]
+        );
+    }
+
+    #[test]
+    fn a_key_over_a_where_alias_reads_the_columns_its_definition_reads() {
+        let _folding = crate::ir::normalize::default_folding();
+        // The `WHERE` computes `k`; the key reads that column, and the
+        // select list reads the table's column through it.
+        let users = Some("users");
+        for by in ["1", "k", "LOWER(name)", "ALL"] {
+            let f = facts_for(&format!(
+                "SELECT LOWER(name) AS k, COUNT(*) AS n FROM users WHERE k <> 'x' GROUP BY {by}"
+            ));
+            assert_eq!(
+                named(&f.select_output_columns),
+                [("NAME", users, Some("K")), ("NAME", users, None)],
+                "GROUP BY {by}"
+            );
+            let Some(group_by) = &f.group_by else {
+                panic!("GROUP BY {by}: expected a grouping, got none");
+            };
+            // The key groups by the expression, not by a column.
+            assert!(
+                group_by.grouping_columns.is_empty(),
+                "GROUP BY {by}: {group_by:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_key_written_out_again_is_the_item_the_query_wrote() {
+        let _folding = crate::ir::normalize::default_folding();
+        // The item's fact is the expression written in the select list,
+        // as it is with no grouping.
+        for item in ["LOWER(name)", "CONCAT(LOWER(name), 'x')"] {
+            let ungrouped = facts_for(&format!("SELECT {item} AS k FROM users"));
+            for by in ["LOWER(name)", "ROLLUP(LOWER(name))"] {
+                let grouped = facts_for(&format!("SELECT {item} AS k FROM users GROUP BY {by}"));
+                assert_eq!(
+                    grouped.projection_items[0].kind, ungrouped.projection_items[0].kind,
+                    "{item} GROUP BY {by}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_grouped_item_is_described_as_the_expression_its_key_holds() {
+        let _folding = crate::ir::normalize::default_folding();
+        // Named by position, alias or ALL, the item is the key's
+        // expression: what the query wrote in the select list.
+        for item in ["LOWER(name)", "name"] {
+            let ungrouped = facts_for(&format!("SELECT {item} AS k FROM users"));
+            for by in ["1", "k", "ALL", "ROLLUP(1)"] {
+                let grouped = facts_for(&format!("SELECT {item} AS k FROM users GROUP BY {by}"));
+                assert_eq!(
+                    grouped.projection_items[0].kind, ungrouped.projection_items[0].kind,
+                    "{item} GROUP BY {by}"
+                );
+            }
+        }
+
+        // An item that reads the first by its alias is that alias,
+        // however the first is grouped.
+        let alias_of = |by: &str| {
+            let f = facts_for(&format!(
+                "SELECT LOWER(name) AS k, k AS k2, COUNT(*) AS n FROM users GROUP BY {by}"
+            ));
+            f.projection_items[1].kind.clone()
+        };
+        let ProjectionItemKind::Expr {
+            expression: crate::context::node_metadata::ExpressionFact::Column(read),
+        } = alias_of("1")
+        else {
+            panic!("a column read: {:?}", alias_of("1"));
+        };
+        assert_eq!((read.name.as_str(), &read.resolved_table), ("K", &None));
+        for by in ["LOWER(name)", "k", "ALL"] {
+            assert_eq!(alias_of(by), alias_of("1"), "GROUP BY {by}");
+        }
+    }
+
+    #[test]
+    fn the_later_of_two_items_over_one_expression_is_the_item_its_key_names() {
+        let _folding = crate::ir::normalize::default_folding();
+        // The key names `b`; `a` writes the same expression out. Each
+        // is the call over the table's column, under its own alias.
+        use crate::context::node_metadata::ExpressionFact;
+        let users = Some("users");
+        for by in ["2", "b"] {
+            let f = facts_for(&format!(
+                "SELECT LOWER(name) AS a, LOWER(name) AS b, COUNT(*) FROM users GROUP BY {by}"
+            ));
+            for (at, alias) in [(0, "A"), (1, "B")] {
+                let item = &f.projection_items[at];
+                assert_eq!(item.alias.as_ref().map(|a| a.as_str()), Some(alias));
+                let ProjectionItemKind::Expr {
+                    expression: ExpressionFact::Function { args, .. },
+                } = &item.kind
+                else {
+                    panic!("GROUP BY {by}: item {alias} is a call: {:?}", item.kind);
+                };
+                let [ExpressionFact::Column(read)] = args.as_slice() else {
+                    panic!("GROUP BY {by}: one column argument: {args:?}");
+                };
+                assert_eq!(
+                    (
+                        read.name.as_str(),
+                        read.resolved_table.as_ref().map(|t| t.name.as_str())
+                    ),
+                    ("NAME", users),
+                    "GROUP BY {by}: item {alias}"
+                );
+            }
+            assert_eq!(
+                named(&f.select_output_columns),
+                [
+                    ("NAME", users, Some("A")),
+                    ("NAME", users, Some("B")),
+                    ("NAME", users, None),
+                ],
+                "GROUP BY {by}"
+            );
+        }
     }
 
     #[test]
     fn simple_select_has_no_flags() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT a FROM t");
         assert_eq!(f.tables_read.len(), 1);
         assert_eq!(f.tables_read[0].name, "t");
@@ -5304,18 +5983,21 @@ mod tests {
 
     #[test]
     fn where_sets_has_where() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT a FROM t WHERE a > 1");
         assert!(f.has_where);
     }
 
     #[test]
     fn distinct_sets_has_distinct() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT DISTINCT a FROM t");
         assert!(f.has_distinct);
     }
 
     #[test]
     fn group_by_sets_has_group_by_and_has_aggregates() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT a, COUNT(*) FROM t GROUP BY a");
         assert!(f.has_group_by);
         assert!(f.has_aggregates);
@@ -5323,6 +6005,7 @@ mod tests {
 
     #[test]
     fn implicit_aggregation_sets_has_aggregates_only() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT COUNT(*) FROM t");
         assert!(!f.has_group_by);
         assert!(f.has_aggregates);
@@ -5330,6 +6013,7 @@ mod tests {
 
     #[test]
     fn join_count_counts_each_join_node() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT a.x FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y");
         assert_eq!(f.immediate_join_count, 2);
         assert_eq!(f.tables_read.len(), 3);
@@ -5337,6 +6021,7 @@ mod tests {
 
     #[test]
     fn comma_from_counts_as_join() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT a.x FROM a, b, c");
         assert_eq!(f.immediate_join_count, 2);
         assert_eq!(f.tables_read.len(), 3);
@@ -5344,6 +6029,7 @@ mod tests {
 
     #[test]
     fn tables_read_is_sorted_and_dedup() {
+        let _folding = crate::ir::normalize::default_folding();
         let f = facts_for("SELECT t.x FROM s.t JOIN s.t t2 ON t.x = t2.x");
         // Same physical table referenced twice via alias — one entry.
         assert_eq!(f.tables_read.len(), 1);
@@ -5353,6 +6039,7 @@ mod tests {
 
     #[test]
     fn setop_does_not_propagate_scalar_flags_from_branches() {
+        let _folding = crate::ir::normalize::default_folding();
         // Every branch has a WHERE; the outer SetSelect has no
         // outer WHERE/GROUP/etc., so `has_where` etc. must be false
         // ("immediate scope" semantics).
@@ -5368,5 +6055,54 @@ mod tests {
         assert!(!f.has_aggregates);
         assert_eq!(f.immediate_join_count, 0);
         assert_eq!(f.tables_read.len(), 3);
+    }
+
+    #[test]
+    fn an_item_a_group_key_repeats_keeps_its_alias_in_the_output_columns() {
+        let _folding = crate::ir::normalize::default_folding();
+        let f = facts_for("SELECT DATE_TRUNC('month', d) AS m, COUNT(*) FROM t GROUP BY 1");
+        assert!(
+            f.select_output_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case("d")
+                    && c.output_alias
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case("m"))),
+            "{:#?}",
+            f.select_output_columns
+        );
+    }
+
+    #[test]
+    fn a_bare_column_item_has_the_same_output_columns_by_ordinal_and_by_name() {
+        let _folding = crate::ir::normalize::default_folding();
+        let rows = |sql: &str| -> Vec<(String, Option<String>, Option<String>)> {
+            facts_for(sql)
+                .select_output_columns
+                .into_iter()
+                .map(|c| (c.name, c.qualifier, c.output_alias))
+                .collect()
+        };
+        let by_ordinal = rows("SELECT a AS e, COUNT(*) FROM t GROUP BY 1");
+        let by_name = rows("SELECT a AS e, COUNT(*) FROM t GROUP BY a");
+        assert_eq!(by_ordinal, by_name);
+        assert!(!by_name.is_empty(), "{by_name:?}");
+    }
+
+    #[test]
+    fn a_star_replace_reads_the_columns_of_its_replacement() {
+        let _folding = crate::ir::normalize::default_folding();
+        let f = facts_for("SELECT * REPLACE (UPPER(name) AS name) FROM users");
+        let name_refs: Vec<&ColumnRef> = f
+            .column_refs
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case("name"))
+            .collect();
+        assert!(!name_refs.is_empty(), "{:#?}", f.column_refs);
+        assert!(
+            name_refs.iter().all(|c| c.resolved_table.is_some()),
+            "a read of `name` names no table: {:#?}",
+            f.column_refs
+        );
     }
 }

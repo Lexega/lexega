@@ -58,8 +58,23 @@ pub struct TablePlan {
     /// `RENAME TABLE` pairs, in statement order. Empty for every other
     /// table action.
     pub renames: Vec<TableRenamePairIr>,
+    /// Each table a `TRUNCATE` truncates, in order: of a list, each table
+    /// listed; else its target. Empty for every other table action.
+    pub(crate) truncated: Vec<TableTarget>,
     pub node_id: NodeId,
     pub span: Span,
+}
+
+impl TablePlan {
+    /// Each table the statement acts on: those a `TRUNCATE` truncates,
+    /// else its target.
+    pub(crate) fn tables(&self) -> &[TableTarget] {
+        if self.truncated.is_empty() {
+            self.target.as_slice()
+        } else {
+            &self.truncated
+        }
+    }
 }
 
 /// IR-internal closed enum of `ALTER TABLE` action variants exposed to
@@ -198,12 +213,16 @@ pub struct TableTarget {
     pub schema: Option<String>,
     pub db: Option<String>,
     pub span: Span,
+    /// The name is a temporary table's (T-SQL `#t`, `##t`).
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TableOptions {
     pub or_replace: bool,
     pub temporary: bool,
+    /// Snowflake `TRANSIENT`: the table persists, without Fail-safe.
+    pub transient: bool,
     /// Snowflake `CREATE PROCEDURE SCOPED { TEMP | TEMPORARY } TABLE …` — a
     /// table scoped to a single stored-procedure execution (also `temporary`).
     pub scoped: bool,
@@ -299,10 +318,11 @@ pub fn lower_create_table_to_table_plan(s: &AstCreateTable, source: &str) -> Tab
     };
     TablePlan {
         action: TableAction::Create,
-        target: Some(target_from_span(source, s.name_span)),
+        target: Some(target_from_name(source, &s.name)),
         options: TableOptions {
             or_replace: s.or_replace_span.is_some(),
-            temporary: s.temp_kind_span.is_some(),
+            temporary: s.persistence == Some(crate::ast::AstTablePersistence::Temporary),
+            transient: s.persistence == Some(crate::ast::AstTablePersistence::Transient),
             scoped: s.scoped_span.is_some(),
             if_not_exists: false,
             if_exists: false,
@@ -322,6 +342,7 @@ pub fn lower_create_table_to_table_plan(s: &AstCreateTable, source: &str) -> Tab
             .data_retention_time_in_days_span
             .and_then(|sp| resolve_data_retention_days(source, sp)),
         renames: Vec::new(),
+        truncated: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -351,10 +372,11 @@ pub fn lower_alter_table_to_table_plan(s: &AstAlterTable, source: &str) -> Table
 
     TablePlan {
         action: TableAction::Alter,
-        target: Some(target_from_span(source, s.name_span)),
+        target: Some(target_from_name(source, &s.name)),
         options: TableOptions {
             or_replace: false,
             temporary: false,
+            transient: false,
             scoped: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
@@ -368,6 +390,7 @@ pub fn lower_alter_table_to_table_plan(s: &AstAlterTable, source: &str) -> Table
         kind: None,
         data_retention_days,
         renames: Vec::new(),
+        truncated: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -386,7 +409,10 @@ pub fn lower_drop_table_to_table_plan(s: &AstDrop, source: &str) -> Option<Table
     if normalize_object_type(text) != "TABLE" {
         return None;
     }
-    let target = s.target_name_span.map(|sp| target_from_span(source, sp));
+    let target = s
+        .target_name
+        .as_ref()
+        .map(|name| target_from_name(source, name));
     let cascade =
         matches!(s.cascade_restrict_span, Some(span) if matches_keyword(source, span, "CASCADE"));
     let restrict =
@@ -397,6 +423,7 @@ pub fn lower_drop_table_to_table_plan(s: &AstDrop, source: &str) -> Option<Table
         options: TableOptions {
             or_replace: false,
             temporary: false,
+            transient: false,
             scoped: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
@@ -410,6 +437,7 @@ pub fn lower_drop_table_to_table_plan(s: &AstDrop, source: &str) -> Option<Table
         kind: None,
         data_retention_days: None,
         renames: Vec::new(),
+        truncated: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     })
@@ -418,13 +446,25 @@ pub fn lower_drop_table_to_table_plan(s: &AstDrop, source: &str) -> Option<Table
 /// Lower a typed [`AstTruncate`] into a [`TablePlan`]. Always
 /// produces `TableAction::Truncate`.
 pub fn lower_truncate_to_table_plan(s: &AstTruncate, source: &str) -> TablePlan {
-    let target = s.target_table_span.map(|sp| target_from_span(source, sp));
+    let target = s
+        .target_table
+        .as_ref()
+        .map(|name| target_from_name(source, name));
+    let truncated = if s.tables.len() < 2 {
+        target.iter().cloned().collect()
+    } else {
+        s.tables
+            .iter()
+            .map(|table| target_from_name(source, &table.name))
+            .collect()
+    };
     TablePlan {
         action: TableAction::Truncate,
         target,
         options: TableOptions {
             or_replace: false,
             temporary: false,
+            transient: false,
             scoped: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
@@ -438,6 +478,7 @@ pub fn lower_truncate_to_table_plan(s: &AstTruncate, source: &str) -> TablePlan 
         kind: None,
         data_retention_days: None,
         renames: Vec::new(),
+        truncated,
         node_id: s.node_id,
         span: s.span,
     }
@@ -460,6 +501,7 @@ pub fn lower_drop_all_row_access_policies_to_table_plan(
         kind: None,
         data_retention_days: None,
         renames: Vec::new(),
+        truncated: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -495,6 +537,7 @@ pub fn lower_mysql_rename_table_to_table_plan(s: &AstMysqlRenameTable, source: &
         kind: None,
         data_retention_days: None,
         renames,
+        truncated: Vec::new(),
         node_id: s.node_id,
         span: s.span,
     }
@@ -578,8 +621,10 @@ fn classify_alter_action(
 
         // ───────────── Actions that do not map to any TBL-* rule ─────────────
         K::RenameColumn { .. }
+        | K::ChangeColumn { .. }
         | K::SwapWith { .. }
         | K::AlterColumn { .. }
+        | K::AlterColumnList { .. }
         | K::AddConstraint { .. }
         | K::DropConstraint { .. }
         | K::DropClusteringKey { .. }
@@ -601,8 +646,47 @@ fn classify_alter_action(
         | K::AlterColumnSetDataType { .. }
         | K::AlterColumnSetDefault { .. }
         | K::AlterColumnDropDefault { .. }
+        | K::OwnerTo { .. }
+        | K::SetSchema { .. }
+        | K::AttachPartition { .. }
+        | K::DetachPartition { .. }
+        | K::SwitchTo { .. }
         | K::GovernanceSpan { .. }
-        | K::Unknown { .. } => {}
+        | K::Unknown { .. }
+        | K::NamedAction { .. } => {}
+    }
+}
+
+/// Whether `name` is a T-SQL temporary table's (`#t`, `##t`), which the
+/// session that made it holds.
+pub fn names_a_temporary_table(name: &crate::ast::AstObjectRef) -> bool {
+    use crate::ast::AstTableNameKind;
+    match name.name_kind {
+        AstTableNameKind::LocalTemp | AstTableNameKind::GlobalTemp => true,
+        AstTableNameKind::Catalog
+        | AstTableNameKind::TableVariable
+        | AstTableNameKind::Stage
+        | AstTableNameKind::Rowset
+        | AstTableNameKind::Templated => false,
+    }
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+pub(crate) fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> TableTarget {
+    let temporary = names_a_temporary_table(name);
+    let Some((db, schema, table)) = crate::ir::utils::written_name_parts(source, name) else {
+        return TableTarget {
+            temporary,
+            ..target_from_span(source, name.span)
+        };
+    };
+    TableTarget {
+        name: table,
+        schema,
+        db,
+        span: name.span,
+        temporary,
     }
 }
 
@@ -627,6 +711,7 @@ pub(crate) fn target_from_span(source: &str, span: Span) -> TableTarget {
         schema,
         db,
         span,
+        temporary: false,
     }
 }
 

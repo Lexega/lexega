@@ -17,17 +17,17 @@
 //! object token is `SERVICE` / `MASTER` / `CERTIFICATE` / `ASYMMETRIC`, never
 //! `DATABASE` / `LOG`) — no dialect branch.
 //!
-//! Recognition captures the verb, the key object, and whether an inline
-//! `PASSWORD` protects/unlocks the material; which combination is dangerous is
-//! the consumer's verdict. The password VALUE is recorded as a redaction span at parse
-//! time. The file path is not surfaced (it can embed a credential).
+//! Recognition captures the verb, the key object, and each inline `PASSWORD`
+//! literal that protects/unlocks the material; which combination is dangerous
+//! is the consumer's verdict. Each password's content is recorded as a
+//! redaction span at parse time. The file path is not surfaced (it can embed a
+//! credential).
 
 use crate::ast::types::{AstMssqlKeyBackup, AstStmt, BackupKeyObject, KeyBackupAction};
 use crate::error::{ParseResult, ParseResultExt};
 use crate::lexer::token::Token;
 use crate::lexer::{Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::principal::peek_string_literal_after;
 
 /// Index of the next significant (non-comment) token at or after `from`.
 fn next_sig_idx(tokens: &[Token], mut from: usize) -> Option<usize> {
@@ -99,11 +99,28 @@ impl<'a> Parser<'a> {
         //    inline `{ENCRYPTION|DECRYPTION} BY PASSWORD = '…'` literal (a
         //    credential) wherever it appears — including nested inside `WITH
         //    PRIVATE KEY (…)`, and both passwords of a `RESTORE … DECRYPTION BY
-        //    PASSWORD … ENCRYPTION BY PASSWORD …`. Each value is redacted.
-        let mut password_spans = Vec::new();
+        //    PASSWORD … ENCRYPTION BY PASSWORD …`. Each content is redacted;
+        //    one a placeholder overlaps is not recorded.
+        // The object, then `{TO | FROM} {FILE | URL} = value` and the
+        // encryption clauses.
+        let head_end = match key_object {
+            BackupKeyObject::ServiceMasterKey => {
+                self.words_end(self.idx, &["SERVICE", "MASTER", "KEY"])
+            }
+            BackupKeyObject::MasterKey => self.words_end(self.idx, &["MASTER", "KEY"]),
+            BackupKeyObject::Certificate => self
+                .words_end(self.idx, &["CERTIFICATE"])
+                .and_then(|k| self.option_value_end(k)),
+            BackupKeyObject::AsymmetricKey => self
+                .words_end(self.idx, &["ASYMMETRIC", "KEY"])
+                .and_then(|k| self.option_value_end(k)),
+        }
+        .unwrap_or(self.idx);
+        let bound = self.clauses_bound(self.key_clauses_end(head_end));
+        let mut password_literal_spans = Vec::new();
         let mut depth: u32 = 0;
         let mut end = verb_tok.span.end;
-        while self.idx < self.tokens.len() {
+        while self.idx < self.tokens.len() && self.idx < bound {
             let tok = &self.tokens[self.idx];
             match tok.kind {
                 TokenKind::Eof => break,
@@ -113,16 +130,10 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             if tok.lexeme(self.source).eq_ignore_ascii_case("PASSWORD") {
-                if let Some(sp) = peek_string_literal_after(self.tokens, self.idx, self.source) {
-                    password_spans.push(sp);
-                }
+                password_literal_spans.extend(self.password_literal_after(self.idx));
             }
             end = tok.span.end;
             self.idx += 1;
-        }
-        let password_present = !password_spans.is_empty();
-        for sp in password_spans {
-            self.redaction_spans.push(sp);
         }
 
         let stmt_span = Span { start, end };
@@ -131,7 +142,7 @@ impl<'a> Parser<'a> {
             span: stmt_span,
             action,
             key_object,
-            password_present,
+            password_literal_spans,
         };
         Ok(AstStmt::MssqlKeyBackup(Box::new(ast)))
     }

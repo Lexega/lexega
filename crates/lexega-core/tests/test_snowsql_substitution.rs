@@ -19,11 +19,11 @@ use lexega_core::api::{analyze_risk, analyze_risk_with_policy_config};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -32,14 +32,16 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
 /// default — substitution is active.
 fn snow_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("snowflake analyze");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
 }
 
 fn pg_rules(sql: &str) -> HashSet<String> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("postgres analyze");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
 }
 
 #[test]

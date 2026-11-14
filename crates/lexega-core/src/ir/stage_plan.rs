@@ -15,7 +15,8 @@
 use super::ddl_plan::DdlTarget;
 use crate::ast::{
     AstAlterStage, AstAlterStageActionKind, AstCopyOption, AstCreateStage, AstDrop,
-    AstStageCredentialOption, AstStageCredentialOptionValue, AstStageCredentialsKind, NodeId,
+    AstStageCredentialOption, AstStageCredentialOptionValue, AstStageCredentialsKind,
+    AstUnloadSource, NodeId,
 };
 use crate::lexer::token::Span;
 
@@ -38,6 +39,11 @@ pub struct StagePlan {
     /// statement has no URL clause / SET URL action, or when the
     /// value side is not a string literal.
     pub url_literal: Option<String>,
+    /// Where the source writes the literal `url_literal` is read from.
+    pub url_span: Option<Span>,
+    /// The password of the URL `url_literal` holds with user information,
+    /// decoded; one a placeholder overlaps is left out.
+    pub url_password_literals: Vec<String>,
     /// `ENCRYPTION = (TYPE = 'NONE')` observed (CREATE) or any
     /// `SET ENCRYPTION = (TYPE = 'NONE')` action observed (ALTER).
     /// Read from `AstCreateStage.encryption_clause` and
@@ -148,6 +154,39 @@ pub enum StageCredentialValue {
     Other { span: Span },
 }
 
+/// The external location a `COPY` or an `UNLOAD` reads or writes, written
+/// as a string literal.
+#[derive(Debug, Clone, Copy)]
+pub struct StageLocation<'a> {
+    /// The literal's value, quotes stripped.
+    pub url: Option<&'a str>,
+    /// The span of the literal, quotes included.
+    pub span: Option<Span>,
+    /// The placeholder spans the source was parsed with.
+    pub placeholders: &'a [Span],
+}
+
+impl StageLocation<'_> {
+    fn url_literal(&self) -> Option<String> {
+        self.url.filter(|s| !s.is_empty()).map(str::to_string)
+    }
+
+    fn url_password_literals(&self, source: &str) -> Vec<String> {
+        url_passwords(
+            self.span.filter(|_| self.url_literal().is_some()),
+            source,
+            self.placeholders,
+        )
+    }
+}
+
+/// The password of the URL the string literal at `span` holds with user
+/// information, decoded; one a placeholder overlaps is left out.
+fn url_passwords(span: Option<Span>, source: &str, placeholders: &[Span]) -> Vec<String> {
+    span.map(|span| super::span_extract::url_password_literals(span, source, placeholders))
+        .unwrap_or_default()
+}
+
 /// Lower a typed [`AstCreateStage`] into a [`StagePlan`].
 ///
 /// Pure structural projection — credential options and URL literal
@@ -155,7 +194,11 @@ pub enum StageCredentialValue {
 /// AST, so we slice the source range and classify with the
 /// NONE-detection rule (case-insensitive containment of
 /// `'NONE'` / `"NONE"` in the upper-cased clause text).
-pub fn lower_create_stage_to_stage_plan(s: &AstCreateStage, source: &str) -> StagePlan {
+pub fn lower_create_stage_to_stage_plan(
+    s: &AstCreateStage,
+    source: &str,
+    placeholders: &[Span],
+) -> StagePlan {
     let credentials = match s.credentials_clause.as_ref() {
         None => StageCredentials::None,
         Some(c) => match c.kind {
@@ -174,6 +217,14 @@ pub fn lower_create_stage_to_stage_plan(s: &AstCreateStage, source: &str) -> Sta
             Some(u.url_text.clone())
         }
     });
+    let url_password_literals = url_passwords(
+        s.url_clause
+            .as_ref()
+            .filter(|u| !u.url_text.is_empty())
+            .map(|u| u.url_value_span),
+        source,
+        placeholders,
+    );
     let (encryption_disabled, encryption_enabled) = match s.encryption_clause {
         Some(span) => classify_create_encryption_clause(source, span),
         None => (false, false),
@@ -184,7 +235,13 @@ pub fn lower_create_stage_to_stage_plan(s: &AstCreateStage, source: &str) -> Sta
         target: None,
         or_replace: s.or_replace_span.is_some(),
         credentials,
+        url_span: s
+            .url_clause
+            .as_ref()
+            .filter(|_| url_literal.is_some())
+            .map(|u| u.url_value_span),
         url_literal,
+        url_password_literals,
         encryption_disabled,
         encryption_enabled,
         // CREATE STAGE WITH TAG (...) does not set the tag flags:
@@ -209,10 +266,15 @@ pub fn lower_create_stage_to_stage_plan(s: &AstCreateStage, source: &str) -> Sta
 /// Encryption / tag / storage-integration flags reflect any matching
 /// action observed across the action list — multiple actions of the
 /// same kind compose with `OR`.
-pub fn lower_alter_stage_to_stage_plan(s: &AstAlterStage, source: &str) -> StagePlan {
+pub fn lower_alter_stage_to_stage_plan(
+    s: &AstAlterStage,
+    source: &str,
+    placeholders: &[Span],
+) -> StagePlan {
     let mut inline_options: Vec<StageCredentialOption> = Vec::new();
     let mut storage_integration_span: Option<Span> = None;
     let mut url_literal: Option<String> = None;
+    let mut url_span: Option<Span> = None;
     let mut encryption_disabled = false;
     let mut encryption_enabled = false;
     let mut set_tag = false;
@@ -233,6 +295,7 @@ pub fn lower_alter_stage_to_stage_plan(s: &AstAlterStage, source: &str) -> Stage
             AstAlterStageActionKind::SetUrl(u) => {
                 if !u.url_text.is_empty() {
                     url_literal = Some(u.url_text.clone());
+                    url_span = Some(u.url_value_span);
                 }
             }
             AstAlterStageActionKind::SetEncryption(enc) => {
@@ -269,6 +332,8 @@ pub fn lower_alter_stage_to_stage_plan(s: &AstAlterStage, source: &str) -> Stage
         or_replace: false,
         credentials,
         url_literal,
+        url_span,
+        url_password_literals: url_passwords(url_span, source, placeholders),
         encryption_disabled,
         encryption_enabled,
         set_tag,
@@ -299,6 +364,8 @@ pub fn lower_drop_stage_to_stage_plan(s: &AstDrop, source: &str) -> Option<Stage
         or_replace: false,
         credentials: StageCredentials::None,
         url_literal: None,
+        url_span: None,
+        url_password_literals: Vec::new(),
         encryption_disabled: false,
         encryption_enabled: false,
         set_tag: false,
@@ -330,13 +397,12 @@ fn classify_create_encryption_clause(source: &str, span: Span) -> (bool, bool) {
 
 /// Resolve `SetEncryptionAction.encryption_type_span` (a span covering
 /// just the type value, e.g. `'NONE'` or `'AWS_SSE_S3'`) into a
-/// disabled-flag boolean: trim quotes /
-/// whitespace then case-insensitive equality with `NONE`.
+/// disabled-flag boolean: the value, case-insensitively equal to `NONE`.
 fn classify_alter_encryption_type(source: &str, span: Span) -> bool {
     let Some(text) = source.get(span.start as usize..span.end as usize) else {
         return false;
     };
-    text.trim().trim_matches('\'').eq_ignore_ascii_case("NONE")
+    crate::ir::span_extract::literal_value_or_text(text).eq_ignore_ascii_case("NONE")
 }
 
 /// Lower a `COPY INTO <location>` statement into a [`StagePlan`].
@@ -357,7 +423,7 @@ pub fn lower_copy_into_location_to_stage_plan(
     node_id: NodeId,
     from_span: Span,
     source: &str,
-    location_url: Option<&str>,
+    location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
     copy_options: &[AstCopyOption],
 ) -> StagePlan {
@@ -368,15 +434,16 @@ pub fn lower_copy_into_location_to_stage_plan(
             options: credentials.iter().map(lower_credential_option).collect(),
         }
     };
-    let url_literal = location_url
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let url_literal = location.url_literal();
+    let url_password_literals = location.url_password_literals(source);
     let unbounded_export = classify_copy_into_location_unbounded(source, from_span);
     StagePlan {
         action: StageAction::CopyToLocation,
         or_replace: false,
         credentials: creds,
         url_literal,
+        url_span: location.span.filter(|_| location.url_literal().is_some()),
+        url_password_literals,
         encryption_disabled: false,
         encryption_enabled: false,
         set_tag: false,
@@ -406,7 +473,7 @@ pub fn lower_copy_into_table_to_stage_plan(
     node_id: NodeId,
     table_name_span: Span,
     source: &str,
-    location_url: Option<&str>,
+    location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
     copy_options: &[AstCopyOption],
 ) -> StagePlan {
@@ -417,14 +484,15 @@ pub fn lower_copy_into_table_to_stage_plan(
             options: credentials.iter().map(lower_credential_option).collect(),
         }
     };
-    let url_literal = location_url
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let url_literal = location.url_literal();
+    let url_password_literals = location.url_password_literals(source);
     StagePlan {
         action: StageAction::CopyToTable,
         or_replace: false,
         credentials: creds,
         url_literal,
+        url_span: location.span.filter(|_| location.url_literal().is_some()),
+        url_password_literals,
         encryption_disabled: false,
         encryption_enabled: false,
         set_tag: false,
@@ -452,10 +520,11 @@ pub fn lower_unload_to_stage_plan(
     span: Span,
     node_id: NodeId,
     source: &str,
-    location_url: Option<&str>,
+    query_span: Span,
+    query: Option<&AstUnloadSource>,
+    location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
 ) -> StagePlan {
-    let _ = source;
     let creds = if credentials.is_empty() {
         StageCredentials::None
     } else {
@@ -463,9 +532,8 @@ pub fn lower_unload_to_stage_plan(
             options: credentials.iter().map(lower_credential_option).collect(),
         }
     };
-    let url_literal = location_url
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let url_literal = location.url_literal();
+    let url_password_literals = location.url_password_literals(source);
     StagePlan {
         action: StageAction::Unload,
         copy_options: Vec::new(),
@@ -473,15 +541,14 @@ pub fn lower_unload_to_stage_plan(
         or_replace: false,
         credentials: creds,
         url_literal,
+        url_span: location.span.filter(|_| location.url_literal().is_some()),
+        url_password_literals,
         encryption_disabled: false,
         encryption_enabled: false,
         set_tag: false,
         unset_tag: false,
         set_storage_integration: false,
-        // UNLOAD's source query is a quoted string, so the bare-table vs
-        // subquery-without-WHERE distinction that drives unbounded-export
-        // detection for COPY INTO does not apply here.
-        unbounded_export: false,
+        unbounded_export: classify_unload_unbounded(source, query_span, query),
         has_unknown_clauses: false,
         node_id,
         span,
@@ -497,7 +564,8 @@ pub fn lower_unload_to_stage_plan(
 pub fn lower_redshift_copy_to_stage_plan(
     span: Span,
     node_id: NodeId,
-    location_url: Option<&str>,
+    source: &str,
+    location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
 ) -> StagePlan {
     let creds = if credentials.is_empty() {
@@ -507,9 +575,8 @@ pub fn lower_redshift_copy_to_stage_plan(
             options: credentials.iter().map(lower_credential_option).collect(),
         }
     };
-    let url_literal = location_url
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    let url_literal = location.url_literal();
+    let url_password_literals = location.url_password_literals(source);
     StagePlan {
         action: StageAction::Load,
         copy_options: Vec::new(),
@@ -517,13 +584,15 @@ pub fn lower_redshift_copy_to_stage_plan(
         or_replace: false,
         credentials: creds,
         url_literal,
+        url_span: location.span.filter(|_| location.url_literal().is_some()),
+        url_password_literals,
         encryption_disabled: false,
         encryption_enabled: false,
         set_tag: false,
         unset_tag: false,
         set_storage_integration: false,
         // COPY's bulk LOAD is an ingest, not an export; the unbounded-export
-        // signal (an UNLOAD/COPY-INTO concern) does not apply.
+        // check (an UNLOAD/COPY-INTO concern) does not apply.
         unbounded_export: false,
         has_unknown_clauses: false,
         node_id,
@@ -544,28 +613,64 @@ pub fn lower_redshift_copy_to_stage_plan(
 /// rather than performing a string scan, so `WHERE`/`(` inside string
 /// literals or comments do not influence the classification.
 fn classify_copy_into_location_unbounded(source: &str, from_span: Span) -> bool {
-    use crate::lexer::{tokenize, Keyword, Punctuation, TokenKind};
+    use crate::lexer::{tokenize, Punctuation, TokenKind};
 
     let Some(text) = source.get(from_span.start as usize..from_span.end as usize) else {
         return false;
     };
-    let lex_result = tokenize(text);
-    let mut has_where = false;
-    let mut has_lparen = false;
-    for tok in &lex_result.tokens {
-        match tok.kind {
-            TokenKind::Keyword(Keyword::Where) => has_where = true,
-            TokenKind::Punctuation(Punctuation::LParen) => has_lparen = true,
-            _ => {}
+    let has_lparen = tokenize(text)
+        .tokens
+        .iter()
+        .any(|tok| matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)));
+    // A bare table reference is always unbounded; a subquery only when it
+    // has no WHERE.
+    !has_lparen || lacks_where(text)
+}
+
+/// True when `text`, tokenized as it stands, holds no `WHERE` keyword: a
+/// `WHERE` inside one of its string literals or comments does not count.
+fn lacks_where(text: &str) -> bool {
+    use crate::lexer::{tokenize, Keyword, TokenKind};
+
+    !tokenize(text)
+        .tokens
+        .iter()
+        .any(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::Where)))
+}
+
+/// Classify an UNLOAD's query as unbounded (reads a table, no `WHERE`). The query is read
+/// from the parsed statement's span; where it was not parsed, from the text
+/// inside the `('…')` argument. Either is the source text of the quoted
+/// argument, its quotes doubled, so a string the query holds is read as
+/// empty literals around bare words: a `WHERE` or `FROM` written inside it
+/// counts.
+fn classify_unload_unbounded(
+    source: &str,
+    query_span: Span,
+    query: Option<&AstUnloadSource>,
+) -> bool {
+    let text = match query {
+        Some(AstUnloadSource::Subquery(stmt)) => {
+            let span = stmt.span();
+            source.get(span.start as usize..span.end as usize)
         }
-    }
-    if !has_lparen {
-        // Bare table reference — always unbounded.
-        true
-    } else {
-        // Subquery — unbounded only if no WHERE keyword present.
-        !has_where
-    }
+        // A whole table is read with no filter.
+        Some(AstUnloadSource::Table { .. }) => return true,
+        None => source
+            .get(query_span.start as usize..query_span.end as usize)
+            .map(|t| t.trim_matches(|c: char| matches!(c, '(' | ')' | '\'') || c.is_whitespace())),
+    };
+    text.is_some_and(|t| reads_from(t) && lacks_where(t))
+}
+
+/// True when the query text holds a `FROM` keyword: it reads a table.
+fn reads_from(text: &str) -> bool {
+    use crate::lexer::{tokenize, Keyword, TokenKind};
+
+    tokenize(text)
+        .tokens
+        .iter()
+        .any(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::From)))
 }
 
 fn lower_credential_option(opt: &AstStageCredentialOption) -> StageCredentialOption {

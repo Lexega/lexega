@@ -30,9 +30,8 @@ use crate::ast::types::{
     AstStorageCredentialProviderVariant, CredentialKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, LiteralKind, Punctuation, Span, TokenKind};
+use crate::lexer::{decode_string_literal, Keyword, LiteralKind, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::create_stage::unquote_sql_string;
 
 impl<'a> Parser<'a> {
     /// Parse `CREATE [STORAGE | SERVICE] CREDENTIAL [IF NOT EXISTS] name [COMMENT '...']`
@@ -515,6 +514,7 @@ impl<'a> Parser<'a> {
         let (application_id_span, application_id_text) =
             self.parse_provider_arg("application_id")?;
         self.consume_optional_comma();
+        self.redaction_spans.extend(self.secret_value_at(self.idx));
         let (client_secret_span, client_secret_text) = self.parse_provider_arg("client_secret")?;
         if in_parens {
             self.consume_optional_rparen();
@@ -531,6 +531,7 @@ impl<'a> Parser<'a> {
         {
             all_literal_values.push(t.clone());
         }
+        let client_secret_text = self.credential_literal(client_secret_span, client_secret_text);
 
         Ok(AstStorageCredentialProvider {
             variant: AstStorageCredentialProviderVariant::AzureServicePrincipal {
@@ -574,8 +575,10 @@ impl<'a> Parser<'a> {
         let in_parens = self.consume_optional_lparen();
         let (account_id_span, account_id_text) = self.parse_provider_arg("account_id")?;
         self.consume_optional_comma();
+        self.redaction_spans.extend(self.secret_value_at(self.idx));
         let (access_key_id_span, access_key_id_text) = self.parse_provider_arg("access_key_id")?;
         self.consume_optional_comma();
+        self.redaction_spans.extend(self.secret_value_at(self.idx));
         let (secret_access_key_span, secret_access_key_text) =
             self.parse_provider_arg("secret_access_key")?;
         if in_parens {
@@ -593,6 +596,9 @@ impl<'a> Parser<'a> {
         {
             all_literal_values.push(t.clone());
         }
+        let access_key_id_text = self.credential_literal(access_key_id_span, access_key_id_text);
+        let secret_access_key_text =
+            self.credential_literal(secret_access_key_span, secret_access_key_text);
 
         Ok(AstStorageCredentialProvider {
             variant: AstStorageCredentialProviderVariant::CloudflareApiToken {
@@ -626,13 +632,23 @@ impl<'a> Parser<'a> {
             let consumed = self
                 .advance()
                 .expect_invariant("string literal consumed after kind match");
-            let text = unquote_sql_string(consumed.lexeme(self.source));
-            Ok((span, Some(text)))
+            let text =
+                decode_string_literal(consumed.lexeme(self.source), self.dialect).map(|d| d.value);
+            Ok((span, text))
+        } else if matches!(tok.kind, TokenKind::Literal(LiteralKind::StringFragment)) {
+            // A string a template writes into: read whole, no literal.
+            Ok((self.parse_string_with_jinja()?.span(), None))
         } else {
             // Parameter / identifier / numeric — accept and advance.
             self.advance();
             Ok((span, None))
         }
+    }
+
+    /// The secret written at `span`, unless a rendered placeholder overlaps
+    /// it: then the value is injected later and no literal.
+    fn credential_literal(&self, span: Span, text: Option<String>) -> Option<String> {
+        text.filter(|_| !self.span_overlaps_placeholder(span))
     }
 
     fn consume_optional_lparen(&mut self) -> bool {

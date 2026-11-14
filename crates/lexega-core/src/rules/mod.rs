@@ -4,7 +4,7 @@
 //! V1 rule engine — predicate language + closure compiler + evaluator.
 //!
 //! Module map:
-//! - [`signal`]   — v1 `Signal` output type, `SignalEvidence`, `EmissionMode`.
+//! - [`finding`]  — v1 `Finding` output type, `FindingEvidence`, `EmissionMode`.
 //! - [`predicate`] — parsed `Predicate` AST + YAML/JSON parser.
 //! - [`mod@compile`]  — closure compiler; produces `CompiledPredicate`.
 //! - [`engine`]   — `Rule` + `evaluate_rules` runtime.
@@ -17,17 +17,23 @@ pub mod compile;
 pub(crate) mod depth;
 pub mod engine;
 pub(crate) mod explain;
+pub mod finding;
+pub mod lists;
 pub mod loader;
 pub mod predicate;
 pub mod schema;
-pub mod signal;
 
 pub use builtin_rules::{all_builtin_rules, canonical_rule_id, former_ids_for};
 pub use compile::{compile, CompileError, CompiledPredicate};
-pub use engine::{evaluate_rules, evaluate_rules_with_explain, MessageTemplate, Rule};
-pub use loader::{load_v1_rules, LoadError, LoadedEntry, LoadedRuleset, PartialRuleOverride};
+pub use engine::{evaluate_rules, evaluate_rules_with_explain, rule_holds, MessageTemplate, Rule};
+pub use finding::{EmissionMode, FactWitness, Finding, FindingEvidence, RuleExplanation};
+pub use lists::{ListChanges, ValueList, ValueLists};
+pub use loader::{
+    load_v1_rules, load_v1_rules_from_json, load_v1_rules_from_toml, FormerIdOverride, ListField,
+    ListShapeProblem, LoadError, LoadedEntry, LoadedRuleset, PartialRuleOverride,
+};
 pub use predicate::{parse_predicate, FieldName, FieldPath, ParseError, Predicate};
-pub use signal::{EmissionMode, FactWitness, RuleExplanation, Signal, SignalEvidence};
+pub use schema::{MaskingPolicy, ShownColumnTag};
 
 /// Typed error for [`build_v1_rule_corpus`] failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,14 +100,22 @@ impl From<LoadError> for MergeError {
 ///   entry with the same `rule_id` wholesale (last-write-wins on the
 ///   merge), so customers can replace any built-in's behaviour by
 ///   re-stating its `id` with their own predicate / message / risk
-///   level.
+///   level. A full rule under a former id of a built-in takes that
+///   built-in's current `id` (keeping the former id as an alias), with
+///   or without built-ins.
 /// - Each [`LoadedEntry::Partial`] is a per-field overlay on the
-///   built-in with the same `id`. The built-in's `triggers` /
-///   `emission` / `per_statement` are inherited verbatim; the
-///   partial entry's `risk_level` / `message` / `enabled` fields
-///   replace the built-in's only where set. A partial entry that
-///   does not match any built-in id returns
+///   built-in with the same `id`, or the one a former `id` resolves
+///   to. The built-in's `triggers` / `emission` / `per_statement` are
+///   inherited verbatim; the partial entry's `risk_level` / `message` /
+///   `enabled` fields replace the built-in's only where set. A partial
+///   entry that does not match any built-in id returns
 ///   [`MergeError::UnresolvedPartialOverride`].
+/// - When `loaded` extends or replaces a built-in list and built-ins
+///   are included, the built-in rules that name a list are rebuilt
+///   against `loaded`'s lists first; full rules and partial overrides
+///   then merge over the rebuilt rules. Corpus order is unchanged.
+/// - The file's own rules resolved against its lists at load time, so
+///   they hold under `include_builtins == false` as well.
 ///
 /// The returned `Vec<Rule>` is owned and can be stored on the
 /// `AnalysisConfig.custom_rules` field; [`evaluate_rules`] is invoked
@@ -126,22 +140,39 @@ pub fn build_v1_rule_corpus(
     let mut corpus: Vec<Rule> = Vec::new();
     let mut index_by_id: HashMap<String, usize> = HashMap::new();
     if include_builtins {
+        let mut rebuilt = if loaded.changes_builtin_lists() {
+            loader::recompile_builtin_list_rules(loaded.lists())?
+        } else {
+            HashMap::new()
+        };
         for r in all_builtin_rules()? {
             index_by_id.insert(r.id.clone(), corpus.len());
-            corpus.push(r.clone());
+            corpus.push(rebuilt.remove(&r.id).unwrap_or_else(|| r.clone()));
         }
     }
     for entry in loaded.into_entries() {
         match entry {
-            LoadedEntry::Full(rule) => match index_by_id.get(&rule.id) {
-                Some(&i) => corpus[i] = rule,
-                None => {
-                    index_by_id.insert(rule.id.clone(), corpus.len());
-                    corpus.push(rule);
+            LoadedEntry::Full(mut rule) => {
+                // A rule under a former id takes the id of the built-in
+                // that absorbed it, and keeps the former id as an alias.
+                let canonical = canonical_rule_id(&rule.id).to_string();
+                if canonical != rule.id {
+                    let former = std::mem::replace(&mut rule.id, canonical);
+                    if !rule.former_ids.contains(&former) {
+                        rule.former_ids.push(former);
+                    }
                 }
-            },
+                match index_by_id.get(&rule.id) {
+                    Some(&i) => corpus[i] = rule,
+                    None => {
+                        index_by_id.insert(rule.id.clone(), corpus.len());
+                        corpus.push(rule);
+                    }
+                }
+            }
             LoadedEntry::Partial(overlay) => {
-                let existing = index_by_id.get(&overlay.id).copied();
+                // A former id overlays the rule that absorbed it.
+                let existing = index_by_id.get(canonical_rule_id(&overlay.id)).copied();
                 match existing {
                     Some(i) => {
                         let base = corpus[i].clone();
@@ -176,7 +207,8 @@ pub fn build_v1_rule_corpus(
 ///
 /// Semantics match [`build_v1_rule_corpus`] for the all-Full case:
 /// built-ins (when `include_builtins`) underlie; customer rules
-/// override by `id`, last-write-wins.
+/// override by `id`, last-write-wins. Takes no list table and never
+/// sees a list change: the built-ins hold the built-in lists.
 ///
 /// Use this from in-process integration paths where the caller holds
 /// owned `Rule` values rather than a `LoadedRuleset` and would
@@ -241,5 +273,103 @@ fn apply_partial_overlay(base: Rule, overlay: PartialRuleOverride) -> Rule {
         message_template: new_message_template,
         emission,
         per_statement,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::builtin_rules::builtin_list_rule_ids;
+    use super::loader::recompile_builtin_list_rules;
+    use super::*;
+    use crate::facts::RiskLevel;
+
+    const EXTEND_REFERENCES: &str = r#"
+lists:
+  credential_references:
+    extend: {values: [From_Pipeline]}
+"#;
+
+    /// Whether `rule` matches a `CREATE USER` whose password is `password`.
+    fn fires_on_password(rule: &Rule, password: &str) -> bool {
+        rule.triggers
+            .evaluate_value(&serde_json::json!({
+                "kind": "create_user",
+                "ddl": {"principal": {"password_literal": password}},
+            }))
+            .is_match()
+    }
+
+    fn ids(rules: &[Rule]) -> Vec<&str> {
+        rules.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    fn builtin_ids() -> Vec<&'static str> {
+        ids(all_builtin_rules().expect("built-in corpus loads"))
+    }
+
+    fn corpus(yaml: &str, include_builtins: bool) -> Vec<Rule> {
+        let loaded = load_v1_rules(yaml).expect("rule file loads");
+        build_v1_rule_corpus(loaded, include_builtins).expect("corpus builds")
+    }
+
+    /// The built-in rule `id` and its position in the corpus.
+    fn builtin(id: &str) -> (usize, &'static Rule) {
+        all_builtin_rules()
+            .expect("built-in corpus loads")
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.id == id)
+            .expect("built-in rule exists")
+    }
+
+    #[test]
+    fn extend_recompiles_only_list_rules() {
+        let loaded = load_v1_rules(EXTEND_REFERENCES).expect("rule file loads");
+        assert!(loaded.changes_builtin_lists());
+        let recompiled = recompile_builtin_list_rules(loaded.lists()).expect("recompiles");
+        let list_rule_ids = builtin_list_rule_ids().expect("built-in corpus loads");
+        assert!(!list_rule_ids.is_empty());
+        assert_eq!(
+            recompiled.keys().cloned().collect::<BTreeSet<_>>(),
+            *list_rule_ids
+        );
+        let merged = build_v1_rule_corpus(loaded, true).expect("corpus builds");
+        assert_eq!(ids(&merged), builtin_ids());
+    }
+
+    #[test]
+    fn full_rule_replacement_wins_over_list_recompile() {
+        let yaml = format!(
+            "{EXTEND_REFERENCES}rules:\n  - id: CRED-PWD-LEAK\n    risk_level: low\n    message: \"custom\"\n    triggers:\n      kind: grant\n"
+        );
+        let merged = corpus(&yaml, true);
+        let (at, _) = builtin("CRED-PWD-LEAK");
+        assert_eq!(ids(&merged), builtin_ids());
+        assert_eq!(merged[at].description, "custom");
+        assert_eq!(merged[at].risk_level, RiskLevel::Low);
+    }
+
+    #[test]
+    fn partial_override_overlays_the_recompiled_rule() {
+        let yaml =
+            format!("{EXTEND_REFERENCES}rules:\n  - id: CRED-PWD-LEAK\n    risk_level: high\n");
+        let merged = corpus(&yaml, true);
+        let (at, original) = builtin("CRED-PWD-LEAK");
+        assert_eq!(ids(&merged), builtin_ids());
+        assert_eq!(merged[at].risk_level, RiskLevel::High);
+        assert_eq!(merged[at].description, original.description);
+        assert!(fires_on_password(&merged[at], "S3cret!"));
+        assert!(!fires_on_password(&merged[at], "REPLACE_ME"));
+        assert!(!fires_on_password(&merged[at], "FROM_PIPELINE"));
+    }
+
+    #[test]
+    fn no_builtin_with_extend_loads() {
+        let yaml = format!(
+            "{EXTEND_REFERENCES}rules:\n  - id: TEST-REF\n    risk_level: low\n    message: \"m\"\n    triggers:\n      use_stmt.target.raw: {{ in_list: credential_references }}\n"
+        );
+        assert_eq!(ids(&corpus(&yaml, false)), ["TEST-REF"]);
     }
 }

@@ -11,14 +11,17 @@
 //! verb, the policy `STATE` (a policy with `STATE = OFF` — or, on `CREATE`, no
 //! `STATE` at all, which defaults to OFF — enforces nothing), and whether
 //! filter / block predicates are present. Which combination is dangerous is
-//! the consumer's verdict; predicate function and table operands carry no governance
-//! signal and are scanned past.
+//! the consumer's verdict. The policy name and each predicate's function and
+//! table are kept as object references.
 //!
 //! Disambiguation from the Snowflake `CREATE/ALTER SECURITY INTEGRATION` form is
 //! structural (the token after `SECURITY` is `POLICY` vs `INTEGRATION`), handled
 //! at the dispatch seam — no dialect branch.
 
-use crate::ast::types::{AstMssqlSecurityPolicy, AstStmt, PolicyState, SecurityPolicyAction};
+use crate::ast::types::{
+    AstMssqlSecurityPolicy, AstSecurityPredicate, AstSecurityPredicateKind, AstStmt, PolicyState,
+    SecurityPolicyAction,
+};
 use crate::error::{ParseResult, ParseResultExt};
 use crate::lexer::token::Token;
 use crate::lexer::{Operator, Punctuation, Span, TokenKind};
@@ -92,6 +95,11 @@ impl<'a> Parser<'a> {
             .ok_or_eof(self.current_span(), vec!["POLICY".to_string()])?;
         let mut end = policy_tok.span.end;
 
+        self.skip_trivia();
+        let name = self
+            .object_ref_at(self.idx, self.id_gen.next())
+            .map(|r| r.1);
+        let mut predicates = Vec::new();
         let mut state = PolicyState::Unset;
         let mut has_filter_predicate = false;
         let mut has_block_predicate = false;
@@ -124,10 +132,26 @@ impl<'a> Parser<'a> {
                 && next_lexeme_is(self.tokens, self.idx + 1, self.source, "PREDICATE")
             {
                 has_filter_predicate = true;
+                if depth == 0 {
+                    predicates.push(
+                        self.security_predicate_after(
+                            self.idx + 1,
+                            AstSecurityPredicateKind::Filter,
+                        ),
+                    );
+                }
             } else if lx.eq_ignore_ascii_case("BLOCK")
                 && next_lexeme_is(self.tokens, self.idx + 1, self.source, "PREDICATE")
             {
                 has_block_predicate = true;
+                if depth == 0 {
+                    predicates.push(
+                        self.security_predicate_after(
+                            self.idx + 1,
+                            AstSecurityPredicateKind::Block,
+                        ),
+                    );
+                }
             }
             end = tok.span.end;
             self.idx += 1;
@@ -141,7 +165,58 @@ impl<'a> Parser<'a> {
             state,
             has_filter_predicate,
             has_block_predicate,
+            name,
+            predicates,
         };
         Ok(AstStmt::MssqlSecurityPolicy(Box::new(ast)))
+    }
+
+    /// The predicate whose `PREDICATE` word is the first significant token
+    /// at or after `from`: `[fn(args)] ON table`, read without consuming. A
+    /// part that is not there is left empty.
+    fn security_predicate_after(
+        &self,
+        from: usize,
+        kind: AstSecurityPredicateKind,
+    ) -> AstSecurityPredicate {
+        let mut predicate = AstSecurityPredicate {
+            kind,
+            function: None,
+            args_span: None,
+            table: None,
+        };
+        let is_on = |i: usize| {
+            self.tokens[i]
+                .lexeme(self.source)
+                .eq_ignore_ascii_case("ON")
+        };
+        let Some(mut at) =
+            next_sig_idx(self.tokens, from).and_then(|w| next_sig_idx(self.tokens, w + 1))
+        else {
+            return predicate;
+        };
+        if !is_on(at) {
+            if let Some((next, function)) = self.object_ref_at(at, self.id_gen.next()) {
+                predicate.function = Some(function);
+                at = next_sig_idx(self.tokens, next).unwrap_or(self.tokens.len());
+            }
+            let opens = self
+                .tokens
+                .get(at)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)));
+            if let (true, Some(close)) = (opens, self.closing_paren_index(at)) {
+                predicate.args_span = Some(Span {
+                    start: self.tokens[at].span.start,
+                    end: self.tokens[close].span.end,
+                });
+                at = next_sig_idx(self.tokens, close + 1).unwrap_or(self.tokens.len());
+            }
+        }
+        if at < self.tokens.len() && is_on(at) {
+            predicate.table = next_sig_idx(self.tokens, at + 1)
+                .and_then(|t| self.object_ref_at(t, self.id_gen.next()))
+                .map(|r| r.1);
+        }
+        predicate
     }
 }

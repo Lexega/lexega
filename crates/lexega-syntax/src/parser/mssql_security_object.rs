@@ -3,6 +3,7 @@
 
 //! T-SQL security-object DDL:
 //! `{ CREATE | ALTER | DROP } MASTER KEY …`
+//! `DROP DATABASE ENCRYPTION KEY`
 //! `{ CREATE | ALTER | DROP } { SYMMETRIC | ASYMMETRIC } KEY <name> …`
 //! `{ CREATE | ALTER | DROP } CERTIFICATE <name> …`
 //! `{ CREATE | ALTER | DROP } [DATABASE SCOPED] CREDENTIAL <name> …`
@@ -65,6 +66,17 @@ impl<'a> Parser<'a> {
             AstMssqlSecurityObjectKind::Certificate
         } else if first_lex.eq_ignore_ascii_case("CREDENTIAL") {
             AstMssqlSecurityObjectKind::Credential
+        } else if first_lex.eq_ignore_ascii_case("DATABASE")
+            && self.words_end(self.idx, &["ENCRYPTION", "KEY"]).is_some()
+        {
+            // DATABASE ENCRYPTION KEY — the database's transparent data
+            // encryption key.
+            self.advance();
+            let key_tok = self
+                .advance()
+                .ok_or_eof(self.current_span(), vec!["KEY".to_string()])?;
+            kw_end = key_tok.span.end;
+            AstMssqlSecurityObjectKind::DatabaseEncryptionKey
         } else if first_lex.eq_ignore_ascii_case("DATABASE") {
             // DATABASE SCOPED CREDENTIAL
             let scoped_tok = self
@@ -98,7 +110,11 @@ impl<'a> Parser<'a> {
 
         // Name — every object except MASTER KEY carries one.
         let mut end = kw_end;
-        let name_span = if matches!(object, AstMssqlSecurityObjectKind::MasterKey) {
+        let name_span = if matches!(
+            object,
+            AstMssqlSecurityObjectKind::MasterKey
+                | AstMssqlSecurityObjectKind::DatabaseEncryptionKey
+        ) {
             None
         } else {
             let name_tok = self
@@ -109,14 +125,17 @@ impl<'a> Parser<'a> {
         };
 
         // Body: consume to semicolon/EOF; lift PASSWORD / SECRET string
-        // literals (`… BY PASSWORD = '<lit>'`, `SECRET = '<lit>'`).
+        // literals (`… BY PASSWORD = '<lit>'`, `SECRET = '<lit>'`). One
+        // overlapping a rendered placeholder is no literal.
         let body_start = end;
+        let body_idx = self.idx;
+        let bound = self.clauses_bound(self.key_clauses_end(self.idx));
         let mut password_literal = None;
         let mut secret_literal = None;
         let mut pending: Option<&str> = None;
         let mut saw_eq = false;
         let mut consumed_any = false;
-        while let Some(t) = self.peek_non_trivia() {
+        while let Some(t) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             if matches!(
                 t.kind,
                 TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
@@ -126,8 +145,14 @@ impl<'a> Parser<'a> {
             let lex = t.lexeme(self.source);
             match pending {
                 Some(kind) if saw_eq => {
-                    if matches!(t.kind, TokenKind::Literal(LiteralKind::String)) {
-                        let inner = inner_string_span(t.span);
+                    if matches!(t.kind, TokenKind::Literal(LiteralKind::String))
+                        && !self.span_overlaps_placeholder(t.span)
+                    {
+                        let inner = crate::parser::principal::inner_literal_span(
+                            t.span,
+                            self.source,
+                            self.dialect,
+                        );
                         if kind == "PASSWORD" && password_literal.is_none() {
                             password_literal = Some(inner);
                         } else if kind == "SECRET" && secret_literal.is_none() {
@@ -157,6 +182,9 @@ impl<'a> Parser<'a> {
             consumed_any = true;
             self.advance();
         }
+        // Every password and secret the body writes is masked out of output
+        // surfaces.
+        self.record_secret_literals(body_idx, self.idx);
         let trailing_span = consumed_any.then_some(Span {
             start: body_start,
             end,
@@ -178,19 +206,119 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Strip the surrounding quotes from a string-literal token span.
-fn inner_string_span(span: Span) -> Span {
-    if span.end > span.start + 1 {
-        Span {
-            start: span.start + 1,
-            end: span.end - 1,
-        }
-    } else {
-        span
-    }
-}
-
 impl<'a> Parser<'a> {
+    /// The index past the clauses of a T-SQL master key, symmetric or
+    /// asymmetric key, certificate or credential statement at `i`, in any
+    /// order: `AUTHORIZATION name`, `FROM {PROVIDER name | ASSEMBLY name |
+    /// [EXECUTABLE] FILE = value | URL = value | BINARY = value}`, `TO
+    /// {FILE | URL} = value`, `[FORCE] REGENERATE`, `FORCE`,
+    /// `[ADD | DROP] ENCRYPTION BY mechanism [, mechanism]*`, `DECRYPTION BY
+    /// mechanism`, `REMOVE {PROVIDER KEY | PRIVATE KEY | ATTESTED OPTION}`,
+    /// `FOR CRYPTOGRAPHIC PROVIDER name`, `ACTIVE FOR BEGIN_DIALOG = value`
+    /// and `WITH option [, option]*`.
+    pub(crate) fn key_clauses_end(&self, mut i: usize) -> usize {
+        while let Some(next) = self.key_clause_end(i).filter(|&next| next > i) {
+            i = next;
+        }
+        i
+    }
+
+    fn key_clause_end(&self, i: usize) -> Option<usize> {
+        if let Some(k) = self.any_words_end(
+            i,
+            &[
+                &["AUTHORIZATION"],
+                &["FROM", "PROVIDER"],
+                &["FROM", "ASSEMBLY"],
+                &["FOR", "CRYPTOGRAPHIC", "PROVIDER"],
+            ],
+        ) {
+            return self.option_value_end(k);
+        }
+        if let Some(k) = self.any_words_end(
+            i,
+            &[
+                &["FROM", "FILE"],
+                &["FROM", "URL"],
+                &["FROM", "EXECUTABLE", "FILE"],
+                &["FROM", "BINARY"],
+                &["TO", "FILE"],
+                &["TO", "URL"],
+                &["ACTIVE", "FOR", "BEGIN_DIALOG"],
+            ],
+        ) {
+            return self.eq_value_end(k);
+        }
+        if let Some(k) = self.any_words_end(
+            i,
+            &[
+                &["ENCRYPTION", "BY"],
+                &["ADD", "ENCRYPTION", "BY"],
+                &["DROP", "ENCRYPTION", "BY"],
+                &["DECRYPTION", "BY"],
+            ],
+        ) {
+            return self.comma_list_end(k, |j| self.key_mechanism_end(j));
+        }
+        if let Some(k) = self.any_words_end(
+            i,
+            &[
+                &["FORCE", "REGENERATE"],
+                &["REGENERATE"],
+                &["FORCE"],
+                &["REMOVE", "PROVIDER", "KEY"],
+                &["REMOVE", "PRIVATE", "KEY"],
+                &["REMOVE", "ATTESTED", "OPTION"],
+            ],
+        ) {
+            return Some(k);
+        }
+        self.with_list_end(i, |k| {
+            self.words_end(k, &["PRIVATE", "KEY"])
+                .and_then(|p| self.parens_end(p))
+                .or_else(|| {
+                    self.words_end(k, &["ENCRYPTION", "BY"])
+                        .and_then(|e| self.comma_list_end(e, |j| self.key_mechanism_end(j)))
+                })
+                .or_else(|| {
+                    self.words_end(k, &["ACTIVE", "FOR", "BEGIN_DIALOG"])
+                        .and_then(|a| self.eq_value_end(a))
+                })
+                .or_else(|| {
+                    self.is_word_at(k)
+                        .then(|| self.eq_value_end(k + 1))
+                        .flatten()
+                })
+        })
+    }
+
+    /// The index past an encryption or decryption mechanism at `i`:
+    /// `CERTIFICATE name [WITH PASSWORD = value]`, `ASYMMETRIC KEY name
+    /// [WITH PASSWORD = value]`, `SYMMETRIC KEY name`, `PASSWORD = value`
+    /// or `SERVICE MASTER KEY`.
+    fn key_mechanism_end(&self, i: usize) -> Option<usize> {
+        if let Some(k) = self.words_end(i, &["PASSWORD"]) {
+            return self.eq_value_end(k);
+        }
+        if let Some(k) = self.words_end(i, &["SERVICE", "MASTER", "KEY"]) {
+            return Some(k);
+        }
+        let name = self.any_words_end(
+            i,
+            &[
+                &["CERTIFICATE"],
+                &["ASYMMETRIC", "KEY"],
+                &["SYMMETRIC", "KEY"],
+            ],
+        )?;
+        let end = self.option_value_end(name)?;
+        Some(
+            self.words_end(end, &["WITH", "PASSWORD"])
+                .and_then(|k| self.eq_value_end(k))
+                .unwrap_or(end),
+        )
+    }
+
     /// Lookahead for the ALTER dispatcher: does `tok` (the token after
     /// ALTER, cursor positioned on it) start a security-object keyword
     /// sequence? (Token stream is significant-only, so idx+1 is the

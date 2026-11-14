@@ -6,7 +6,7 @@
 //! Covers:
 //! - Parsing (simple, qualified, backtick-quoted, DESC alias)
 //! - Formatting (semantic preservation)
-//! - Risk analysis (signal generation, multi-statement)
+//! - Risk analysis (finding generation, multi-statement)
 //! - Regression with existing DESCRIBE TABLE/VIEW
 
 use lexega_core::analyzer::RuleMatch;
@@ -32,10 +32,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
@@ -129,18 +128,18 @@ fn format_describe_history_with_whitespace() {
 // ============================================================================
 
 #[test]
-fn risk_describe_history_info_signal() {
+fn risk_describe_history_info_finding() {
     let sql = "DESCRIBE HISTORY my_table;";
     let report = dbx_analyze(sql);
 
     assert!(
         report.summary.info_count >= 1,
-        "Should have info signal for DESCRIBE HISTORY, got: {:?}",
+        "Should have info finding for DESCRIBE HISTORY, got: {:?}",
         report.summary
     );
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
-        "Should find INFO-DBX-TBL-HIST signal"
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
+        "Should find INFO-DBX-TBL-HIST finding"
     );
 }
 
@@ -150,16 +149,15 @@ fn risk_describe_history_qualified_table() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
         "Should find INFO-DBX-TBL-HIST for qualified name"
     );
 
     // Check detail includes full table name
-    let signal = report
-        .signals
-        .iter()
+    let finding = report
+        .entries()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "INFO-DBX-TBL-HIST"));
-    assert!(signal.is_some(), "Should have INFO-DBX-TBL-HIST signal");
+    assert!(finding.is_some(), "Should have INFO-DBX-TBL-HIST finding");
 }
 
 #[test]
@@ -176,12 +174,12 @@ fn risk_describe_history_tables_read() {
 }
 
 #[test]
-fn risk_desc_history_alias_signal() {
+fn risk_desc_history_alias_finding() {
     let sql = "DESC HISTORY events;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
         "DESC HISTORY should also trigger INFO-DBX-TBL-HIST"
     );
 }
@@ -195,10 +193,9 @@ fn risk_multi_describe_history() {
     "#;
     let report = dbx_analyze(sql);
 
-    // Count evidence (signals may deduplicate, but evidence should reflect all 3)
+    // Count evidence (findings may deduplicate, but evidence should reflect all 3)
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|f| matches!(f, RuleMatch::Analysis(g) if g.matched_rule == "INFO-DBX-TBL-HIST"))
         .map(|f| {
             let RuleMatch::Analysis(ref p) = f;
@@ -272,12 +269,12 @@ fn combined_describe_history_and_optimize() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
-        "Should detect DESCRIBE HISTORY signal"
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
+        "Should detect DESCRIBE HISTORY finding"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-OPT"),
-        "Should detect OPTIMIZE signal"
+        has_finding(&report, "DBX-TBL-OPT"),
+        "Should detect OPTIMIZE finding"
     );
 }
 
@@ -290,11 +287,11 @@ fn combined_describe_history_and_vacuum() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
-        "Should detect DESCRIBE HISTORY signal"
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
+        "Should detect DESCRIBE HISTORY finding"
     );
     assert!(
-        has_signal(&report, "DBX-VACUUM-LOWRET"),
-        "Should detect VACUUM low retention signal"
+        has_finding(&report, "DBX-VACUUM-LOWRET"),
+        "Should detect VACUUM low retention finding"
     );
 }

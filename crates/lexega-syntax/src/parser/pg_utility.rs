@@ -20,16 +20,16 @@
 //! keyword casing and spacing.
 
 use crate::ast::types::{
-    AstAlterPgTrigger, AstAlterSequence, AstAlterType, AstAnalyzeStmt, AstCommentOn,
+    AstAlterPgTrigger, AstAlterSequence, AstAlterType, AstAnalyzeStmt, AstColumnRef, AstCommentOn,
     AstCreateExtension, AstCreateIndex, AstCreatePgTrigger, AstCreateSequence, AstCreateType,
-    AstDoBlock, AstDropPgTrigger, AstStmt, AstVacuum, PgAlterTriggerAction, PgCascadeRestrict,
-    PgDeferrableMode, PgForEachMode, PgReferencingEntry, PgTriggerEvent, PgTriggerEventKind,
-    PgTriggerTiming,
+    AstDoBlock, AstDropPgTrigger, AstExpr, AstIdentifier, AstObjectRef, AstStmt, AstVacuum,
+    PgAlterTriggerAction, PgCascadeRestrict, PgDeferrableMode, PgForEachMode, PgReferencingEntry,
+    PgTriggerEvent, PgTriggerEventKind, PgTriggerTiming,
 };
 use crate::cst::TokenId;
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::lexer::{Keyword, LiteralKind, Punctuation, Span, TokenKind};
+use crate::parser::core::{split_last_part, NamePosition, Parser};
 
 impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
@@ -173,46 +173,13 @@ impl<'a> Parser<'a> {
         // Index name (optional — PG allows omitting it, but it's typical)
         // The name comes before ON, so we peek to decide.
         let mut index_name = None;
-        if let Some(tok) = self.peek_non_trivia() {
-            if matches!(
-                tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-            ) && !matches!(tok.kind, TokenKind::Keyword(Keyword::On))
-            {
-                let name_start = tok.span.start;
-                let t = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-                let mut name_end = t.span.end;
-                // Handle qualified: schema.index_name
-                while let Some(dot_tok) = self.peek_non_trivia() {
-                    if matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                        self.advance(); // dot
-                        if let Some(next) = self.peek_non_trivia() {
-                            if matches!(
-                                next.kind,
-                                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-                            ) {
-                                let n = self.advance().ok_or_eof(
-                                    self.current_span(),
-                                    vec!["identifier".to_string()],
-                                )?;
-                                name_end = n.span.end;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                index_name = Some(Span {
-                    start: name_start,
-                    end: name_end,
-                });
-                end = name_end;
+        let at_on = self
+            .peek_non_trivia()
+            .is_some_and(|tok| matches!(tok.kind, TokenKind::Keyword(Keyword::On)));
+        if !at_on {
+            if let Some(name) = self.take_name_span(crate::parser::core::NamePosition::Object) {
+                index_name = Some(name);
+                end = name.end;
             }
         }
 
@@ -228,12 +195,12 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Table name (qualified)
+        // Table name (qualified), a template writing some of it included
         let mut table_name = Span { start: end, end };
         if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) {
                 table_name = self.parse_qualified_name_span()?;
                 end = table_name.end;
@@ -272,6 +239,7 @@ impl<'a> Parser<'a> {
         let mut columns_l_paren = create_keyword; // fallback
         let mut columns_r_paren = create_keyword; // fallback
         let mut columns_span = Span { start: end, end };
+        let mut column_exprs = Vec::new();
         if let Some(tok) = self.peek_non_trivia() {
             if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
                 let lp = self
@@ -280,8 +248,19 @@ impl<'a> Parser<'a> {
                 columns_l_paren = self.last_token_id();
                 let col_start = lp.span.start;
                 end = lp.span.end;
+                let columns_from = self.idx;
 
-                let mut depth = 1u32;
+                // The list read as key expressions up to its `)`; where it
+                // does not read so, its tokens are skipped to the matching `)`.
+                let mut depth = match self.parse_index_key_exprs() {
+                    Some((exprs, r_paren)) => {
+                        end = r_paren.end;
+                        columns_r_paren = self.last_token_id();
+                        column_exprs = exprs;
+                        0u32
+                    }
+                    None => 1,
+                };
                 while depth > 0 {
                     if let Some(inner) = self.peek_non_trivia() {
                         match inner.kind {
@@ -314,6 +293,8 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                // The key list, expressions included, is read by its tokens.
+                self.record_unparsed_secrets(columns_from, self.idx);
                 columns_span = Span {
                     start: col_start,
                     end,
@@ -550,9 +531,97 @@ impl<'a> Parser<'a> {
             table_name,
             using_method,
             columns_span,
+            column_exprs,
             include_span,
             where_predicate,
         })))
+    }
+
+    /// The key expression of each element of an index's column list, whose
+    /// `(` was just read, up to and including its `)`. An element is a key
+    /// followed by modifiers (`ASC`, `DESC`, `NULLS FIRST`, an operator
+    /// class and its options, `COLLATE name`): a name written with an
+    /// integer in parentheses is a column with a prefix length (`col(10)`),
+    /// any other key an expression. With the span of the `)`; `None`, the
+    /// tokens given back, where an element reads as neither.
+    fn parse_index_key_exprs(&mut self) -> Option<(Vec<AstExpr>, Span)> {
+        self.try_read(|p| {
+            let mut exprs = Vec::new();
+            loop {
+                let mut key = match p.parse_prefixed_column() {
+                    Some(column) => column,
+                    None => p.parse_expr_without_recovery()?,
+                };
+                // A collation is a modifier of the key, not part of it.
+                while let AstExpr::Collate { expr, .. } = key {
+                    key = *expr;
+                }
+                exprs.push(key);
+                p.skip_index_key_modifiers()?;
+                let next = p.advance()?;
+                if matches!(next.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                    return Some((exprs, next.span));
+                }
+                if !matches!(next.kind, TokenKind::Punctuation(Punctuation::Comma)) {
+                    return None;
+                }
+            }
+        })
+    }
+
+    /// A column written with a prefix length, `name(10)`, as the column.
+    fn parse_prefixed_column(&mut self) -> Option<AstExpr> {
+        self.try_read(|p| {
+            let name = p.advance().filter(|t| p.can_be_identifier_token(t))?;
+            p.advance()
+                .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen)))?;
+            p.advance().filter(|t| {
+                matches!(t.kind, TokenKind::Literal(LiteralKind::Number))
+                    && t.lexeme(p.source).bytes().all(|b| b.is_ascii_digit())
+            })?;
+            p.advance()
+                .filter(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::RParen)))?;
+            Some(AstExpr::Ident {
+                node_id: p.id_gen.next(),
+                column_ref: AstColumnRef {
+                    node_id: p.id_gen.next(),
+                    qualifier: None,
+                    name: AstIdentifier {
+                        node_id: p.id_gen.next(),
+                        span: name.span,
+                        kind: crate::ast::AstIdentifierKind::Name,
+                        templated: None,
+                    },
+                },
+            })
+        })
+    }
+
+    /// Skips an index key's modifiers up to the `,` or `)` that ends its
+    /// element, none consumed: names, words, dots and parenthesized options.
+    /// `None` at anything else, which a key read short would leave there.
+    fn skip_index_key_modifiers(&mut self) -> Option<()> {
+        let mut depth = 0u32;
+        loop {
+            let next = self.peek_non_trivia()?;
+            if matches!(next.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+                depth += 1;
+            } else if matches!(next.kind, TokenKind::Punctuation(Punctuation::RParen)) {
+                match depth.checked_sub(1) {
+                    Some(inner) => depth = inner,
+                    None => return Some(()),
+                }
+            } else if depth == 0 && matches!(next.kind, TokenKind::Punctuation(Punctuation::Comma))
+            {
+                return Some(());
+            } else if depth == 0
+                && !(self.can_be_identifier_token(next)
+                    || matches!(next.kind, TokenKind::Punctuation(Punctuation::Dot)))
+            {
+                return None;
+            }
+            self.advance();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -652,7 +721,7 @@ impl<'a> Parser<'a> {
         let object_name = if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) {
                 let name = self.parse_qualified_name_span()?;
                 end = name.end;
@@ -735,15 +804,25 @@ impl<'a> Parser<'a> {
         // closer; reassemble the whole run into one value span (shared with the
         // expression parser) so the inner tokens are not mis-parsed as a fresh
         // statement and dropped to OpaqueContent.
-        let is_dollar_value = self.dialect.supports_dollar_quoted_strings()
-            && self
-                .peek_non_trivia()
-                .map(|t| {
-                    matches!(t.kind, TokenKind::Identifier { .. })
-                        && crate::parser::core::is_dollar_quote_tag(t.lexeme(self.source))
+        // A `$$` string Snowflake writes as words is read by the literal
+        // reader, up to its closing `$$`.
+        let is_dollar_value = self
+            .peek_non_trivia()
+            .is_some_and(|t| crate::parser::core::is_dollar_quote_delimiter(&t.kind));
+        let dollar_words_value =
+            if is_dollar_value && self.dialect.dollar_strings_written_as_words() {
+                self.one_literal_at(self.idx).filter(|literal| {
+                    literal.spelling == crate::parser::principal::LiteralSpelling::DollarQuoted
                 })
-                .unwrap_or(false);
-        if is_dollar_value {
+            } else {
+                None
+            };
+        if let Some(literal) = dollar_words_value {
+            let last = self.tokens[literal.past - 1].span.end;
+            self.idx = literal.past;
+            value_end = last;
+            end = last;
+        } else if is_dollar_value && self.dialect.supports_dollar_quoted_strings() {
             let span = self.reassemble_dollar_quoted_span();
             value_end = span.end;
             end = span.end;
@@ -787,6 +866,31 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
     // DO [LANGUAGE lang] $$ body $$
     // -----------------------------------------------------------------------
+
+    /// MySQL `DO expr [, …]` at the current `DO`.
+    pub(crate) fn try_parse_mysql_do_stmt(&mut self) -> ParseResult<AstStmt> {
+        let do_tok = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["DO".to_string()])?;
+        let mut exprs = vec![self.parse_expr()?];
+        while self
+            .peek()
+            .is_some_and(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::Comma)))
+        {
+            self.advance();
+            exprs.push(self.parse_expr()?);
+        }
+        let end = exprs.last().map_or(do_tok.span.end, |e| e.span().end);
+        Ok(AstStmt::MysqlDo(Box::new(crate::ast::AstMysqlDo {
+            node_id: self.id_gen.next(),
+            span: Span {
+                start: do_tok.span.start,
+                end,
+            },
+            keyword_span: do_tok.span,
+            exprs,
+        })))
+    }
 
     pub(crate) fn try_parse_do_block_stmt(&mut self) -> ParseResult<AstStmt> {
         let _depth = self.track_depth("do_block")?;
@@ -840,8 +944,10 @@ impl<'a> Parser<'a> {
         let mut body_token = do_keyword; // fallback
         let mut body_span = Span { start: end, end };
         let mut body_stmt: Option<Box<AstStmt>> = None;
+        let mut dollar_body = false;
         if let Some(tok) = self.peek_non_trivia() {
-            if crate::parser::core::is_dollar_quote_tag(tok.lexeme(self.source)) {
+            if self.delimits_dollar_quote(tok) {
+                dollar_body = true;
                 let open_tok = self
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["$$".to_string()])?;
@@ -864,12 +970,14 @@ impl<'a> Parser<'a> {
                 };
             } else {
                 // Not a dollar-quote — consume single token as body (e.g. a string literal)
+                let from = self.idx;
                 let t = self
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["body".to_string()])?;
                 body_token = self.last_token_id();
                 body_span = t.span;
                 end = t.span.end;
+                self.record_string_body_secrets(from, self.idx);
             }
         }
 
@@ -901,6 +1009,24 @@ impl<'a> Parser<'a> {
             }
         }
 
+        if dollar_body {
+            // The block's language: PL/pgSQL where none is written.
+            let language = match language {
+                Some(name) => {
+                    let written = self
+                        .source
+                        .get(name.start as usize..name.end as usize)
+                        .unwrap_or("");
+                    crate::ast::AstRoutineLanguage::from_name(
+                        &crate::dialect::normalize_identifier_in(self.dialect, written),
+                        written,
+                        self.dialect,
+                    )
+                }
+                None => crate::ast::AstRoutineLanguage::Sql,
+            };
+            self.note_routine_body(body_span, &language, body_stmt.as_deref());
+        }
         let stmt_span = Span { start, end };
 
         let syntax_id = self
@@ -1113,13 +1239,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Optional: table name
+        // Optional: table name, a template writing some of it included
         let mut table_name = None;
         let mut table_name_span = None;
         if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) && !matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
                 && !matches!(tok.kind, TokenKind::Eof)
             {
@@ -1369,13 +1495,13 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Optional: table name
+        // Optional: table name, a template writing some of it included
         let mut table_name = None;
         let mut table_name_span = None;
         if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) && !matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
                 && !matches!(tok.kind, TokenKind::Eof)
             {
@@ -1536,11 +1662,11 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Type name (qualified)
+        // Type name (qualified), a template writing some of it included
         let type_name = if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) {
                 let name = self.parse_qualified_name_span()?;
                 end = name.end;
@@ -1815,11 +1941,11 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Type name (qualified)
+        // Type name (qualified), a template writing some of it included
         let type_name = if let Some(tok) = self.peek_non_trivia() {
             if matches!(
                 tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                TokenKind::Identifier { .. } | TokenKind::Keyword(_) | TokenKind::JinjaExprOpen
             ) {
                 let name = self.parse_qualified_name_span()?;
                 end = name.end;
@@ -2318,22 +2444,20 @@ impl<'a> Parser<'a> {
         }
 
         // Extension name
-        let extension_name = if let Some(tok) = self.peek_non_trivia() {
-            if matches!(
-                tok.kind,
-                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-            ) {
-                let t = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["extension name".to_string()])?;
-                let name = t.span;
-                end = t.span.end;
-                name
-            } else {
-                Span { start: end, end }
-            }
+        let word_follows = self.peek_non_trivia().is_some_and(|t| {
+            matches!(t.kind, TokenKind::Identifier { .. } | TokenKind::Keyword(_))
+        });
+        let named = if word_follows {
+            Some(self.take_name_or_token_span("extension name")?)
         } else {
-            Span { start: end, end }
+            self.take_name_span(NamePosition::Object)
+        };
+        let extension_name = match named {
+            Some(name) => {
+                end = name.end;
+                name
+            }
+            None => Span { start: end, end },
         };
 
         // Optional clauses: WITH, SCHEMA, VERSION, CASCADE
@@ -2367,20 +2491,18 @@ impl<'a> Parser<'a> {
                         schema_keyword = Some(self.last_token_id());
                         end = t.span.end;
                         // Schema name
-                        if let Some(name_tok) = self.peek_non_trivia() {
-                            if matches!(
-                                name_tok.kind,
-                                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-                            ) {
-                                let n = self.advance().ok_or_eof(
-                                    self.current_span(),
-                                    vec!["schema name".to_string()],
-                                )?;
-                                let s = n.span;
-                                schema_name = Some(s);
-                                schema_name_span = Some(s);
-                                end = n.span.end;
-                            }
+                        let word_follows = self.peek_non_trivia().is_some_and(|t| {
+                            matches!(t.kind, TokenKind::Identifier { .. } | TokenKind::Keyword(_))
+                        });
+                        let named = if word_follows {
+                            Some(self.take_name_or_token_span("schema name")?)
+                        } else {
+                            self.take_name_span(NamePosition::Object)
+                        };
+                        if let Some(s) = named {
+                            schema_name = Some(s);
+                            schema_name_span = Some(s);
+                            end = s.end;
                         }
                     } else if lex.eq_ignore_ascii_case("VERSION") {
                         let t = self
@@ -2548,29 +2670,13 @@ impl<'a> Parser<'a> {
         }
 
         // Sequence name (optionally schema-qualified: schema.name)
-        let name_start_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["sequence name".to_string()])?;
-        let mut name_end = name_start_tok.span.end;
-
-        // Check for schema.name (dot-qualified)
-        if let Some(dot_tok) = self.peek_non_trivia() {
-            if matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                let name_part = self.advance().ok_or_eof(
-                    self.current_span(),
-                    vec!["sequence name after dot".to_string()],
-                )?;
-                name_end = name_part.span.end;
-            }
-        }
-        let name = Span {
-            start: name_start_tok.span.start,
-            end: name_end,
-        };
+        let name = self.parse_object_name_span()?;
+        let name_end = name.end;
 
         // Consume remaining options until semicolon or EOF
+        let options_from = self.idx;
         let options_span = self.consume_sequence_options()?;
+        let (owned_by_table, owned_by_column) = self.sequence_owner(options_from, self.idx);
 
         let end = options_span.map(|s| s.end).unwrap_or(name_end);
         let stmt_span = Span { start, end };
@@ -2601,7 +2707,32 @@ impl<'a> Parser<'a> {
             if_not_exists,
             name,
             options_span,
+            owned_by_table,
+            owned_by_column,
         })))
+    }
+
+    /// The table and column of the `OWNED BY table.column` among the
+    /// sequence options `from..to`; neither for `OWNED BY NONE` or where the
+    /// name is not dotted.
+    fn sequence_owner(&self, from: usize, to: usize) -> (Option<AstObjectRef>, Option<Span>) {
+        let owner = (from..to)
+            .find_map(|i| self.words_end(i, &["OWNED", "BY"]))
+            .and_then(|after| self.object_ref_at(after, self.id_gen.next()))
+            .and_then(|(_, name)| split_last_part(name));
+        match owner {
+            Some((table, column)) => (Some(table), Some(column)),
+            None => (None, None),
+        }
+    }
+
+    /// The new name of the `RENAME TO new_name` among the sequence options
+    /// `from..to`.
+    fn sequence_rename(&self, from: usize, to: usize) -> Option<Span> {
+        (from..to)
+            .find_map(|i| self.words_end(i, &["RENAME", "TO"]))
+            .and_then(|after| self.name_span_at(after, NamePosition::Object))
+            .map(|(_, name)| name)
     }
 
     // -----------------------------------------------------------------------
@@ -2656,29 +2787,13 @@ impl<'a> Parser<'a> {
         }
 
         // Sequence name (optionally schema-qualified)
-        let name_start_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["sequence name".to_string()])?;
-        let mut name_end = name_start_tok.span.end;
-
-        // Check for schema.name
-        if let Some(dot_tok) = self.peek_non_trivia() {
-            if matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance(); // consume dot
-                let name_part = self.advance().ok_or_eof(
-                    self.current_span(),
-                    vec!["sequence name after dot".to_string()],
-                )?;
-                name_end = name_part.span.end;
-            }
-        }
-        let name = Span {
-            start: name_start_tok.span.start,
-            end: name_end,
-        };
+        let name = self.parse_object_name_span()?;
+        let name_end = name.end;
 
         // Consume remaining options/clauses until semicolon or EOF
+        let options_from = self.idx;
         let options_span = self.consume_sequence_options()?;
+        let rename_to = self.sequence_rename(options_from, self.idx);
 
         let end = options_span.map(|s| s.end).unwrap_or(name_end);
         let stmt_span = Span { start, end };
@@ -2701,6 +2816,7 @@ impl<'a> Parser<'a> {
             if_exists,
             name,
             options_span,
+            rename_to,
         })))
     }
 
@@ -2712,6 +2828,7 @@ impl<'a> Parser<'a> {
     // identifiers and dots. We consume everything until semicolon/EOF.
     // -----------------------------------------------------------------------
     fn consume_sequence_options(&mut self) -> ParseResult<Option<Span>> {
+        let from = self.idx;
         let mut end: Option<u32> = None;
         let mut start: Option<u32> = None;
 
@@ -2724,7 +2841,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             // Stop at any statement-starting keyword that isn't a sequence option
-            if self.is_statement_start_keyword(tok) {
+            if self.is_statement_keyword(tok) {
                 break;
             }
             let consumed = self
@@ -2736,32 +2853,12 @@ impl<'a> Parser<'a> {
             end = Some(consumed.span.end);
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         match (start, end) {
             (Some(s), Some(e)) => Ok(Some(Span { start: s, end: e })),
             _ => Ok(None),
         }
-    }
-
-    /// Check if a token looks like the start of a new statement (not a sequence option).
-    fn is_statement_start_keyword(&self, tok: &crate::lexer::Token) -> bool {
-        matches!(
-            tok.kind,
-            TokenKind::Keyword(Keyword::Create)
-                | TokenKind::Keyword(Keyword::Alter)
-                | TokenKind::Keyword(Keyword::Drop)
-                | TokenKind::Keyword(Keyword::Insert)
-                | TokenKind::Keyword(Keyword::Update)
-                | TokenKind::Keyword(Keyword::Delete)
-                | TokenKind::Keyword(Keyword::Select)
-                | TokenKind::Keyword(Keyword::Grant)
-                | TokenKind::Keyword(Keyword::Revoke)
-                | TokenKind::Keyword(Keyword::Deny)
-                | TokenKind::Keyword(Keyword::Truncate)
-                | TokenKind::Keyword(Keyword::Merge)
-                | TokenKind::Keyword(Keyword::Begin)
-                | TokenKind::Keyword(Keyword::Commit)
-                | TokenKind::Keyword(Keyword::Rollback)
-        )
     }
 
     // -----------------------------------------------------------------------
@@ -2893,7 +2990,7 @@ impl<'a> Parser<'a> {
         let (for_each, for_each_span) = self.parse_trigger_for_each()?;
 
         // Optional: WHEN (condition)
-        let when_condition = self.parse_trigger_when()?;
+        let (when_condition, when_expr) = self.parse_trigger_when()?;
 
         // EXECUTE {FUNCTION | PROCEDURE} func_name(args)
         let (execute_span, function_name, function_args_span, function_call_parens) =
@@ -2939,6 +3036,7 @@ impl<'a> Parser<'a> {
             for_each,
             for_each_span,
             when_condition,
+            when_expr,
             execute_span,
             function_name,
             function_args_span,
@@ -3396,15 +3494,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse optional WHEN (condition)
-    fn parse_trigger_when(&mut self) -> ParseResult<Option<Span>> {
+    /// Parse optional WHEN (condition): its span, and the condition read as
+    /// an expression where it parses.
+    fn parse_trigger_when(&mut self) -> ParseResult<(Option<Span>, Option<Box<AstExpr>>)> {
         let tok = match self.peek_non_trivia() {
             Some(t) => t,
-            None => return Ok(None),
+            None => return Ok((None, None)),
         };
 
         if !matches!(tok.kind, TokenKind::Keyword(Keyword::When)) {
-            return Ok(None);
+            return Ok((None, None));
         }
         let when_tok = self
             .advance()
@@ -3427,6 +3526,13 @@ impl<'a> Parser<'a> {
                     message: "Expected '(' after WHEN".to_string(),
                 },
             ));
+        }
+        if let Some((parens, expr)) = self.parse_parenthesized_expr() {
+            let span = Span {
+                start,
+                end: parens.end,
+            };
+            return Ok((Some(span), Some(Box::new(expr))));
         }
         self.advance(); // (
 
@@ -3458,7 +3564,7 @@ impl<'a> Parser<'a> {
             end = next.span.end;
         }
 
-        Ok(Some(Span { start, end }))
+        Ok((Some(Span { start, end }), None))
     }
 
     /// Parse EXECUTE {FUNCTION | PROCEDURE} func_name(args)

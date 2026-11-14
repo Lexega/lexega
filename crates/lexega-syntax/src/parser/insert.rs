@@ -9,6 +9,7 @@ use crate::Span;
 
 /// Result of parsing an INSERT body (VALUES or SELECT query)
 struct InsertBodyParsed {
+    values_node_id: NodeId,
     body_span: Option<Span>,
     source_kind: AstInsertSourceKind,
     values_span: Option<Span>,
@@ -21,21 +22,132 @@ struct InsertBodyParsed {
     set_clause_span: Option<Span>,
     set_assignments: Vec<(String, AstExpr)>,
     values_row_constructor: bool,
+    execute: Option<Box<AstStmt>>,
 }
 
 /// Result of parsing the INSERT/REPLACE target (INTO, table, PARTITION,
 /// table hints, column list).
 struct InsertTargetParsed {
-    target_table_span: Option<Span>,
+    target_table: Option<AstObjectRef>,
+    target_node_id: NodeId,
+    target_alias_span: Option<Span>,
     partition_span: Option<Span>,
     columns_span: Option<Span>,
+    columns: Vec<AstExpr>,
     column_count: Option<usize>,
     end: u32,
     into_span: Option<Span>,
+    /// `TABLE` before the target (Databricks).
+    table_keyword_span: Option<Span>,
     table_hints: Option<Box<crate::ast::AstTableHintClause>>,
 }
 
+/// Whether a DML target's grammar lets its alias follow the name without `AS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmlTargetAlias {
+    /// `name AS alias` only (INSERT, REPLACE).
+    AfterAs,
+    /// `name [AS] alias` (MERGE).
+    AsOptional,
+}
+
+/// Index just past the `)` that closes the `(` at `open`.
+fn closing_paren_end(toks: &[crate::lexer::Token], open: usize) -> Option<usize> {
+    let mut depth: usize = 0;
+    for (i, t) in toks.iter().enumerate().skip(open) {
+        if matches!(
+            t.kind,
+            TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
+        ) {
+            depth += 1;
+        } else if matches!(
+            t.kind,
+            TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
+        ) {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
 impl<'a> Parser<'a> {
+    /// The target of a DML statement whose tokens are
+    /// `self.tokens[start..end]` (`start < end`), read as `name [WITH
+    /// (hints)] [[AS] alias]` ([`Self::object_ref_at`] reads `name`), and
+    /// its alias. A range of any other shape is a target whose span covers
+    /// the whole range, with no parts and no alias. The target carries
+    /// `node_id`.
+    pub(crate) fn dml_target(
+        &self,
+        start: usize,
+        end: usize,
+        form: DmlTargetAlias,
+        node_id: NodeId,
+    ) -> (crate::ast::AstObjectRef, Option<Span>) {
+        let read = self
+            .object_ref_at(start, node_id)
+            .filter(|(name_end, _)| *name_end <= end)
+            .and_then(|(name_end, name)| {
+                let alias = self.dml_target_alias_after(name_end, end, form)?;
+                Some((name, alias))
+            });
+        match read {
+            Some(target) => target,
+            // Not a name with an alias: the range is not one name either.
+            None => (self.object_ref_of_range(start, end, node_id), None),
+        }
+    }
+
+    /// What follows a DML target's name in `self.tokens[i..end]`: nothing or
+    /// `WITH (hints)` alone (`Some(None)`), or `[WITH (hints)] [AS] alias`
+    /// (`Some(Some(alias))`;
+    /// `AS` required under [`DmlTargetAlias::AfterAs`]). `None` for any
+    /// other shape.
+    fn dml_target_alias_after(
+        &self,
+        mut i: usize,
+        end: usize,
+        form: DmlTargetAlias,
+    ) -> Option<Option<Span>> {
+        if i == end {
+            return Some(None);
+        }
+        let toks = self.tokens.get(..end)?;
+        let kind_at = |i: usize| toks.get(i).map(|t| &t.kind);
+
+        // T-SQL table hints: `WITH (HOLDLOCK)`.
+        if matches!(kind_at(i), Some(TokenKind::Keyword(Keyword::With)))
+            && matches!(
+                kind_at(i + 1),
+                Some(TokenKind::Punctuation(crate::lexer::Punctuation::LParen))
+            )
+        {
+            i = closing_paren_end(toks, i + 1)?;
+            // The hints and the alias are independent.
+            if i == end {
+                return Some(None);
+            }
+        }
+
+        let has_as = matches!(kind_at(i), Some(TokenKind::Keyword(Keyword::As)));
+        if has_as {
+            i += 1;
+        } else if form == DmlTargetAlias::AfterAs {
+            return None;
+        }
+        let [alias] = toks.get(i..)? else {
+            return None;
+        };
+        self.can_be_label(
+            i,
+            crate::dialect::LabelPosition::TableAlias { after_as: has_as },
+        )
+        .then_some(Some(alias.span))
+    }
+
     fn parse_values_row(&mut self) -> crate::error::ParseResult<Option<(Vec<AstExpr>, Span)>> {
         // Expect opening paren
         let lparen = match self.peek() {
@@ -99,6 +211,8 @@ impl<'a> Parser<'a> {
                                 name: AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: default_tok.span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 },
                             },
                         }
@@ -158,11 +272,27 @@ impl<'a> Parser<'a> {
     }
 
     /// Helper to parse INSERT target table and optional column list.
+    /// Whether the token at `i` names, bare, a rowset function of the
+    /// dialect's routines: one that reads another server's rows as a table.
+    fn rowset_function_at(&self, i: usize) -> bool {
+        let Some(tok) = self.tokens.get(i) else {
+            return false;
+        };
+        let written = tok.lexeme(self.source);
+        let parts = crate::dialect::normalize_routine_name_in(self.dialect, &[written]);
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        self.dialect.system_routine(&parts).is_some()
+            && self.dialect.is_table_valued_function(written)
+    }
+
     fn parse_insert_target_and_columns(
         &mut self,
         span_end: u32,
+        overwrite: bool,
     ) -> crate::error::ParseResult<InsertTargetParsed> {
-        let mut target_table_span: Option<Span> = None;
+        let mut target_table: Option<AstObjectRef> = None;
+        let target_node_id = self.id_gen.next();
+        let mut target_alias_span: Option<Span> = None;
         let mut partition_span: Option<Span> = None;
         let mut columns_span: Option<Span> = None;
         let mut column_count: Option<usize> = None;
@@ -182,15 +312,46 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // Databricks: `TABLE` before the target, and `INSERT OVERWRITE`
+        // naming its target without `INTO`.
+        let mut table_keyword_span: Option<Span> = None;
+        let table_keyword = self.dialect.supports_insert_table_keyword();
+        if table_keyword && (has_into || overwrite) {
+            if let Some(tok) = self.peek() {
+                if matches!(tok.kind, TokenKind::Keyword(Keyword::Table)) {
+                    let table_tok = self
+                        .advance()
+                        .expect_invariant("TABLE keyword confirmed by peek");
+                    table_keyword_span = Some(table_tok.span);
+                    updated_end = table_tok.span.end;
+                }
+            }
+        }
+
+        // `INSERT OVERWRITE [LOCAL] DIRECTORY` writes files, and names no
+        // table.
+        let names_directory = self.word_at(self.idx, "DIRECTORY")
+            || (self.word_at(self.idx, "LOCAL") && self.word_at(self.idx + 1, "DIRECTORY"));
+
         // Capture target table span. MySQL also allows the table directly
         // after INSERT/REPLACE (no INTO).
-        if has_into || self.dialect.supports_insert_optional_into() {
+        if has_into
+            || self.dialect.supports_insert_optional_into()
+            || (table_keyword && overwrite && !names_directory)
+        {
             let stop_at_set = self.dialect.supports_insert_set_form();
             let stop_at_partition = self.dialect.supports_insert_partition_clause();
             let stop_at_value = self.dialect.supports_insert_value_synonym();
+            let stop_at_exec = self.dialect.supports_exec_procedure_call();
             // Consume tokens up to LParen, VALUES, SELECT, WITH (hints), or
-            // a dialect-gated clause head (SET / PARTITION / VALUE-synonym).
+            // a dialect-gated clause head (SET / PARTITION / VALUE-synonym /
+            // EXEC[UTE]).
             let start_idx = self.idx;
+            // The name first: its own parentheses (`IDENTIFIER(…)`) are not
+            // the column list.
+            if let Some(next) = self.object_name_end(start_idx) {
+                self.idx = next;
+            }
             while let Some(t) = self.peek() {
                 match &t.kind {
                     TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
@@ -200,7 +361,13 @@ impl<'a> Parser<'a> {
                     | TokenKind::Keyword(Keyword::With) => break,
                     TokenKind::Keyword(Keyword::Set) if stop_at_set => break,
                     TokenKind::Keyword(Keyword::Partition) if stop_at_partition => break,
-                    // MySQL `INSERT ... TABLE tbl` — TABLE heads a query
+                    TokenKind::Keyword(Keyword::Execute) if stop_at_exec => break,
+                    TokenKind::Identifier { .. }
+                        if stop_at_exec && t.lexeme(self.source).eq_ignore_ascii_case("EXEC") =>
+                    {
+                        break
+                    }
+                    // `INSERT ... TABLE tbl` (MySQL, PostgreSQL) — TABLE heads a query
                     // source, not part of the target name.
                     TokenKind::Keyword(Keyword::Table)
                         if self.dialect.supports_table_query_statement() =>
@@ -211,6 +378,7 @@ impl<'a> Parser<'a> {
                     // head when directly followed by '('.
                     TokenKind::Identifier {
                         kind: crate::lexer::IdentifierKind::Unquoted,
+                        ..
                     } if stop_at_value
                         && t.lexeme(self.source).eq_ignore_ascii_case("VALUE")
                         && self.peek_ahead(1).is_some_and(|n| {
@@ -232,13 +400,35 @@ impl<'a> Parser<'a> {
             }
             let end_idx = self.idx;
             if end_idx > start_idx {
-                let first = &self.tokens[start_idx];
-                let last = &self.tokens[end_idx - 1];
-                target_table_span = Some(Span {
-                    start: first.span.start,
-                    end: last.span.end,
-                });
-                updated_end = last.span.end;
+                updated_end = self.tokens[end_idx - 1].span.end;
+                let name_node_id = self.id_gen.next();
+                let (mut target, alias) =
+                    self.dml_target(start_idx, end_idx, DmlTargetAlias::AfterAs, name_node_id);
+                // A rowset function the dialect defines, called as the
+                // target: its call, and the names after it, are the target.
+                if end_idx == start_idx + 1 && self.rowset_function_at(start_idx) {
+                    if let Some(past) = self.parens_end(self.idx) {
+                        // `OPENDATASOURCE(…).db.schema.table`: the name
+                        // after the call's `.`, read by the shared reader.
+                        let member = self.tokens.get(past).is_some_and(|t| {
+                            matches!(
+                                t.kind,
+                                TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
+                            )
+                        });
+                        let end = member
+                            .then(|| self.object_name_end(past + 1))
+                            .flatten()
+                            .unwrap_or(past);
+                        self.idx = end;
+                        updated_end = self.tokens[end - 1].span.end;
+                        target.span.end = updated_end;
+                        target.parts = None;
+                        target.name_kind = crate::ast::AstTableNameKind::Rowset;
+                    }
+                }
+                target_table = Some(target);
+                target_alias_span = alias;
             }
         }
 
@@ -285,18 +475,23 @@ impl<'a> Parser<'a> {
 
         // MSSQL: Parse optional table hints, e.g. INSERT INTO t WITH (TABLOCK) (col1, col2)
         // This must be parsed BEFORE the column list since hints come first.
-        let hints = self.try_parse_table_hint_clause()?;
+        let hints =
+            self.try_parse_table_hint_clause(crate::parser::table_ref::HintIntroducer::With)?;
         if let Some(h) = hints {
             updated_end = h.span.end;
             table_hints = Some(h);
         }
 
         // Optional column list starting with '('. Capture up to matching ')' and count columns.
+        // A `(` that opens a query (`INSERT INTO t (SELECT …)`) is the source.
+        let mut list_open: Option<usize> = None;
         if let Some(tok) = self.peek() {
             if matches!(
                 tok.kind,
                 TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-            ) {
+            ) && !crate::parser::set_operations::query_starts_at(self, self.idx)
+            {
+                list_open = Some(self.idx);
                 let start = tok.span.start;
                 let mut depth: usize = 0;
                 let mut col_count: usize = 0;
@@ -344,13 +539,22 @@ impl<'a> Parser<'a> {
             }
         }
 
+        let columns = match (list_open, columns_span) {
+            (Some(open), Some(_)) => self.insert_column_entries(open, self.idx - 1),
+            (Some(_), None) | (None, Some(_)) | (None, None) => Vec::new(),
+        };
+
         Ok(InsertTargetParsed {
-            target_table_span,
+            target_table,
+            target_node_id,
+            target_alias_span,
             partition_span,
             columns_span,
+            columns,
             column_count,
             end: updated_end,
             into_span,
+            table_keyword_span,
             table_hints,
         })
     }
@@ -359,6 +563,7 @@ impl<'a> Parser<'a> {
     fn parse_insert_body_natural(&mut self) -> crate::error::ParseResult<InsertBodyParsed> {
         use crate::error::{ExpectInvariant, ParseError, ParseErrorKind};
 
+        let values_node_id = self.id_gen.next();
         let mut source_kind = AstInsertSourceKind::Unknown;
         let mut values_span: Option<Span> = None;
         let mut values_keyword_span: Option<Span> = None;
@@ -368,13 +573,14 @@ impl<'a> Parser<'a> {
         let mut query: Option<Box<AstStmt>> = None;
         let mut default_values_span: Option<Span> = None;
         let mut values_row_constructor = false;
+        let mut execute: Option<Box<AstStmt>> = None;
         let body_start: u32;
         let mut body_end: Option<u32> = None;
 
-        // Check what comes next: DEFAULT VALUES, VALUES, SET, or SELECT/WITH
-        let next_tok = self.peek();
-        if next_tok.is_none() {
+        // Check what comes next: DEFAULT VALUES, VALUES, SET, SELECT/WITH or EXEC
+        let Some(tok) = self.peek() else {
             return Ok(InsertBodyParsed {
+                values_node_id,
                 body_span: None,
                 source_kind,
                 values_span,
@@ -387,10 +593,9 @@ impl<'a> Parser<'a> {
                 set_clause_span: None,
                 set_assignments: Vec::new(),
                 values_row_constructor: false,
+                execute: None,
             });
-        }
-
-        let tok = next_tok.unwrap();
+        };
 
         // MySQL: INSERT/REPLACE ... SET col = expr, ...
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Set))
@@ -398,6 +603,7 @@ impl<'a> Parser<'a> {
         {
             let (set_span, assignments) = self.parse_insert_set_assignments()?;
             return Ok(InsertBodyParsed {
+                values_node_id,
                 body_span: Some(set_span),
                 source_kind: AstInsertSourceKind::SetAssignments,
                 values_span: None,
@@ -410,6 +616,7 @@ impl<'a> Parser<'a> {
                 set_clause_span: Some(set_span),
                 set_assignments: assignments,
                 values_row_constructor: false,
+                execute: None,
             });
         }
 
@@ -431,6 +638,7 @@ impl<'a> Parser<'a> {
 
                 let body_span = Some(dv_span);
                 return Ok(InsertBodyParsed {
+                    values_node_id,
                     body_span,
                     source_kind,
                     values_span,
@@ -443,6 +651,7 @@ impl<'a> Parser<'a> {
                     set_clause_span: None,
                     set_assignments: Vec::new(),
                     values_row_constructor: false,
+                    execute: None,
                 });
             }
         }
@@ -454,6 +663,7 @@ impl<'a> Parser<'a> {
                 tok.kind,
                 TokenKind::Identifier {
                     kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
                 }
             )
             && tok.lexeme(self.source).eq_ignore_ascii_case("VALUE")
@@ -467,6 +677,7 @@ impl<'a> Parser<'a> {
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Values)) || is_value_synonym {
             // VALUES-based INSERT
             source_kind = AstInsertSourceKind::Values;
+            let values_from = (self.idx, self.recovery_errors.len());
             let values_tok = self.advance().expect_invariant("VALUES keyword after peek");
             values_keyword_span = Some(values_tok.span);
             body_start = values_tok.span.start;
@@ -560,13 +771,29 @@ impl<'a> Parser<'a> {
                     end,
                 });
             }
-        } else if matches!(
-            tok.kind,
-            TokenKind::Keyword(Keyword::Select) | TokenKind::Keyword(Keyword::With)
-        ) || (matches!(tok.kind, TokenKind::Keyword(Keyword::Table))
-            && self.dialect.supports_table_query_statement())
-        {
-            // Query-based INSERT (incl. MySQL `INSERT ... TABLE tbl`)
+
+            // `VALUES (…) UNION SELECT …`: the rows are a query's first
+            // operand; the source is read again as that query.
+            if !is_value_synonym
+                && self
+                    .peek()
+                    .is_some_and(|t| crate::parser::sql_stmt::is_set_op_keyword(&t.kind).is_some())
+            {
+                self.idx = values_from.0;
+                self.recovery_errors.truncate(values_from.1);
+                let stmt = self.try_parse_set_or_select_stmt()?;
+                source_kind = AstInsertSourceKind::Query;
+                values_keyword_span = None;
+                values_span = None;
+                values_rows_spans.clear();
+                values_rows.clear();
+                values_row_constructor = false;
+                body_end = Some(stmt.span().end);
+                query_span = Some(stmt.span());
+                query = Some(Box::new(stmt));
+            }
+        } else if crate::parser::set_operations::query_starts_at(self, self.idx) {
+            // Query-based INSERT (incl. `INSERT ... TABLE tbl`)
             source_kind = AstInsertSourceKind::Query;
             body_start = tok.span.start;
 
@@ -583,9 +810,22 @@ impl<'a> Parser<'a> {
                     return Err(e);
                 }
             }
+        } else if self.dialect.supports_exec_procedure_call()
+            && (matches!(tok.kind, TokenKind::Keyword(Keyword::Execute))
+                || matches!(tok.kind, TokenKind::Identifier { .. })
+                    && tok.lexeme(self.source).eq_ignore_ascii_case("EXEC"))
+        {
+            // T-SQL `INSERT … EXEC[UTE] …`: the rows the EXEC statement
+            // returns, read by the statement's own reader.
+            source_kind = AstInsertSourceKind::Execute;
+            body_start = tok.span.start;
+            let stmt = self.try_parse_mssql_exec_stmt()?;
+            body_end = Some(stmt.span().end);
+            execute = Some(Box::new(stmt));
         } else {
             // Unknown/unsupported
             return Ok(InsertBodyParsed {
+                values_node_id,
                 body_span: None,
                 source_kind,
                 values_span,
@@ -598,6 +838,7 @@ impl<'a> Parser<'a> {
                 set_clause_span: None,
                 set_assignments: Vec::new(),
                 values_row_constructor: false,
+                execute: None,
             });
         }
 
@@ -607,6 +848,7 @@ impl<'a> Parser<'a> {
         });
 
         Ok(InsertBodyParsed {
+            values_node_id,
             body_span,
             source_kind,
             values_span,
@@ -619,6 +861,7 @@ impl<'a> Parser<'a> {
             set_clause_span: None,
             set_assignments: Vec::new(),
             values_row_constructor,
+            execute,
         })
     }
 
@@ -894,20 +1137,24 @@ impl<'a> Parser<'a> {
 
         // Parse target table, optional PARTITION selection, optional table
         // hints, and optional column list
-        let target = self.parse_insert_target_and_columns(span.end)?;
+        let target = self.parse_insert_target_and_columns(span.end, overwrite_span.is_some())?;
         let InsertTargetParsed {
-            target_table_span,
+            target_table,
+            target_node_id,
+            target_alias_span,
             partition_span,
             columns_span,
+            columns,
             column_count: _column_count,
             end: updated_end,
             into_span: into_kw_span,
+            table_keyword_span,
             table_hints,
         } = target;
         span.end = updated_end;
 
         // VALIDATION: INSERT statement requires INTO with target table
-        if target_table_span.is_none() {
+        if target_table.is_none() {
             return Err(ParseError::new(
                 self.current_span(),
                 ParseErrorKind::MissingClause {
@@ -984,6 +1231,7 @@ impl<'a> Parser<'a> {
         // Only valid after a VALUES body; rewinds if AS is not followed by
         // an identifier.
         let mut row_alias_span: Option<Span> = None;
+        let mut row_alias: Option<crate::ast::AstInsertRowAlias> = None;
         if matches!(body.source_kind, AstInsertSourceKind::Values) {
             if let Some(tok) = self.peek() {
                 if matches!(tok.kind, TokenKind::Keyword(Keyword::As)) {
@@ -997,6 +1245,13 @@ impl<'a> Parser<'a> {
                                 .advance()
                                 .expect_invariant("alias identifier confirmed by peek");
                             let mut alias_end = alias.span.end;
+                            let alias = crate::ast::AstIdentifier {
+                                node_id: self.id_gen.next(),
+                                span: alias.span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
+                            };
+                            let mut columns: Vec<crate::ast::AstIdentifier> = Vec::new();
                             // Optional column-alias list: (x, y)
                             if let Some(lp) = self.peek() {
                                 if matches!(
@@ -1018,6 +1273,17 @@ impl<'a> Parser<'a> {
                                                     break;
                                                 }
                                             }
+                                            TokenKind::Identifier { .. }
+                                            | TokenKind::Keyword(_)
+                                                if depth == 1 =>
+                                            {
+                                                columns.push(crate::ast::AstIdentifier {
+                                                    node_id: self.id_gen.next(),
+                                                    span: t.span,
+                                                    kind: crate::ast::AstIdentifierKind::Name,
+                                                    templated: None,
+                                                });
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1027,6 +1293,7 @@ impl<'a> Parser<'a> {
                                 start: as_tok.span.start,
                                 end: alias_end,
                             });
+                            row_alias = Some(crate::ast::AstInsertRowAlias { alias, columns });
                             span.end = alias_end;
                         }
                         _ => {
@@ -1061,10 +1328,13 @@ impl<'a> Parser<'a> {
             span,
             keyword_span,
             overwrite_span,
-            target_table_span,
+            target_table,
+            target_node_id,
+            target_alias_span,
             columns_span,
             body.body_span,
             body.source_kind,
+            body.values_node_id,
             body.values_span,
             body.values_rows_spans,
             body.values_rows,
@@ -1072,7 +1342,10 @@ impl<'a> Parser<'a> {
             body.query,
         );
         stmt.into_span = into_kw_span;
+        stmt.table_keyword_span = table_keyword_span;
+        stmt.columns = columns;
         stmt.values_keyword_span = body.values_keyword_span;
+        stmt.execute = body.execute;
         stmt.output = output;
         stmt.returning = returning;
         stmt.on_conflict = on_conflict;
@@ -1084,6 +1357,7 @@ impl<'a> Parser<'a> {
         stmt.ignore_span = ignore_span;
         stmt.partition_span = partition_span;
         stmt.row_alias_span = row_alias_span;
+        stmt.row_alias = row_alias;
         stmt.set_clause_span = body.set_clause_span;
         stmt.set_assignments = body.set_assignments;
         stmt.on_duplicate_key_update = on_duplicate_key_update;
@@ -1107,6 +1381,7 @@ impl<'a> Parser<'a> {
                 tok.kind,
                 TokenKind::Identifier {
                     kind: crate::lexer::IdentifierKind::Unquoted,
+                    ..
                 }
             ) {
                 break;
@@ -1159,19 +1434,23 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let target = self.parse_insert_target_and_columns(span.end)?;
+        let target = self.parse_insert_target_and_columns(span.end, false)?;
         let InsertTargetParsed {
-            target_table_span,
+            target_table,
+            target_node_id,
+            target_alias_span,
             partition_span,
             columns_span,
+            columns,
             column_count: _column_count,
             end: updated_end,
             into_span,
+            table_keyword_span: _table_keyword_span,
             table_hints: _table_hints,
         } = target;
         span.end = updated_end;
 
-        if target_table_span.is_none() {
+        if target_table.is_none() {
             return Err(ParseError::new(
                 self.current_span(),
                 ParseErrorKind::MissingClause {
@@ -1204,11 +1483,15 @@ impl<'a> Parser<'a> {
             keyword_span,
             priority,
             into_span,
-            target_table_span,
+            target_table,
+            target_node_id,
+            target_alias_span,
             partition_span,
             columns_span,
+            columns,
             body_span: body.body_span,
             source_kind: body.source_kind,
+            values_node_id: body.values_node_id,
             values_span: body.values_span,
             values_keyword_span: body.values_keyword_span,
             values_rows_spans: body.values_rows_spans,
@@ -1222,8 +1505,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Helper to parse a WHEN clause in multi-insert.
-    fn parse_multi_insert_when_clause(&mut self) -> Option<(AstMultiInsertWhenClause, u32)> {
-        let when_tok = self.advance()?;
+    fn parse_multi_insert_when_clause(
+        &mut self,
+    ) -> crate::error::ParseResult<(AstMultiInsertWhenClause, u32)> {
+        use crate::error::ParseResultExt;
+        let when_tok = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["WHEN".to_string()])?;
         let when_span = when_tok.span;
 
         // Parse condition until THEN
@@ -1245,29 +1533,24 @@ impl<'a> Parser<'a> {
             });
         }
 
-        let then_tok = self.advance()?; // THEN
+        let then_tok = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["THEN".to_string()])?;
         let then_span = then_tok.span;
         let mut span_end = then_span.end;
 
         // Parse one or more INTO clauses
         let mut w_into = Vec::new();
-        while let Some(next) = self.peek() {
-            match &next.kind {
-                TokenKind::Keyword(Keyword::Into) => {
-                    let into = self.parse_multi_insert_into_clause()?;
-                    span_end = into
-                        .values_span
-                        .or(into.columns_span)
-                        .or(into.target_table_span)
-                        .unwrap_or(into.into_span)
-                        .end;
-                    w_into.push(into);
-                }
-                _ => break,
-            }
+        while self
+            .peek()
+            .is_some_and(|next| matches!(next.kind, TokenKind::Keyword(Keyword::Into)))
+        {
+            let into = self.parse_multi_insert_into_clause()?;
+            span_end = multi_insert_into_end(&into);
+            w_into.push(into);
         }
 
-        Some((
+        Ok((
             AstMultiInsertWhenClause {
                 node_id: self.id_gen.next(),
                 when_span,
@@ -1280,33 +1563,25 @@ impl<'a> Parser<'a> {
     }
 
     /// Helper to parse ELSE INTO clauses in multi-insert.
-    fn parse_multi_insert_else_clauses(&mut self) -> (Vec<AstMultiInsertIntoClause>, u32) {
+    fn parse_multi_insert_else_clauses(
+        &mut self,
+    ) -> crate::error::ParseResult<(Vec<AstMultiInsertIntoClause>, u32)> {
         let else_tok = self.advance().expect_invariant(
             "ELSE keyword confirmed before calling parse_multi_insert_else_clauses",
         );
         let mut span_end = else_tok.span.end;
         let mut else_into_clauses = Vec::new();
 
-        while let Some(next) = self.peek() {
-            match &next.kind {
-                TokenKind::Keyword(Keyword::Into) => {
-                    let into = match self.parse_multi_insert_into_clause() {
-                        Some(i) => i,
-                        None => break,
-                    };
-                    span_end = into
-                        .values_span
-                        .or(into.columns_span)
-                        .or(into.target_table_span)
-                        .unwrap_or(into.into_span)
-                        .end;
-                    else_into_clauses.push(into);
-                }
-                _ => break,
-            }
+        while self
+            .peek()
+            .is_some_and(|next| matches!(next.kind, TokenKind::Keyword(Keyword::Into)))
+        {
+            let into = self.parse_multi_insert_into_clause()?;
+            span_end = multi_insert_into_end(&into);
+            else_into_clauses.push(into);
         }
 
-        (else_into_clauses, span_end)
+        Ok((else_into_clauses, span_end))
     }
 
     /// Parse a multi-table INSERT statement with Result-based error handling.
@@ -1362,39 +1637,17 @@ impl<'a> Parser<'a> {
         while let Some(tok) = self.peek() {
             match &tok.kind {
                 TokenKind::Keyword(Keyword::Into) => {
-                    let into = self.parse_multi_insert_into_clause().ok_or_else(|| {
-                        ParseError::new(
-                            self.current_span(),
-                            ParseErrorKind::InvalidSyntax {
-                                message: "Failed to parse INTO clause in multi-table INSERT"
-                                    .to_string(),
-                            },
-                        )
-                    })?;
-                    span.end = into
-                        .values_span
-                        .or(into.columns_span)
-                        .or(into.target_table_span)
-                        .unwrap_or(into.into_span)
-                        .end;
+                    let into = self.parse_multi_insert_into_clause()?;
+                    span.end = multi_insert_into_end(&into);
                     into_clauses.push(into);
                 }
                 TokenKind::Keyword(Keyword::When) => {
-                    let (when_clause, end) =
-                        self.parse_multi_insert_when_clause().ok_or_else(|| {
-                            ParseError::new(
-                                self.current_span(),
-                                ParseErrorKind::InvalidSyntax {
-                                    message: "Failed to parse WHEN clause in multi-table INSERT"
-                                        .to_string(),
-                                },
-                            )
-                        })?;
+                    let (when_clause, end) = self.parse_multi_insert_when_clause()?;
                     span.end = end;
                     when_clauses.push(when_clause);
                 }
                 TokenKind::Keyword(Keyword::Else) => {
-                    let (else_clauses, end) = self.parse_multi_insert_else_clauses();
+                    let (else_clauses, end) = self.parse_multi_insert_else_clauses()?;
                     span.end = end;
                     else_into_clauses = else_clauses;
                 }
@@ -1431,12 +1684,16 @@ impl<'a> Parser<'a> {
         Ok(AstStmt::MultiInsert(Box::new(stmt)))
     }
 
-    fn parse_multi_insert_into_clause(&mut self) -> Option<AstMultiInsertIntoClause> {
-        let into_tok = self.advance()?; // INTO
+    fn parse_multi_insert_into_clause(
+        &mut self,
+    ) -> crate::error::ParseResult<AstMultiInsertIntoClause> {
+        use crate::error::ParseResultExt;
+        let into_tok = self
+            .advance()
+            .ok_or_eof(self.current_span(), vec!["INTO".to_string()])?;
         let into_span = into_tok.span;
-        let mut target_table_span: Option<Span> = None;
+        let mut target_table: Option<AstObjectRef> = None;
         let mut columns_span: Option<Span> = None;
-        let mut values_span: Option<Span> = None;
 
         // Capture target table until we see '(', VALUES, WHEN/ELSE, or SELECT.
         let start_idx = self.idx;
@@ -1457,20 +1714,19 @@ impl<'a> Parser<'a> {
         }
         let end_idx = self.idx;
         if end_idx > start_idx {
-            let first = &self.tokens[start_idx];
-            let last = &self.tokens[end_idx - 1];
-            target_table_span = Some(Span {
-                start: first.span.start,
-                end: last.span.end,
-            });
+            let node_id = self.id_gen.next();
+            let (target, _) = self.dml_target(start_idx, end_idx, DmlTargetAlias::AfterAs, node_id);
+            target_table = Some(target);
         }
 
         // Optional column list starting with '('.
+        let mut columns: Vec<AstExpr> = Vec::new();
         if let Some(tok) = self.peek() {
             if matches!(
                 tok.kind,
                 TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
             ) {
+                let open = self.idx;
                 let start = tok.span.start;
                 let mut depth: usize = 0;
                 while let Some(t) = self.advance() {
@@ -1489,43 +1745,84 @@ impl<'a> Parser<'a> {
                         _ => {}
                     }
                 }
+                if columns_span.is_some() {
+                    columns = self.insert_column_entries(open, self.idx - 1);
+                }
             }
         }
 
-        // Optional VALUES clause.
+        // Optional VALUES clause: its rows, read as an INSERT's are.
+        let mut values_keyword_span: Option<Span> = None;
+        let mut values_rows_spans: Vec<Span> = Vec::new();
+        let mut values_rows: Vec<Vec<AstExpr>> = Vec::new();
         if let Some(tok) = self.peek() {
             if matches!(tok.kind, TokenKind::Keyword(Keyword::Values)) {
-                let start = tok.span.start;
+                values_keyword_span = Some(tok.span);
                 let _ = self.advance(); // VALUES
-                                        // Capture until next INTO/WHEN/ELSE/SELECT or end of statement.
-                while let Some(t) = self.peek() {
-                    match &t.kind {
-                        TokenKind::Keyword(Keyword::Into)
-                        | TokenKind::Keyword(Keyword::When)
-                        | TokenKind::Keyword(Keyword::Else)
-                        | TokenKind::Keyword(Keyword::Select)
-                        | TokenKind::Punctuation(crate::lexer::Punctuation::Semi)
-                        | TokenKind::Eof => break,
-                        _ => {
-                            let _ = self.advance();
-                        }
+                while let Some((row, row_span)) = self.parse_values_row()? {
+                    values_rows.push(row);
+                    values_rows_spans.push(row_span);
+                    let more = self.peek().is_some_and(|t| {
+                        matches!(
+                            t.kind,
+                            TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                        )
+                    });
+                    if !more {
+                        break;
                     }
+                    let _ = self.advance(); // ,
                 }
-                let end = match self.tokens.get(self.idx.saturating_sub(1)) {
-                    Some(last) => last.span.end,
-                    None => start,
-                };
-                values_span = Some(Span { start, end });
             }
         }
 
-        Some(AstMultiInsertIntoClause {
+        Ok(AstMultiInsertIntoClause {
             node_id: self.id_gen.next(),
             into_span,
-            target_table_span,
+            target_table,
             columns_span,
-            values_span,
+            columns,
+            values_keyword_span,
+            values_rows_spans,
+            values_rows,
         })
+    }
+
+    /// The entries of the column list whose `(` is the token at `open` and
+    /// whose `)` is the token at `close`, each read as a MERGE insert's
+    /// column is. Empty where an entry is not one expression. The parser is
+    /// left where it was.
+    fn insert_column_entries(&mut self, open: usize, close: usize) -> Vec<AstExpr> {
+        let resume = self.idx;
+        self.idx = open + 1;
+        let mut entries = Vec::new();
+        let mut complete = self.idx == close;
+        while !complete {
+            let Ok(entry) = self.parse_primary_expr_in_mode() else {
+                break;
+            };
+            entries.push(entry);
+            complete = self.idx == close;
+            let separated = self.idx < close
+                && self.peek().is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
+                    )
+                });
+            if !complete && !separated {
+                break;
+            }
+            if separated {
+                self.idx += 1;
+            }
+        }
+        self.idx = resume;
+        if complete {
+            entries
+        } else {
+            Vec::new()
+        }
     }
 
     /// Parse optional ON CONFLICT clause (PostgreSQL upsert).
@@ -1615,64 +1912,8 @@ impl<'a> Parser<'a> {
                     }
                 }
 
-                // Parse SET items: col = expr, ...
-                let mut set_items = Vec::new();
-                loop {
-                    // Parse column name
-                    let col_name = match self.peek() {
-                        Some(tok)
-                            if matches!(
-                                tok.kind,
-                                TokenKind::Identifier { .. } | TokenKind::Keyword(_)
-                            ) =>
-                        {
-                            let name = tok.lexeme(self.source).to_string();
-                            self.advance();
-                            name
-                        }
-                        _ => break,
-                    };
-
-                    // Expect =
-                    match self.peek() {
-                        Some(tok)
-                            if matches!(
-                                tok.kind,
-                                TokenKind::Operator(crate::lexer::Operator::Eq)
-                            ) =>
-                        {
-                            self.advance(); // consume =
-                        }
-                        _ => {
-                            return Err(ParseError::new(
-                                self.current_span(),
-                                crate::error::ParseErrorKind::InvalidStatement {
-                                    message: format!(
-                                        "Expected '=' after column name '{}'",
-                                        col_name
-                                    ),
-                                },
-                            ));
-                        }
-                    }
-
-                    // Parse value expression
-                    let expr = self.parse_expr()?;
-                    set_items.push((col_name, expr));
-
-                    // Check for comma or end
-                    match self.peek() {
-                        Some(tok)
-                            if matches!(
-                                tok.kind,
-                                TokenKind::Punctuation(crate::lexer::Punctuation::Comma)
-                            ) =>
-                        {
-                            self.advance(); // consume comma
-                        }
-                        _ => break,
-                    }
-                }
+                // The SET items, read as an UPDATE's are.
+                let set_items = crate::parser::sql_stmt::parse_update_set_assignments(self)?;
 
                 // Parse optional WHERE clause
                 let where_clause = match self.peek() {
@@ -1688,7 +1929,7 @@ impl<'a> Parser<'a> {
                     end: where_clause
                         .as_ref()
                         .map(|w| w.span().end)
-                        .or_else(|| set_items.last().map(|(_, e)| e.span().end))
+                        .or_else(|| set_items.last().map(|a| a.span.end))
                         .unwrap_or(update_tok.span.end),
                 };
 
@@ -1953,4 +2194,17 @@ impl<'a> Parser<'a> {
             },
         })
     }
+}
+
+/// Where a multi-table `INSERT`'s `INTO` clause ends: its last row, the
+/// `VALUES` keyword, the column list, the target or `INTO`.
+fn multi_insert_into_end(into: &AstMultiInsertIntoClause) -> u32 {
+    into.values_rows_spans
+        .last()
+        .copied()
+        .or(into.values_keyword_span)
+        .or(into.columns_span)
+        .or(into.target_table.as_ref().map(|t| t.span))
+        .unwrap_or(into.into_span)
+        .end
 }

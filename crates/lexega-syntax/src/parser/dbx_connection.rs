@@ -144,6 +144,7 @@ impl<'a> Parser<'a> {
                 }
 
                 // Consume everything until matching RParen (handling nested parens for secret() calls)
+                let options_from = self.idx;
                 let mut depth: u32 = 1;
                 let mut last_end = lparen.span.end;
                 while depth > 0 {
@@ -157,6 +158,7 @@ impl<'a> Parser<'a> {
                         _ => {}
                     }
                 }
+                self.record_option_secrets(options_from, self.idx);
                 options_span = Some(Span {
                     start: opts_start,
                     end: last_end,
@@ -506,6 +508,7 @@ impl<'a> Parser<'a> {
             }
 
             // Consume everything until matching RParen (handles nested parens for secret() calls)
+            let options_from = self.idx;
             let mut depth: u32 = 1;
             let mut last_end = lparen.span.end;
             while depth > 0 {
@@ -519,6 +522,7 @@ impl<'a> Parser<'a> {
                     _ => {}
                 }
             }
+            self.record_option_secrets(options_from, self.idx);
 
             let options_span = Span {
                 start: opts_start,

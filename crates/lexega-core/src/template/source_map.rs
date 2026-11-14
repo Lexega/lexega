@@ -1,6 +1,10 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::sync::Arc;
+
+use crate::analyzer::{LineIndex, TextPosition};
+
 /// Source of a line in the rendered SQL
 #[derive(Debug, Clone)]
 pub enum LineSource {
@@ -32,18 +36,110 @@ impl LineSource {
     }
 }
 
+/// Where a run of the rendered text came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOrigin {
+    /// The template's text from this byte, unchanged.
+    Copied { template: usize },
+    /// Written by the construct at this byte of the template: the
+    /// expression, or the call of the macro, that wrote it.
+    Produced { template: usize },
+    /// Nothing in the template is known to have written it.
+    Unknown,
+}
+
+/// A run of the rendered text: from byte `rendered` up to the next run.
+#[derive(Debug, Clone, Copy)]
+struct RenderedRun {
+    rendered: usize,
+    origin: RunOrigin,
+}
+
+/// The template a map points into.
+#[derive(Debug, Clone)]
+struct Template {
+    text: Arc<str>,
+    lines: Arc<LineIndex>,
+}
+
 /// Maps rendered SQL positions back to template positions
 #[derive(Debug, Clone, Default)]
 pub struct SourceMap {
     /// Maps rendered line number (1-indexed) to its source
     line_mappings: Vec<LineSource>,
+    /// Where each run of the rendered text came from, in rendered order.
+    runs: Vec<RenderedRun>,
+    /// The template the runs point into.
+    template: Option<Template>,
 }
 
 impl SourceMap {
     pub fn new() -> Self {
-        Self {
-            line_mappings: Vec::new(),
+        Self::default()
+    }
+
+    /// Record that the rendered text from byte `rendered` on came from
+    /// `origin`, until the next run; runs are recorded in rendered order.
+    pub fn add_run(&mut self, rendered: usize, origin: RunOrigin) {
+        match self.runs.last_mut() {
+            Some(last) if last.rendered >= rendered => last.origin = origin,
+            Some(_) | None => self.runs.push(RenderedRun { rendered, origin }),
         }
+    }
+
+    /// Record `text` as the template the runs point into.
+    pub fn set_template(&mut self, text: &str) {
+        self.template = Some(Template {
+            lines: Arc::new(LineIndex::new(text)),
+            text: Arc::from(text),
+        });
+    }
+
+    /// Take the runs and the template of `other`, whose rendered text this
+    /// map's describes.
+    pub fn adopt_origins(&mut self, other: SourceMap) {
+        self.runs = other.runs;
+        self.template = other.template;
+    }
+
+    /// Record that `length` bytes were inserted into the rendered text at
+    /// byte `at`, from the origins `inserted` gives, each by its offset into
+    /// the insertion: the runs after it move by `length`.
+    pub fn insert_rendered(&mut self, at: usize, length: usize, inserted: &[(usize, RunOrigin)]) {
+        let split = self.runs.partition_point(|run| run.rendered < at);
+        let after = self.runs.split_off(split);
+        // The run the insertion cuts goes on after it.
+        let resumed = self.runs.last().map(|run| match run.origin {
+            RunOrigin::Copied { template } => RunOrigin::Copied {
+                template: template + (at - run.rendered),
+            },
+            RunOrigin::Produced { .. } | RunOrigin::Unknown => run.origin,
+        });
+        for (offset, origin) in inserted {
+            self.add_run(at + offset, *origin);
+        }
+        let continues_at = after.first().map(|run| run.rendered);
+        if let Some(origin) = resumed.filter(|_| continues_at != Some(at)) {
+            self.add_run(at + length, origin);
+        }
+        for run in after {
+            self.add_run(run.rendered + length, run.origin);
+        }
+    }
+
+    /// The place in the template of rendered byte `rendered`: where it was
+    /// copied from, or the construct that wrote it. `None` where no template
+    /// is recorded or nothing in it is known to have written that byte.
+    pub fn template_position(&self, rendered: usize) -> Option<TextPosition> {
+        let template = self.template.as_ref()?;
+        let before = self.runs.partition_point(|run| run.rendered <= rendered);
+        let run = self.runs.get(before.checked_sub(1)?)?;
+        let at = match run.origin {
+            RunOrigin::Copied { template } => template + (rendered - run.rendered),
+            RunOrigin::Produced { template } => template,
+            RunOrigin::Unknown => return None,
+        };
+        Some(template.lines.position(&template.text, at))
     }
 
     /// Record that the current output line corresponds to a template line (literal SQL)
@@ -131,4 +227,51 @@ pub struct SourceMapStats {
     pub template_mapped_lines: usize,
     pub generated_lines: usize,
     pub coverage_ratio: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A copied run places a rendered byte at the template byte it was copied
+    // from, its column in characters and UTF-16 units; a produced run places
+    // every byte at the construct that wrote it; an insertion moves what
+    // follows it.
+    #[test]
+    fn a_rendered_byte_is_placed_where_the_template_wrote_it() {
+        let template = "select 'ñ' as x\nfrom {{ ref('t') }} where '€😀' = 'é' and e = null";
+        let rendered = "select 'ñ' as x\nfrom t where '€😀' = 'é' and e = null";
+        let expr = template.find("{{").expect("expression");
+        let after_expr = template.find(" where").expect("where");
+        let mut map = SourceMap::new();
+        map.set_template(template);
+        map.add_run(0, RunOrigin::Copied { template: 0 });
+        let ref_at = rendered.find("t where").expect("ref");
+        map.add_run(ref_at, RunOrigin::Produced { template: expr });
+        map.add_run(
+            ref_at + 1,
+            RunOrigin::Copied {
+                template: after_expr,
+            },
+        );
+        let e = rendered.find("e = null").expect("e");
+        let position = map.template_position(e).expect("placed");
+        let e_template = template.find("e = null").expect("e");
+        let index = LineIndex::new(template);
+        assert_eq!(position, index.position(template, e_template));
+        assert_eq!(
+            (position.line, position.column, position.utf16_column),
+            (2, 42, 43)
+        );
+        assert_eq!(
+            map.template_position(ref_at),
+            Some(index.position(template, expr))
+        );
+        // Text inserted before the line moves it, and is placed where its
+        // origin says.
+        map.insert_rendered(0, 5, &[(0, RunOrigin::Unknown)]);
+        assert_eq!(map.template_position(2), None);
+        assert_eq!(map.template_position(e + 5), Some(position));
+        assert_eq!(map.template_position(5), Some(TextPosition::line_start(1)));
+    }
 }

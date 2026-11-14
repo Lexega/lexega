@@ -21,9 +21,10 @@ use lexega_core::{
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn token_kinds(sql: &str, dialect: &dyn Dialect) -> Vec<TokenKind> {
@@ -65,15 +66,16 @@ fn format_and_verify(sql: &str, config: &FormatterConfig) {
     let formatted = format_sql_with_config(sql, config)
         .unwrap_or_else(|e| panic!("Format failed for {}: {}", config.dialect.name(), e));
 
-    lexega_core::verify_formatting_safe_with_dialect(&sql, &formatted, config.dialect.as_ref())
+    lexega_core::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
         .unwrap_or_else(|e| panic!("MSSQL formatting verification failed: {}", e));
 }
 
 /// Build an AnalysisConfig that uses the MSSQL dialect for risk analysis.
 fn mssql_analysis_config() -> lexega_core::analyzer::AnalysisConfig {
-    let mut config = lexega_core::analyzer::AnalysisConfig::default();
-    config.dialect = Some(mssql());
-    config
+    lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    }
 }
 
 // ============================================================================
@@ -486,7 +488,7 @@ fn test_hash_not_comment_in_mssql() {
     let trivia = all_trivia_kinds(sql, &d);
     // There should be no line-comment trivia
     assert!(
-        !trivia.iter().any(|t| *t == TriviaKind::LineComment),
+        !trivia.contains(&TriviaKind::LineComment),
         "# should NOT be a line comment in MSSQL — it denotes temp tables"
     );
 }
@@ -497,7 +499,7 @@ fn test_dash_dash_comment_in_mssql() {
     let sql = "SELECT 1 --comment";
     let trivia = all_trivia_kinds(sql, &d);
     assert!(
-        trivia.iter().any(|t| *t == TriviaKind::LineComment),
+        trivia.contains(&TriviaKind::LineComment),
         "-- should be a line comment in MSSQL"
     );
 }
@@ -509,7 +511,7 @@ fn test_dash_dash_no_space_in_mssql() {
     let sql = "SELECT 1 --comment_no_space";
     let trivia = all_trivia_kinds(sql, &d);
     assert!(
-        trivia.iter().any(|t| *t == TriviaKind::LineComment),
+        trivia.contains(&TriviaKind::LineComment),
         "-- without space should still be a comment in MSSQL"
     );
 }
@@ -520,7 +522,7 @@ fn test_block_comment_in_mssql() {
     let sql = "SELECT /* block */ 1";
     let trivia = all_trivia_kinds(sql, &d);
     assert!(
-        trivia.iter().any(|t| *t == TriviaKind::BlockComment),
+        trivia.contains(&TriviaKind::BlockComment),
         "Block comments should work in MSSQL"
     );
 }
@@ -626,11 +628,11 @@ fn test_hash_cross_dialect() {
 
     // MSSQL: # is NOT a comment
     let mssql_trivia = all_trivia_kinds(sql, &mssql_d);
-    let mssql_has_comment = mssql_trivia.iter().any(|t| *t == TriviaKind::LineComment);
+    let mssql_has_comment = mssql_trivia.contains(&TriviaKind::LineComment);
 
     // MySQL: # IS a comment
     let mysql_trivia = all_trivia_kinds(sql, &my_d);
-    let mysql_has_comment = mysql_trivia.iter().any(|t| *t == TriviaKind::LineComment);
+    let mysql_has_comment = mysql_trivia.contains(&TriviaKind::LineComment);
 
     assert!(!mssql_has_comment, "MSSQL should NOT treat # as comment");
     assert!(mysql_has_comment, "MySQL SHOULD treat # as comment");
@@ -1016,7 +1018,8 @@ fn test_mssql_at_variable_kind() {
     assert!(matches!(
         kinds[1],
         TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            ..
         }
     ));
 }
@@ -1029,7 +1032,8 @@ fn test_mssql_system_variable_double_at() {
     assert!(matches!(
         kinds[1],
         TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            ..
         }
     ));
 }
@@ -1048,7 +1052,8 @@ fn test_mssql_at_variable_assignment() {
     assert!(matches!(
         kinds[1],
         TokenKind::Identifier {
-            kind: IdentifierKind::AtVariable
+            kind: IdentifierKind::AtVariable,
+            ..
         }
     ));
 }
@@ -1091,9 +1096,17 @@ fn test_snowflake_at_is_unknown() {
 }
 
 #[test]
-fn test_pg_at_is_unknown() {
-    let kinds = token_kinds("SELECT @var;", &lexega_core::dialect::PostgresDialect);
-    assert!(matches!(kinds[1], TokenKind::Unknown));
+fn test_pg_at_is_an_operator() {
+    // PostgreSQL's `@` is its absolute-value operator, not a variable prefix.
+    let sql = "SELECT @var;";
+    let dialect = lexega_core::dialect::PostgresDialect;
+    let kinds = token_kinds(sql, &dialect);
+    assert!(matches!(
+        kinds[1],
+        TokenKind::Operator(lexega_core::Operator::At)
+    ));
+    assert!(matches!(kinds[2], TokenKind::Identifier { .. }));
+    assert_eq!(token_lexemes(sql, &dialect)[2], "var");
 }
 
 // ============================================================================
@@ -1115,7 +1128,8 @@ fn test_mssql_temp_table_kind() {
             matches!(
                 k,
                 TokenKind::Identifier {
-                    kind: IdentifierKind::TempTable
+                    kind: IdentifierKind::TempTable,
+                    ..
                 }
             )
         })
@@ -1131,7 +1145,8 @@ fn test_mssql_global_temp_table() {
     assert!(kinds.iter().any(|k| matches!(
         k,
         TokenKind::Identifier {
-            kind: IdentifierKind::TempTable
+            kind: IdentifierKind::TempTable,
+            ..
         }
     )));
 }
@@ -1164,7 +1179,8 @@ fn test_snowflake_hash_is_operator() {
     assert!(!kinds.iter().any(|k| matches!(
         k,
         TokenKind::Identifier {
-            kind: IdentifierKind::TempTable
+            kind: IdentifierKind::TempTable,
+            ..
         }
     )));
 }
@@ -1489,20 +1505,20 @@ fn test_mssql_table_hint_not_parsed_in_snowflake() {
 // 18. Table Hint Analyzer Rules
 // ============================================================================
 
-/// Helper: check if report contains a signal with specific rule ID
+/// Helper: check if report contains a finding with specific rule ID
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| {
+    report.entries().any(|s| {
         let lexega_core::analyzer::RuleMatch::Analysis(p) = s;
         p.matched_rule == rule_id
     })
 }
 
-/// Helper: get a signal by rule ID
-fn get_rule_signal<'a>(
+/// Helper: get a finding by rule ID
+fn get_rule_finding<'a>(
     report: &'a lexega_core::analyzer::AnalysisReport,
     rule_id: &str,
-) -> Option<&'a lexega_core::analyzer::AnalysisSignal> {
-    report.signals.iter().find_map(|s| {
+) -> Option<&'a lexega_core::analyzer::AnalysisFinding> {
+    report.entries().find_map(|s| {
         let lexega_core::analyzer::RuleMatch::Analysis(p) = s;
         if p.matched_rule == rule_id {
             Some(p)
@@ -1515,8 +1531,7 @@ fn get_rule_signal<'a>(
 /// Helper: count total evidence for a rule (handles deduplication)
 fn evidence_count_for_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> usize {
     report
-        .signals
-        .iter()
+        .entries()
         .filter_map(|s| {
             let lexega_core::analyzer::RuleMatch::Analysis(p) = s;
             if p.matched_rule == rule_id {
@@ -1528,7 +1543,7 @@ fn evidence_count_for_rule(report: &lexega_core::analyzer::AnalysisReport, rule_
         .sum()
 }
 
-// --- MSSQL-HINT-DIRTYREAD (High) ---
+// --- MSSQL-HINT-DIRTYREAD (Medium) ---
 
 #[test]
 fn test_hint_rule_nolock_select() {
@@ -1538,12 +1553,12 @@ fn test_hint_rule_nolock_select() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-DIRTYREAD"),
-        "NOLOCK should trigger MSSQL-HINT-DIRTYREAD. Signals: {:?}",
-        report.signals
+        "NOLOCK should trigger MSSQL-HINT-DIRTYREAD. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "MSSQL-HINT-DIRTYREAD").unwrap();
-    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::High);
+    let sig = get_rule_finding(&report, "MSSQL-HINT-DIRTYREAD").unwrap();
+    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Medium);
 }
 
 #[test]
@@ -1594,11 +1609,11 @@ fn test_hint_rule_tablockx() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-XLOCK"),
-        "TABLOCKX should trigger MSSQL-HINT-XLOCK. Signals: {:?}",
-        report.signals
+        "TABLOCKX should trigger MSSQL-HINT-XLOCK. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "MSSQL-HINT-XLOCK").unwrap();
+    let sig = get_rule_finding(&report, "MSSQL-HINT-XLOCK").unwrap();
     assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Medium);
 }
 
@@ -1614,7 +1629,7 @@ fn test_hint_rule_xlock() {
     );
 }
 
-// --- MSSQL-HINT-INDEX (Medium) ---
+// --- MSSQL-HINT-INDEX (Low) ---
 
 #[test]
 fn test_hint_rule_index_hint() {
@@ -1624,12 +1639,12 @@ fn test_hint_rule_index_hint() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-INDEX"),
-        "INDEX hint should trigger MSSQL-HINT-INDEX. Signals: {:?}",
-        report.signals
+        "INDEX hint should trigger MSSQL-HINT-INDEX. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "MSSQL-HINT-INDEX").unwrap();
-    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Medium);
+    let sig = get_rule_finding(&report, "MSSQL-HINT-INDEX").unwrap();
+    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Low);
 }
 
 #[test]
@@ -1644,7 +1659,7 @@ fn test_hint_rule_index_by_number() {
     );
 }
 
-// --- MSSQL-HINT-FORCESCAN (Medium) ---
+// --- MSSQL-HINT-FORCESCAN (Low) ---
 
 #[test]
 fn test_hint_rule_forcescan() {
@@ -1654,12 +1669,12 @@ fn test_hint_rule_forcescan() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-FORCESCAN"),
-        "FORCESCAN should trigger MSSQL-HINT-FORCESCAN. Signals: {:?}",
-        report.signals
+        "FORCESCAN should trigger MSSQL-HINT-FORCESCAN. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "MSSQL-HINT-FORCESCAN").unwrap();
-    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Medium);
+    let sig = get_rule_finding(&report, "MSSQL-HINT-FORCESCAN").unwrap();
+    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Low);
 }
 
 // --- MSSQL-HINT-FORCESEEK (Low) ---
@@ -1672,11 +1687,11 @@ fn test_hint_rule_forceseek() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-FORCESEEK"),
-        "FORCESEEK should trigger MSSQL-HINT-FORCESEEK. Signals: {:?}",
-        report.signals
+        "FORCESEEK should trigger MSSQL-HINT-FORCESEEK. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "MSSQL-HINT-FORCESEEK").unwrap();
+    let sig = get_rule_finding(&report, "MSSQL-HINT-FORCESEEK").unwrap();
     assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Low);
 }
 
@@ -1702,11 +1717,11 @@ fn test_hint_rule_info_any_hint() {
 
     assert!(
         has_rule(&report, "INFO-MSSQL-HINT"),
-        "Any table hint should trigger INFO-MSSQL-HINT. Signals: {:?}",
-        report.signals
+        "Any table hint should trigger INFO-MSSQL-HINT. Findings: {:?}",
+        report.findings
     );
 
-    let sig = get_rule_signal(&report, "INFO-MSSQL-HINT").unwrap();
+    let sig = get_rule_finding(&report, "INFO-MSSQL-HINT").unwrap();
     assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Info);
 }
 
@@ -1720,7 +1735,7 @@ fn test_hint_rule_info_holdlock() {
 
     assert!(
         has_rule(&report, "INFO-MSSQL-HINT"),
-        "HOLDLOCK should produce info-level hint signal"
+        "HOLDLOCK should produce info-level hint finding"
     );
     // Should NOT trigger any of the specific risk rules
     assert!(
@@ -1736,18 +1751,18 @@ fn test_hint_rule_info_holdlock() {
 // --- Negative tests (no false positives) ---
 
 #[test]
-fn test_hint_rule_no_hints_no_signals() {
+fn test_hint_rule_no_hints_no_findings() {
     let sql = "SELECT * FROM Orders WHERE id = 1;";
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &mssql_analysis_config())
         .expect("analysis should succeed");
 
     assert!(
         !has_rule(&report, "MSSQL-HINT-DIRTYREAD"),
-        "No hints → no dirty-read signal"
+        "No hints → no dirty-read finding"
     );
     assert!(
         !has_rule(&report, "INFO-MSSQL-HINT"),
-        "No hints → no info-level hint signal"
+        "No hints → no info-level hint finding"
     );
 }
 
@@ -1777,7 +1792,7 @@ fn test_hint_rule_multiple_tables_multiple_hints() {
     // Info-level hint should also fire
     assert!(
         has_rule(&report, "INFO-MSSQL-HINT"),
-        "Info signal should fire for any hint"
+        "Info finding should fire for any hint"
     );
 
     // Evidence count for INFO should cover both tables
@@ -1820,8 +1835,8 @@ fn test_hint_rule_insert_tablock() {
     // TABLOCK is not NOLOCK/XLOCK/INDEX/FORCESCAN/FORCESEEK — only INFO fires
     assert!(
         has_rule(&report, "INFO-MSSQL-HINT"),
-        "TABLOCK on INSERT should trigger INFO-MSSQL-HINT. Signals: {:?}",
-        report.signals
+        "TABLOCK on INSERT should trigger INFO-MSSQL-HINT. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -1834,11 +1849,11 @@ fn test_hint_rule_insert_nolock() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-DIRTYREAD"),
-        "NOLOCK on INSERT should trigger MSSQL-HINT-DIRTYREAD. Signals: {:?}",
-        report.signals
+        "NOLOCK on INSERT should trigger MSSQL-HINT-DIRTYREAD. Findings: {:?}",
+        report.findings
     );
-    let sig = get_rule_signal(&report, "MSSQL-HINT-DIRTYREAD").unwrap();
-    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::High);
+    let sig = get_rule_finding(&report, "MSSQL-HINT-DIRTYREAD").unwrap();
+    assert_eq!(sig.risk_level, lexega_core::analyzer::RiskLevel::Medium);
 }
 
 #[test]
@@ -1866,20 +1881,20 @@ fn test_hint_rule_insert_select_with_nolock() {
 
     assert!(
         has_rule(&report, "MSSQL-HINT-DIRTYREAD"),
-        "NOLOCK in INSERT...SELECT source should trigger MSSQL-HINT-DIRTYREAD. Signals: {:?}",
-        report.signals
+        "NOLOCK in INSERT...SELECT source should trigger MSSQL-HINT-DIRTYREAD. Findings: {:?}",
+        report.findings
     );
 }
 
 #[test]
-fn test_hint_rule_insert_no_hints_no_signal() {
+fn test_hint_rule_insert_no_hints_no_finding() {
     let sql = "INSERT INTO Orders (id, name) VALUES (1, 'test');";
     let report = lexega_core::api::analyze_risk_with_policy_config(sql, &mssql_analysis_config())
         .expect("analysis should succeed");
 
     assert!(
         !has_rule(&report, "INFO-MSSQL-HINT"),
-        "INSERT without hints should NOT trigger any hint signals"
+        "INSERT without hints should NOT trigger any hint findings"
     );
 }
 
@@ -1967,6 +1982,79 @@ fn test_top_percent_preserves_keyword() {
         formatted.contains("PERCENT"),
         "PERCENT keyword must be preserved, got: {}",
         formatted
+    );
+}
+
+/// The parsed / analysed / skipped counts of `sql` under `dialect`, and the
+/// raw aliases its statements' projections publish.
+fn published_aliases(sql: &str, dialect: &str) -> ((u64, u64, u64), Vec<String>) {
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: lexega_core::dialect::dialect_from_name(dialect),
+        trace_mode: true,
+        ..Default::default()
+    };
+    let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config).expect("analyze");
+    let json = serde_json::to_value(&report).expect("report serializes");
+    let count = |key: &str| json["summary"][key].as_u64().expect("count");
+    let mut aliases = Vec::new();
+    for statement in json["statement_traces"].as_array().expect("statements") {
+        for scope in statement["facts"]["query"]["scopes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for projection in scope["projections"].as_array().into_iter().flatten() {
+                if let Some(raw) = projection["alias"]["raw"].as_str() {
+                    aliases.push(raw.to_string());
+                }
+            }
+        }
+    }
+    (
+        (
+            count("statements_parsed"),
+            count("statements_analyzed"),
+            count("statements_skipped"),
+        ),
+        aliases,
+    )
+}
+
+#[test]
+fn a_string_alias_publishes_the_quoted_name() {
+    let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for dialect in ["mssql", "mysql"] {
+        assert_eq!(
+            published_aliases(
+                "SELECT c AS 'Customer Name', d 'x' FROM t WHERE id = 1",
+                dialect
+            ),
+            ((1, 1, 0), names(&["CUSTOMER NAME", "X"])),
+            "{dialect}"
+        );
+    }
+    // A string is read as T-SQL writes it: `N` prefix, doubled quote.
+    assert_eq!(
+        published_aliases(
+            "SELECT c AS N'Name', d 'it''s' FROM t WHERE id = 1",
+            "mssql"
+        ),
+        ((1, 1, 0), names(&["NAME", "IT'S"]))
+    );
+    // Written without a terminator, the next statement is its own.
+    assert_eq!(
+        published_aliases("SELECT c 'x' FROM t WHERE id = 1\nDELETE FROM t", "mssql"),
+        ((2, 2, 0), names(&["X"]))
+    );
+    // MySQL reads a `"…"` string as a string.
+    assert_eq!(
+        published_aliases("SELECT c \"x\" FROM t", "mysql"),
+        ((1, 1, 0), names(&["X"]))
+    );
+    // A dialect that writes no string alias does not read one.
+    assert_eq!(
+        published_aliases("SELECT c AS 'x' FROM t", "postgres"),
+        ((1, 0, 1), names(&[]))
     );
 }
 

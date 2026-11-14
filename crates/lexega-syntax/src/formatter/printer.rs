@@ -35,9 +35,9 @@
 //! Statement formatters should rely on push_span(), push_keyword_span(), etc.
 
 use crate::context::span_map::MappingKind;
-use crate::context::{FormattedContext, RenderContext};
+use crate::context::{CopiedSpan, FormattedContext, RenderContext};
 use crate::cst::Cst;
-use crate::formatter::config::{FormatterConfig, IndentStyle, KeywordCase, NewlineStyle};
+use crate::formatter::config::{FormatterConfig, IndentStyle, KeywordCase, LineBreak};
 use crate::formatter::span_tracker::SpanTracker;
 use crate::lexer::{Span, TriviaKind};
 
@@ -45,6 +45,9 @@ use crate::lexer::{Span, TriviaKind};
 pub struct Printer<'a> {
     /// Formatter configuration
     config: &'a FormatterConfig,
+
+    /// The line break written
+    line_break: LineBreak,
 
     /// Source text (for reference)
     source: &'a str,
@@ -90,6 +93,9 @@ pub struct Printer<'a> {
 
     /// Maximum recursion depth allowed (default: 100)
     max_recursion_depth: usize,
+
+    /// Every span copied as written (`push_raw_source`), in output order.
+    copied: Vec<CopiedSpan>,
 }
 
 impl<'a> Printer<'a> {
@@ -102,8 +108,14 @@ impl<'a> Printer<'a> {
     pub fn new(config: &'a FormatterConfig, source: &'a str, cst: Option<&'a Cst>) -> Self {
         let estimated_capacity = (source.len() as f32 * 1.8) as usize;
 
+        // `Auto` is read from the tokens of the source; without a CST it is Unix.
+        let line_break = config
+            .newline_style
+            .resolve(source, cst.map_or(&[], |cst| cst.tokens.as_slice()));
+
         Self {
             config,
+            line_break,
             source,
             output: String::with_capacity(estimated_capacity),
             span_tracker: SpanTracker::new(),
@@ -118,6 +130,7 @@ impl<'a> Printer<'a> {
             source_position: 0,
             recursion_depth: 0,
             max_recursion_depth: 150,
+            copied: Vec::new(),
         }
     }
 
@@ -1513,6 +1526,44 @@ impl<'a> Printer<'a> {
     /// NOTE: This does NOT advance source_position past the last emitted token.
     /// The trivia in the gap between our last token and `target` will be emitted
     /// by the next push_span/emit_trivia_until call.
+    /// The span from the first to the last token lying within
+    /// `start..end`; `None` where none does or no CST is attached.
+    pub(crate) fn tokens_span_within(&self, start: u32, end: u32) -> Option<Span> {
+        let mut within = self
+            .cst?
+            .tokens
+            .iter()
+            .filter(|t| t.span.start >= start && t.span.end <= end);
+        let first = within.next()?.span;
+        let last = within.next_back().map_or(first, |t| t.span);
+        Some(Span {
+            start: first.start,
+            end: last.end,
+        })
+    }
+
+    /// The span of the first token starting at or after `start`; `None`
+    /// where none does or no CST is attached.
+    pub(crate) fn token_span_from(&self, start: u32) -> Option<Span> {
+        self.cst?
+            .tokens
+            .iter()
+            .find(|t| t.span.start >= start)
+            .map(|t| t.span)
+    }
+
+    /// The span of the token with text ending at `end`; `None` where none
+    /// does or no CST is attached.
+    pub(crate) fn token_span_ending_at(&self, end: u32) -> Option<Span> {
+        let tokens = &self.cst?.tokens;
+        let after = tokens.partition_point(|t| t.span.end <= end);
+        tokens[..after]
+            .iter()
+            .rev()
+            .find(|t| t.span.end == end && t.span.start < t.span.end)
+            .map(|t| t.span)
+    }
+
     pub fn emit_all_tokens_until(&mut self, target: u32) {
         if target <= self.source_position {
             return;
@@ -1531,8 +1582,17 @@ impl<'a> Printer<'a> {
         // Find and emit all tokens that are within our range
         let mut processed_until_idx = self.next_token_idx;
         for (idx, token) in tokens.iter().enumerate().skip(self.next_token_idx) {
+            // The rows a `COPY` reads trail the `;` that ends it, which has
+            // no width after psql's `\copy`: kept wherever it stands.
+            let rows: Vec<&crate::lexer::token::Trivia> = token
+                .trailing_trivia
+                .iter()
+                .filter(|trivia| {
+                    trivia.kind == TriviaKind::CopyData && trivia.span.end > self.source_position
+                })
+                .collect();
             // Skip tokens we've already passed
-            if token.span.end <= self.source_position {
+            if token.span.end <= self.source_position && rows.is_empty() {
                 processed_until_idx = idx + 1;
                 continue;
             }
@@ -1552,6 +1612,12 @@ impl<'a> Printer<'a> {
                 // Punctuation, literals, etc. - emit as-is
                 self.push_span(token.span);
             }
+            for trivia in rows {
+                if trivia.span.end > self.source_position {
+                    self.emit_trivia_item(trivia);
+                    self.source_position = trivia.span.end;
+                }
+            }
 
             processed_until_idx = idx + 1;
         }
@@ -1561,6 +1627,16 @@ impl<'a> Printer<'a> {
 
         // DO NOT advance source_position here - let the next emit_trivia_until
         // call handle any trivia in the remaining gap up to `target`
+    }
+
+    /// Whether only spaces and tabs stand before `start` on its line in the
+    /// source, the first line included.
+    fn starts_its_line(&self, start: usize) -> bool {
+        self.source
+            .as_bytes()
+            .get(..start)
+            .and_then(|before| before.iter().rev().find(|&&b| b != b' ' && b != b'\t'))
+            .is_none_or(|&b| b == b'\n' || b == b'\r')
     }
 
     /// Emit a single trivia item (comment) with proper formatting
@@ -1579,31 +1655,11 @@ impl<'a> Printer<'a> {
 
         match trivia.kind {
             TriviaKind::LineComment => {
-                // Check if the line comment was on its own line in the source
-                // by scanning backwards from the comment start to find if there's a newline
-                // before any non-whitespace characters
-                let was_on_own_line = if start > 0 {
-                    let mut pos = start;
-                    let mut found_newline = false;
-                    while pos > 0 {
-                        pos -= 1;
-                        let ch = self.source.as_bytes()[pos];
-                        if ch == b'\n' || ch == b'\r' {
-                            found_newline = true;
-                            break;
-                        } else if ch != b' ' && ch != b'\t' {
-                            // Found a non-whitespace character before signal newline
-                            break;
-                        }
-                    }
-                    found_newline || pos == 0
-                } else {
-                    true // At start of file, treat as own line
-                };
+                let was_on_own_line = self.starts_its_line(start);
 
                 // Line comments: if it was on its own line in source, preserve that
                 if was_on_own_line && !self.at_line_start {
-                    self.newline();
+                    self.end_line_as_required();
                 }
 
                 if self.at_line_start {
@@ -1613,29 +1669,12 @@ impl<'a> Printer<'a> {
                 }
                 self.output.push_str(text.trim());
                 self.at_line_start = false;
-                self.newline(); // MANDATORY - line comment extends to EOL
+                self.end_line_as_required(); // MANDATORY - line comment extends to EOL
             }
             TriviaKind::BlockComment => {
                 // Block comments: space before (if not at line start), text, trailing space/newline
 
-                // Check if the block comment was on its own line in source (preceded by newline)
-                let was_on_own_line = if start > 0 {
-                    let mut pos = start;
-                    let mut found_newline = false;
-                    while pos > 0 {
-                        pos -= 1;
-                        let ch = self.source.as_bytes()[pos];
-                        if ch == b'\n' || ch == b'\r' {
-                            found_newline = true;
-                            break;
-                        } else if ch != b' ' && ch != b'\t' {
-                            break;
-                        }
-                    }
-                    found_newline || pos == 0
-                } else {
-                    true
-                };
+                let was_on_own_line = self.starts_its_line(start);
 
                 // Check if IMMEDIATELY followed by a newline in source (no intervening whitespace)
                 // This is critical for idempotency: if original has `*/ ON`, we emit `*/ ` (space)
@@ -1664,8 +1703,8 @@ impl<'a> Printer<'a> {
                     self.newline();
                 } else {
                     self.output.push(' ');
+                    self.at_line_start = false;
                 }
-                self.at_line_start = followed_by_newline;
             }
             TriviaKind::JinjaComment => {
                 // Jinja comments {# ... #}: same handling as block comments
@@ -1697,8 +1736,41 @@ impl<'a> Printer<'a> {
                     self.newline();
                 } else {
                     self.output.push(' ');
+                    self.at_line_start = false;
                 }
-                self.at_line_start = followed_by_newline;
+            }
+            // A psql command reads the rest of its line: the line ends after it.
+            TriviaKind::PsqlMetaCommand(_) => {
+                if self.at_line_start {
+                    self.write_indent();
+                } else if !self.output.ends_with(' ') && !self.output.ends_with('\n') {
+                    self.output.push(' ');
+                }
+                self.output.push_str(text.trim());
+                self.end_line_as_required();
+                self.at_line_start = true;
+            }
+            // The client reads the command from a line's start to its end.
+            TriviaKind::ClientDelimiter => {
+                if !self.at_line_start {
+                    self.end_line_as_required();
+                }
+                self.output.push_str(text.trim());
+                self.end_line_as_required();
+                self.at_line_start = true;
+            }
+            // The rows a `COPY` reads are data: kept byte for byte, from a
+            // line's start.
+            TriviaKind::CopyData => {
+                let kept = self.output.trim_end_matches([' ', '\t']).len();
+                self.output.truncate(kept);
+                if !self.output.is_empty() && !self.output.ends_with(['\n', '\r']) {
+                    self.output.push_str(self.line_break.as_str());
+                }
+                self.output.push_str(text);
+                self.output.push_str(self.line_break.as_str());
+                self.line_position = 0;
+                self.at_line_start = true;
             }
             TriviaKind::Whitespace | TriviaKind::Newline => {
                 // Ignore - formatter controls whitespace
@@ -1744,8 +1816,16 @@ impl<'a> Printer<'a> {
 
         let text = &self.source[start..end];
 
-        // Push raw text without any processing
+        // Push raw text without any processing, and record where it went.
+        let output_start = self.output.len() as u32;
         self.output.push_str(text);
+        self.copied.push(CopiedSpan {
+            source: span,
+            output: Span {
+                start: output_start,
+                end: self.output.len() as u32,
+            },
+        });
         self.line_position += text.len();
 
         // Check if we're now at line start (text ended with newline)
@@ -1757,6 +1837,82 @@ impl<'a> Printer<'a> {
 
         // Emit trailing trivia for the span
         self.emit_trivia_until(span.end, true);
+    }
+
+    /// Prints `span` as written, tokens, comments and spacing alike, after
+    /// the comments before it. The comments after its last token are not
+    /// printed: `emit_trivia_until(span.end, true)` prints them, or
+    /// [`Self::push_source_until`] copies them with the text after.
+    pub(crate) fn push_span_as_written(&mut self, span: Span) {
+        self.emit_trivia_until(span.start, false);
+        if self.at_line_start {
+            self.write_indent();
+            self.at_line_start = false;
+        }
+        self.push_source_until(span.end);
+    }
+
+    /// Copies the source from the cursor to `end` as written, tokens,
+    /// comments and spacing alike, and moves the cursor there. The token
+    /// that ends at `end` stays next, for its trailing comments.
+    pub(crate) fn push_source_until(&mut self, end: u32) {
+        let start = self.source_position;
+        let Some(text) = self
+            .source
+            .get(start as usize..end as usize)
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        let output_start = self.output.len() as u32;
+        self.output.push_str(text);
+        self.copied.push(CopiedSpan {
+            source: Span { start, end },
+            output: Span {
+                start: output_start,
+                end: self.output.len() as u32,
+            },
+        });
+        self.line_position = match text.rfind('\n') {
+            Some(nl) => text.len() - nl - 1,
+            None => self.line_position + text.len(),
+        };
+        self.at_line_start = text.ends_with('\n');
+        self.source_position = end;
+        if let Some(cst) = self.cst {
+            self.next_token_idx = cst.tokens.partition_point(|t| t.span.end < end);
+        }
+    }
+
+    /// Push the tokens within `span` as the expression path prints bare
+    /// words and the calls of them: each word in identifier case, any other
+    /// token as written. With no CST, the span as one word.
+    pub(crate) fn push_words_within(&mut self, span: Span) {
+        use crate::lexer::TokenKind;
+        let tokens: Vec<(Span, bool)> = self
+            .cst
+            .map(|cst| {
+                cst.tokens
+                    .iter()
+                    .filter(|t| t.span.start >= span.start && t.span.end <= span.end)
+                    .map(|t| {
+                        let word =
+                            matches!(t.kind, TokenKind::Keyword(_) | TokenKind::Identifier { .. });
+                        (t.span, word)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if tokens.is_empty() {
+            self.push_identifier_span_v2(span);
+        }
+        for (token, word) in tokens {
+            if word {
+                self.push_identifier_span_v2(token);
+            } else {
+                self.push_span(token);
+            }
+        }
     }
 
     /// Push identifier from source span with case conversion (V2)
@@ -2240,6 +2396,16 @@ impl<'a> Printer<'a> {
         self.push_keyword(keyword);
     }
 
+    /// [`Self::newline`], dropping the spaces a block comment left at the
+    /// end of the line.
+    pub fn end_line(&mut self) {
+        let kept = self.output.trim_end_matches([' ', '\t']).len();
+        if kept > 0 && !self.output[..kept].ends_with(['\n', '\r']) {
+            self.output.truncate(kept);
+        }
+        self.newline();
+    }
+
     /// Add newline
     ///
     /// **ARCHITECTURE**:
@@ -2250,8 +2416,22 @@ impl<'a> Printer<'a> {
     ///
     /// NOTE: If the output already ends with a newline (ignoring trailing whitespace/indent),
     /// this is a no-op to prevent double newlines from trivia emission followed by explicit newline() calls.
+    ///
+    /// A line that would end holding only a bare T-SQL `go` name (with at
+    /// most a count and comments) is not ended: sqlcmd and SSMS would end
+    /// the batch there. What follows goes on after a space.
     #[inline]
     pub fn newline(&mut self) {
+        if self.line_is_added_separator() {
+            self.space();
+            return;
+        }
+        self.end_line_as_required();
+    }
+
+    /// [`Self::newline`] without the batch-separator check: for the line
+    /// break a line comment or a client command needs.
+    fn end_line_as_required(&mut self) {
         // Prevent double newlines: check if output ends with newline (ignoring trailing whitespace)
         // Limit scan to last 64 bytes (more than enough for any reasonable indentation)
         let bytes = self.output.as_bytes();
@@ -2264,12 +2444,126 @@ impl<'a> Printer<'a> {
         if ends_with_newline {
             return;
         }
-        match self.config.newline_style {
-            NewlineStyle::Unix => self.output.push('\n'),
-            NewlineStyle::Windows => self.output.push_str("\r\n"),
-        }
+        self.output.push_str(self.line_break.as_str());
         self.line_position = 0;
         self.at_line_start = true;
+    }
+
+    /// Ends the line before list item `item`, unless the item is a bare
+    /// T-SQL `go` ([`Self::is_bare_go`]): alone on a line it would end the
+    /// batch for sqlcmd and SSMS, so it stays on the line of the item before
+    /// it, at any width.
+    pub(crate) fn break_before_item(&mut self, item: Span) {
+        if self.at_line_start {
+            return;
+        }
+        if !self.is_bare_go(item) {
+            self.newline();
+        } else if self.config.space_after_comma {
+            self.space();
+        }
+    }
+
+    /// Ends the line before a leading comma, unless the line holds only a
+    /// bare T-SQL `go` name ([`Self::newline`]): the comma follows it there.
+    pub(crate) fn break_before_comma(&mut self) {
+        if !self.at_line_start && !self.line_is_added_separator() {
+            self.newline();
+        }
+    }
+
+    /// Whether the token at source position `at` is a bare T-SQL `go` that
+    /// does not start its line in the source ([`crate::parser::go_line_start`]).
+    pub(crate) fn go_name_within_line(&self, at: u32) -> bool {
+        let Some(cst) = self.cst else {
+            return false;
+        };
+        let Some(tok) = cst
+            .tokens
+            .get(cst.tokens.partition_point(|t| t.span.start < at))
+        else {
+            return false;
+        };
+        self.is_bare_go(tok.span)
+            && crate::parser::go_line_start(
+                self.source,
+                &cst.tokens,
+                tok,
+                self.config.dialect.as_ref(),
+            )
+            .is_none()
+    }
+
+    /// Whether `span` holds one token, an unquoted `go`, in a dialect with
+    /// batch separators.
+    fn is_bare_go(&self, span: Span) -> bool {
+        use crate::lexer::TokenKind;
+        let Some(cst) = self.cst else {
+            return false;
+        };
+        if !self.config.dialect.supports_go_batch_separator() {
+            return false;
+        }
+        let first = cst.tokens.partition_point(|t| t.span.start < span.start);
+        let mut within = cst.tokens[first..]
+            .iter()
+            .take_while(|t| t.span.end <= span.end)
+            .filter(|t| t.span.start < t.span.end);
+        match (within.next(), within.next()) {
+            (Some(tok), None) => {
+                matches!(tok.kind, TokenKind::Identifier { .. })
+                    && tok.lexeme(self.source).eq_ignore_ascii_case("go")
+            }
+            (None, _) | (Some(_), Some(_)) => false,
+        }
+    }
+
+    /// Whether the line being written would, ended here, be a T-SQL batch
+    /// separator the source does not have: a `go` name with at most a count
+    /// and comments ([`crate::parser::is_batch_separator`], read on the line
+    /// alone), where the last source token printed is no separator.
+    fn line_is_added_separator(&self) -> bool {
+        let dialect = self.config.dialect.as_ref();
+        if !dialect.supports_go_batch_separator() {
+            return false;
+        }
+        let line = &self.output[self.output.rfind('\n').map_or(0, |nl| nl + 1)..];
+        let head = line.trim_start();
+        let go_first = head.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("go"));
+        if !go_first && !head.starts_with("/*") {
+            return false;
+        }
+        let tokens = crate::lexer::tokenize_with_dialect(line, dialect).tokens;
+        let separator = tokens
+            .iter()
+            .find(|t| t.span.start < t.span.end)
+            .is_some_and(|go| crate::parser::is_batch_separator(line, &tokens, go, dialect));
+        separator && !self.printed_source_separator()
+    }
+
+    /// Whether the last source token printed is a batch separator in the
+    /// source, or the repeat count of one.
+    fn printed_source_separator(&self) -> bool {
+        use crate::lexer::{LiteralKind, TokenKind};
+        let Some(cst) = self.cst else {
+            return false;
+        };
+        let tokens = &cst.tokens;
+        let printed = tokens.partition_point(|t| t.span.end <= self.source_position);
+        let mut before = tokens[..printed]
+            .iter()
+            .rev()
+            .filter(|t| t.span.start < t.span.end);
+        let last = before.next();
+        let go = match last {
+            Some(count) if matches!(count.kind, TokenKind::Literal(LiteralKind::Number)) => {
+                before.next()
+            }
+            Some(_) | None => last,
+        };
+        go.is_some_and(|go| {
+            crate::parser::is_batch_separator(self.source, tokens, go, self.config.dialect.as_ref())
+        })
     }
 
     /// Add newline only if not already at line start
@@ -2284,15 +2578,19 @@ impl<'a> Printer<'a> {
 
     /// Ensure there is a blank line (two newlines) at the current position.
     ///
-    /// Used between top-level statements to ensure visual separation.
+    /// Used between top-level statements to ensure visual separation. Not
+    /// after a bare `go` name alone on its line ([`Self::newline`]).
     #[inline]
     pub fn ensure_blank_line(&mut self) {
+        if self.line_is_added_separator() {
+            self.space();
+            return;
+        }
         // Check if output already ends with blank line
         let output = self.output.as_str();
-        let double_newline = if matches!(self.config.newline_style, NewlineStyle::Windows) {
-            "\r\n\r\n"
-        } else {
-            "\n\n"
+        let (single_newline, double_newline) = match self.line_break {
+            LineBreak::Lf => ("\n", "\n\n"),
+            LineBreak::Crlf => ("\r\n", "\r\n\r\n"),
         };
 
         if output.ends_with(double_newline) {
@@ -2302,12 +2600,6 @@ impl<'a> Printer<'a> {
 
         // Force a blank line between statements.
         // Use push_newline_raw() to bypass the "no double newlines" guard in newline()
-        let single_newline = if matches!(self.config.newline_style, NewlineStyle::Windows) {
-            "\r\n"
-        } else {
-            "\n"
-        };
-
         if output.ends_with(single_newline) {
             // Already have one newline, add one more for blank line
             self.push_newline_raw();
@@ -2318,14 +2610,67 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Breaks lines up to `end` as the source does: each comment before
+    /// `end` after the line breaks written before it, then the line breaks
+    /// before `end`, which starts its line. One line break stays one; two or
+    /// more print as one blank line.
+    pub(crate) fn break_lines_as_written(&mut self, end: u32) {
+        let Some(cst) = self.cst else {
+            self.newline_if_needed();
+            return;
+        };
+        let from = self.source_position;
+        let first = cst
+            .tokens
+            .partition_point(|t| t.span.start < from)
+            .saturating_sub(1);
+        let mut breaks = 0usize;
+        // A comment the source ends on `end`'s own line keeps `end` there.
+        let mut after_comment = false;
+        for trivia in cst.tokens[first..]
+            .iter()
+            .take_while(|t| t.span.start <= end)
+            .flat_map(|t| t.leading_trivia.iter().chain(&t.trailing_trivia))
+            .filter(|trivia| trivia.span.start >= from && trivia.span.end <= end)
+        {
+            match trivia.kind {
+                TriviaKind::Newline => breaks += 1,
+                TriviaKind::Whitespace => {}
+                TriviaKind::LineComment
+                | TriviaKind::BlockComment
+                | TriviaKind::JinjaComment
+                | TriviaKind::MysqlVersionComment
+                | TriviaKind::PsqlMetaCommand(_)
+                | TriviaKind::ClientDelimiter
+                | TriviaKind::CopyData => {
+                    self.break_lines(breaks);
+                    breaks = 0;
+                    after_comment = true;
+                    self.emit_trivia_until(trivia.span.end, false);
+                }
+            }
+        }
+        if breaks == 0 && after_comment {
+            return;
+        }
+        self.break_lines(breaks.max(1));
+    }
+
+    /// Ends the line for one source line break or none, and leaves a blank
+    /// line for more.
+    fn break_lines(&mut self, breaks: usize) {
+        match breaks {
+            0 => {}
+            1 => self.newline_if_needed(),
+            _ => self.ensure_blank_line(),
+        }
+    }
+
     /// Push a raw newline without checking for existing newlines.
     /// Use this only in ensure_blank_line() where we explicitly want multiple newlines.
     #[inline]
     fn push_newline_raw(&mut self) {
-        match self.config.newline_style {
-            NewlineStyle::Unix => self.output.push('\n'),
-            NewlineStyle::Windows => self.output.push_str("\r\n"),
-        }
+        self.output.push_str(self.line_break.as_str());
         self.line_position = 0;
         self.at_line_start = true;
     }
@@ -2507,7 +2852,8 @@ impl<'a> Printer<'a> {
 
         // 2. Build FormattedContext with SpanMap (CST has trivia, no separate TriviaMap needed)
         let formatted_ctx = FormattedContext::new(self.output, span_map.clone())
-            .map_err(|e| crate::formatter::FormatterError::InvalidContext(format!("{:?}", e)))?;
+            .map_err(|e| crate::formatter::FormatterError::InvalidContext(format!("{:?}", e)))?
+            .with_copied_spans(self.copied);
 
         // 3. Add to RenderContext
         let context = context.with_formatted(formatted_ctx);
@@ -2527,11 +2873,19 @@ impl<'a> Printer<'a> {
     }
 
     /// Insert padding spaces at a specific position in the output.
-    /// Used for post-hoc alignment of AS aliases.
+    /// Used for post-hoc alignment of AS aliases. A span copied as written
+    /// after that position moves with the text.
     pub fn insert_padding_at(&mut self, position: usize, num_spaces: usize) {
         if position <= self.output.len() && num_spaces > 0 {
             let padding: String = " ".repeat(num_spaces);
             self.output.insert_str(position, &padding);
+            let (position, shift) = (position as u32, num_spaces as u32);
+            for copied in self.copied.iter_mut() {
+                if copied.output.start >= position {
+                    copied.output.start += shift;
+                    copied.output.end += shift;
+                }
+            }
         }
     }
 
@@ -2931,8 +3285,10 @@ mod tests {
 
     #[test]
     fn test_keyword_case() {
-        let mut config = FormatterConfig::default();
-        config.keyword_case = KeywordCase::Upper;
+        let config = FormatterConfig {
+            keyword_case: KeywordCase::Upper,
+            ..Default::default()
+        };
         let source = "SELECT 1";
         let mut printer = Printer::new(&config, source, None);
 
@@ -2943,8 +3299,10 @@ mod tests {
 
     #[test]
     fn test_indentation() {
-        let mut config = FormatterConfig::default();
-        config.indent_style = IndentStyle::Spaces(2);
+        let config = FormatterConfig {
+            indent_style: IndentStyle::Spaces(2),
+            ..Default::default()
+        };
         let source = "SELECT 1";
         let mut printer = Printer::new(&config, source, None);
 

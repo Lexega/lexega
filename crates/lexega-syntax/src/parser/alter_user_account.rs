@@ -20,12 +20,12 @@
 //! prefix matches AUTHENTICATION POLICY attachment.
 
 use crate::ast::types::{
-    AstAlterAccount, AstAlterAccountAction, AstAlterAccountActionKind, AstAlterUser,
-    AstAlterUserAction, AstAlterUserActionKind, AstStmt,
+    AstAccountPolicyKind, AstAlterAccount, AstAlterAccountAction, AstAlterAccountActionKind,
+    AstAlterUser, AstAlterUserAction, AstAlterUserActionKind, AstObjectRef, AstStmt,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::parser::core::{Parser, StatementContext};
 
 impl<'a> Parser<'a> {
     /// Lookahead: returns `true` iff the next non-trivia tokens at the current
@@ -46,6 +46,24 @@ impl<'a> Parser<'a> {
         let matched = self.scan_alter_account_authpol_attachment_prefix();
         self.idx = saved;
         matched
+    }
+
+    /// The `{PASSWORD | SESSION | PACKAGES} POLICY name` written at token
+    /// `i`: the index past the name, the policy kind and the name. `None`
+    /// where the words or the name are not there.
+    pub(crate) fn account_policy_at(
+        &self,
+        i: usize,
+    ) -> Option<(usize, AstAccountPolicyKind, AstObjectRef)> {
+        let (after, kind) = [
+            ("PASSWORD", AstAccountPolicyKind::Password),
+            ("SESSION", AstAccountPolicyKind::Session),
+            ("PACKAGES", AstAccountPolicyKind::Packages),
+        ]
+        .into_iter()
+        .find_map(|(word, kind)| Some((self.words_end(i, &[word, "POLICY"])?, kind)))?;
+        let (next, policy) = self.object_ref_at(after, self.id_gen.next())?;
+        Some((next, kind, policy))
     }
 
     fn scan_alter_user_authpol_attachment_prefix(&mut self) -> bool {
@@ -279,6 +297,8 @@ impl<'a> Parser<'a> {
 
         // ACCOUNT (Identifier, not Keyword)
         let account_span = expect_identifier_lexeme(self, "ACCOUNT")?;
+        // Each parameter's value, as every statement setting one records it.
+        self.record_setting_secrets(self.idx);
 
         // Action: SET or UNSET
         let kind_tok = self.peek_non_trivia().ok_or_else(|| {
@@ -296,29 +316,50 @@ impl<'a> Parser<'a> {
                     .advance()
                     .expect_invariant("SET: consumed after Keyword::Set match");
                 let set_span = set_tok.span;
-                let props_start = self
-                    .peek_non_trivia()
-                    .map(|t| t.span.start)
-                    .unwrap_or(set_span.end);
-                let properties = crate::parser::snowflake_account_ddl::walk_object_properties(self);
-                let end = properties
-                    .last()
-                    .map(|p| p.value_span.map(|v| v.end).unwrap_or(p.name_span.end))
-                    .unwrap_or(set_span.end);
-                (
-                    AstAlterAccountActionKind::Set {
-                        set_span,
-                        properties_span: Span {
-                            start: props_start,
+                let policy = self.account_policy_at(self.idx).filter(|(next, ..)| {
+                    self.tokens.get(*next).is_none_or(|tok| {
+                        matches!(
+                            tok.kind,
+                            TokenKind::Eof | TokenKind::Punctuation(Punctuation::Semi)
+                        ) || self.starts_statement(*next, StatementContext::OptionTail)
+                    })
+                });
+                if let Some((next, kind, policy)) = policy {
+                    let end = policy.span.end;
+                    self.idx = next;
+                    (
+                        AstAlterAccountActionKind::SetPolicy { kind, policy },
+                        Span {
+                            start: set_span.start,
                             end,
                         },
-                        properties,
-                    },
-                    Span {
-                        start: set_span.start,
-                        end,
-                    },
-                )
+                    )
+                } else {
+                    let props_start = self
+                        .peek_non_trivia()
+                        .map(|t| t.span.start)
+                        .unwrap_or(set_span.end);
+                    let properties =
+                        crate::parser::snowflake_account_ddl::walk_object_properties(self);
+                    let end = properties
+                        .last()
+                        .map(|p| p.value_span.map(|v| v.end).unwrap_or(p.name_span.end))
+                        .unwrap_or(set_span.end);
+                    (
+                        AstAlterAccountActionKind::Set {
+                            set_span,
+                            properties_span: Span {
+                                start: props_start,
+                                end,
+                            },
+                            properties,
+                        },
+                        Span {
+                            start: set_span.start,
+                            end,
+                        },
+                    )
+                }
             }
             TokenKind::Keyword(Keyword::Unset) => {
                 let unset_tok = self

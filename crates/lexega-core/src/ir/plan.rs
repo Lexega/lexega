@@ -67,6 +67,9 @@ pub enum RelPlan {
         name: IdentKey,
         scope: ScopeId,
         columns: Vec<ColumnId>,
+        /// Columns read through this reference that its binding's body
+        /// exposes by star.
+        demanded: Vec<DemandedColumn>,
         alias: Option<IdentKey>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
@@ -108,6 +111,15 @@ pub enum RelPlan {
     /// `RelPlan::Aggregate`, not represented as a Filter.
     Filter {
         input: Box<RelPlan>,
+        /// Select items the node computes for each input row before its
+        /// predicate reads them, in select-list order: the computed aliases a
+        /// block's `WHERE` reads where an `Aggregate` or a `Window` stands
+        /// between it and the projection, none whose calls in one statement
+        /// may differ (the current time is one value). An entry reads the
+        /// node's input and the entries before it. Its output is a column of
+        /// the node's output after the input's, and no column a star of the
+        /// select list above yields. Empty for every other filter.
+        computed: Vec<ComputedItem>,
         predicate: ScalarExpr,
         kind: FilterKind,
         /// Per-node `/*+ ... */` directives. Default empty.
@@ -126,6 +138,12 @@ pub enum RelPlan {
         having: Option<ScalarExpr>,
         /// Output columns: grouping keys first, then aggregates.
         output_columns: Vec<ColumnId>,
+        /// Select items the node computes for each input row before its
+        /// aggregates read them, in select-list order. An entry reads the
+        /// node's input and the entries before it. Its output is a column
+        /// of the node's output after `output_columns`, and no column a
+        /// star of the select list above yields.
+        computed: Vec<ComputedItem>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
         node_id: NodeId,
@@ -142,10 +160,16 @@ pub enum RelPlan {
     /// through and appends the window-call outputs. See
     /// [`RelPlan::output_schema`] in `schema.rs`; every fold over this
     /// node emits the input passthroughs alongside the window outputs.
+    /// The outputs of `computed` follow them.
     Window {
         input: Box<RelPlan>,
         windows: Vec<WindowCall>,
         window_outputs: Vec<ColumnId>,
+        /// Select items the node computes before its calls read them, in
+        /// select-list order. An entry reads the node's input and the
+        /// entries before it. Its output is no column a star of the
+        /// select list above yields.
+        computed: Vec<ComputedItem>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
         node_id: NodeId,
@@ -162,13 +186,23 @@ pub enum RelPlan {
         /// Snowflake `ASOF JOIN MATCH_CONDITION(...)` predicate.
         /// `None` for every non-ASOF join.
         match_condition: Option<ScalarExpr>,
-        /// Column-list for `USING (a, b, …)`.
-        using: Vec<ColumnId>,
+        /// The columns the join merges: the list of `USING (a, b, …)`,
+        /// in its order; for a `NATURAL` join, each name both sides are
+        /// known to hold, in the left side's order. Where the plan does
+        /// not know every column of a side, those are the names it knows
+        /// the side holds, and the join may merge names it does not list.
+        /// A `NATURAL` join lists no column for a name the catalog shows
+        /// several columns of on one side.
+        using: Vec<UsingColumn>,
         natural: bool,
         /// Snowflake `DIRECTED` join-order modifier.
         directed: bool,
-        /// Lateral joins: right side can reference left side's columns.
-        /// Includes T-SQL `CROSS APPLY` / `OUTER APPLY` lowering.
+        /// Set for `CROSS APPLY`, `OUTER APPLY` and `LATERAL` written
+        /// before `JOIN`, and for every join of a chain whose first item
+        /// is written `LATERAL` (`FROM t, LATERAL (…) s JOIN u ON …`: the
+        /// plain `JOIN u`). `JOIN LATERAL (…)` and `, LATERAL (…)` leave
+        /// it false: there the keyword is on the right item, which may
+        /// read the left side all the same.
         lateral: bool,
         /// Comma-join provenance. `true` when this Join was
         /// synthesized by the FROM-list comma loop (`SELECT … FROM a,
@@ -256,19 +290,37 @@ pub enum RelPlan {
     /// analysis).
     Insert {
         target: TableRef,
+        /// Node id of the target, shared with no other source or target;
+        /// the target's columns are allocated on it.
+        target_node: NodeId,
         target_columns: Vec<ColumnId>,
+        /// Columns an INSERT with no column list writes, each read by
+        /// name through the row it proposes or returns. No position of
+        /// the source is known for them.
+        unplaced_columns: Vec<ColumnId>,
+        /// Columns of the row the INSERT proposes that it does not write:
+        /// each holds the target column's default, a value of no source.
+        defaulted_columns: Vec<ColumnId>,
+        /// The target's columns the statement reads, each allocated on
+        /// `target_node`.
+        target_read_columns: Vec<ColumnId>,
         source: InsertSource,
         /// PostgreSQL `ON CONFLICT …` or, via alternate lowering,
         /// MySQL `ON DUPLICATE KEY UPDATE`.
         on_conflict: Option<OnConflict>,
-        /// Snowflake / Databricks `INSERT OVERWRITE`.
-        overwrite: bool,
+        /// Snowflake / Databricks `INSERT OVERWRITE`: what it replaces.
+        overwrite: Option<OverwriteScope>,
         /// Databricks `INSERT REPLACE INTO`.
         replace_into: bool,
         /// PostgreSQL `OVERRIDING { SYSTEM | USER } VALUE`.
         overriding: Option<OverridingValue>,
         /// PostgreSQL `RETURNING …`.
         returning: Option<Returning>,
+        /// The columns `returning` reads under an updating conflict
+        /// action: each holds what the inserted row has under its name or
+        /// what the row the conflict update left has, a column the update
+        /// writes or the target's stored one.
+        returned_merges: Vec<ReturnedMerge>,
         /// T-SQL `OUTPUT … [INTO …]`.
         output: Option<DmlOutput>,
         /// MSSQL `INSERT INTO t WITH (TABLOCK)` table hints on the
@@ -288,11 +340,25 @@ pub enum RelPlan {
 
     Update {
         target: TableRef,
-        assignments: Vec<(ColumnId, ScalarExpr)>,
+        /// Node id of the target, shared with no other source or target;
+        /// the target's columns are allocated on it.
+        target_node: NodeId,
+        /// The target's columns the statement reads, each allocated on
+        /// `target_node`.
+        target_read_columns: Vec<ColumnId>,
+        /// PostgreSQL `UPDATE ONLY parent`: the rows of the table alone,
+        /// none of a table that inherits from it. Span covers `ONLY`.
+        only: Option<Span>,
+        assignments: Vec<Assignment>,
         /// Optional join / FROM clause lowered as a scan + filter.
         from: Option<Box<RelPlan>>,
+        /// The FROM source that is the target's row, where the statement
+        /// names its target by one; `None` where the target is a source of
+        /// its own beside the FROM list, or there is none.
+        target_row: Option<NodeId>,
         predicate: Option<ScalarExpr>,
-        /// T-SQL `UPDATE TOP (n) [PERCENT]`.
+        /// The cap on the rows it writes: T-SQL `UPDATE TOP (n) [PERCENT]`,
+        /// MySQL `UPDATE … LIMIT n`.
         top: Option<DmlTop>,
         /// PostgreSQL `RETURNING …`.
         returning: Option<Returning>,
@@ -306,10 +372,24 @@ pub enum RelPlan {
 
     Delete {
         target: TableRef,
+        /// Node id of the target, shared with no other source or target;
+        /// the target's columns are allocated on it.
+        target_node: NodeId,
+        /// The target's columns the statement reads, each allocated on
+        /// `target_node`.
+        target_read_columns: Vec<ColumnId>,
         /// Optional `USING` clause.
         using: Option<Box<RelPlan>>,
+        /// The `USING` / FROM source that is the target's row, where the
+        /// statement names its target by one; `None` otherwise.
+        target_row: Option<NodeId>,
+        /// The `USING` / FROM sources beside the target's row whose rows
+        /// the statement deletes too: MySQL's further targets written
+        /// before `FROM` (`DELETE t1, t2 FROM …`), each the source it names.
+        deleted_sources: Vec<NodeId>,
         predicate: Option<ScalarExpr>,
-        /// T-SQL `DELETE TOP (n) [PERCENT]`.
+        /// The cap on the rows it deletes: T-SQL `DELETE TOP (n) [PERCENT]`,
+        /// MySQL `DELETE … LIMIT n`.
         top: Option<DmlTop>,
         /// PostgreSQL `RETURNING …`.
         returning: Option<Returning>,
@@ -324,6 +404,16 @@ pub enum RelPlan {
     /// `MERGE INTO … USING …` with one or more branches.
     Merge {
         target: TableRef,
+        /// Node id of the target, shared with no other source or target;
+        /// the target's columns are allocated on it.
+        target_node: NodeId,
+        /// The target's columns the statement reads, each allocated on
+        /// `target_node`.
+        target_read_columns: Vec<ColumnId>,
+        /// PostgreSQL `MERGE INTO ONLY parent`: the rows of the table
+        /// alone, none of a table that inherits from it. Span covers
+        /// `ONLY`.
+        only: Option<Span>,
         source: Box<RelPlan>,
         on: ScalarExpr,
         branches: Vec<MergeBranch>,
@@ -331,6 +421,12 @@ pub enum RelPlan {
         with_schema_evolution: bool,
         /// T-SQL `OUTPUT … [INTO …]`.
         output: Option<DmlOutput>,
+        /// PostgreSQL `RETURNING …`.
+        returning: Option<Returning>,
+        /// The columns `returning` reads under a name the branches write:
+        /// each holds what one of the branches writes under it, or the
+        /// stored column where a branch writes none.
+        returned_merges: Vec<ReturnedMerge>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
         node_id: NodeId,
@@ -479,6 +575,9 @@ pub enum RelPlan {
         /// raw declared names without round-tripping through the
         /// `BindingTable`. Mirrors `CteBinding.declared_columns`.
         alias_columns: Vec<IdentKey>,
+        /// The body column each of `columns` is, by position in `columns`;
+        /// `None` where it cannot be known.
+        body_columns: Vec<Option<ColumnId>>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
         node_id: NodeId,
@@ -495,9 +594,9 @@ pub enum RelPlan {
     /// are walked, but the function name is excluded from
     /// `tables_read`).
     ///
-    /// `output_columns` carries the fresh [`ColumnId`]s the outer
-    /// walk's `scan_cols` accumulated against this TVF. True arity
-    /// is catalog-dependent; this keeps whatever names the outer
+    /// `output_columns` carries the [`ColumnId`]s the enclosing block
+    /// reads from this TVF, listed once the statement is lowered. True
+    /// arity is catalog-dependent; this keeps whatever names the outer
     /// scope bound.
     ///
     /// `lateral` records whether `LATERAL` was present. Snowflake
@@ -585,13 +684,20 @@ pub enum RelPlan {
         span: Span,
     },
 
-    /// `CONNECT BY` hierarchical query (Oracle).
+    /// `CONNECT BY` hierarchical query (Oracle), over the rows of its
+    /// block's FROM, below the block's `WHERE`.
     ConnectBy {
         input: Box<RelPlan>,
         start_with: Option<ScalarExpr>,
         connect: ScalarExpr,
         nocycle: bool,
+        /// The input's columns, then `pseudo_columns`.
         output_columns: Vec<ColumnId>,
+        /// The columns the block reads of the values the traversal makes
+        /// for each row (`LEVEL`, `CONNECT_BY_ISLEAF`,
+        /// `CONNECT_BY_ISCYCLE`), in the order first read: numbers, never
+        /// NULL, computed by this node.
+        pseudo_columns: Vec<ColumnId>,
         /// Per-node `/*+ ... */` directives. Default empty.
         hints: Vec<Hint>,
         node_id: NodeId,
@@ -647,6 +753,45 @@ pub enum RelPlan {
 }
 
 impl RelPlan {
+    /// Node id of this plan node: its own `node_id`, or the statement's
+    /// for the variants that carry only `stmt_node_id`.
+    pub fn node_id(&self) -> NodeId {
+        match self {
+            RelPlan::Scan { node_id, .. }
+            | RelPlan::Values { node_id, .. }
+            | RelPlan::CteRef { node_id, .. }
+            | RelPlan::ModelRef { node_id, .. }
+            | RelPlan::Project { node_id, .. }
+            | RelPlan::Filter { node_id, .. }
+            | RelPlan::Aggregate { node_id, .. }
+            | RelPlan::Window { node_id, .. }
+            | RelPlan::Join { node_id, .. }
+            | RelPlan::SetOp { node_id, .. }
+            | RelPlan::Sort { node_id, .. }
+            | RelPlan::Limit { node_id, .. }
+            | RelPlan::Insert { node_id, .. }
+            | RelPlan::Update { node_id, .. }
+            | RelPlan::Delete { node_id, .. }
+            | RelPlan::Merge { node_id, .. }
+            | RelPlan::MultiInsert { node_id, .. }
+            | RelPlan::Explain { node_id, .. }
+            | RelPlan::CreateAsQuery { node_id, .. }
+            | RelPlan::WithScope { node_id, .. }
+            | RelPlan::DerivedTable { node_id, .. }
+            | RelPlan::TableFunction { node_id, .. }
+            | RelPlan::Unnest { node_id, .. }
+            | RelPlan::Pivot { node_id, .. }
+            | RelPlan::Unpivot { node_id, .. }
+            | RelPlan::MatchRecognize { node_id, .. }
+            | RelPlan::ConnectBy { node_id, .. }
+            | RelPlan::TableSample { node_id, .. } => *node_id,
+            RelPlan::CreateTableForm { stmt_node_id, .. }
+            | RelPlan::InvalidInput { stmt_node_id, .. }
+            | RelPlan::ParseRecovery { stmt_node_id, .. }
+            | RelPlan::Opaque { stmt_node_id, .. } => *stmt_node_id,
+        }
+    }
+
     /// Source span of this plan node.
     pub fn span(&self) -> Span {
         match self {
@@ -781,16 +926,11 @@ impl RelPlan {
     /// `TableSample`) — and the single source is a [`RelPlan::Scan`],
     /// return the leaf Scan's `node_id`. Otherwise `None`.
     ///
-    /// Used by the CTE lowerer + finalize pass to redirect alias
-    /// resolution for references through such CTEs onto the leaf
-    /// table directly: the structural meaning of `*` is "every
-    /// column of the source", and when the source is a single Scan
-    /// the demanded ColumnIds can be lazily allocated against the
-    /// Scan's NodeId via the same `scan_cols` mechanism that handles
-    /// regular `FROM <table>` references. Without this redirect,
-    /// star-only-body CTEs would leave `CteBinding.output_columns`
-    /// empty and downstream `cte.col` references would lose lineage
-    /// to the underlying table.
+    /// Such a body lists no visible columns of its own
+    /// ([`Self::cte_visible_output_schema`]): the scan's listed columns
+    /// are the ones the statement read, not the table's width, and a
+    /// column read through a reference to the body is demanded from it
+    /// instead.
     ///
     /// Recursion only descends through `Filter` / `Sort` / `Limit` /
     /// `TableSample` / `Window` (operators that preserve every input
@@ -852,84 +992,165 @@ impl RelPlan {
         }
     }
 
-    /// Combined passthrough-leaf detection: returns the leaf Scan
-    /// `node_id` for either the plain `SELECT *` form
-    /// ([`Self::cte_body_star_passthrough_leaf_scan_node`]) or the
-    /// rename-allowed form
-    /// ([`Self::cte_body_star_rename_passthrough_leaf_scan_node`]).
-    /// Used by the lowerer's CTE registration + finalize pass so the
-    /// alias-redirect machinery applies uniformly to both shapes.
-    pub fn cte_body_passthrough_leaf_scan_node(&self) -> Option<NodeId> {
-        self.cte_body_star_passthrough_leaf_scan_node().or_else(|| {
-            self.cte_body_star_rename_passthrough_leaf_scan_node()
-                .map(|(n, _)| n)
-        })
-    }
-
-    /// Like [`Self::cte_body_star_passthrough_leaf_scan_node`] but
-    /// tolerates `* RENAME (<from> AS <to>, …)`,
-    /// `* REPLACE (<expr> AS <column>, …)`, and
-    /// `* EXCLUDE (<column>, …)` modifiers, returning both the leaf
-    /// Scan's `node_id` and the collected rename pairs. `REPLACE` does
-    /// not affect column *names* — its expressions are walked separately
-    /// by `compute_column_refs` via the Star arm — and `EXCLUDE` only
-    /// narrows the output column set without rewriting any column's
-    /// value, so the leaf-scan alias redirect remains semantically
-    /// valid: downstream references to *non-excluded* columns still
-    /// resolve to the same `ColumnId`s as the body's own filters,
-    /// keeping constraint propagation through the CTE intact (constraint
-    /// drop for the excluded columns is handled by the constraint fold's
-    /// `Project[Star]` arm directly from `s.exclude`).
-    /// `ILIKE` modifiers and qualified-star projections still
-    /// disqualify; same single-source / pure passthrough wrapper rules
-    /// as the plain variant.
-    ///
-    /// Downstream `cte.col` references can route to the leaf Scan via
-    /// the same alias redirect, while the lowerer applies the rename
-    /// pairs at allocate-on-first-use so the demanded name (`user_id`)
-    /// becomes the source name (`id`) on the resulting
-    /// `ColumnOrigin::Table` binding.
-    pub fn cte_body_star_rename_passthrough_leaf_scan_node(
-        &self,
-    ) -> Option<(NodeId, Vec<StarRename>)> {
-        let RelPlan::Project { items, input, .. } = self else {
-            return None;
-        };
-        if items.is_empty() {
-            return None;
-        }
-        let mut renames: Vec<StarRename> = Vec::new();
-        for it in items {
-            let s = match it {
-                ProjectItem::Star(s) => s,
-                ProjectItem::Expr(_) => return None,
-            };
-            if !matches!(s.qualifier, StarQualifier::Unqualified) {
-                return None;
-            }
-            if s.ilike.is_some() {
-                return None;
-            }
-            renames.extend(s.rename.iter().cloned());
-        }
-        let mut cursor: &RelPlan = input.as_ref();
+    /// The `RETURNING` list of the `INSERT`, `UPDATE`, `DELETE` or `MERGE`
+    /// this plan is, under any `WithScope`: the rows a binding over the
+    /// plan hands its references. `None` for any other plan and for a
+    /// statement with no list.
+    pub(crate) fn returned_at_root(&self) -> Option<&Returning> {
+        let mut cursor = self;
         loop {
             match cursor {
-                RelPlan::Scan { node_id, .. } => return Some((*node_id, renames)),
-                RelPlan::Filter { input, .. }
-                | RelPlan::Sort { input, .. }
-                | RelPlan::Limit { input, .. }
-                | RelPlan::TableSample { input, .. }
-                | RelPlan::Window { input, .. } => {
-                    cursor = input.as_ref();
-                }
-                RelPlan::Values { .. }
+                RelPlan::WithScope { body, .. } => cursor = body.as_ref(),
+                RelPlan::Insert { returning, .. }
+                | RelPlan::Update { returning, .. }
+                | RelPlan::Delete { returning, .. }
+                | RelPlan::Merge { returning, .. } => return returning.as_ref(),
+                RelPlan::Scan { .. }
+                | RelPlan::Values { .. }
                 | RelPlan::CteRef { .. }
                 | RelPlan::ModelRef { .. }
                 | RelPlan::Project { .. }
+                | RelPlan::Filter { .. }
                 | RelPlan::Aggregate { .. }
+                | RelPlan::Window { .. }
                 | RelPlan::Join { .. }
                 | RelPlan::SetOp { .. }
+                | RelPlan::Sort { .. }
+                | RelPlan::Limit { .. }
+                | RelPlan::MultiInsert { .. }
+                | RelPlan::Explain { .. }
+                | RelPlan::CreateAsQuery { .. }
+                | RelPlan::CreateTableForm { .. }
+                | RelPlan::DerivedTable { .. }
+                | RelPlan::TableFunction { .. }
+                | RelPlan::Unnest { .. }
+                | RelPlan::Pivot { .. }
+                | RelPlan::Unpivot { .. }
+                | RelPlan::MatchRecognize { .. }
+                | RelPlan::ConnectBy { .. }
+                | RelPlan::TableSample { .. }
+                | RelPlan::InvalidInput { .. }
+                | RelPlan::ParseRecovery { .. }
+                | RelPlan::Opaque { .. } => return None,
+            }
+        }
+    }
+
+    /// The select list that names the columns of the query this plan is,
+    /// under any `WithScope`, `Sort` or `Limit`: its outermost `Project`'s
+    /// items, or those of a set operation's first branch, which name its
+    /// columns by position; and that `Project`'s input. `None` for any
+    /// other plan, and for a set operation that pairs its branches'
+    /// columns by name (`CORRESPONDING`).
+    pub(crate) fn naming_select_at_root(&self) -> Option<(&RelPlan, &[ProjectItem])> {
+        let mut cursor = self;
+        loop {
+            match cursor {
+                RelPlan::WithScope { body, .. } => cursor = body.as_ref(),
+                RelPlan::Sort { input, .. } | RelPlan::Limit { input, .. } => {
+                    cursor = input.as_ref()
+                }
+                RelPlan::SetOp {
+                    inputs,
+                    corresponding: None,
+                    ..
+                } => cursor = inputs.first()?.as_ref(),
+                RelPlan::Project { input, items, .. } => return Some((input.as_ref(), items)),
+                RelPlan::SetOp {
+                    corresponding: Some(_),
+                    ..
+                }
+                | RelPlan::Scan { .. }
+                | RelPlan::Values { .. }
+                | RelPlan::CteRef { .. }
+                | RelPlan::ModelRef { .. }
+                | RelPlan::Filter { .. }
+                | RelPlan::Aggregate { .. }
+                | RelPlan::Window { .. }
+                | RelPlan::Join { .. }
+                | RelPlan::Insert { .. }
+                | RelPlan::Update { .. }
+                | RelPlan::Delete { .. }
+                | RelPlan::Merge { .. }
+                | RelPlan::MultiInsert { .. }
+                | RelPlan::Explain { .. }
+                | RelPlan::CreateAsQuery { .. }
+                | RelPlan::CreateTableForm { .. }
+                | RelPlan::DerivedTable { .. }
+                | RelPlan::TableFunction { .. }
+                | RelPlan::Unnest { .. }
+                | RelPlan::Pivot { .. }
+                | RelPlan::Unpivot { .. }
+                | RelPlan::MatchRecognize { .. }
+                | RelPlan::ConnectBy { .. }
+                | RelPlan::TableSample { .. }
+                | RelPlan::InvalidInput { .. }
+                | RelPlan::ParseRecovery { .. }
+                | RelPlan::Opaque { .. } => return None,
+            }
+        }
+    }
+
+    /// The item with output `column` that a block computes before its
+    /// calls or its `WHERE`, where `self` is the input of the block's
+    /// `Project`: looked for in the block's filters, `Window` and
+    /// `Aggregate`, and in the `WHERE` under the `Aggregate`.
+    pub fn computed_before_calls(&self, column: ColumnId) -> Option<&ComputedItem> {
+        self.computed_before_calls_at(column).map(|(_, item)| item)
+    }
+
+    /// [`Self::computed_before_calls`], with the node that computes it.
+    pub(crate) fn computed_before_calls_at(
+        &self,
+        column: ColumnId,
+    ) -> Option<(&RelPlan, &ComputedItem)> {
+        let mut cursor = self;
+        loop {
+            let node = cursor;
+            let computed = match cursor {
+                RelPlan::Filter {
+                    input, computed, ..
+                }
+                | RelPlan::Window {
+                    input, computed, ..
+                } => {
+                    cursor = input.as_ref();
+                    computed
+                }
+                // Below an `Aggregate` only the block's `WHERE` computes
+                // any.
+                RelPlan::Aggregate {
+                    input, computed, ..
+                } => {
+                    let mut found = computed
+                        .iter()
+                        .find(|item| item.output == column)
+                        .map(|item| (node, item));
+                    let mut below = input.as_ref();
+                    while let (
+                        None,
+                        RelPlan::Filter {
+                            input, computed, ..
+                        },
+                    ) = (found, below)
+                    {
+                        found = computed
+                            .iter()
+                            .find(|item| item.output == column)
+                            .map(|item| (below, item));
+                        below = input.as_ref();
+                    }
+                    return found;
+                }
+                RelPlan::Scan { .. }
+                | RelPlan::Values { .. }
+                | RelPlan::CteRef { .. }
+                | RelPlan::ModelRef { .. }
+                | RelPlan::Project { .. }
+                | RelPlan::Join { .. }
+                | RelPlan::SetOp { .. }
+                | RelPlan::Sort { .. }
+                | RelPlan::Limit { .. }
                 | RelPlan::Insert { .. }
                 | RelPlan::Update { .. }
                 | RelPlan::Delete { .. }
@@ -946,9 +1167,13 @@ impl RelPlan {
                 | RelPlan::Unpivot { .. }
                 | RelPlan::MatchRecognize { .. }
                 | RelPlan::ConnectBy { .. }
+                | RelPlan::TableSample { .. }
                 | RelPlan::InvalidInput { .. }
                 | RelPlan::ParseRecovery { .. }
                 | RelPlan::Opaque { .. } => return None,
+            };
+            if let Some(item) = computed.iter().find(|item| item.output == column) {
+                return Some((node, item));
             }
         }
     }
@@ -960,7 +1185,7 @@ impl RelPlan {
 
 /// Which clause produced a `RelPlan::Filter`. All three share the
 /// same relational shape (a predicate over a sub-plan) but are
-/// exposed as distinct flags to analyses / signal rules. `HAVING`
+/// exposed as distinct flags to analyses / rules. `HAVING`
 /// remains folded into `RelPlan::Aggregate.having` for predicates
 /// whose column refs all resolve through the Aggregate's output
 /// schema; the `Having` variant is reserved for HAVING predicates
@@ -1004,6 +1229,18 @@ impl ProjectItem {
     }
 }
 
+/// A column a `Window` or an `Aggregate` computes before its calls: the
+/// expression of a select item one of those calls reads through its
+/// alias, where the expression holds a nested plan or a call to a
+/// volatile function, or reads another such column, and so is in the
+/// plan once. The select item is a bare read of `output`. A `Filter`
+/// computes one before its predicate reads it.
+#[derive(Debug, Clone)]
+pub struct ComputedItem {
+    pub output: ColumnId,
+    pub expr: ScalarExpr,
+}
+
 /// A single computed output column `<expr> [AS <alias>]`.
 #[derive(Debug, Clone)]
 pub struct ProjectExpr {
@@ -1012,6 +1249,41 @@ pub struct ProjectExpr {
     pub expr: ScalarExpr,
     pub alias: Option<IdentKey>,
     pub span: Span,
+}
+
+impl ProjectExpr {
+    /// The expression the query wrote for the item, where the item's own
+    /// is a bare read of what its block computes before its calls: that
+    /// [`ComputedItem`]'s expression, and the item's own otherwise.
+    /// `input` is the input of the item's `Project`.
+    pub fn as_written<'p>(&'p self, input: &'p RelPlan) -> &'p ScalarExpr {
+        match &self.expr {
+            ScalarExpr::Column { column, .. } => input
+                .computed_before_calls(*column)
+                .map_or(&self.expr, |item| &item.expr),
+            ScalarExpr::OuterRef { .. }
+            | ScalarExpr::PatternVarRef { .. }
+            | ScalarExpr::Lit { .. }
+            | ScalarExpr::Opaque { .. }
+            | ScalarExpr::BinOp { .. }
+            | ScalarExpr::LogicalChain { .. }
+            | ScalarExpr::OperatorChain { .. }
+            | ScalarExpr::UnaryOp { .. }
+            | ScalarExpr::FuncCall { .. }
+            | ScalarExpr::Case { .. }
+            | ScalarExpr::Cast { .. }
+            | ScalarExpr::InList { .. }
+            | ScalarExpr::Between { .. }
+            | ScalarExpr::Like { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::ScalarSubquery { .. }
+            | ScalarExpr::QuantifiedCmp { .. }
+            | ScalarExpr::RowCmp { .. }
+            | ScalarExpr::WindowFn { .. }
+            | ScalarExpr::FieldAccess { .. }
+            | ScalarExpr::Lambda { .. } => &self.expr,
+        }
+    }
 }
 
 /// A star projection with Snowflake / BigQuery-style modifiers.
@@ -1043,6 +1315,36 @@ pub struct ProjectStar {
     /// star in a mixed projection list (`SELECT a, t.*, b`).
     /// `star_projections` is populated only for the pure case.
     pub top_level_pure: bool,
+    /// The sources every column of which the star's expansion considered,
+    /// in the order considered, each once: each column became an item
+    /// unless a modifier of the star left it out. Never an open source: an
+    /// uncatalogued scan, a reference with an unexpanded star at its
+    /// body's root, a table function with no declared outputs. A
+    /// reference whose body lists items beside an unexpanded star has
+    /// its listed columns produced as items and is still absent here, as
+    /// is a table whose catalog names some of its columns without
+    /// listing them all.
+    /// Nor a recursive binding's reference to itself: a star over it in
+    /// the step is unexpanded, and the body is open.
+    pub enumerated: Vec<NodeId>,
+    /// The columns the star's expansion produced an item for that no
+    /// source of `enumerated` lists: what a `PIVOT`, `UNPIVOT` or
+    /// `MATCH_RECOGNIZE` over a FROM item defines, and what it lists of
+    /// an open source under it. A wrapper carries the node id of the
+    /// source it wraps, so its columns are recorded one by one.
+    pub itemized: Vec<ColumnId>,
+    /// Whether the items the star's expansion produced are every column
+    /// the star yields, in the star's order: it enumerated each source
+    /// it ranges over, and the plan knows the order of what a join of
+    /// them merges.
+    pub complete: bool,
+    /// How many of the items directly before the star its expansion
+    /// produced at positions the plan does not know. None for a
+    /// complete star. Otherwise every item it produced, less the leading
+    /// ones: the columns of its first sources, in FROM order, for as
+    /// long as each lists every column, then the first columns of the
+    /// next source as far as that source places them.
+    pub unplaced: usize,
     pub span: Span,
 }
 
@@ -1226,6 +1528,15 @@ impl PivotValues {
     }
 }
 
+/// One column of a `USING` clause: the column the join exposes and the
+/// column of each side it merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsingColumn {
+    pub merged: ColumnId,
+    pub left: ColumnId,
+    pub right: ColumnId,
+}
+
 /// One source-column group in an `UNPIVOT`.
 ///
 /// Snowflake permits tuple forms like
@@ -1297,8 +1608,8 @@ pub struct ResolvedModel {
         Option<std::collections::HashMap<IdentKey, Vec<crate::context::node_metadata::ColumnRef>>>,
     /// Whether the upstream model's body had any filter
     /// (WHERE / QUALIFY / HAVING / transitively filtered source).
-    /// Used by the IR's `has_any_filter` query at `ModelRef`
-    /// boundaries.
+    /// A `ModelRef` of a model that has one reads only the rows that
+    /// passed it.
     pub has_filter: bool,
     pub node_id: NodeId,
 }
@@ -1377,11 +1688,69 @@ pub enum GroupingSpec {
     Cube(Vec<GroupKey>),
     /// `GROUP BY ROLLUP(a, b)`.
     Rollup(Vec<GroupKey>),
-    /// `GROUP BY GROUPING SETS ((a), (a, b), ())`.
-    GroupingSets(Vec<Vec<GroupKey>>),
+    /// `GROUP BY GROUPING SETS ((a), (a, b), ())`, and a grouping whose
+    /// sets are written out: a grouping-element list
+    /// (`GROUP BY a, ROLLUP(b)`), and a `ROLLUP` or `CUBE` that names one
+    /// select item twice or beside an alias of it.
+    GroupingSets(GroupingSets),
     /// Snowflake / BigQuery `GROUP BY ALL`. Resolution of the key list
     /// happens during lowering — the resolved keys are stored here.
-    All(Vec<GroupKey>),
+    All {
+        keys: Vec<GroupKey>,
+        /// Whether `keys` is every key the clause groups by. False where
+        /// a star of the select list does not list all of its columns:
+        /// the ones it leaves out are keys the plan does not hold.
+        complete: bool,
+    },
+}
+
+/// The key columns of a grouping by sets, and the sets. A key column
+/// holds its key's value in the rows of the sets that group by it and
+/// NULL in the rows of the others.
+#[derive(Debug, Clone, Default)]
+pub struct GroupingSets {
+    /// Each distinct key, once. Two keys are one where they have one
+    /// output.
+    pub keys: Vec<GroupKey>,
+    /// Key columns over the expression of a key of `keys`.
+    pub repeats: Vec<RepeatedGroupKey>,
+    /// Each grouping set. Where the clause denotes more sets than are
+    /// written out, two stand for them: one of every key column, and one
+    /// of the key columns every set has.
+    pub sets: Vec<GroupingSet>,
+}
+
+impl GroupingSets {
+    /// Every key column: its output, and the key whose expression it
+    /// holds.
+    pub fn columns(&self) -> impl Iterator<Item = (ColumnId, &GroupKey)> + '_ {
+        let keys = self.keys.iter().map(|key| (key.output, key));
+        let repeats = self
+            .repeats
+            .iter()
+            .filter_map(|repeat| Some((repeat.output, self.keys.get(repeat.key)?)));
+        keys.chain(repeats)
+    }
+}
+
+/// A second key column over one key's expression: a select-list alias of
+/// a keyed item, grouped on its own beside the item.
+#[derive(Debug, Clone)]
+pub struct RepeatedGroupKey {
+    /// Index in [`GroupingSets::keys`] of the key whose expression this
+    /// column holds.
+    pub key: usize,
+    pub output: ColumnId,
+    pub span: Span,
+}
+
+/// One grouping set: the key columns it groups by, each at most once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupingSet {
+    /// Indices into [`GroupingSets::keys`].
+    pub keys: Vec<usize>,
+    /// Indices into [`GroupingSets::repeats`].
+    pub repeats: Vec<usize>,
 }
 
 /// One grouping key.
@@ -1394,6 +1763,14 @@ pub struct GroupKey {
     /// aggregate's output.
     pub output: ColumnId,
     pub span: Span,
+    /// What the query wrote at each read of `output` above the aggregate
+    /// that it wrote as `expr`, in the order lowered: that occurrence,
+    /// which is the same expression as `expr` with the spans of where it
+    /// stands. Its span is the read's. A read by a select alias, and the
+    /// select item that gave the key its expression, have none. No walk
+    /// of the plan visits these: they say how a read was written, and
+    /// the read is of `output`.
+    pub written_again: Vec<ScalarExpr>,
 }
 
 /// One aggregate call in an `Aggregate` node.
@@ -1690,8 +2067,17 @@ pub struct CteBinding {
     pub declared_columns: Option<Vec<IdentKey>>,
     pub body: CteBody,
     pub output_columns: Vec<ColumnId>,
+    /// The body column each slot is, by slot; `None` where it cannot be known.
+    pub slot_columns: Vec<Option<ColumnId>>,
     pub node_id: NodeId,
     pub span: Span,
+}
+
+/// A column read through a reference whose body exposes it by star.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemandedColumn {
+    pub slot: u32,
+    pub column: ColumnId,
 }
 
 /// CTE body: recursive CTEs split anchor/step.
@@ -1733,25 +2119,75 @@ pub enum MergeAction {
         target_columns: Vec<ColumnId>,
         values: Vec<ScalarExpr>,
     },
-    /// Snowflake / Databricks `INSERT *` — copy every source column
-    /// into the target by position. No explicit column list or values.
-    InsertStar,
-    /// Snowflake / Databricks `INSERT ALL BY NAME` — match source and
-    /// target columns by name rather than position.
-    InsertAllByName,
+    /// Databricks `INSERT *` — insert every column of the target from
+    /// the source's column of the same name. No explicit column list or
+    /// values. `columns` holds one entry per column the catalog declares
+    /// for the target; empty where the catalog does not resolve it.
+    InsertStar {
+        columns: Vec<MergeStarColumn>,
+    },
+    /// Snowflake `INSERT ALL BY NAME` — match source and target columns
+    /// by name. `columns` is as for [`MergeAction::InsertStar`].
+    InsertAllByName {
+        columns: Vec<MergeStarColumn>,
+    },
     /// `UPDATE SET c1 = e1, c2 = e2, …` — explicit assignments.
     Update {
-        assignments: Vec<(ColumnId, ScalarExpr)>,
+        assignments: Vec<Assignment>,
     },
-    /// Snowflake `UPDATE SET *` — copy every source column onto the
-    /// matching target column by position.
-    UpdateSetStar,
-    /// Snowflake / Databricks `UPDATE ALL BY NAME` — match and update
-    /// by name.
-    UpdateAllByName,
+    /// Databricks `UPDATE SET *` — set every column of the target from
+    /// the source's column of the same name. `columns` is as for
+    /// [`MergeAction::InsertStar`].
+    UpdateSetStar {
+        columns: Vec<MergeStarColumn>,
+    },
+    /// Snowflake `UPDATE ALL BY NAME` — match and update by name.
+    /// `columns` is as for [`MergeAction::InsertStar`].
+    UpdateAllByName {
+        columns: Vec<MergeStarColumn>,
+    },
     Delete,
     /// `DO NOTHING` / BigQuery `WHEN NOT MATCHED THEN DO NOTHING`.
     DoNothing,
+}
+
+/// One target column a MERGE action over every target column writes.
+#[derive(Debug, Clone)]
+pub struct MergeStarColumn {
+    /// The column written: defined by the `Merge` node and named for
+    /// the target column.
+    pub written: ColumnId,
+    /// The source's column of the target column's name; `None` where
+    /// the source is not known to have one.
+    pub source: Option<ColumnId>,
+}
+
+/// One assignment of an `UPDATE`, of a `MERGE`'s update action or of an
+/// upsert's update action.
+#[derive(Debug, Clone)]
+pub struct Assignment {
+    /// The node of the source whose row the assignment writes: the
+    /// statement's target, or a table an `UPDATE` lists before `SET`.
+    pub written_node: NodeId,
+    /// The columns written, in the order the assignment names them; each
+    /// defined by the statement's node.
+    pub columns: Vec<ColumnId>,
+    pub value: AssignedValue,
+}
+
+/// What an assignment's columns take: column `i` takes position `i`.
+#[derive(Debug, Clone)]
+pub enum AssignedValue {
+    /// One expression per position: `SET c = e`, `SET (a, b) = (e1, e2)`,
+    /// `SET (a, b) = ROW(e1, e2)`. A column past the end takes nothing.
+    Row(Vec<ScalarExpr>),
+    /// The one row a query yields, by its `positional_columns()`:
+    /// `SET (a, b) = (SELECT x, y …)`.
+    Query {
+        subquery: Box<RelPlan>,
+        correlates_with: Vec<ColumnId>,
+        span: Span,
+    },
 }
 
 // ── MATCH_RECOGNIZE typed body ──────────────────────────────────
@@ -2019,6 +2455,15 @@ pub enum OverridingValue {
     User,
 }
 
+/// What an `INSERT OVERWRITE` replaces (Snowflake, Databricks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverwriteScope {
+    /// Every row of the target.
+    Table,
+    /// The rows of the partitions its `PARTITION (…)` clause names.
+    Partitions,
+}
+
 /// PostgreSQL `ON CONFLICT` (aka "upsert") — typed, not a string blob.
 #[derive(Debug, Clone)]
 pub struct OnConflict {
@@ -2051,19 +2496,27 @@ pub enum ConflictTarget {
 pub enum ConflictAction {
     /// `ON CONFLICT … DO NOTHING`.
     DoNothing,
-    /// `ON CONFLICT … DO UPDATE SET …`. `assignments` may reference
-    /// `EXCLUDED.*` columns via [`ScalarExpr::Column`] whose binding
-    /// points into the `excluded` pseudo-table allocated during lowering.
+    /// `ON CONFLICT … DO UPDATE SET …`. `EXCLUDED.c` in `assignments`
+    /// and `where_clause` reads the column the INSERT writes under `c`,
+    /// else the target's.
     DoUpdate {
-        assignments: Vec<(ColumnId, ScalarExpr)>,
+        assignments: Vec<Assignment>,
         where_clause: Option<ScalarExpr>,
     },
     /// MySQL `ON DUPLICATE KEY UPDATE` — semantically equivalent to
     /// `DoUpdate` with `Unspecified` target, kept distinct so the
     /// renderer can round-trip.
-    MySqlDuplicateKeyUpdate {
-        assignments: Vec<(ColumnId, ScalarExpr)>,
-    },
+    MySqlDuplicateKeyUpdate { assignments: Vec<Assignment> },
+}
+
+/// A column a `RETURNING` list reads that holds, per row, the value of
+/// one of several columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnedMerge {
+    /// The column the list reads.
+    pub column: ColumnId,
+    /// The columns it is one of.
+    pub alternatives: Vec<ColumnId>,
 }
 
 /// PostgreSQL `RETURNING …` clause. Applies to INSERT/UPDATE/DELETE.
@@ -2073,11 +2526,68 @@ pub struct Returning {
     pub span: Span,
 }
 
+impl Returning {
+    /// The column of each item that has one, in the list's order.
+    pub(crate) fn columns(&self) -> Vec<ColumnId> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                ReturningItem::Expr { output, .. } => *output,
+                ReturningItem::Star(_) => None,
+            })
+            .collect()
+    }
+}
+
+/// A star in a `RETURNING` list.
+#[derive(Debug, Clone)]
+pub struct ReturnedStar {
+    /// What the star ranges over.
+    pub range: ReturnedStarRange,
+    /// `* EXCLUDE (…)` / `* EXCEPT (…)`: the columns the star leaves out.
+    pub exclude: Vec<StarExclude>,
+    /// `* REPLACE (<expr> AS <col>)`: the names whose column is the
+    /// expression. An item made for the star holds each expression.
+    pub replaced: Vec<IdentKey>,
+    /// `* RENAME (<from> AS <to>)`: the columns the star yields under
+    /// another name.
+    pub rename: Vec<StarRename>,
+    /// Whether the items made for the star hold every column it yields,
+    /// in its order.
+    pub complete: bool,
+    /// How many of the items directly before the star, made for it, are
+    /// at no position the plan knows. For a star that is not complete,
+    /// its columns at positions the plan does not know. For a complete
+    /// one, what is none of its columns: a name read through it that
+    /// it does not list, a `REPLACE` of a name it does not list.
+    pub unplaced: usize,
+    pub span: Span,
+}
+
+/// What a star in a `RETURNING` list ranges over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnedStarRange {
+    /// `*`: the returned row, then the columns of each other source of
+    /// the statement, in the order written.
+    Statement,
+    /// The target's name or alias: the returned row.
+    Row,
+    /// `old.*`: the row as stored before the statement.
+    Stored,
+    /// `new.*`: the row the statement leaves.
+    Written,
+    /// A source's alias: that source's columns.
+    Source(NodeId),
+    /// A qualifier that names nothing the list reads, or `expr.*`.
+    Unresolved,
+}
+
 /// One item in a `RETURNING` / `OUTPUT` list.
 #[derive(Debug, Clone)]
 pub enum ReturningItem {
-    /// `RETURNING *`.
-    Star,
+    /// A star, bare or qualified. It has no column of its own: its
+    /// columns are the `Expr` items made for it, directly before it.
+    Star(ReturnedStar),
     /// A scalar expression with optional alias and synthesized output id.
     Expr {
         expr: ScalarExpr,
@@ -2100,10 +2610,8 @@ pub struct DmlOutput {
     pub span: Span,
 }
 
-/// T-SQL `UPDATE TOP (n) [PERCENT]` / `DELETE TOP (n) [PERCENT]` — bounds
-/// the number of rows touched. Only `TOP` is modeled here because PG
-/// `LIMIT` / ANSI `FETCH FIRST` are not legal on DML statements across
-/// the supported dialects.
+/// The cap on the rows an `UPDATE` or a `DELETE` writes: T-SQL `TOP (n)
+/// [PERCENT]`, MySQL's single-table `LIMIT n` (never a percentage).
 #[derive(Debug, Clone)]
 pub struct DmlTop {
     pub count: ScalarExpr,
@@ -2126,15 +2634,20 @@ pub enum MultiInsertMode {
 }
 
 /// One `INTO table [(cols)] VALUES (…)` clause inside an
-/// [`RelPlan::MultiInsert`]. The `values` list is populated when the
-/// clause is `INTO t VALUES (…)`; omitted (empty) when the clause is
-/// `INTO t (cols)` and the positional columns come from the trailing
-/// sub-query.
+/// [`RelPlan::MultiInsert`]. `values` holds the rows the clause writes;
+/// it is empty when the clause is `INTO t (cols)` and the positional
+/// columns come from the trailing sub-query.
 #[derive(Debug, Clone)]
 pub struct MultiInsertTarget {
     pub target: TableRef,
+    /// Node id of the target, shared with no other source or target.
+    pub target_node: NodeId,
     pub target_columns: Vec<ColumnId>,
-    pub values: Vec<ScalarExpr>,
+    /// The target's columns the statement reads, each allocated on
+    /// `target_node`.
+    pub target_read_columns: Vec<ColumnId>,
+    /// The rows `VALUES` writes, each in the order of `target_columns`.
+    pub values: Vec<Vec<ScalarExpr>>,
     pub span: Span,
 }
 

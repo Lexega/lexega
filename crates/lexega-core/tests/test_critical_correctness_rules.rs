@@ -18,17 +18,34 @@ fn analyze_sql(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 
 fn rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> HashSet<String> {
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
+        })
+        .collect()
+}
+
+fn context_rule_ids(report: &lexega_core::analyzer::AnalysisReport) -> HashSet<String> {
+    report
+        .context
+        .iter()
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == rule_id))
+}
+
+fn has_context_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report
+        .context
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == rule_id))
 }
@@ -62,7 +79,7 @@ fn test_snw_extacc_hosts_chg_external_access_allowed_hosts_changed() {
 #[test]
 fn test_c167_authentication_policy_disabled() {
     // UNSET AUTHENTICATION_METHODS emits Modified (SNW-AUTHPOL-CHG) and MethodsChanged (SNW-AUTHPOL-METHODS-CHG),
-    // not Disabled (SNW-AUTHPOL-OFF). SNW-AUTHPOL-OFF would require a "disabled" condition signal.
+    // not Disabled (SNW-AUTHPOL-OFF). SNW-AUTHPOL-OFF would require a "disabled" condition finding.
     let sql = "ALTER AUTHENTICATION POLICY my_auth_policy UNSET AUTHENTICATION_METHODS;";
     let report = analyze_sql(sql);
     let ids = rule_ids(&report);
@@ -72,9 +89,9 @@ fn test_c167_authentication_policy_disabled() {
         ids
     );
     assert!(
-        has_rule(&report, "SNW-AUTHPOL-CHG"),
+        has_context_rule(&report, "SNW-AUTHPOL-CHG"),
         "Expected SNW-AUTHPOL-CHG (Modified). Got: {:?}",
-        ids
+        context_rule_ids(&report)
     );
 }
 
@@ -99,6 +116,43 @@ fn test_snw_authpol_mfa_off() {
         "Expected SNW-AUTHPOL-MFA-OFF. Got: {:?}",
         rule_ids(&report)
     );
+}
+
+#[test]
+fn test_snw_authpol_mfa_off_only_where_password_is_allowed() {
+    let critical = lexega_core::analyzer::RiskLevel::Critical;
+    for sql in [
+        // Password allowed (listed, `ALL`, or no list: the default is every method).
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('PASSWORD');",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('SAML', 'PASSWORD');",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('ALL');",
+        "CREATE AUTHENTICATION POLICY p CLIENT_TYPES = ('DRIVERS');",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('PASSWORD') MFA_ENROLLMENT = OPTIONAL;",
+    ] {
+        let report = analyze_sql(sql);
+        assert!(
+            has_rule_at(&report, "SNW-AUTHPOL-MFA-OFF", critical),
+            "SNW-AUTHPOL-MFA-OFF should fire at Critical on `{sql}`. Got: {:?}",
+            rule_ids(&report)
+        );
+    }
+    for sql in [
+        // No password login to protect.
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('KEYPAIR');",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('OAUTH');",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('KEYPAIR', 'OAUTH', 'SAML');",
+        // MFA required for password logins.
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('PASSWORD') MFA_ENROLLMENT = REQUIRED;",
+        "CREATE AUTHENTICATION POLICY p AUTHENTICATION_METHODS = ('PASSWORD') MFA_ENROLLMENT = REQUIRED_PASSWORD_ONLY;",
+        "CREATE AUTHENTICATION POLICY p MFA_ENROLLMENT = REQUIRED;",
+    ] {
+        let report = analyze_sql(sql);
+        assert!(
+            !has_rule(&report, "SNW-AUTHPOL-MFA-OFF"),
+            "SNW-AUTHPOL-MFA-OFF must not fire on `{sql}`. Got: {:?}",
+            rule_ids(&report)
+        );
+    }
 }
 
 #[test]
@@ -194,11 +248,18 @@ fn test_dynsql_literal_only_is_silent() {
 
 #[test]
 fn test_dynsql_with_variable() {
+    // EXECUTE IMMEDIATE binds through USING: an unbound variable is
+    // DYNSQL-NO-PARAM's, and DYNSQL does not report it again.
     let sql = "EXECUTE IMMEDIATE :my_sql_var;";
     let report = analyze_sql(sql);
     assert!(
-        has_rule(&report, "DYNSQL"),
-        "Expected DYNSQL for variable-based dynamic SQL. Got: {:?}",
+        !has_rule(&report, "DYNSQL"),
+        "DYNSQL leaves an unbound EXECUTE IMMEDIATE to DYNSQL-NO-PARAM. Got: {:?}",
+        rule_ids(&report)
+    );
+    assert!(
+        has_rule(&report, "DYNSQL-NO-PARAM"),
+        "Expected DYNSQL-NO-PARAM for variable-based dynamic SQL. Got: {:?}",
         rule_ids(&report)
     );
 }
@@ -215,6 +276,89 @@ fn test_c_proj_enforce_off() {
         "Expected SNW-PROJPOL-ENFORCE-OFF. Got: {:?}",
         rule_ids(&report)
     );
+}
+
+fn has_rule_at(
+    report: &lexega_core::analyzer::AnalysisReport,
+    rule_id: &str,
+    level: lexega_core::analyzer::RiskLevel,
+) -> bool {
+    report
+        .findings
+        .iter()
+        .any(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == rule_id && a.risk_level == level))
+}
+
+#[test]
+fn test_c_proj_enforce_off_when_projection_is_allowed_everywhere() {
+    for sql in [
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> PROJECTION_CONSTRAINT(ALLOW => TRUE);",
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> PROJECTION_CONSTRAINT(ENFORCEMENT => 'NONE');",
+        "ALTER PROJECTION POLICY p SET BODY -> PROJECTION_CONSTRAINT(ALLOW => TRUE);",
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> CASE WHEN current_role() = 'ADMIN' THEN PROJECTION_CONSTRAINT(ALLOW => TRUE) ELSE PROJECTION_CONSTRAINT(ALLOW => TRUE) END;",
+    ] {
+        let report = analyze_sql(sql);
+        assert!(
+            has_rule_at(
+                &report,
+                "SNW-PROJPOL-ENFORCE-OFF",
+                lexega_core::analyzer::RiskLevel::Critical
+            ),
+            "SNW-PROJPOL-ENFORCE-OFF should fire at Critical on `{sql}`. Got: {:?}",
+            rule_ids(&report)
+        );
+    }
+}
+
+#[test]
+fn test_c_proj_enforce_off_reads_the_default_path() {
+    let case_default_allows = "CASE WHEN CURRENT_ROLE() = 'ANALYST' THEN PROJECTION_CONSTRAINT(ALLOW => FALSE) ELSE PROJECTION_CONSTRAINT(ALLOW => TRUE) END";
+    let case_no_else =
+        "CASE WHEN CURRENT_ROLE() = 'ANALYST' THEN PROJECTION_CONSTRAINT(ALLOW => FALSE) END";
+    let case_exempt_role = "CASE WHEN CURRENT_ROLE() = 'ADMIN' THEN PROJECTION_CONSTRAINT(ALLOW => TRUE) ELSE PROJECTION_CONSTRAINT(ALLOW => FALSE) END";
+    let sqls = |body: &str| {
+        [
+            format!("CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> {body};"),
+            format!("ALTER PROJECTION POLICY p SET BODY -> {body};"),
+        ]
+    };
+    for body in [case_default_allows, case_no_else] {
+        for sql in sqls(body) {
+            let report = analyze_sql(&sql);
+            assert!(
+                has_rule(&report, "SNW-PROJPOL-ENFORCE-OFF"),
+                "SNW-PROJPOL-ENFORCE-OFF should fire on `{sql}`. Got: {:?}",
+                rule_ids(&report)
+            );
+        }
+    }
+    for sql in sqls(case_exempt_role) {
+        let report = analyze_sql(&sql);
+        assert!(
+            !has_rule(&report, "SNW-PROJPOL-ENFORCE-OFF"),
+            "SNW-PROJPOL-ENFORCE-OFF must not fire on `{sql}`. Got: {:?}",
+            rule_ids(&report)
+        );
+    }
+}
+
+#[test]
+fn test_c_proj_enforce_off_silent_where_something_is_blocked() {
+    for sql in [
+        // NULLIFY returns NULL in place of the data.
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> PROJECTION_CONSTRAINT(ALLOW => FALSE, ENFORCEMENT => 'NULLIFY');",
+        "ALTER PROJECTION POLICY p SET BODY -> PROJECTION_CONSTRAINT(ALLOW => FALSE, ENFORCEMENT => 'NULLIFY');",
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> PROJECTION_CONSTRAINT(ALLOW => FALSE, ENFORCEMENT => 'FAIL');",
+        // One authorised role may project; everyone else is blocked.
+        "CREATE PROJECTION POLICY p AS () RETURNS PROJECTION_CONSTRAINT -> CASE WHEN current_role() = 'ADMIN' THEN PROJECTION_CONSTRAINT(ALLOW => TRUE) ELSE PROJECTION_CONSTRAINT(ALLOW => FALSE) END;",
+    ] {
+        let report = analyze_sql(sql);
+        assert!(
+            !has_rule(&report, "SNW-PROJPOL-ENFORCE-OFF"),
+            "SNW-PROJPOL-ENFORCE-OFF must not fire on `{sql}`. Got: {:?}",
+            rule_ids(&report)
+        );
+    }
 }
 
 #[test]
@@ -264,9 +408,9 @@ fn test_snw_authpol_chg() {
     let sql = "ALTER AUTHENTICATION POLICY my_auth_policy RENAME TO new_auth_policy;";
     let report = analyze_sql(sql);
     assert!(
-        has_rule(&report, "SNW-AUTHPOL-CHG"),
+        has_context_rule(&report, "SNW-AUTHPOL-CHG"),
         "Expected SNW-AUTHPOL-CHG (Authentication Policy Modified). Got: {:?}",
-        rule_ids(&report)
+        context_rule_ids(&report)
     );
 }
 

@@ -3,18 +3,21 @@
 
 //! The single fact-extraction entry point.
 
+use super::identity::TextOrigin;
 use std::error::Error;
 use std::fmt;
 
 use crate::ast::{
-    AstExpr, AstFunctionArg, AstLiteral, AstObjectKind, AstPluralObjectKind, AstPrivilegeKind,
-    BinaryOperator, LogicalChainOperator,
+    AstExpr, AstFunctionArg, AstIsPredicate, AstLiteral, AstObjectKind, AstPluralObjectKind,
+    AstPrivilegeKind, BinaryOperator, LogicalChainOperator,
 };
+use crate::ir::normalize::NameKind;
 use crate::ir::policy_attachment_plan::{
     PolicyAttachmentPlan, PolicyAttachmentPrincipal as IrPolicyAttachmentPrincipal,
     PolicyAttachmentTarget as IrPolicyAttachmentTarget,
     PolicyAttachmentVerb as IrPolicyAttachmentVerb,
 };
+use crate::ir::span_extract::{literal_value_or_name, literal_value_or_text, string_literal_value};
 use crate::ir::{
     AccountPlan, AccountProvisioningAction, AggregationPolicyShape, AlertAction, AlertPlan,
     ApiIntegrationShape, ApplicationAction, ApplicationAlterActionIr, ApplicationPackagePlan,
@@ -96,8 +99,8 @@ use super::ddl::{
     TableRenamePair, TagFacts, TaskAlterAction, TaskAlterActionKind, TaskBodyFacts,
     TaskBodyParseStatus, TaskCreateOptions, TaskExecuteAsClause, TaskFacts, TaskOverlapPolicy,
     TriggerEvent as TriggerEventFacts, TriggerTiming as TriggerTimingFacts, UserMappingFacts,
-    UserMappingOption, VacuumOptions, ViewCheckOption, ViewFacts, ViewSqlSecurity,
-    VolumeAlterAction, VolumeFacts, WarehouseFacts,
+    UserMappingOption, VacuumOptions, ViewAlterActionKind, ViewCheckOption, ViewFacts,
+    ViewSqlSecurity, VolumeAlterAction, VolumeFacts, WarehouseFacts,
 };
 use super::handler::{
     HandlerBody, HandlerBodyStatementKind, HandlerCondition, HandlerFacts, HandlerType,
@@ -130,6 +133,10 @@ use super::use_stmt::{UseFacts, UseStatementKind, UseTargetFacts};
 pub struct CatalogCtx<'a> {
     /// Catalog index for tag / row-count / column-count lookups.
     pub catalog: Option<&'a crate::ir::IndexedCatalogContext>,
+    /// What lowering learned of the tables the statement reads, from the
+    /// catalog where one is attached and from the relations the script's
+    /// statements made: what reasoning reads. `catalog` where `None`.
+    pub known: Option<&'a crate::ir::IndexedCatalogContext>,
     /// Function catalog for temporal / deterministic / aggregate flags.
     pub function_catalog: &'a crate::ir::FunctionCatalog,
     /// Source text for span resolution.
@@ -148,6 +155,16 @@ pub struct CatalogCtx<'a> {
     pub scan_index: Option<&'a crate::ir::expression_fact::ScanIndex>,
     /// Semantic analyses the projection consults.
     pub reasoning: &'a dyn super::reasoning::Reasoning,
+    /// The placeholder spans `source` was parsed with: where a render or a
+    /// substitution wrote text for a value it could not resolve. A
+    /// credential value overlapping one is no literal. Empty for text
+    /// parsed without any.
+    pub placeholders: &'a [Span],
+    /// Whether to state the columns of the relation the statement returns
+    /// or makes ([`super::query::QueryFacts::output_columns`]), which
+    /// comparing two versions of a statement reads. Off elsewhere: the
+    /// analyses they need are not run for nothing.
+    pub output_columns: bool,
 }
 
 /// Typed error for fact-extraction failures.
@@ -244,7 +261,32 @@ pub(crate) fn derive_facts_from_show_plan(plan: &crate::ir::DdlPlan) -> Option<S
         .map(|kind| minimal_ddl_statement(kind, plan))
 }
 
-pub fn minimal_ddl_statement(kind: StatementKind, plan: &crate::ir::DdlPlan) -> StatementFacts {
+/// Project a T-SQL trigger's definition plan to public [`StatementFacts`]:
+/// kind `create_trigger` or `alter_trigger` with `ddl.action`, the trigger
+/// as `ddl.target`, `or_alter` for `CREATE OR ALTER` (published as a
+/// creation as a procedure's is), and its `body` as `ddl.trigger_body`.
+pub(crate) fn derive_facts_from_mssql_trigger_plan(
+    plan: &crate::ir::DdlPlan,
+    or_alter: bool,
+    body: Option<&ProcedureBodyShape>,
+) -> Option<StatementFacts> {
+    let kind = plan.statement_kind()?;
+    let mut facts = minimal_ddl_statement(kind, plan);
+    if let Some(ddl) = facts.ddl.as_mut() {
+        ddl.object_kind = ObjectKind::Trigger;
+        if let Some(target) = ddl.target.as_mut() {
+            target.kind = ObjectKind::Trigger;
+        }
+        ddl.options.or_alter = or_alter;
+        ddl.trigger_body = body.map(project_procedure_body);
+    }
+    Some(facts)
+}
+
+pub(crate) fn minimal_ddl_statement(
+    kind: StatementKind,
+    plan: &crate::ir::DdlPlan,
+) -> StatementFacts {
     // Generic DDL statements without a richer dedicated facts projection still
     // surface their recognition options (OR REPLACE, IF [NOT] EXISTS,
     // CASCADE / RESTRICT) so rules can predicate on them — e.g.
@@ -374,6 +416,7 @@ pub fn minimal_ddl_statement(kind: StatementKind, plan: &crate::ir::DdlPlan) -> 
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -926,16 +969,16 @@ fn span_to_ident_name(span: Span, source: &str) -> IdentName {
     // grantee names (e.g., `DATABASE ROLE db.dbr`) preserve their full
     // qualifier in `target.name.canonical` instead.
     let raw = span_slice(span, source).trim();
-    if let Some(last) = split_qualified_raw(raw).pop() {
-        IdentName::new(last)
-    } else {
-        IdentName::new(raw)
-    }
+    let name = match crate::ir::lower_ddl::split_qualified(raw).pop() {
+        Some(last) => IdentName::new(last),
+        None => IdentName::new(raw),
+    };
+    name.written_at(span)
 }
 
 fn parse_table_ref(span: Span, source: &str) -> TableRef {
     let raw = span_slice(span, source).trim();
-    let parts = split_qualified_raw(raw);
+    let parts = crate::ir::lower_ddl::split_qualified(raw);
     let (database, schema, name) = match parts.as_slice() {
         [n] => (None, None, n.clone()),
         [s, n] => (None, Some(s.clone()), n.clone()),
@@ -961,10 +1004,13 @@ pub fn derive_facts_from_privilege_plan(plan: &PrivilegePlan, source: &str) -> S
     // Privilege projection reads the plan alone; no analysis is consulted.
     let ctx = CatalogCtx {
         catalog: None,
+        known: None,
         function_catalog: &func_catalog,
         source,
         scan_index: None,
         reasoning: &super::reasoning::RecognitionOnly,
+        placeholders: &[],
+        output_columns: false,
     };
     project_privilege_statement(plan, &ctx)
 }
@@ -1014,7 +1060,14 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
     };
     let stage = StageDdlFacts {
         credentials: project_stage_credentials(&plan.credentials, source),
-        url_literal: plan.url_literal.clone(),
+        url_literal: plan.url_literal.clone().map(|url| match plan.url_span {
+            Some(span) => super::identity::WrittenText::at(url, span),
+            None => super::identity::WrittenText {
+                text: url,
+                origin: super::identity::TextOrigin::default(),
+            },
+        }),
+        url_password_literals: password_literals(&plan.url_password_literals),
         encryption_disabled: plan.encryption_disabled,
         encryption_enabled: plan.encryption_enabled,
         set_tag: plan.set_tag,
@@ -1126,6 +1179,7 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -1190,20 +1244,12 @@ fn project_stage_credentials(creds: &StageCredentials, source: &str) -> Vec<Stag
 fn project_copy_options(opts: &[crate::ast::AstCopyOption], source: &str) -> Vec<CopyOption> {
     opts.iter()
         .map(|o| {
-            let key = IdentName::new(slice_span_text(source, o.name_span));
+            let key = IdentName::new(slice_span_text(source, o.name_span)).written_at(o.name_span);
             let raw = slice_span_text(source, o.value_span);
             let value = if raw.starts_with('(') {
                 None
             } else {
-                let unquoted = {
-                    let b = raw.as_bytes();
-                    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
-                        &raw[1..raw.len() - 1]
-                    } else {
-                        raw
-                    }
-                };
-                Some(IdentName::new(unquoted))
+                Some(IdentName::new(literal_value_or_name(raw)))
             };
             CopyOption { key, value }
         })
@@ -1266,6 +1312,7 @@ fn project_storage_credential_statement(
             .map(project_storage_credential_alter_action)
             .collect(),
         comment,
+        comment_url_password_literals: password_literals(&plan.comment_url_password_literals),
     };
     let ddl = DdlFacts {
         action: match plan.action {
@@ -1347,6 +1394,7 @@ fn project_storage_credential_statement(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -1431,6 +1479,7 @@ fn project_provider(p: &StorageCredentialProvider) -> StorageCredentialProviderF
             .iter()
             .map(|s| StorageCredentialLiteral { value: s.clone() })
             .collect(),
+        url_password_literals: password_literals(&p.url_password_literals),
     }
 }
 
@@ -1571,6 +1620,7 @@ fn project_dynamic_table_statement(plan: &DynamicTablePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -1705,6 +1755,7 @@ fn project_table_statement(plan: &TablePlan) -> StatementFacts {
     };
     let table = TableFacts {
         or_replace: plan.options.or_replace,
+        temporary: plan.options.temporary || plan.target.as_ref().is_some_and(|t| t.temporary),
         column_added: plan.alter_flags.column_added,
         column_dropped: plan.alter_flags.column_dropped,
         renamed: plan.alter_flags.renamed,
@@ -1762,6 +1813,7 @@ fn project_table_statement(plan: &TablePlan) -> StatementFacts {
             if_exists: plan.options.if_exists,
             if_not_exists: plan.options.if_not_exists,
             temporary: plan.options.temporary,
+            transient: plan.options.transient,
             scoped: plan.options.scoped,
             cascade: plan.options.cascade,
             restrict: plan.options.restrict,
@@ -1835,6 +1887,7 @@ fn project_table_statement(plan: &TablePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -1997,6 +2050,7 @@ pub fn derive_facts_from_table_maintenance_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2159,6 +2213,7 @@ fn project_pipe_statement(plan: &PipePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2203,10 +2258,7 @@ fn project_pipe_statement(plan: &PipePlan) -> StatementFacts {
 
 /// Build a public `StatementFacts` directly from a lowered
 /// [`NetworkRulePlan`].
-pub fn derive_facts_from_network_rule_plan(
-    plan: &NetworkRulePlan,
-    _source: &str,
-) -> StatementFacts {
+pub fn derive_facts_from_network_rule_plan(plan: &NetworkRulePlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         NetworkRuleAction::Create => StatementKind::CreateNetworkRule,
         NetworkRuleAction::Alter => StatementKind::AlterNetworkRule,
@@ -2242,7 +2294,7 @@ pub fn derive_facts_from_network_rule_plan(
         object_kind: ObjectKind::NetworkRule,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::NetworkRule,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -2318,6 +2370,7 @@ pub fn derive_facts_from_network_rule_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2364,7 +2417,7 @@ pub fn derive_facts_from_network_rule_plan(
 /// [`ResourceMonitorPlan`].
 pub fn derive_facts_from_resource_monitor_plan(
     plan: &ResourceMonitorPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         ResourceMonitorAction::Create => StatementKind::CreateResourceMonitor,
@@ -2402,7 +2455,7 @@ pub fn derive_facts_from_resource_monitor_plan(
         object_kind: ObjectKind::ResourceMonitor,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::ResourceMonitor,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -2478,6 +2531,7 @@ pub fn derive_facts_from_resource_monitor_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2533,10 +2587,7 @@ fn project_compute_pool_alter_action(a: ComputePoolAlterActionIr) -> ComputePool
 }
 
 /// Build a public `StatementFacts` from a lowered [`ComputePoolPlan`].
-pub fn derive_facts_from_compute_pool_plan(
-    plan: &ComputePoolPlan,
-    _source: &str,
-) -> StatementFacts {
+pub fn derive_facts_from_compute_pool_plan(plan: &ComputePoolPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ComputePoolAction::Create => StatementKind::CreateComputePool,
         ComputePoolAction::Alter => StatementKind::AlterComputePool,
@@ -2566,7 +2617,7 @@ pub fn derive_facts_from_compute_pool_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             if_exists: plan.options.if_exists,
@@ -2642,6 +2693,7 @@ pub fn derive_facts_from_compute_pool_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2697,7 +2749,7 @@ fn project_git_repository_alter_action(a: GitRepositoryAlterActionIr) -> GitRepo
 /// Build a public `StatementFacts` from a lowered [`GitRepositoryPlan`].
 pub fn derive_facts_from_git_repository_plan(
     plan: &GitRepositoryPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         GitRepositoryAction::Create => StatementKind::CreateGitRepository,
@@ -2727,7 +2779,7 @@ pub fn derive_facts_from_git_repository_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -2803,6 +2855,7 @@ pub fn derive_facts_from_git_repository_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -2849,7 +2902,7 @@ pub fn derive_facts_from_git_repository_plan(
 /// Recognition only — which endpoints are trusted, and at what severity, is YAML.
 pub fn derive_facts_from_external_function_plan(
     plan: &crate::ir::ExternalFunctionPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let external_function = crate::facts::ddl::ExternalFunctionFacts {
         api_integration: plan.api_integration.clone(),
@@ -2866,7 +2919,7 @@ pub fn derive_facts_from_external_function_plan(
         object_kind: ObjectKind::Function,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Function,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.or_replace,
@@ -2940,6 +2993,7 @@ pub fn derive_facts_from_external_function_plan(
         create_trigger: None,
         view: None,
         external_function: Some(external_function),
+        trigger_body: None,
     };
     let mut facts = derive_facts_stmt_kind_only(StatementKind::CreateExternalFunction, plan.span);
     facts.ddl = Some(ddl);
@@ -2964,7 +3018,7 @@ fn project_image_repository_alter_action(
 /// Build a public `StatementFacts` from a lowered [`ImageRepositoryPlan`].
 pub fn derive_facts_from_image_repository_plan(
     plan: &ImageRepositoryPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         ImageRepositoryAction::Create => StatementKind::CreateImageRepository,
@@ -2991,7 +3045,7 @@ pub fn derive_facts_from_image_repository_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3067,6 +3121,7 @@ pub fn derive_facts_from_image_repository_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3119,7 +3174,7 @@ fn project_streamlit_alter_action(a: StreamlitAlterActionIr) -> StreamlitAlterAc
 }
 
 /// Build a public `StatementFacts` from a lowered [`StreamlitPlan`].
-pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         StreamlitAction::Create => StatementKind::CreateStreamlit,
         StreamlitAction::Alter => StatementKind::AlterStreamlit,
@@ -3145,7 +3200,7 @@ pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, _source: &str) -> 
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3221,6 +3276,7 @@ pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, _source: &str) -> 
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3275,7 +3331,7 @@ fn project_service_alter_action(a: ServiceAlterActionIr) -> ServiceAlterAction {
 }
 
 /// Build a public `StatementFacts` from a lowered [`ServicePlan`].
-pub fn derive_facts_from_service_plan(plan: &ServicePlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_service_plan(plan: &ServicePlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ServiceAction::Create => StatementKind::CreateService,
         ServiceAction::Alter => StatementKind::AlterService,
@@ -3302,7 +3358,7 @@ pub fn derive_facts_from_service_plan(plan: &ServicePlan, _source: &str) -> Stat
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3378,6 +3434,7 @@ pub fn derive_facts_from_service_plan(plan: &ServicePlan, _source: &str) -> Stat
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3430,7 +3487,7 @@ fn project_notebook_alter_action(a: NotebookAlterActionIr) -> NotebookAlterActio
 }
 
 /// Build a public `StatementFacts` from a lowered [`NotebookPlan`].
-pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         NotebookAction::Create => StatementKind::CreateNotebook,
         NotebookAction::Alter => StatementKind::AlterNotebook,
@@ -3456,7 +3513,7 @@ pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, _source: &str) -> St
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3532,6 +3589,7 @@ pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, _source: &str) -> St
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3583,7 +3641,7 @@ fn project_semantic_view_alter_action(a: SemanticViewAlterActionIr) -> SemanticV
 /// Build a public `StatementFacts` from a lowered [`SemanticViewPlan`].
 pub fn derive_facts_from_semantic_view_plan(
     plan: &SemanticViewPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         SemanticViewAction::Create => StatementKind::CreateSemanticView,
@@ -3618,7 +3676,7 @@ pub fn derive_facts_from_semantic_view_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3694,6 +3752,7 @@ pub fn derive_facts_from_semantic_view_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3748,7 +3807,7 @@ fn project_cortex_search_service_alter_action(
 /// Build a public `StatementFacts` from a lowered [`CortexSearchServicePlan`].
 pub fn derive_facts_from_cortex_search_service_plan(
     plan: &CortexSearchServicePlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         CortexSearchServiceAction::Create => StatementKind::CreateCortexSearchService,
@@ -3777,7 +3836,7 @@ pub fn derive_facts_from_cortex_search_service_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -3853,6 +3912,7 @@ pub fn derive_facts_from_cortex_search_service_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -3902,7 +3962,7 @@ fn project_application_alter_action(a: ApplicationAlterActionIr) -> ApplicationA
 }
 
 /// Build a public `StatementFacts` from a lowered [`ApplicationPlan`].
-pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ApplicationAction::Create => StatementKind::CreateApplication,
         ApplicationAction::Alter => StatementKind::AlterApplication,
@@ -3928,7 +3988,7 @@ pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, _source: &str)
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -4004,6 +4064,7 @@ pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, _source: &str)
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -4045,7 +4106,7 @@ pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, _source: &str)
 /// Build a public `StatementFacts` from a lowered [`ApplicationPackagePlan`].
 pub fn derive_facts_from_application_package_plan(
     plan: &ApplicationPackagePlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         ApplicationAction::Create => StatementKind::CreateApplicationPackage,
@@ -4070,7 +4131,7 @@ pub fn derive_facts_from_application_package_plan(
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -4146,6 +4207,7 @@ pub fn derive_facts_from_application_package_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -4195,7 +4257,7 @@ fn project_listing_alter_action(a: ListingAlterActionIr) -> ListingAlterAction {
 }
 
 /// Build a public `StatementFacts` from a lowered [`ListingPlan`].
-pub fn derive_facts_from_listing_plan(plan: &ListingPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_listing_plan(plan: &ListingPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ListingAction::Create => StatementKind::CreateListing,
         ListingAction::Alter => StatementKind::AlterListing,
@@ -4221,7 +4283,7 @@ pub fn derive_facts_from_listing_plan(plan: &ListingPlan, _source: &str) -> Stat
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -4297,6 +4359,7 @@ pub fn derive_facts_from_listing_plan(plan: &ListingPlan, _source: &str) -> Stat
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -4339,7 +4402,7 @@ pub fn derive_facts_from_listing_plan(plan: &ListingPlan, _source: &str) -> Stat
 /// account's admin credentials are deliberately not carried (least-leak).
 pub fn derive_facts_from_managed_account_plan(
     plan: &ManagedAccountPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         AccountProvisioningAction::Create => StatementKind::CreateManagedAccount,
@@ -4353,18 +4416,25 @@ pub fn derive_facts_from_managed_account_plan(
         plan.target.as_ref(),
         &plan.options,
         Some(managed_account),
+        source,
     );
     statement_facts_with_ddl(kind, plan.span, Some(ddl))
 }
 
 /// Build a public `StatementFacts` from a lowered [`OrgAccountPlan`] (org-level
 /// CREATE / DROP ACCOUNT). Recognition only; credentials are not carried.
-pub fn derive_facts_from_org_account_plan(plan: &OrgAccountPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_org_account_plan(plan: &OrgAccountPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         AccountProvisioningAction::Create => StatementKind::CreateAccount,
         AccountProvisioningAction::Drop => StatementKind::DropAccount,
     };
-    let ddl = account_provisioning_ddl(plan.action, plan.target.as_ref(), &plan.options, None);
+    let ddl = account_provisioning_ddl(
+        plan.action,
+        plan.target.as_ref(),
+        &plan.options,
+        None,
+        source,
+    );
     statement_facts_with_ddl(kind, plan.span, Some(ddl))
 }
 
@@ -4389,6 +4459,7 @@ fn account_provisioning_ddl(
     target: Option<&crate::ir::AccountProvisioningTarget>,
     options: &crate::ir::AccountProvisioningOptions,
     managed_account: Option<ManagedAccountFacts>,
+    source: &str,
 ) -> DdlFacts {
     DdlFacts {
         action: match action {
@@ -4398,7 +4469,7 @@ fn account_provisioning_ddl(
         object_kind: ObjectKind::Generic,
         target: target.map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: options.or_replace,
@@ -4474,6 +4545,7 @@ fn account_provisioning_ddl(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     }
 }
 
@@ -4527,7 +4599,7 @@ fn statement_facts_with_ddl(
 /// Build a public `StatementFacts` directly from a lowered
 /// [`SecretPlan`]. Secret values are never carried (see the plan's
 /// least-leak invariant).
-pub fn derive_facts_from_secret_plan(plan: &SecretPlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_secret_plan(plan: &SecretPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         SecretAction::Create => StatementKind::CreateSecret,
         SecretAction::Alter => StatementKind::AlterSecret,
@@ -4549,7 +4621,7 @@ pub fn derive_facts_from_secret_plan(plan: &SecretPlan, _source: &str) -> Statem
         object_kind: ObjectKind::Secret,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Secret,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -4625,6 +4697,7 @@ pub fn derive_facts_from_secret_plan(plan: &SecretPlan, _source: &str) -> Statem
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -4670,7 +4743,7 @@ pub fn derive_facts_from_secret_plan(plan: &SecretPlan, _source: &str) -> Statem
 /// Build a public `StatementFacts` directly from a lowered
 /// [`SharePlan`]. Catalog is not consulted — the typed plan already
 /// carries the required structural data.
-pub fn derive_facts_from_share_plan(plan: &SharePlan, _source: &str) -> StatementFacts {
+pub fn derive_facts_from_share_plan(plan: &SharePlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ShareAction::Create => StatementKind::CreateShare,
         ShareAction::Alter => StatementKind::AlterShare,
@@ -4693,7 +4766,7 @@ pub fn derive_facts_from_share_plan(plan: &SharePlan, _source: &str) -> Statemen
         object_kind: ObjectKind::Share,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Share,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -4769,6 +4842,7 @@ pub fn derive_facts_from_share_plan(plan: &SharePlan, _source: &str) -> Statemen
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -4960,6 +5034,7 @@ fn project_tag_statement(plan: &TagPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -5113,6 +5188,7 @@ fn project_file_format_statement(plan: &FileFormatPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -5253,6 +5329,7 @@ fn project_session_statement(plan: &SessionPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
 
     StatementFacts {
@@ -5423,6 +5500,7 @@ fn project_stream_statement(plan: &StreamPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -5597,6 +5675,7 @@ fn project_datashare_statement(plan: &DatasharePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
 
     StatementFacts {
@@ -5707,6 +5786,10 @@ fn project_schema_statement(plan: &SchemaPlan) -> StatementFacts {
             .map(project_schema_alter_action)
             .collect(),
         create_origin: plan.create_origin.map(project_schema_create_origin),
+        drops_contents: plan.action == SchemaAction::Drop
+            && (plan.options.cascade
+                || (!plan.options.restrict
+                    && crate::ir::normalize::dialect_in_force().drop_schema_drops_contents())),
     };
     let ddl = DdlFacts {
         action: match plan.action {
@@ -5728,6 +5811,8 @@ fn project_schema_statement(plan: &SchemaPlan) -> StatementFacts {
             or_replace: plan.options.or_replace,
             if_exists: plan.options.if_exists,
             if_not_exists: plan.options.if_not_exists,
+            cascade: plan.options.cascade,
+            restrict: plan.options.restrict,
             ..DdlOptions::default()
         },
         alter_changes: Vec::new(),
@@ -5798,6 +5883,7 @@ fn project_schema_statement(plan: &SchemaPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -5974,6 +6060,7 @@ fn project_catalog_statement(plan: &CatalogPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -6162,6 +6249,7 @@ fn project_volume_statement(plan: &VolumePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -6206,9 +6294,9 @@ fn project_volume_statement(plan: &VolumePlan) -> StatementFacts {
 
 pub fn derive_facts_from_external_location_plan(
     plan: &ExternalLocationPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
-    project_external_location_statement(plan)
+    project_external_location_statement(plan, source)
 }
 
 fn project_external_location_alter_action(
@@ -6224,7 +6312,10 @@ fn project_external_location_alter_action(
     }
 }
 
-fn project_external_location_statement(plan: &ExternalLocationPlan) -> StatementFacts {
+fn project_external_location_statement(
+    plan: &ExternalLocationPlan,
+    source: &str,
+) -> StatementFacts {
     let kind = match plan.action {
         ExternalLocationAction::Create => StatementKind::CreateExternalLocation,
         ExternalLocationAction::Alter => StatementKind::AlterExternalLocation,
@@ -6250,7 +6341,7 @@ fn project_external_location_statement(plan: &ExternalLocationPlan) -> Statement
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             if_not_exists: plan.options.if_not_exists,
@@ -6325,6 +6416,7 @@ fn project_external_location_statement(plan: &ExternalLocationPlan) -> Statement
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -6367,8 +6459,8 @@ fn project_external_location_statement(plan: &ExternalLocationPlan) -> Statement
 // Connection projection (Databricks Unity Catalog foreign connection).
 // ---------------------------------------------------------------------------
 
-pub fn derive_facts_from_connection_plan(plan: &ConnectionPlan, _source: &str) -> StatementFacts {
-    project_connection_statement(plan)
+pub fn derive_facts_from_connection_plan(plan: &ConnectionPlan, source: &str) -> StatementFacts {
+    project_connection_statement(plan, source)
 }
 
 fn project_connection_alter_action(a: IrConnectionAlterAction) -> ConnectionAlterAction {
@@ -6384,7 +6476,7 @@ fn project_connection_alter_action(a: IrConnectionAlterAction) -> ConnectionAlte
     }
 }
 
-fn project_connection_statement(plan: &ConnectionPlan) -> StatementFacts {
+fn project_connection_statement(plan: &ConnectionPlan, source: &str) -> StatementFacts {
     let kind = match plan.action {
         ConnectionAction::Create => StatementKind::CreateConnection,
         ConnectionAction::Alter => StatementKind::AlterConnection,
@@ -6411,7 +6503,7 @@ fn project_connection_statement(plan: &ConnectionPlan) -> StatementFacts {
         object_kind: ObjectKind::Generic,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::Generic,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             if_not_exists: plan.options.if_not_exists,
@@ -6487,6 +6579,7 @@ fn project_connection_statement(plan: &ConnectionPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -6648,6 +6741,7 @@ fn project_external_data_source_statement(plan: &ExternalDataSourcePlan) -> Stat
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -6790,6 +6884,7 @@ fn project_foreign_server_statement(plan: &ForeignServerPlan) -> StatementFacts 
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -6914,6 +7009,7 @@ fn project_server_configuration_statement(plan: &ServerConfigurationPlan) -> Sta
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::AlterServerConfiguration,
@@ -7087,6 +7183,7 @@ fn project_event_statement(plan: &EventPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -7238,6 +7335,7 @@ fn project_trigger_create_statement(plan: &TriggerCreatePlan) -> StatementFacts 
         create_trigger: Some(create_trigger),
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::CreateMysqlTrigger,
@@ -7378,6 +7476,7 @@ fn project_mysql_load_data_statement(plan: &MysqlLoadDataPlan) -> StatementFacts
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::MysqlLoadData,
@@ -7431,15 +7530,25 @@ pub fn derive_facts_from_foreign_table_plan(
         is_partition: plan.is_partition,
         options_present: plan.options_present,
     };
+    // A foreign table is a table a later statement reads, named by its
+    // `[[db.]schema.]name` parts.
+    let parts = crate::ir::lower::split_object_ref(&plan.name);
+    let (db, schema, name) = match parts.as_slice() {
+        _ if parts.iter().any(String::is_empty) => (None, None, plan.name.clone()),
+        [n] => (None, None, n.clone()),
+        [s, n] => (None, Some(s.clone()), n.clone()),
+        [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
+        _ => (None, None, plan.name.clone()),
+    };
     let ddl = DdlFacts {
         action: DdlAction::Create,
-        object_kind: ObjectKind::Generic,
+        object_kind: ObjectKind::ExternalTable,
         target: Some(ObjectRef {
-            kind: ObjectKind::Generic,
+            kind: ObjectKind::ExternalTable,
             name: TableRef::new(
-                IdentName::new(plan.name.clone()),
-                None,
-                None,
+                IdentName::new(name),
+                schema.map(IdentName::new),
+                db.map(IdentName::new),
                 Some(plan.name_span),
             ),
         }),
@@ -7515,6 +7624,7 @@ pub fn derive_facts_from_foreign_table_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::CreateForeignTable,
@@ -7661,6 +7771,7 @@ pub fn derive_facts_from_import_foreign_schema_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::ImportForeignSchema,
@@ -7711,7 +7822,7 @@ pub fn derive_facts_from_user_mapping_plan(
 
 fn project_user_mapping_option(o: &UserMappingOptionIr) -> UserMappingOption {
     UserMappingOption {
-        key: IdentName::new(o.key.clone()),
+        key: IdentName::new(o.key.clone()).written_at(o.key_span),
         value_literal: o.value_literal.clone(),
     }
 }
@@ -7820,6 +7931,7 @@ fn project_user_mapping_statement(plan: &UserMappingPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -7943,6 +8055,7 @@ fn project_flow_statement(plan: &FlowPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -8422,6 +8535,7 @@ pub fn derive_facts_from_pg_copy_plan(
             create_trigger: None,
             view: None,
             external_function: None,
+            trigger_body: None,
         }
     });
     StatementFacts {
@@ -8577,6 +8691,20 @@ pub fn derive_facts_from_dbcc_plan(
 }
 
 // ---------------------------------------------------------------------------
+// Password literals: a T-SQL key statement's (OPEN / CLOSE KEY, BACKUP /
+// RESTORE KEY, ADD SIGNATURE, ALTER SERVICE MASTER KEY) and a URL's.
+// ---------------------------------------------------------------------------
+
+/// Decoded password literals as facts.
+fn password_literals(values: &[String]) -> Vec<crate::facts::PasswordLiteral> {
+    values
+        .iter()
+        .cloned()
+        .map(|value| crate::facts::PasswordLiteral { value })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Encryption-key activation (OPEN / CLOSE KEY) projection.
 // ---------------------------------------------------------------------------
 
@@ -8604,7 +8732,8 @@ pub fn derive_facts_from_key_management_plan(
     let mssql_key_management = crate::facts::MssqlKeyManagementFacts {
         action,
         key_kind,
-        password_present: plan.password_present,
+        password_present: !plan.password_literals.is_empty(),
+        password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
         kind: StatementKind::MssqlKeyManagement,
@@ -8738,7 +8867,8 @@ pub fn derive_facts_from_key_backup_plan(
     let mssql_key_backup = crate::facts::MssqlKeyBackupFacts {
         action,
         key_object,
-        password_present: plan.password_present,
+        password_present: !plan.password_literals.is_empty(),
+        password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
         kind: StatementKind::MssqlKeyBackup,
@@ -8865,7 +8995,8 @@ pub fn derive_facts_from_add_signature_plan(
     let mssql_add_signature = crate::facts::MssqlAddSignatureFacts {
         counter: plan.counter,
         signer_kind,
-        password_present: plan.password_present,
+        password_present: !plan.password_literals.is_empty(),
+        password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
         kind: StatementKind::MssqlAddSignature,
@@ -8929,7 +9060,8 @@ pub fn derive_facts_from_service_master_key_plan(
     let mssql_service_master_key = crate::facts::MssqlServiceMasterKeyFacts {
         operation,
         force: plan.force,
-        password_present: plan.password_present,
+        password_present: !plan.password_literals.is_empty(),
+        password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
         kind: StatementKind::MssqlServiceMasterKey,
@@ -9147,6 +9279,7 @@ fn project_task_statement(plan: &TaskPlan) -> StatementFacts {
         TaskAction::Create => StatementKind::CreateTask,
         TaskAction::Alter => StatementKind::AlterTask,
         TaskAction::Drop => StatementKind::DropTask,
+        TaskAction::Execute => StatementKind::ExecuteTask,
     };
     let create_options = plan
         .create_options
@@ -9166,6 +9299,7 @@ fn project_task_statement(plan: &TaskPlan) -> StatementFacts {
             TaskAction::Create => DdlAction::Create,
             TaskAction::Alter => DdlAction::Alter,
             TaskAction::Drop => DdlAction::Drop,
+            TaskAction::Execute => DdlAction::Execute,
         },
         object_kind: ObjectKind::Task,
         target: plan.target.as_ref().map(|t| ObjectRef {
@@ -9252,6 +9386,7 @@ fn project_task_statement(plan: &TaskPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -9449,6 +9584,7 @@ pub fn derive_facts_from_alert_plan(plan: &AlertPlan, _source: &str) -> Statemen
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -9490,7 +9626,7 @@ pub fn derive_facts_from_alert_plan(plan: &AlertPlan, _source: &str) -> Statemen
 /// Build a public `StatementFacts` from a lowered [`DataMetricFunctionPlan`].
 pub fn derive_facts_from_data_metric_function_plan(
     plan: &DataMetricFunctionPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let kind = match plan.action {
         DataMetricFunctionAction::Create => StatementKind::CreateDataMetricFunction,
@@ -9507,7 +9643,7 @@ pub fn derive_facts_from_data_metric_function_plan(
         object_kind: ObjectKind::DataMetricFunction,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::DataMetricFunction,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -9583,6 +9719,7 @@ pub fn derive_facts_from_data_metric_function_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -9625,7 +9762,7 @@ pub fn derive_facts_from_data_metric_function_plan(
 /// [`ReplicationFailoverGroupPlan`].
 pub fn derive_facts_from_replication_failover_group_plan(
     plan: &ReplicationFailoverGroupPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let group_kind = match plan.group_type {
         ReplicationGroupType::Replication => ReplicationGroupKind::Replication,
@@ -9662,7 +9799,7 @@ pub fn derive_facts_from_replication_failover_group_plan(
         object_kind: ObjectKind::ReplicationGroup,
         target: plan.target.as_ref().map(|t| ObjectRef {
             kind: ObjectKind::ReplicationGroup,
-            name: TableRef::new(IdentName::new(t.name.clone()), None, None, Some(t.span)),
+            name: parse_table_ref(t.span, source),
         }),
         options: DdlOptions {
             if_exists: plan.options.if_exists,
@@ -9738,6 +9875,7 @@ pub fn derive_facts_from_replication_failover_group_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -9860,6 +9998,7 @@ pub fn derive_facts_from_account_plan(plan: &AccountPlan, _source: &str) -> Stat
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: StatementKind::AlterAccount,
@@ -9954,6 +10093,7 @@ fn project_function_statement(plan: &FunctionPlan) -> StatementFacts {
         body,
         actions,
         definer: plan.definer.as_ref().map(definer_to_facts),
+        loadable_library: plan.loadable_library.clone(),
     };
     let ddl = DdlFacts {
         action: match plan.action {
@@ -10046,6 +10186,7 @@ fn project_function_statement(plan: &FunctionPlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -10257,6 +10398,7 @@ fn project_procedure_statement(plan: &ProcedurePlan) -> StatementFacts {
         body,
         actions,
         definer: plan.definer.as_ref().map(definer_to_facts),
+        runs_as: plan.runs_as.map(project_execute_as_mode),
     };
     let ddl = DdlFacts {
         action: match plan.action {
@@ -10349,6 +10491,7 @@ fn project_procedure_statement(plan: &ProcedurePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -10387,7 +10530,7 @@ fn project_procedure_statement(plan: &ProcedurePlan) -> StatementFacts {
     }
 }
 
-fn project_procedure_body(body: &ProcedureBodyShape) -> ProcedureBodyFacts {
+pub(crate) fn project_procedure_body(body: &ProcedureBodyShape) -> ProcedureBodyFacts {
     ProcedureBodyFacts {
         statement_kinds: body
             .statement_kinds
@@ -10429,6 +10572,7 @@ pub(crate) fn project_dynamic_sql_call(
             DynamicSqlSurfaceIr::DblinkExec => DynamicSqlSurface::DblinkExec,
             DynamicSqlSurfaceIr::MssqlExecProcCall => DynamicSqlSurface::MssqlExecProcCall,
             DynamicSqlSurfaceIr::CallProcCall => DynamicSqlSurface::CallProcCall,
+            DynamicSqlSurfaceIr::PsqlGexec => DynamicSqlSurface::PsqlGexec,
         },
         argument: match call.argument {
             DynamicSqlArgIr::Literal => DynamicSqlArg::Literal,
@@ -10449,6 +10593,7 @@ pub(crate) fn project_dynamic_sql_call(
                 DynamicSqlParameterization::NotApplicable
             }
         },
+        argument_parameter: call.argument_parameter.as_deref().map(IdentName::new),
         provenance: call
             .provenance
             .iter()
@@ -10731,6 +10876,7 @@ fn project_database_statement(plan: &DatabasePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -10891,6 +11037,7 @@ fn project_warehouse_statement(plan: &WarehousePlan) -> StatementFacts {
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -11040,7 +11187,7 @@ fn project_policy_attachment_facts(
 /// (`Pg{Create,Alter,Drop}Policy` vs `{Create,Alter,Drop}RowAccessPolicy`)
 /// so the right family of rules fires.
 ///
-/// The IR plan itself stays dialect-clean. The dialect signal is
+/// The IR plan itself stays dialect-clean. The dialect is
 /// recovered at the `analyze_ddl_facts` dispatch site (which knows the
 /// dialect via the originating `AstStmt` variant — `CreatePgPolicy` is
 /// constructed only by the PG parser) and passed explicitly to
@@ -11086,6 +11233,8 @@ pub enum MssqlDdlKind {
     SetOption,
     /// T-SQL `DROP TRIGGER` — DML / DDL / logon trigger removal.
     DropTrigger,
+    /// T-SQL `{ ENABLE | DISABLE } TRIGGER … ON …`.
+    TriggerState,
 }
 
 /// Build a public `StatementFacts` directly from a lowered
@@ -11111,10 +11260,11 @@ pub fn derive_facts_from_mssql_ddl_plan(
         MssqlDdlKind::DropLogin => StatementKind::MssqlDropLogin,
         MssqlDdlKind::SetOption => StatementKind::MssqlSetOption,
         MssqlDdlKind::DropTrigger => StatementKind::MssqlDropTrigger,
+        MssqlDdlKind::TriggerState => StatementKind::MssqlTriggerState,
     };
     let object_kind = match kind {
         MssqlDdlKind::CreateUser => ObjectKind::User,
-        MssqlDdlKind::DropTrigger => ObjectKind::Trigger,
+        MssqlDdlKind::DropTrigger | MssqlDdlKind::TriggerState => ObjectKind::Trigger,
         MssqlDdlKind::BulkInsert
         | MssqlDdlKind::CreateExternalModel
         | MssqlDdlKind::AlterExternalModel
@@ -11128,15 +11278,32 @@ pub fn derive_facts_from_mssql_ddl_plan(
         MssqlDdlKind::CreateExternalModel
         | MssqlDdlKind::CreateLogin
         | MssqlDdlKind::CreateUser => DdlAction::Create,
-        MssqlDdlKind::AlterExternalModel | MssqlDdlKind::AlterLogin => DdlAction::Alter,
+        MssqlDdlKind::AlterExternalModel
+        | MssqlDdlKind::AlterLogin
+        | MssqlDdlKind::TriggerState => DdlAction::Alter,
         MssqlDdlKind::DropExternalModel | MssqlDdlKind::DropTrigger | MssqlDdlKind::DropLogin => {
             DdlAction::Drop
         }
         MssqlDdlKind::BulkInsert => DdlAction::BulkLoad,
         MssqlDdlKind::SetOption => DdlAction::Configure,
     };
+    // A trigger-state statement's target is the table or view its triggers
+    // are on, as for PostgreSQL's `ALTER TABLE … TRIGGER`.
+    let target_kind = match kind {
+        MssqlDdlKind::TriggerState => ObjectKind::Generic,
+        MssqlDdlKind::BulkInsert
+        | MssqlDdlKind::CreateExternalModel
+        | MssqlDdlKind::AlterExternalModel
+        | MssqlDdlKind::DropExternalModel
+        | MssqlDdlKind::CreateLogin
+        | MssqlDdlKind::CreateUser
+        | MssqlDdlKind::AlterLogin
+        | MssqlDdlKind::DropLogin
+        | MssqlDdlKind::SetOption
+        | MssqlDdlKind::DropTrigger => object_kind,
+    };
     let target = plan.target.as_ref().map(|t| ObjectRef {
-        kind: object_kind,
+        kind: target_kind,
         name: TableRef::new(
             IdentName::new(t.name.clone()),
             t.schema.clone().map(IdentName::new),
@@ -11200,7 +11367,11 @@ pub fn derive_facts_from_mssql_ddl_plan(
         domain: None,
         index: None,
         trigger: None,
-        trigger_state: None,
+        trigger_state: plan.pg_trigger_state.as_ref().map(|detail| {
+            crate::facts::ddl::TriggerStateFacts {
+                action: project_ir_trigger_state_action(detail.action),
+            }
+        }),
         pg_session: None,
         bq_assert: None,
         bq_create_model: None,
@@ -11238,6 +11409,7 @@ pub fn derive_facts_from_mssql_ddl_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -11369,6 +11541,7 @@ fn project_principal_options(
     crate::facts::ddl::PrincipalFacts {
         kind: project_ir_principal_kind(options.principal_kind),
         password_literal: options.password_literal.clone(),
+        password_set: options.password_set,
         mysql_host: options.mysql_host.clone(),
         server_scope: options.server_scope,
         membership: options
@@ -11428,6 +11601,7 @@ fn project_snowflake_user_facts(
         rsa_public_key_set: s.rsa_public_key_set,
         rsa_public_key_2_set: s.rsa_public_key_2_set,
         network_policy: s.network_policy.clone().map(IdentName::new),
+        network_policy_unset: s.network_policy_unset,
     }
 }
 
@@ -11567,6 +11741,7 @@ pub fn derive_facts_from_principal_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -11726,7 +11901,7 @@ pub enum PgDdlKind {
 pub fn derive_facts_from_pg_ddl_plan(
     plan: &crate::ir::DdlPlan,
     kind: PgDdlKind,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let stmt_kind = match kind {
         PgDdlKind::CreateDomain => StatementKind::PgCreateDomain,
@@ -11810,14 +11985,11 @@ pub fn derive_facts_from_pg_ddl_plan(
         PgDdlKind::CreateType => DdlAction::Create,
         PgDdlKind::AlterType => DdlAction::Alter,
     };
+    // The plan read the target from its text, folding one that names no
+    // relation: its name is read from the text again.
     let target = plan.target.as_ref().map(|t| ObjectRef {
         kind: ObjectKind::Generic,
-        name: TableRef::new(
-            IdentName::new(t.name.clone()),
-            t.schema.clone().map(IdentName::new),
-            t.db.clone().map(IdentName::new),
-            Some(t.span),
-        ),
+        name: parse_table_ref(t.span, source),
     });
     let domain = plan
         .domain
@@ -11940,6 +12112,7 @@ pub fn derive_facts_from_pg_ddl_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -12145,17 +12318,33 @@ pub enum BqDdlKind {
     CreateExternalSchema,
 }
 
+/// The kind of an `ASSERT` in the dialect in force: BigQuery's own
+/// statement in BigQuery, the generic assertion in every other dialect.
+fn assert_statement_kind() -> StatementKind {
+    use crate::ir::CatalogDialect as D;
+    match D::from_dialect_name(crate::ir::normalize::dialect_in_force().name()) {
+        D::BigQuery => StatementKind::BqAssert,
+        D::Default
+        | D::Snowflake
+        | D::PostgreSql
+        | D::Databricks
+        | D::MySql
+        | D::MsSql
+        | D::Redshift => StatementKind::Assert,
+    }
+}
+
 /// Build [`StatementFacts`] for a BigQuery DDL statement, routed by
 /// the narrow [`BqDdlKind`] dispatch.
 pub fn derive_facts_from_bq_ddl_plan(
     plan: &crate::ir::DdlPlan,
     kind: BqDdlKind,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
     let stmt_kind = match kind {
         BqDdlKind::ExportData => StatementKind::BqExportData,
         BqDdlKind::LoadData => StatementKind::BqLoadData,
-        BqDdlKind::Assert => StatementKind::BqAssert,
+        BqDdlKind::Assert => assert_statement_kind(),
         BqDdlKind::CreateModel => StatementKind::BqCreateModel,
         BqDdlKind::AlterModel => StatementKind::BqAlterModel,
         BqDdlKind::DropModel => StatementKind::BqDropModel,
@@ -12185,14 +12374,54 @@ pub fn derive_facts_from_bq_ddl_plan(
         | BqDdlKind::DropSearchIndex
         | BqDdlKind::DropVectorIndex => DdlAction::Drop,
     };
+    // An external or snapshot table a statement creates is a table a later
+    // statement reads; the other objects of the family keep the generic kind.
+    let object_kind = match kind {
+        BqDdlKind::CreateExternalTable => ObjectKind::ExternalTable,
+        BqDdlKind::CreateSnapshotTable => ObjectKind::Table,
+        BqDdlKind::ExportData
+        | BqDdlKind::LoadData
+        | BqDdlKind::Assert
+        | BqDdlKind::CreateModel
+        | BqDdlKind::AlterModel
+        | BqDdlKind::DropModel
+        | BqDdlKind::ExportModel
+        | BqDdlKind::DropSnapshotTable
+        | BqDdlKind::CreateSearchIndex
+        | BqDdlKind::DropSearchIndex
+        | BqDdlKind::CreateVectorIndex
+        | BqDdlKind::AlterVectorIndex
+        | BqDdlKind::DropVectorIndex
+        | BqDdlKind::CreateExternalSchema => ObjectKind::Generic,
+    };
+    // A snapshot table keeps the parts the parser read, as written; any
+    // other target the plan read from its text, folding one that names no
+    // relation, so its name is read from the text again.
     let target = plan.target.as_ref().map(|t| ObjectRef {
-        kind: ObjectKind::Generic,
-        name: TableRef::new(
-            IdentName::new(t.name.clone()),
-            t.schema.clone().map(IdentName::new),
-            t.db.clone().map(IdentName::new),
-            Some(t.span),
-        ),
+        kind: object_kind,
+        name: match kind {
+            BqDdlKind::CreateSnapshotTable => TableRef::new(
+                IdentName::new(t.name.clone()),
+                t.schema.clone().map(IdentName::new),
+                t.db.clone().map(IdentName::new),
+                Some(t.span),
+            ),
+            BqDdlKind::ExportData
+            | BqDdlKind::LoadData
+            | BqDdlKind::Assert
+            | BqDdlKind::CreateModel
+            | BqDdlKind::AlterModel
+            | BqDdlKind::DropModel
+            | BqDdlKind::ExportModel
+            | BqDdlKind::DropSnapshotTable
+            | BqDdlKind::CreateSearchIndex
+            | BqDdlKind::DropSearchIndex
+            | BqDdlKind::CreateVectorIndex
+            | BqDdlKind::AlterVectorIndex
+            | BqDdlKind::DropVectorIndex
+            | BqDdlKind::CreateExternalTable
+            | BqDdlKind::CreateExternalSchema => parse_table_ref(t.span, source),
+        },
     });
     let bq_assert = plan
         .bq_assert
@@ -12225,9 +12454,12 @@ pub fn derive_facts_from_bq_ddl_plan(
                     access_kind: crate::facts::query::TableAccessKind::Read,
                     table_kind: None,
                     in_catalog: None,
+                    searched_as: None,
+                    temporary: false,
                 })
                 .collect();
             Some(crate::facts::query::QueryFacts {
+                tables_used: tables_used(&reads_table, &[]),
                 reads_table,
                 ..crate::facts::query::QueryFacts::default()
             })
@@ -12252,7 +12484,7 @@ pub fn derive_facts_from_bq_ddl_plan(
     let bq_options = plan.bq_options.as_ref().map(project_ir_bq_options);
     let ddl = DdlFacts {
         action,
-        object_kind: ObjectKind::Generic,
+        object_kind,
         target,
         options: DdlOptions {
             or_replace: plan.options.or_replace,
@@ -12328,6 +12560,7 @@ pub fn derive_facts_from_bq_ddl_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -12377,9 +12610,10 @@ pub fn derive_facts_from_bq_ddl_plan(
 // ---------------------------------------------------------------------------
 
 /// Project the `CREATE VIEW` security-context clauses into the public
-/// [`ViewFacts`] carrier: the MySQL prelude (`DEFINER` + `SQL SECURITY`) and
+/// [`ViewFacts`] carrier: the MySQL prelude (`DEFINER` + `SQL SECURITY`),
 /// the PostgreSQL `WITH (...)` option list (`security_invoker`,
-/// `security_barrier`, `check_option`). Returns `None` when no such clause is
+/// `security_barrier`, `check_option`) and Snowflake's `SECURE`. Returns
+/// `None` when no such clause is
 /// present, so `ddl.view` stays absent. The view lifecycle otherwise lowers
 /// through the generic `DdlPlan`, so this is projected directly from the AST
 /// at the dispatch site.
@@ -12407,7 +12641,7 @@ pub fn project_view_prelude_facts(
         } else if name.eq_ignore_ascii_case("security_barrier") {
             security_barrier = pg_option_bool(value);
         } else if name.eq_ignore_ascii_case("check_option") {
-            let v = value.map(unquote_option_value).unwrap_or_default();
+            let v = value.map(literal_value_or_name).unwrap_or_default();
             check_option = if v.eq_ignore_ascii_case("local") {
                 Some(ViewCheckOption::Local)
             } else if v.eq_ignore_ascii_case("cascaded") {
@@ -12426,11 +12660,13 @@ pub fn project_view_prelude_facts(
         });
     }
 
+    let secure = view.secure_span.is_some();
     if definer.is_none()
         && sql_security.is_none()
         && security_invoker.is_none()
         && security_barrier.is_none()
         && check_option.is_none()
+        && !secure
     {
         return None;
     }
@@ -12440,16 +12676,115 @@ pub fn project_view_prelude_facts(
         security_invoker,
         security_barrier,
         check_option,
+        secure,
+        ..ViewFacts::default()
     })
 }
 
-/// Strip one level of quoting from an option value literal.
-fn unquote_option_value(raw: &str) -> &str {
-    let v = raw.trim();
-    v.strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .or_else(|| v.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-        .unwrap_or(v)
+/// Project the action an `ALTER VIEW` performs into [`ViewFacts`]: its
+/// kind, and the policy attach / detach flags `ALTER TABLE` publishes in
+/// [`TableFacts`]. Every action of the statement reaches `action`.
+pub(crate) fn project_alter_view_facts(view: &crate::ast::AstAlterView) -> ViewFacts {
+    use crate::ast::AstAlterViewActionKind as K;
+    use ViewAlterActionKind as A;
+    let mut facts = ViewFacts::default();
+    let action = match &view.action.kind {
+        K::AddRowAccessPolicy { .. } => {
+            facts.row_access_policy_added = true;
+            A::AddRowAccessPolicy
+        }
+        K::DropRowAccessPolicy { .. } => {
+            facts.row_access_policy_removed = true;
+            A::DropRowAccessPolicy
+        }
+        K::DropAllRowAccessPolicies { .. } => {
+            facts.row_access_policy_removed = true;
+            facts.drop_all_row_access_policies = true;
+            A::DropAllRowAccessPolicies
+        }
+        K::UnsetAggregationPolicy { .. } => {
+            facts.aggregation_policy_removed = true;
+            A::UnsetAggregationPolicy
+        }
+        K::UnsetJoinPolicy { .. } => {
+            facts.aggregation_policy_removed = true;
+            A::UnsetJoinPolicy
+        }
+        K::AlterColumn {
+            masking_policy,
+            projection_policy,
+            policy_unset,
+            ..
+        } => {
+            facts.masking_policy_added = masking_policy.is_some() || projection_policy.is_some();
+            facts.masking_policy_removed = policy_unset.is_some();
+            A::AlterColumn
+        }
+        K::SetOptions { .. } => A::SetOptions,
+        K::AlterColumnSetOptions { .. } => A::SetColumnOptions,
+        K::RenameTo { .. } => A::Rename,
+        K::RenameColumn { .. } => A::RenameColumn,
+        K::SetSecure { .. } => A::SetSecure,
+        K::UnsetSecure { .. } => A::UnsetSecure,
+        K::SetComment { .. } => A::SetComment,
+        K::UnsetComment { .. } => A::UnsetComment,
+        K::SetChangeTracking { .. } => A::SetChangeTracking,
+        K::SetTag { .. } => A::SetTag,
+        K::UnsetTag { .. } => A::UnsetTag,
+        K::SetAggregationPolicy { .. } => A::SetAggregationPolicy,
+        K::SetJoinPolicy { .. } => A::SetJoinPolicy,
+        K::AddColumn { .. } => A::AddColumn,
+        K::DataMetricFunction { .. } => A::DataMetricFunction,
+        K::OpaqueRemainder { .. } => A::Unknown,
+    };
+    facts.action = Some(action);
+    facts
+}
+
+/// [`project_alter_view_facts`] for `ALTER MATERIALIZED VIEW`.
+pub(crate) fn project_alter_materialized_view_facts(
+    view: &crate::ast::AstAlterMaterializedView,
+) -> ViewFacts {
+    use crate::ast::AstAlterMaterializedViewActionKind as K;
+    use ViewAlterActionKind as A;
+    let mut facts = ViewFacts::default();
+    let action = match &view.action.kind {
+        K::AddRowAccessPolicy { .. } => {
+            facts.row_access_policy_added = true;
+            A::AddRowAccessPolicy
+        }
+        K::DropRowAccessPolicy { .. } => {
+            facts.row_access_policy_removed = true;
+            A::DropRowAccessPolicy
+        }
+        K::DropAllRowAccessPolicies { .. } => {
+            facts.row_access_policy_removed = true;
+            facts.drop_all_row_access_policies = true;
+            A::DropAllRowAccessPolicies
+        }
+        K::AlterColumn {
+            masking_policy,
+            projection_policy,
+            policy_unset,
+            ..
+        } => {
+            facts.masking_policy_added = masking_policy.is_some() || projection_policy.is_some();
+            facts.masking_policy_removed = policy_unset.is_some();
+            A::AlterColumn
+        }
+        K::SetOptions { .. } => A::SetOptions,
+        K::RenameColumn { .. } => A::RenameColumn,
+        K::RenameTo { .. } => A::Rename,
+        K::SetSecure { .. } => A::SetSecure,
+        K::UnsetSecure { .. } => A::UnsetSecure,
+        K::SetComment { .. } => A::SetComment,
+        K::UnsetComment { .. } => A::UnsetComment,
+        K::SetTag { .. } => A::SetTag,
+        K::UnsetTag { .. } => A::UnsetTag,
+        K::OpaqueRemainder { .. } => A::Unknown,
+    };
+    facts.action = Some(action);
+    facts
 }
 
 /// Normalize a PostgreSQL boolean option literal (`true`/`false`, `on`/`off`,
@@ -12460,7 +12795,7 @@ fn pg_option_bool(value: Option<&str>) -> Option<bool> {
     let Some(raw) = value else {
         return Some(true);
     };
-    let v = unquote_option_value(raw);
+    let v = literal_value_or_name(raw);
     if v.eq_ignore_ascii_case("true")
         || v.eq_ignore_ascii_case("on")
         || v.eq_ignore_ascii_case("yes")
@@ -12604,6 +12939,7 @@ pub fn derive_facts_from_view_ddl_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind: stmt_kind,
@@ -12685,8 +13021,9 @@ fn project_ir_bq_options(
             .all_literal_values
             .iter()
             .map(|v| crate::facts::ddl::BqLiteralValue {
-                value: v.clone(),
-                cloud_scheme: classify_cloud_storage_uri(v),
+                value: v.value.clone(),
+                cloud_scheme: classify_cloud_storage_uri(&v.value),
+                url_password_literals: password_literals(&v.url_password_literals),
             })
             .collect(),
     }
@@ -12768,13 +13105,51 @@ pub fn derive_facts_from_query_plan_with_catalog(
     outer_span: Option<crate::lexer::token::Span>,
     reasoning: &dyn super::reasoning::Reasoning,
 ) -> StatementFacts {
-    let scan_index = crate::ir::expression_fact::build_scan_index(plan);
+    derive_facts_from_query_plan_and_held_plans(
+        plan,
+        &crate::ir::expression_fact::build_scan_index(plan),
+        bindings,
+        derived_facts,
+        source,
+        function_catalog,
+        catalog,
+        catalog,
+        outer_span,
+        reasoning,
+        &[],
+        false,
+    )
+}
+
+/// As [`derive_facts_from_query_plan_with_catalog`], read through
+/// `scan_index`, the scan index of `plan` and of the plans its expressions
+/// hold outside it ([`crate::ir::expression_fact::build_scan_index_over`]):
+/// the bodies of a policy statement, for which lowering returns no plan. A
+/// column of a source in one of them is published with that source's
+/// table.
+pub(crate) fn derive_facts_from_query_plan_and_held_plans(
+    plan: &crate::ir::plan::RelPlan,
+    scan_index: &crate::ir::expression_fact::ScanIndex,
+    bindings: &crate::ir::column::BindingTable,
+    derived_facts: &crate::ir::derived_facts::DerivedFacts,
+    source: &str,
+    function_catalog: &crate::ir::FunctionCatalog,
+    catalog: Option<&crate::ir::IndexedCatalogContext>,
+    known: Option<&crate::ir::IndexedCatalogContext>,
+    outer_span: Option<crate::lexer::token::Span>,
+    reasoning: &dyn super::reasoning::Reasoning,
+    placeholders: &[crate::lexer::token::Span],
+    output_columns: bool,
+) -> StatementFacts {
     let ctx = CatalogCtx {
         catalog,
+        known,
         function_catalog,
         source,
-        scan_index: Some(&scan_index),
+        scan_index: Some(scan_index),
         reasoning,
+        placeholders,
+        output_columns,
     };
     project_query_statement(plan, bindings, derived_facts, &ctx, outer_span)
 }
@@ -12963,7 +13338,7 @@ fn statement_kind_from_rel_plan(plan: &crate::ir::plan::RelPlan) -> StatementKin
 // top-down so the outermost owning node wins. Per-scope-set fields
 // (`where_predicates`, `having_predicates`, `aggregates`,
 // `window_functions`, `set_operations`, `scalar_subqueries`,
-// `lateral_flattens`, `star_projections`, `join_predicates`) accumulate
+// `table_functions`, `star_projections`, `join_predicates`) accumulate
 // across every encounter within the scope.
 //
 // Expression projection (`ScalarExpr` → `super::expr::Expr`) covers the
@@ -12980,22 +13355,24 @@ use super::catalog::Nullability;
 use super::expr::{
     BinaryOp, BinaryOpExpr, CaseBranch, CaseExpr, CastExpr, CastKind, CollectionExpr,
     CollectionKind, ComparisonOp as PublicComparisonOp, Expr, FieldAccessExpr, FuncCallExpr,
-    InListExpr, OpaqueExpr, OpaqueExprReason, OuterColumnRef, ParameterKind, ParameterRef,
-    QuantifiedCmpExpr, QuantifiedRhsExpr, Quantifier as PublicQuantifier, StarExpr, SubqueryExpr,
-    SubqueryKind, UnaryOp, UnaryOpExpr, WindowExpr, WindowFunctionName,
+    InListExpr, NamedArgument, OpaqueExpr, OpaqueExprReason, OuterColumnRef, ParameterKind,
+    ParameterRef, QuantifiedCmpExpr, QuantifiedRhsExpr, Quantifier as PublicQuantifier, StarExpr,
+    SubqueryExpr, SubqueryKind, UnaryOp, UnaryOpExpr, WindowExpr, WindowFunctionName,
 };
 use super::identity::{
     ColumnRef, IdentName as PublicIdentName, ScopeIdentity, TableRef as PublicTableRef,
 };
 use super::literal::LiteralValue;
 use super::query::{
-    AggregateEvent, AggregateFunction, JoinColumnPair, JoinEvent, JoinKind as PublicJoinKind,
-    JoinPredicateEvent, LateralEvent, LimitEvent, NullsOrdering, OrderByEvent, OrderDirection,
-    PredicateEvent, PredicateKind, PredicateNode, ProjectionEvent, ProjectionKind, QueryFacts,
-    ScopeFacts, ScopeKind, SetOpEvent, SetOpKind as PublicSetOpKind, StarProjectionEvent,
-    SubqueryRef, TableAccessKind, TableEvent, WindowEvent, WindowFrame as PublicWindowFrame,
-    WindowFrameBound, WindowFrameExclusion, WindowFrameKind,
+    AggregateEvent, AggregateFunction, FunctionOrigin, JoinColumnPair, JoinEvent,
+    JoinKind as PublicJoinKind, JoinPredicateEvent, JoinSource as PublicJoinSource, LimitEvent,
+    NullsOrdering, OrderByEvent, OrderDirection, PredicateEvent, PredicateKind, PredicateNode,
+    ProjectionEvent, ProjectionKind, QueryFacts, ScopeFacts, ScopeKind, SetOpEvent,
+    SetOpKind as PublicSetOpKind, StarProjectionEvent, SubqueryRef, TableAccessKind, TableEvent,
+    TableFunctionEvent, WindowEvent, WindowFrame as PublicWindowFrame, WindowFrameBound,
+    WindowFrameExclusion, WindowFrameKind,
 };
+use super::reasoning::{ReadAt, ReadSite};
 use crate::context::node_metadata as legacy_meta;
 use crate::ir::column::{BindingTable, ColumnId};
 use crate::ir::derived_facts::{derive_facts_from_plan, DerivedFacts};
@@ -13005,7 +13382,7 @@ use crate::ir::plan::{
     JoinKind as IrJoinKind, ProjectItem, RelPlan, ResolvedFunc, SetOpKind as IrSetOpKind, SortKey,
     StarQualifier, WindowCall, WindowFrame as IrWindowFrame,
 };
-use crate::ir::scalar::{FieldStep, Lit, QuantifiedRhs, Quantifier, ScalarExpr};
+use crate::ir::scalar::{FieldStep, Lit, QuantifiedRhs, ScalarExpr};
 
 /// Project a lowered query [`RelPlan`] (with its companion
 /// [`BindingTable`] and the IR-side [`DerivedFacts`] cached on) into the public [`QueryFacts`] surface.
@@ -13019,7 +13396,7 @@ use crate::ir::scalar::{FieldStep, Lit, QuantifiedRhs, Quantifier, ScalarExpr};
 /// - Per-scope `tables`, `joins`, `set_operations`, `where_predicates`,
 ///   `having_predicates`, `join_predicates`, `projections`, `group_by`,
 ///   `order_by`, `limit`, `qualify`, `aggregates`, `window_functions`,
-///   `star_projections`, `scalar_subqueries`, `lateral_flattens`.
+///   `star_projections`, `scalar_subqueries`, `table_functions`.
 /// - Expression trees as typed `super::expr::Expr` (closed-enum exhaustive
 ///   over `ScalarExpr`).
 ///
@@ -13033,50 +13410,246 @@ pub fn project_query_facts<'a>(
     derived_facts: &DerivedFacts,
     ctx: &'a CatalogCtx<'a>,
 ) -> QueryFacts {
-    project_query_facts_with_outer_ctes(
+    let reasoning = ctx.reasoning.for_query(super::reasoning::QueryInputs {
+        plan,
+        bindings,
+        catalog: ctx.known.or(ctx.catalog),
+        function_catalog: ctx.function_catalog,
+        source: ctx.source,
+    });
+    let mut facts = project_query_facts_with_outer_ctes(
         plan,
         bindings,
         derived_facts,
         ctx,
         &[],
-        std::collections::BTreeSet::new(),
-    )
+        reasoning.as_ref(),
+    );
+    if ctx.output_columns {
+        facts.output_columns = project_output_columns(plan, bindings, ctx, reasoning.as_ref());
+    }
+    facts
 }
 
-/// Variant of [`project_query_facts`] that accepts the CTE bindings
-/// visible at the caller's scope. Used by the inner-subquery recursion
-/// in `QueryWalker::project_subquery_expr` so a `CteRef` inside the
-/// subquery can be resolved by the null-guard analysis even though
-/// the subquery's local `root_plan` does not carry the enclosing
-/// `WithScope`. Top-level (statement-root) callers pass `&[]`.
+/// Whether `written`, a select item of `project`, is a column that a filter
+/// directly below the projection keeps only where it is not NULL: a
+/// top-level `col IS NOT NULL` conjunct of its predicate.
+fn kept_not_null_below(project: &RelPlan, written: &ScalarExpr) -> bool {
+    let ScalarExpr::Column { column, .. } = written else {
+        return false;
+    };
+    let RelPlan::Project { input, .. } = project else {
+        return false;
+    };
+    let mut node = input.as_ref();
+    while let RelPlan::Filter {
+        input, predicate, ..
+    } = node
+    {
+        if tests_not_null(predicate, *column) {
+            return true;
+        }
+        node = input;
+    }
+    false
+}
+
+/// Whether `predicate` holds only where `column` is not NULL by a
+/// `column IS NOT NULL` among its `AND`ed conjuncts.
+fn tests_not_null(predicate: &ScalarExpr, column: ColumnId) -> bool {
+    if let ScalarExpr::UnaryOp {
+        op: crate::ir::scalar::UnaryOpKind::IsNotNull,
+        arg,
+        ..
+    } = predicate
+    {
+        return matches!(arg.as_ref(), ScalarExpr::Column { column: tested, .. } if *tested == column);
+    }
+    if let ScalarExpr::BinOp {
+        op: crate::ir::scalar::BinOpKind::And,
+        left,
+        right,
+        ..
+    } = predicate
+    {
+        return tests_not_null(left, column) || tests_not_null(right, column);
+    }
+    if let ScalarExpr::LogicalChain {
+        op: crate::ir::scalar::LogicalOp::And,
+        operands,
+        ..
+    } = predicate
+    {
+        return operands
+            .iter()
+            .any(|operand| tests_not_null(operand, column));
+    }
+    false
+}
+
+/// Nullability of `col` read at `site`: reasoning's answer, or, where
+/// reasoning has none, the catalog's declaration for the id.
+fn nullability_at(
+    reasoning: &dyn super::reasoning::QueryReasoning,
+    catalog: Option<&crate::ir::IndexedCatalogContext>,
+    site: ReadSite<'_>,
+    col: ColumnId,
+) -> Nullability {
+    match reasoning.nullability(site, col) {
+        Nullability::Unknown => {
+            let catalog_nullable = catalog.and_then(|cat| {
+                let trait_obj: &dyn crate::ir::CatalogContext = cat;
+                trait_obj.column_metadata(col).and_then(|m| m.nullable)
+            });
+            match catalog_nullable {
+                Some(true) => Nullability::CatalogNullable,
+                Some(false) => Nullability::CatalogNonNullable,
+                None => Nullability::Unknown,
+            }
+        }
+        known @ (Nullability::CatalogNullable
+        | Nullability::CatalogNonNullable
+        | Nullability::FilteredNonNullable
+        | Nullability::DerivedNonNullable { .. }
+        | Nullability::DerivedNullable { .. }) => known,
+    }
+}
+
+/// Each column of the relation `plan` returns or makes
+/// ([`returned_relation`]), in its order, named as the relation names it,
+/// with what `reasoning` shows of it there.
+fn project_output_columns(
+    plan: &RelPlan,
+    bindings: &BindingTable,
+    ctx: &CatalogCtx<'_>,
+    reasoning: &dyn super::reasoning::QueryReasoning,
+) -> Vec<crate::facts::diff::OutputColumnFact> {
+    use crate::facts::diff::OutputColumnFact;
+    use crate::ir::schema::Position;
+    let Some((relation, declared)) = returned_relation(plan) else {
+        return Vec::new();
+    };
+    // A `CREATE … (names) AS` names the column at each position.
+    let mut named: std::collections::HashMap<ColumnId, &str> = std::collections::HashMap::new();
+    if let Some(declared) = declared {
+        let positions = relation.positional_columns();
+        for (index, name) in declared.iter().enumerate() {
+            if let Position::Column(column) = positions.at(index) {
+                named.insert(column, name.as_str());
+            }
+        }
+    }
+    let site = ReadSite {
+        node: relation,
+        at: ReadAt::Output,
+    };
+    relation
+        .output_schema()
+        .into_iter()
+        .map(|column| {
+            let name = named.get(&column).copied().unwrap_or_else(|| {
+                bindings
+                    .get(column)
+                    .map_or("", |binding| binding.display_name.as_str())
+            });
+            let nullable = match nullability_at(reasoning, ctx.catalog, site, column) {
+                Nullability::CatalogNullable | Nullability::DerivedNullable { .. } => Some(true),
+                Nullability::CatalogNonNullable
+                | Nullability::DerivedNonNullable { .. }
+                | Nullability::FilteredNonNullable => Some(false),
+                Nullability::Unknown => None,
+            };
+            let sources = reasoning.lineage_roots(column).map(|roots| {
+                roots
+                    .iter()
+                    .map(|root| source_column_ref(*root, bindings, ctx))
+                    .collect()
+            });
+            let taint_tags = reasoning
+                .output_catalog_tags(column)
+                .into_iter()
+                .map(|tag| CatalogTag {
+                    key: PublicIdentName::new(&tag.qualified_name),
+                    value: tag.value,
+                })
+                .collect();
+            let constraints = project_constraint_set(
+                &reasoning.output_constraints(relation, column),
+                reasoning.output_unique(relation, column),
+            );
+            OutputColumnFact {
+                column: ColumnRef::minimal(column_name(name), None),
+                nullable,
+                sources,
+                taint_tags,
+                constraints,
+            }
+        })
+        .collect()
+}
+
+/// A column's name `name`. One that can hold a literal (a column named by
+/// its expression's text, which no identifier spells, or by a value a
+/// pivot reads) is made of text the source writes somewhere the relations
+/// that pass the name on do not record: a report masks it wherever the
+/// source holds a literal it does not show.
+fn column_name(name: &str) -> PublicIdentName {
+    let written = PublicIdentName::new(name);
+    let spells_an_identifier = name
+        .chars()
+        .next()
+        .is_some_and(|first| !first.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#' | '@'));
+    let holds_text = !spells_an_identifier
+        || name.contains('\'')
+        || ["$$", "{{", "{%"].iter().any(|open| name.contains(open));
+    match holds_text {
+        true => written.written_at(Span {
+            start: 0,
+            end: u32::MAX,
+        }),
+        false => written,
+    }
+}
+
+/// A column a value is drawn from, named with the table it is read from
+/// where the plan names one.
+fn source_column_ref(id: ColumnId, bindings: &BindingTable, ctx: &CatalogCtx<'_>) -> ColumnRef {
+    use crate::ir::column::ColumnOrigin;
+    let Some(binding) = bindings.get(id) else {
+        return ColumnRef::minimal(PublicIdentName::new(""), None);
+    };
+    let table = match &binding.origin {
+        ColumnOrigin::Table { table_node, .. } => ctx
+            .scan_index
+            .and_then(|index| index.get(table_node))
+            .map(|table| project_metadata_table_ref(table, None)),
+        ColumnOrigin::Computed { .. }
+        | ColumnOrigin::Merged { .. }
+        | ColumnOrigin::SetOp { .. }
+        | ColumnOrigin::OuterRef { .. }
+        | ColumnOrigin::RecursiveRef { .. }
+        | ColumnOrigin::Unattributed { .. } => None,
+    };
+    ColumnRef::minimal(column_name(&binding.display_name), table)
+}
+
+/// Variant of [`project_query_facts`] for a scope nested in a statement:
+/// `outer_ctes` are the CTE bindings visible at the scope's root, so a
+/// `CteRef` inside it resolves to its binding even though `plan` does not
+/// carry the enclosing `WithScope`, and `reasoning` is the scope's
+/// reasoning. A statement root passes `&[]` and the statement's reasoning.
 pub fn project_query_facts_with_outer_ctes<'a>(
     plan: &'a RelPlan,
     bindings: &'a BindingTable,
     derived_facts: &DerivedFacts,
     ctx: &'a CatalogCtx<'a>,
     outer_ctes: &[&'a crate::ir::plan::CteBinding],
-    outer_volatile: std::collections::BTreeSet<ColumnId>,
+    reasoning: &dyn super::reasoning::QueryReasoning,
 ) -> QueryFacts {
-    // `outer_volatile` threads the enclosing scopes' volatile columns so
-    // a correlated reference inside this scope resolves its volatility
-    // against the parent.
-    let reasoning = ctx.reasoning.for_query(super::reasoning::QueryInputs {
-        plan,
-        bindings,
-        catalog: ctx.catalog,
-        function_catalog: ctx.function_catalog,
-        source: ctx.source,
-        outer_ctes,
-        outer_volatile: &outer_volatile,
-    });
-    let mut walker = QueryWalker::new(
-        bindings,
-        ctx,
-        plan,
-        reasoning.as_ref(),
-        outer_ctes.to_vec(),
-        &outer_volatile,
-    );
+    let mut walker = QueryWalker::new(bindings, ctx, plan, reasoning, outer_ctes.to_vec());
     walker.walk(plan, ScopeIdentity::OUTER);
     let mut facts = walker.finalize(plan, derived_facts);
     // T-SQL OPENROWSET(...) call sites: walk the IR plan for
@@ -13085,7 +13658,7 @@ pub fn project_query_facts_with_outer_ctes<'a>(
     for args in crate::ir::dynamic_sql::collect_openrowset_calls(plan) {
         let string_args = args
             .into_iter()
-            .map(|value| crate::facts::query::OpenrowsetArgFacts { value })
+            .filter_map(|arg| project_remote_source_arg(arg, ctx))
             .collect();
         facts
             .openrowset_calls
@@ -13096,13 +13669,107 @@ pub fn project_query_facts_with_outer_ctes<'a>(
     for args in crate::ir::dynamic_sql::collect_opendatasource_calls(plan) {
         let string_args = args
             .into_iter()
-            .map(|value| crate::facts::query::OpenrowsetArgFacts { value })
+            .filter_map(|arg| project_remote_source_arg(arg, ctx))
             .collect();
         facts
             .opendatasource_calls
             .push(crate::facts::query::OpenrowsetCallFacts { string_args });
     }
+    facts.function_calls = project_function_calls(plan, ctx.function_catalog);
     facts
+}
+
+/// A remote-source call's argument as facts: a string literal, with the
+/// entries it writes read as a connection string, or a `'data source';
+/// 'user';'password'` run, with its strings as those entries. `None` for
+/// an argument that is neither.
+fn project_remote_source_arg(
+    arg: crate::ir::dynamic_sql::RemoteSourceArg,
+    ctx: &CatalogCtx<'_>,
+) -> Option<crate::facts::query::OpenrowsetArgFacts> {
+    use crate::ir::dynamic_sql::RemoteSourceArg;
+    use crate::ir::span_extract::{connection_string_entries, login_run_entries};
+    let (value, entries) = match arg {
+        RemoteSourceArg::String { written, span } => (
+            written,
+            connection_string_entries(span, ctx.source, ctx.placeholders),
+        ),
+        RemoteSourceArg::Text { span } => {
+            let entries = login_run_entries(span, ctx.source, ctx.placeholders);
+            if entries.is_empty() {
+                return None;
+            }
+            (slice_span_text(ctx.source, span).to_string(), entries)
+        }
+    };
+    let connection_string = entries
+        .into_iter()
+        .map(|entry| {
+            let normalized = entry.key.to_ascii_uppercase();
+            crate::facts::query::ConnectionStringEntry {
+                key: IdentName::from_parts(entry.key, normalized),
+                value_literal: entry.value,
+            }
+        })
+        .collect();
+    Some(crate::facts::query::OpenrowsetArgFacts {
+        value,
+        connection_string,
+    })
+}
+
+/// Every function call in `plan`, nested plans included, named as a call
+/// in an expression is published.
+fn project_function_calls(
+    plan: &RelPlan,
+    catalog: &crate::ir::FunctionCatalog,
+) -> Vec<crate::facts::query::FunctionCallEvent> {
+    use crate::ir::visitor::{walk_rel_plan, walk_scalar_expr, RelPlanVisitor};
+
+    struct Calls<'c> {
+        catalog: &'c crate::ir::FunctionCatalog,
+        found: Vec<crate::facts::query::FunctionCallEvent>,
+    }
+
+    impl<'a> RelPlanVisitor<'a> for Calls<'_> {
+        fn visit_rel_plan(&mut self, plan: &'a RelPlan) {
+            walk_rel_plan(self, plan);
+        }
+
+        fn visit_scalar_expr(&mut self, expr: &'a ScalarExpr) {
+            if let ScalarExpr::FuncCall { func, span, .. } = expr {
+                // A call the catalog does not hold keeps its name as
+                // written, qualified or not: `pg_catalog.lo_export` is
+                // `lo_export` in schema `pg_catalog`.
+                let (name, schema) = match func {
+                    ResolvedFunc::Unresolved {
+                        raw_name,
+                        namespace,
+                        ..
+                    } => {
+                        let mut parts = crate::ir::lower_ddl::split_qualified(raw_name);
+                        let name = parts.pop().unwrap_or_else(|| raw_name.clone());
+                        let schema = namespace.clone().or_else(|| parts.pop());
+                        (PublicIdentName::new(name), schema.map(PublicIdentName::new))
+                    }
+                    ResolvedFunc::Resolved { .. } => (resolved_func_name(func, self.catalog), None),
+                };
+                self.found.push(crate::facts::query::FunctionCallEvent {
+                    name,
+                    schema,
+                    source_span: Some(*span),
+                });
+            }
+            walk_scalar_expr(self, expr);
+        }
+    }
+
+    let mut calls = Calls {
+        catalog,
+        found: Vec::new(),
+    };
+    calls.visit_rel_plan(plan);
+    calls.found
 }
 
 /// Walker state for [`project_query_facts`]. The `scopes` vec grows as
@@ -13136,11 +13803,76 @@ struct QueryWalker<'a, 'r> {
     /// `project_scalar_expr` inherit the value (a scalar subquery inside
     /// a `COALESCE(...)` in a SELECT list is still in `Projection`).
     current_subquery_position: crate::facts::SubqueryPosition,
-    /// Union of every enclosing scope's volatile columns, for resolving a
-    /// correlated reference's volatility (`ColumnId`s are global, so the
-    /// union suffices). Empty at the statement root; each nested subquery
-    /// walker receives its parent's volatile columns ∪ `outer_volatile`.
-    outer_volatile: &'r std::collections::BTreeSet<ColumnId>,
+    /// Where the expression currently being projected reads its columns.
+    /// Set beside `current_subquery_position` at each top-level
+    /// expression site; nested projection inherits it.
+    current_site: ReadSite<'a>,
+    /// Group key output → the projection of its expression, for each key
+    /// a select item presented. The key's `group_by` entry reuses it, so
+    /// the expression's subqueries are registered once.
+    presented_keys: std::collections::HashMap<ColumnId, Expr>,
+    /// Each read of a group key's output that the query wrote as the
+    /// key's expression, by column and span → the expression. Such a read
+    /// is presented as the expression.
+    written_keys: std::collections::HashMap<(ColumnId, Span), &'a ScalarExpr>,
+    /// Each column a DML statement of the plan writes, with the
+    /// statement's target.
+    written_columns: Vec<(&'a legacy_meta::TableRef, ColumnId)>,
+    /// Each column an `UPDATE` assignment, a `MERGE` branch or an upsert's
+    /// update action of the plan writes to a catalogued table, with its
+    /// tags and its value's.
+    written_tags: Vec<crate::facts::query::WrittenColumnEvent>,
+    /// Each column a table function the walk has passed yields: no
+    /// catalog is asked whether it is a key.
+    function_columns: std::collections::BTreeSet<ColumnId>,
+    /// Per select list, what it reads, gathered on the way down to its
+    /// scope's sources.
+    select_reads: std::collections::BTreeMap<SelectList, SelectReads>,
+    /// The scopes whose select list the walk is below.
+    under_select_list: std::collections::BTreeSet<ScopeIdentity>,
+    /// The set-operation branch the walk is in, per scope; none outside
+    /// one.
+    branches: std::collections::BTreeMap<ScopeIdentity, u32>,
+    /// The number of set-operation branches the walk has entered.
+    branches_entered: u32,
+    /// Per derived table's scope, the select list that reads its columns
+    /// and the body columns those are.
+    derived_reads: std::collections::BTreeMap<
+        ScopeIdentity,
+        (SelectList, std::collections::HashSet<ColumnId>),
+    >,
+    /// Each published table function, for `columns_selected`.
+    pending_functions: Vec<PendingFunction<'a>>,
+}
+
+/// A select list: its scope, and the set-operation branch it is the list
+/// of (0 outside one).
+type SelectList = (ScopeIdentity, u32);
+
+/// Whether the source of everything a written value reads is known.
+#[derive(Debug, Clone, Copy)]
+enum ValueSource {
+    Known,
+    /// The value reads a column the plan places at no position of its
+    /// source: which of the source's columns it holds is not known.
+    PartlyUnknown,
+}
+
+/// A published table function whose `columns_selected` is settled after
+/// the walk.
+struct PendingFunction<'a> {
+    /// The select list of its query.
+    list: SelectList,
+    /// Its scope's.
+    scope: ScopeIdentity,
+    /// Its place in the scope's `table_functions`.
+    index: usize,
+    /// The node of the source it is.
+    node: crate::ast::NodeId,
+    columns: &'a [ColumnId],
+    alias: Option<&'a crate::context::node_metadata::IdentKey>,
+    /// What its arguments read.
+    argument_reads: std::collections::HashSet<ColumnId>,
 }
 
 impl<'a, 'r> QueryWalker<'a, 'r> {
@@ -13150,7 +13882,6 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         root_plan: &'a RelPlan,
         reasoning: &'r dyn super::reasoning::QueryReasoning,
         cte_bindings_in_scope: Vec<&'a crate::ir::plan::CteBinding>,
-        outer_volatile: &'r std::collections::BTreeSet<ColumnId>,
     ) -> Self {
         Self {
             scopes: vec![empty_scope_facts(
@@ -13165,136 +13896,128 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             reasoning,
             cte_bindings_in_scope,
             current_subquery_position: crate::facts::SubqueryPosition::Other,
-            outer_volatile,
+            current_site: ReadSite {
+                node: root_plan,
+                at: ReadAt::Context,
+            },
+            presented_keys: std::collections::HashMap::new(),
+            written_keys: crate::ir::derived_facts::written_again_keys(root_plan),
+            written_columns: Vec::new(),
+            written_tags: Vec::new(),
+            function_columns: std::collections::BTreeSet::new(),
+            select_reads: std::collections::BTreeMap::new(),
+            under_select_list: std::collections::BTreeSet::new(),
+            branches: std::collections::BTreeMap::new(),
+            branches_entered: 0,
+            derived_reads: std::collections::BTreeMap::new(),
+            pending_functions: Vec::new(),
         }
     }
 
-    /// Project a scalar expression with `position` scoped on the walker
-    /// for the duration of the call (and any nested calls). Inner
-    /// recursive calls inside `project_scalar_expr` inherit the value,
+    /// The select list of `scope` the walk is in.
+    fn select_list(&self, scope: ScopeIdentity) -> SelectList {
+        (scope, self.branches.get(&scope).copied().unwrap_or(0))
+    }
+
+    /// Settle each table function's `columns_selected`: the select list of
+    /// its query reads one of its columns, or a column of a call whose
+    /// arguments read one (`UNNEST(a.c) u1, UNNEST(u1.y) u2` selecting
+    /// `u2` reads `u1`).
+    fn settle_selected_functions(&mut self) {
+        let pending = std::mem::take(&mut self.pending_functions);
+        let mut selected = vec![false; pending.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (function, settled) in pending.iter().zip(selected.iter_mut()) {
+                if *settled {
+                    continue;
+                }
+                let Some(reads) = self.select_reads.get_mut(&function.list) else {
+                    continue;
+                };
+                if reads.reads_function(function.columns, function.alias, function.node) {
+                    *settled = true;
+                    changed = true;
+                    reads
+                        .columns
+                        .extend(function.argument_reads.iter().copied());
+                }
+            }
+        }
+        for (function, settled) in pending.iter().zip(selected) {
+            if let Some(event) = self
+                .scope_mut(function.scope)
+                .table_functions
+                .get_mut(function.index)
+            {
+                event.columns_selected = settled;
+            }
+        }
+    }
+
+    /// What the query wrote where `expr` stands, where `expr` is a read
+    /// of a group key the query wrote as the key's expression.
+    fn written_again(&self, expr: &ScalarExpr) -> Option<&'a ScalarExpr> {
+        match expr {
+            ScalarExpr::Column { column, span } => {
+                self.written_keys.get(&(*column, *span)).copied()
+            }
+            ScalarExpr::OuterRef { .. }
+            | ScalarExpr::Lit { .. }
+            | ScalarExpr::BinOp { .. }
+            | ScalarExpr::LogicalChain { .. }
+            | ScalarExpr::OperatorChain { .. }
+            | ScalarExpr::UnaryOp { .. }
+            | ScalarExpr::FuncCall { .. }
+            | ScalarExpr::Case { .. }
+            | ScalarExpr::Cast { .. }
+            | ScalarExpr::InList { .. }
+            | ScalarExpr::Between { .. }
+            | ScalarExpr::Like { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::ScalarSubquery { .. }
+            | ScalarExpr::QuantifiedCmp { .. }
+            | ScalarExpr::RowCmp { .. }
+            | ScalarExpr::WindowFn { .. }
+            | ScalarExpr::FieldAccess { .. }
+            | ScalarExpr::Lambda { .. }
+            | ScalarExpr::PatternVarRef { .. }
+            | ScalarExpr::Opaque { .. } => None,
+        }
+    }
+
+    /// Run `project` with `site` as the walker's read site, restoring the
+    /// previous site on return so sibling expressions are unaffected.
+    fn at_site<T>(&mut self, site: ReadSite<'a>, project: impl FnOnce(&mut Self) -> T) -> T {
+        let prev = std::mem::replace(&mut self.current_site, site);
+        let result = project(self);
+        self.current_site = prev;
+        result
+    }
+
+    /// Project a scalar expression read at `site`, with `position` scoped
+    /// on the walker for the duration of the call (and any nested calls).
+    /// Inner recursive calls inside `project_scalar_expr` inherit both,
     /// so a scalar subquery embedded several layers deep in a projection
     /// expression still receives `position: projection`. Restores the
     /// previous position on return so sibling expressions are unaffected.
     fn project_scalar_expr_at(
         &mut self,
         expr: &ScalarExpr,
+        site: ReadSite<'a>,
         position: crate::facts::SubqueryPosition,
     ) -> Expr {
         let prev = std::mem::replace(&mut self.current_subquery_position, position);
-        let result = self.project_scalar_expr(expr);
+        let result = self.at_site(site, |w| w.project_scalar_expr(expr));
         self.current_subquery_position = prev;
         result
     }
 
-    /// Map a column id through nullability reasoning + filter-guard
-    /// reasoning + catalog into the public closed-enum [`Nullability`].
-    ///
-    /// Priority order:
-    /// 1. Reasoning says nullable → [`Nullability::DerivedNullable`]
-    ///    (dataflow shapes — LEFT JOIN pad, CASE-no-ELSE, SAFE_CAST —
-    ///    the catalog cannot see).
-    /// 2. `is_projected_col_null_guarded` says the column is null-
-    ///    guarded by a Filter{Where} predicate or a null-safe wrapper
-    ///    → [`Nullability::FilteredNonNullable`].
-    /// 3. Catalog says NOT NULL → [`Nullability::CatalogNonNullable`].
-    /// 4. Catalog says nullable → [`Nullability::CatalogNullable`].
-    /// 5. Otherwise → [`Nullability::Unknown`].
-    fn nullability_for(&self, col: crate::ir::column::ColumnId) -> Nullability {
-        if self.reasoning.is_column_nullable(col) {
-            return Nullability::DerivedNullable {
-                reason: super::catalog::NullableReason::DerivedFromNullableInputs,
-            };
-        }
-        // Filter-derived non-nullability: an enclosing `WHERE x IS NOT NULL`
-        // proves the column non-null for all rows surviving to the
-        // projection (COALESCE-wrap / IS-NOT-NULL / strict-comparison forms).
-        if self
-            .reasoning
-            .is_projected_col_null_guarded(col, &self.cte_bindings_in_scope, None)
-        {
-            return Nullability::FilteredNonNullable;
-        }
-        // `column_metadata` is a `CatalogContext` trait method; the
-        // concrete `IndexedCatalogContext` implements it via the trait
-        // so cast through the trait object for the lookup.
-        let catalog_nullable = match self.ctx.catalog {
-            Some(cat) => {
-                let trait_obj: &dyn crate::ir::CatalogContext = cat;
-                trait_obj.column_metadata(col).and_then(|m| m.nullable)
-            }
-            None => None,
-        };
-        match catalog_nullable {
-            Some(true) => Nullability::CatalogNullable,
-            Some(false) => Nullability::CatalogNonNullable,
-            None => Nullability::Unknown,
-        }
-    }
-
-    /// Refinement of [`Self::nullability_for`] that recovers
-    /// `CatalogNullable` provenance through transparent CTE /
-    /// DerivedTable / set-op pass-through projections.
-    ///
-    /// The base [`Self::nullability_for`] cascade only consults the
-    /// catalog for `ColumnOrigin::Table` ColumnIds; nullability
-    /// reasoning answers for the top-level plan's `output_schema`,
-    /// which excludes JOIN-internal ColumnIds. As a
-    /// result, the cascade collapses to `Nullability::Unknown` for a
-    /// `CteRef` outer-col or `DerivedTable` outer-col whose lineage
-    /// resolves to a catalog-attested nullable base — even though the
-    /// silent-NULL-drop hazard the rule warns about is still present
-    /// at the JOIN's ON predicate.
-    ///
-    /// Refinement: when the cascade lands on either `Unknown` or
-    /// `DerivedNullable { DerivedFromNullableInputs }`, walk the IR's
-    /// global lineage index to find any lineage source with
-    /// `column_metadata(...).nullable == Some(true)`. If found,
-    /// re-classify as `CatalogNullable`. The catalog testimony at the
-    /// base of a transparent chain is the same testimony the rule
-    /// would see on a base-table direct join — passing through Project
-    /// nodes does not erase it.
-    ///
-    /// LEFT-JOIN-pad / CASE-no-ELSE / SAFE_CAST cases also produce
-    /// `DerivedFromNullableInputs` (the reason discriminator is not
-    /// kind-specific), but their lineage roots
-    /// are catalog-non-null base columns — the refinement does not
-    /// fire on those shapes and `DerivedNullable` is preserved.
-    /// Filter-guarded (`Nullability::FilteredNonNullable`) — the
-    /// rule's "add IS NOT NULL filter" remediation, applied upstream
-    /// of the JOIN — and direct catalog (`CatalogNullable` /
-    /// `CatalogNonNullable`) verdicts short-circuit the refinement
-    /// at higher priority.
-    fn nullability_with_catalog_lineage(&self, id: ColumnId) -> Nullability {
-        let direct = self.nullability_for(id);
-        let refinement_eligible = match direct {
-            Nullability::Unknown => true,
-            Nullability::DerivedNullable {
-                reason: super::catalog::NullableReason::DerivedFromNullableInputs,
-            } => true,
-            Nullability::CatalogNullable
-            | Nullability::CatalogNonNullable
-            | Nullability::FilteredNonNullable
-            | Nullability::DerivedNonNullable { .. }
-            | Nullability::DerivedNullable { .. } => false,
-        };
-        if !refinement_eligible {
-            return direct;
-        }
-        let Some(catalog) = self.ctx.catalog else {
-            return direct;
-        };
-        let trait_obj: &dyn crate::ir::CatalogContext = catalog;
-        let Some(sources) = self.reasoning.lineage_roots(id) else {
-            return direct;
-        };
-        for src in sources {
-            if let Some(meta) = trait_obj.column_metadata(*src) {
-                if meta.nullable == Some(true) {
-                    return Nullability::CatalogNullable;
-                }
-            }
-        }
-        direct
+    /// Nullability of `col` read at `site`: reasoning's answer, or, where
+    /// reasoning has none, the catalog's declaration for the id.
+    fn nullability_at(&self, site: ReadSite<'_>, col: ColumnId) -> Nullability {
+        nullability_at(self.reasoning, self.ctx.catalog, site, col)
     }
 
     fn alloc_scope(&mut self, kind: ScopeKind, source_span: Option<Span>) -> ScopeIdentity {
@@ -13313,23 +14036,13 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     }
 
     fn walk(&mut self, plan: &'a RelPlan, current: ScopeIdentity) {
+        // What this node's expressions read.
+        let context = ReadSite {
+            node: plan,
+            at: ReadAt::Context,
+        };
         match plan {
-            RelPlan::Scan { table, span, .. } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(table, self.ctx.catalog);
-                let event = TableEvent {
-                    table: project_metadata_table_ref(table, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::Read,
-                    table_kind,
-                    in_catalog,
-                };
-                self.scope_mut(current).tables.push(event);
-            }
+            RelPlan::Scan { table, span, .. } => self.walk_scan(current, table, span),
 
             // Sources that are not base tables: excluded from
             // `tables_read`, as in `derive_facts_from_plan`.
@@ -13338,33 +14051,21 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             RelPlan::TableFunction {
                 call,
                 alias,
+                output_columns,
                 lateral,
+                node_id,
                 span,
                 ..
-            } => {
-                // Lateral / CROSS APPLY-style flatten: surface as
-                // LateralEvent so rules can audit lateral usage.
-                if *lateral {
-                    let (function_name, args) = match call {
-                        ScalarExpr::FuncCall { func, args, .. } => (
-                            resolved_func_name(func, self.ctx.function_catalog),
-                            args.as_slice(),
-                        ),
-                        _ => (PublicIdentName::new(""), &[][..]),
-                    };
-                    let alias_ident = alias.as_ref().map(|a| PublicIdentName::new(a.as_str()));
-                    let projected_args = args
-                        .iter()
-                        .map(|a| self.project_scalar_expr(a))
-                        .collect::<Vec<_>>();
-                    self.scope_mut(current).lateral_flattens.push(LateralEvent {
-                        function: function_name,
-                        args: projected_args,
-                        alias: alias_ident,
-                        source_span: Some(*span),
-                    });
-                }
-            }
+            } => self.walk_table_function(
+                current,
+                context,
+                call,
+                alias,
+                output_columns,
+                lateral,
+                node_id,
+                span,
+            ),
 
             // Project: emit ProjectionEvents (outer-only per scope) and
             // walk input.
@@ -13374,88 +14075,19 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 distinct,
                 distinct_on,
                 ..
-            } => {
-                // `has_distinct` reflects the scope's outermost
-                // `Project { distinct: true }` — the visit order is
-                // outside-in so the first arm to see this scope wins.
-                // `DISTINCT ON` is excluded (semantically GROUP BY,
-                // surfaced via `group_by`).
-                if *distinct && !self.scope_mut(current).has_distinct {
-                    self.scope_mut(current).has_distinct = true;
-                }
-                self.emit_project_items(current, items, distinct_on);
-                self.walk(input, current);
-            }
+            } => self.walk_project(current, context, input, items, distinct, distinct_on),
 
             // Filter: classify by `kind` (Where / Qualify / Having) and
             // emit a PredicateEvent into the corresponding per-scope-set
             // (or set the outer-only `qualify` slot on first encounter).
             RelPlan::Filter {
                 input,
+                computed,
                 predicate,
                 kind,
                 span,
                 ..
-            } => {
-                let position = match kind {
-                    FilterKind::Where => crate::facts::SubqueryPosition::Where,
-                    FilterKind::Having => crate::facts::SubqueryPosition::Having,
-                    FilterKind::Qualify => crate::facts::SubqueryPosition::Qualify,
-                };
-                let projected = self.project_scalar_expr_at(predicate, position);
-                match kind {
-                    FilterKind::Where => {
-                        let event = PredicateEvent {
-                            root: projected.clone(),
-                            scope_id: current,
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                            source_span: Some(*span),
-                        };
-                        self.scope_mut(current).where_predicates.push(event);
-                        self.scope_mut(current).predicates.push(PredicateNode {
-                            kind: PredicateKind::Where,
-                            root: projected,
-                            scope_id: current,
-                            source_span: Some(*span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    }
-                    FilterKind::Qualify => {
-                        if self.scope_mut(current).qualify.is_none() {
-                            self.scope_mut(current).qualify = Some(projected.clone());
-                        }
-                        self.scope_mut(current).predicates.push(PredicateNode {
-                            kind: PredicateKind::Qualify,
-                            root: projected,
-                            scope_id: current,
-                            source_span: Some(*span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    }
-                    FilterKind::Having => {
-                        let event = PredicateEvent {
-                            root: projected.clone(),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                            scope_id: current,
-                            source_span: Some(*span),
-                        };
-                        self.scope_mut(current).having_predicates.push(event);
-                        self.scope_mut(current).predicates.push(PredicateNode {
-                            kind: PredicateKind::Having,
-                            root: projected,
-                            scope_id: current,
-                            source_span: Some(*span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    }
-                }
-                self.walk(input, current);
-            }
+            } => self.walk_filter(current, context, input, computed, predicate, kind, span),
 
             // Aggregate: emit AggregateEvents for each call (per-scope-set),
             // populate group_by (outer-only per scope), and surface
@@ -13465,47 +14097,26 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 grouping,
                 aggregates,
                 having,
+                computed,
                 span,
                 ..
-            } => {
-                self.emit_aggregate_calls(current, aggregates);
-                self.emit_group_by(current, grouping);
-                if let Some(having_expr) = having {
-                    let projected = self.project_scalar_expr_at(
-                        having_expr,
-                        crate::facts::SubqueryPosition::Having,
-                    );
-                    let event = PredicateEvent {
-                        root: projected.clone(),
-                        scope_id: current,
-                        source_span: Some(*span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    };
-                    self.scope_mut(current).having_predicates.push(event);
-                    self.scope_mut(current).predicates.push(PredicateNode {
-                        kind: PredicateKind::Having,
-                        root: projected,
-                        scope_id: current,
-                        source_span: Some(*span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    });
-                }
-                self.walk(input, current);
-            }
+            } => self.walk_aggregate(
+                plan, current, context, input, grouping, aggregates, having, computed, span,
+            ),
 
             // Window: emit WindowEvents per call (per-scope-set) and
             // walk input.
-            RelPlan::Window { input, windows, .. } => {
-                self.emit_window_calls(current, windows);
-                self.walk(input, current);
-            }
+            RelPlan::Window {
+                input,
+                windows,
+                computed,
+                ..
+            } => self.walk_window(current, context, input, windows, computed),
 
             // Sort: populate order_by (outer-only per scope) and walk
             // input.
             RelPlan::Sort { input, keys, .. } => {
-                self.emit_order_by(current, keys);
+                self.emit_order_by(current, context, keys);
                 self.walk(input, current);
             }
 
@@ -13517,18 +14128,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 offset,
                 span,
                 ..
-            } => {
-                if self.scope_mut(current).limit.is_none() {
-                    let limit_expr = limit.as_ref().map(|e| self.project_scalar_expr(e));
-                    let offset_expr = offset.as_ref().map(|e| self.project_scalar_expr(e));
-                    self.scope_mut(current).limit = Some(LimitEvent {
-                        limit: limit_expr,
-                        offset: offset_expr,
-                        source_span: Some(*span),
-                    });
-                }
-                self.walk(input, current);
-            }
+            } => self.walk_limit(current, context, input, limit, offset, span),
 
             RelPlan::TableSample { input, .. } => {
                 self.has_sample = true;
@@ -13540,7 +14140,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             } => {
                 // PIVOT carries aggregate calls; project them so rules
                 // that audit aggregates over PIVOT see the same shape.
-                self.emit_aggregate_calls(current, aggregates);
+                self.emit_aggregate_calls(current, context, aggregates);
                 self.walk(input, current);
             }
 
@@ -13565,221 +14165,63 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 span,
                 clause_span,
                 ..
-            } => {
-                self.walk(left, current);
-                self.walk(right, current);
-                let on_predicate = on.as_ref().map(|e| {
-                    self.project_scalar_expr_at(e, crate::facts::SubqueryPosition::JoinOn)
-                });
-                let filters_join = on.as_ref().map(predicate_filters_join).unwrap_or(false);
-                if let Some(predicate_expr) = on.as_ref() {
-                    let projected = self.project_scalar_expr_at(
-                        predicate_expr,
-                        crate::facts::SubqueryPosition::JoinOn,
-                    );
-                    let public_kind = project_join_kind(*kind, *lateral, *natural);
-                    self.scope_mut(current)
-                        .join_predicates
-                        .push(JoinPredicateEvent {
-                            root: projected.clone(),
-                            scope_id: current,
-                            source_span: Some(*span),
-                        });
-                    self.scope_mut(current).predicates.push(PredicateNode {
-                        kind: PredicateKind::JoinOn {
-                            join_kind: public_kind,
-                        },
-                        root: projected,
-                        scope_id: current,
-                        source_span: Some(*span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    });
-                }
-                if let Some(mc_expr) = match_condition.as_ref() {
-                    let mc_span = mc_expr.span();
-                    let projected = self.project_scalar_expr(mc_expr);
-                    self.scope_mut(current).predicates.push(PredicateNode {
-                        kind: PredicateKind::AsofMatch,
-                        root: projected,
-                        scope_id: current,
-                        source_span: Some(mc_span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    });
-                }
-                if let (Some(l), Some(r)) = (principal_table_ref(left), principal_table_ref(right))
-                {
-                    let on_columns = on
-                        .as_ref()
-                        .map(|e| self.extract_join_column_pairs(e))
-                        .unwrap_or_default();
-                    // Catalog-aware row-count estimates for the
-                    // operands' principal base tables. Used by
-                    // Q-JOIN-CROSS-CENH to size the cartesian product in
-                    // its message; absent when no catalog is
-                    // attached or the table has no row_count estimate.
-                    let (left_row_count, right_row_count) = match self.ctx.catalog {
-                        Some(cat) => (
-                            principal_scan_metadata_table_ref_with_ctes(
-                                left,
-                                &self.cte_bindings_in_scope,
-                            )
-                            .and_then(|t| cat.table_row_count(t)),
-                            principal_scan_metadata_table_ref_with_ctes(
-                                right,
-                                &self.cte_bindings_in_scope,
-                            )
-                            .and_then(|t| cat.table_row_count(t)),
-                        ),
-                        None => (None, None),
-                    };
-                    let cartesian_estimate = match (left_row_count, right_row_count) {
-                        (Some(a), Some(b)) => Some(a.saturating_mul(b)),
-                        _ => None,
-                    };
-                    self.scope_mut(current).joins.push(JoinEvent {
-                        left: l,
-                        right: r,
-                        kind: project_join_kind(*kind, *lateral, *natural),
-                        on_columns,
-                        on_predicate,
-                        source_span: Some(*clause_span),
-                        filters_join,
-                        implicit: *implicit,
-                        left_row_count,
-                        right_row_count,
-                        cartesian_estimate,
-                    });
-                }
-            }
+            } => self.walk_join(
+                plan,
+                current,
+                context,
+                left,
+                right,
+                kind,
+                lateral,
+                natural,
+                implicit,
+                on,
+                match_condition,
+                span,
+                clause_span,
+            ),
 
             RelPlan::SetOp {
                 op, inputs, span, ..
-            } => {
-                self.scope_mut(current).set_operations.push(SetOpEvent {
-                    kind: project_set_op_kind(*op),
-                    branch_count: inputs.len() as u32,
-                    source_span: Some(*span),
-                });
-                for input in inputs {
-                    self.walk(input, current);
-                }
-            }
+            } => self.walk_set_op(current, op, inputs, span),
 
-            RelPlan::WithScope { ctes, body, .. } => {
-                // Push each CTE binding onto the scope's accumulated
-                // outer-CTE list before walking its body, so a sibling
-                // CTE (and the WithScope's body) can resolve CteRefs
-                // to earlier-declared CTEs. Pop after walking the body
-                // so sibling-level WithScopes don't leak.
-                let pushed = ctes.len();
-                for cte in ctes {
-                    self.cte_bindings_in_scope.push(cte);
-                    let recursive = matches!(cte.body, CteBody::Recursive { .. });
-                    let cte_scope = self.alloc_scope(
-                        ScopeKind::Cte {
-                            name: PublicIdentName::new(cte.name.as_str()),
-                            recursive,
-                        },
-                        Some(cte.span),
-                    );
-                    match &cte.body {
-                        CteBody::NonRecursive(body) => {
-                            self.walk(body, cte_scope);
-                        }
-                        CteBody::Recursive { anchor, step, .. } => {
-                            self.walk(anchor, cte_scope);
-                            self.walk(step, cte_scope);
-                        }
-                    }
-                }
-                self.walk(body, current);
-                for _ in 0..pushed {
-                    self.cte_bindings_in_scope.pop();
-                }
-            }
+            RelPlan::WithScope { ctes, body, .. } => self.walk_with_scope(current, ctes, body),
 
             RelPlan::DerivedTable {
-                input, alias, span, ..
-            } => {
-                let alias_ident = alias
-                    .as_ref()
-                    .map(|a| PublicIdentName::new(a.as_str()))
-                    .unwrap_or_else(|| PublicIdentName::new(""));
-                let dt_scope =
-                    self.alloc_scope(ScopeKind::DerivedTable { alias: alias_ident }, Some(*span));
-                self.walk(input, dt_scope);
-            }
+                input,
+                alias,
+                columns,
+                body_columns,
+                span,
+                ..
+            } => self.walk_derived_table(current, input, alias, columns, body_columns, span),
 
             RelPlan::Insert {
                 target,
+                target_columns,
+                unplaced_columns,
                 source,
+                on_conflict,
                 span,
                 ..
-            } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::InsertedInto,
-                    table_kind,
-                    in_catalog,
-                });
-                if let Some(plan) = insert_source_plan(source) {
-                    self.walk(plan, current);
-                }
-            }
+            } => self.walk_insert(
+                current,
+                target,
+                target_columns,
+                unplaced_columns,
+                source,
+                on_conflict,
+                span,
+            ),
 
             RelPlan::Update {
                 target,
+                assignments,
                 from,
                 predicate,
                 span,
                 ..
-            } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::Updated,
-                    table_kind,
-                    in_catalog,
-                });
-                if let Some(from) = from {
-                    self.walk(from, current);
-                }
-                if let Some(pred) = predicate {
-                    let projected = self.project_scalar_expr(pred);
-                    self.scope_mut(current)
-                        .where_predicates
-                        .push(PredicateEvent {
-                            root: projected.clone(),
-                            scope_id: current,
-                            source_span: Some(*span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    self.scope_mut(current).predicates.push(PredicateNode {
-                        kind: PredicateKind::UpdateWhere,
-                        root: projected,
-                        scope_id: current,
-                        source_span: Some(*span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    });
-                }
-            }
+            } => self.walk_update(current, context, target, assignments, from, predicate, span),
 
             RelPlan::Delete {
                 target,
@@ -13787,44 +14229,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 predicate,
                 span,
                 ..
-            } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::DeletedFrom,
-                    table_kind,
-                    in_catalog,
-                });
-                if let Some(using) = using {
-                    self.walk(using, current);
-                }
-                if let Some(pred) = predicate {
-                    let projected = self.project_scalar_expr(pred);
-                    self.scope_mut(current)
-                        .where_predicates
-                        .push(PredicateEvent {
-                            root: projected.clone(),
-                            scope_id: current,
-                            source_span: Some(*span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    self.scope_mut(current).predicates.push(PredicateNode {
-                        kind: PredicateKind::DeleteWhere,
-                        root: projected,
-                        scope_id: current,
-                        source_span: Some(*span),
-                        null_effects: Vec::new(),
-                        cross_scope_effects: Vec::new(),
-                    });
-                }
-            }
+            } => self.walk_delete(current, context, target, using, predicate, span),
 
             RelPlan::Merge {
                 target,
@@ -13833,93 +14238,36 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 branches,
                 span,
                 ..
-            } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::ReadAndWritten,
-                    table_kind,
-                    in_catalog,
-                });
-                self.walk(source, current);
-                let projected_on = self.project_scalar_expr(on);
-                self.scope_mut(current)
-                    .join_predicates
-                    .push(JoinPredicateEvent {
-                        root: projected_on.clone(),
-                        scope_id: current,
-                        source_span: Some(*span),
-                    });
-                self.scope_mut(current).predicates.push(PredicateNode {
-                    kind: PredicateKind::MergeOn,
-                    root: projected_on,
-                    scope_id: current,
-                    source_span: Some(*span),
-                    null_effects: Vec::new(),
-                    cross_scope_effects: Vec::new(),
-                });
-                for branch in branches {
-                    if let Some(branch_pred) = &branch.predicate {
-                        let projected = self.project_scalar_expr(branch_pred);
-                        self.scope_mut(current).predicates.push(PredicateNode {
-                            kind: PredicateKind::MergeWhen {
-                                branch_kind: project_merge_branch_kind(branch.kind),
-                            },
-                            root: projected,
-                            scope_id: current,
-                            source_span: Some(branch.span),
-                            null_effects: Vec::new(),
-                            cross_scope_effects: Vec::new(),
-                        });
-                    }
-                }
-            }
+            } => self.walk_merge(current, context, target, source, on, branches, span),
 
-            RelPlan::MultiInsert { source, .. } => {
+            RelPlan::MultiInsert {
+                source,
+                unconditional_clauses,
+                when_clauses,
+                else_clauses,
+                ..
+            } => {
+                let whens = when_clauses.iter().flat_map(|when| &when.targets);
+                for into in unconditional_clauses
+                    .iter()
+                    .chain(whens)
+                    .chain(else_clauses)
+                {
+                    self.written_columns.extend(
+                        into.target_columns
+                            .iter()
+                            .map(|written| (&into.target, *written)),
+                    );
+                }
                 self.walk(source, current);
             }
 
             RelPlan::CreateAsQuery {
                 target, body, span, ..
-            } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::Written,
-                    table_kind,
-                    in_catalog,
-                });
-                if let Some(body) = body {
-                    self.walk(body, current);
-                }
-            }
+            } => self.walk_create_as_query(current, target, body, span),
 
             RelPlan::CreateTableForm { target, span, .. } => {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(target, self.ctx.catalog);
-                self.scope_mut(current).tables.push(TableEvent {
-                    table: project_metadata_table_ref(target, Some(*span)),
-                    scope_id: current,
-                    source_span: Some(*span),
-                    catalog_tags,
-                    row_count,
-                    column_count,
-                    access_kind: TableAccessKind::Written,
-                    table_kind,
-                    in_catalog,
-                });
+                self.walk_create_table_form(current, target, span)
             }
 
             // Terminal recovery / opaque arms. No structure to project.
@@ -13929,18 +14277,975 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
+    /// [`Self::walk`] of a `RelPlan::Scan`.
+    #[inline(never)]
+    fn walk_scan(
+        &mut self,
+        current: ScopeIdentity,
+        table: &'a crate::context::node_metadata::TableRef,
+        span: &'a Span,
+    ) {
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            table_catalog_metadata(table, self.ctx.catalog);
+        let event = TableEvent {
+            table: project_metadata_table_ref(table, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::Read,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        };
+        self.scope_mut(current).tables.push(event);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::TableFunction`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_table_function(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        call: &'a ScalarExpr,
+        alias: &'a Option<crate::context::node_metadata::IdentKey>,
+        output_columns: &'a [ColumnId],
+        lateral: &'a bool,
+        node_id: &'a crate::ast::NodeId,
+        span: &'a Span,
+    ) {
+        self.function_columns.extend(output_columns.iter().copied());
+        // A source that is a call publishes it; one that is a
+        // variable or another value is no call.
+        let projected = match self.at_site(context, |w| w.project_scalar_expr(call)) {
+            Expr::FuncCall { func_call } => Some(func_call),
+            Expr::Column { .. }
+            | Expr::Literal { .. }
+            | Expr::BinaryOp { .. }
+            | Expr::LogicalChain { .. }
+            | Expr::OperatorChain { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::Case { .. }
+            | Expr::Cast { .. }
+            | Expr::Tuple { .. }
+            | Expr::InList { .. }
+            | Expr::Subquery { .. }
+            | Expr::QuantifiedCmp { .. }
+            | Expr::Star { .. }
+            | Expr::Collection { .. }
+            | Expr::OuterColumn { .. }
+            | Expr::Parameter { .. }
+            | Expr::Window { .. }
+            | Expr::FieldAccess { .. }
+            | Expr::IndexAccess { .. }
+            | Expr::Opaque { .. } => None,
+        };
+        if let Some(projected) = projected {
+            let origin = match call.called_function() {
+                Some(ResolvedFunc::Resolved { .. }) => FunctionOrigin::BuiltIn,
+                Some(ResolvedFunc::Unresolved { .. }) | None => FunctionOrigin::User,
+            };
+            let mut argument_reads = std::collections::HashSet::new();
+            collect_reads(call, &mut argument_reads);
+            let index = self.scope_mut(current).table_functions.len();
+            self.pending_functions.push(PendingFunction {
+                list: self.select_list(current),
+                scope: current,
+                index,
+                node: *node_id,
+                columns: output_columns,
+                alias: alias.as_ref(),
+                argument_reads,
+            });
+            self.scope_mut(current)
+                .table_functions
+                .push(TableFunctionEvent {
+                    call: projected,
+                    origin,
+                    // Settled once the walk has seen every select list.
+                    columns_selected: false,
+                    alias: alias.as_ref().map(|a| column_name(a.as_str())),
+                    lateral: *lateral,
+                    source_span: Some(*span),
+                });
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Project`.
+    #[inline(never)]
+    fn walk_project(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        input: &'a RelPlan,
+        items: &'a [ProjectItem],
+        distinct: &'a bool,
+        distinct_on: &'a [ScalarExpr],
+    ) {
+        // `has_distinct` reflects the scope's outermost
+        // `Project { distinct: true }` — the visit order is
+        // outside-in so the first arm to see this scope wins.
+        // `DISTINCT ON` is excluded (semantically GROUP BY,
+        // surfaced via `group_by`).
+        if *distinct && !self.scope_mut(current).has_distinct {
+            self.scope_mut(current).has_distinct = true;
+        }
+        self.emit_project_items(current, context, input, items, distinct_on);
+        // The first `Project` down a scope's walk is its select
+        // list (one per set-operation branch); one below it
+        // computes what the list reads.
+        let select_list = self.under_select_list.insert(current);
+        let list = self.select_list(current);
+        let reads = self.select_reads.entry(list).or_default();
+        for item in items {
+            match item {
+                ProjectItem::Expr(p) if select_list => reads.add(&p.expr),
+                ProjectItem::Expr(p) => reads.add_for(p.output, &p.expr),
+                ProjectItem::Star(star) if select_list => {
+                    let qualifier = match &star.qualifier {
+                        StarQualifier::Unqualified => Some(None),
+                        StarQualifier::Named(parts) => {
+                            parts.last().map(|last| Some(last.name.clone()))
+                        }
+                        StarQualifier::FromExpr(expr) => {
+                            reads.add(expr);
+                            None
+                        }
+                    };
+                    if let Some(qualifier) = qualifier {
+                        reads.stars.push(StarCover {
+                            qualifier,
+                            enumerated: star.enumerated.clone(),
+                        });
+                    }
+                    for replace in &star.replace {
+                        reads.add(&replace.expr);
+                    }
+                }
+                ProjectItem::Star(_) => {}
+            }
+        }
+        // A derived table's select list: what its items read for the
+        // enclosing list that reads their columns, it reads too.
+        if select_list {
+            if let Some((outer, body_columns)) = self.derived_reads.remove(&current) {
+                let read: Vec<&ScalarExpr> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ProjectItem::Expr(p) if body_columns.contains(&p.output) => Some(&p.expr),
+                        ProjectItem::Expr(_) | ProjectItem::Star(_) => None,
+                    })
+                    .collect();
+                if let Some(outer_reads) = self.select_reads.get_mut(&outer) {
+                    for expr in read {
+                        outer_reads.add(expr);
+                    }
+                }
+            }
+        }
+        self.walk(input, current);
+        if select_list {
+            self.under_select_list.remove(&current);
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Filter`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_filter(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        input: &'a RelPlan,
+        computed: &'a [crate::ir::plan::ComputedItem],
+        predicate: &'a ScalarExpr,
+        kind: &'a crate::ir::plan::FilterKind,
+        span: &'a Span,
+    ) {
+        let list = self.select_list(current);
+        if let Some(reads) = self.select_reads.get_mut(&list) {
+            reads.add_computed(computed);
+        }
+        let position = match kind {
+            FilterKind::Where => crate::facts::SubqueryPosition::Where,
+            FilterKind::Having => crate::facts::SubqueryPosition::Having,
+            FilterKind::Qualify => crate::facts::SubqueryPosition::Qualify,
+        };
+        let projected = self.project_scalar_expr_at(predicate, context, position);
+        match kind {
+            FilterKind::Where => {
+                let event = PredicateEvent {
+                    root: projected.clone(),
+                    scope_id: current,
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                    source_span: Some(*span),
+                };
+                self.scope_mut(current).where_predicates.push(event);
+                self.scope_mut(current).predicates.push(PredicateNode {
+                    kind: PredicateKind::Where,
+                    root: projected,
+                    scope_id: current,
+                    source_span: Some(*span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            }
+            FilterKind::Qualify => {
+                if self.scope_mut(current).qualify.is_none() {
+                    self.scope_mut(current).qualify = Some(projected.clone());
+                }
+                self.scope_mut(current).predicates.push(PredicateNode {
+                    kind: PredicateKind::Qualify,
+                    root: projected,
+                    scope_id: current,
+                    source_span: Some(*span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            }
+            FilterKind::Having => {
+                let event = PredicateEvent {
+                    root: projected.clone(),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                    scope_id: current,
+                    source_span: Some(*span),
+                };
+                self.scope_mut(current).having_predicates.push(event);
+                self.scope_mut(current).predicates.push(PredicateNode {
+                    kind: PredicateKind::Having,
+                    root: projected,
+                    scope_id: current,
+                    source_span: Some(*span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            }
+        }
+        self.walk(input, current);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Aggregate`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_aggregate(
+        &mut self,
+        plan: &'a RelPlan,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        input: &'a RelPlan,
+        grouping: &'a GroupingSpec,
+        aggregates: &'a [crate::ir::plan::AggregateCall],
+        having: &'a Option<ScalarExpr>,
+        computed: &'a [crate::ir::plan::ComputedItem],
+        span: &'a Span,
+    ) {
+        let list = self.select_list(current);
+        if let Some(reads) = self.select_reads.get_mut(&list) {
+            for call in aggregates {
+                if reads.columns.contains(&call.output) {
+                    for arg in call
+                        .args
+                        .iter()
+                        .chain(call.named_args.iter().map(|(_, v)| v))
+                    {
+                        reads.add(arg);
+                    }
+                    if let Some(filter) = &call.filter {
+                        reads.add(filter);
+                    }
+                    for key in call.arg_order.iter().chain(&call.within_group_order) {
+                        reads.add(&key.expr);
+                    }
+                }
+            }
+            let keys: &[crate::ir::plan::GroupKey] = match grouping {
+                GroupingSpec::None => &[],
+                GroupingSpec::Standard(keys)
+                | GroupingSpec::Cube(keys)
+                | GroupingSpec::Rollup(keys)
+                | GroupingSpec::All { keys, .. } => keys,
+                GroupingSpec::GroupingSets(sets) => &sets.keys,
+            };
+            for key in keys {
+                reads.add_for(key.output, &key.expr);
+            }
+            reads.add_computed(computed);
+        }
+        self.emit_aggregate_calls(current, context, aggregates);
+        self.emit_group_by(current, context, plan, grouping);
+        if let Some(having_expr) = having {
+            // `HAVING` reads the grouped rows.
+            let projected = self.project_scalar_expr_at(
+                having_expr,
+                ReadSite {
+                    node: plan,
+                    at: ReadAt::Defined,
+                },
+                crate::facts::SubqueryPosition::Having,
+            );
+            let event = PredicateEvent {
+                root: projected.clone(),
+                scope_id: current,
+                source_span: Some(*span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            };
+            self.scope_mut(current).having_predicates.push(event);
+            self.scope_mut(current).predicates.push(PredicateNode {
+                kind: PredicateKind::Having,
+                root: projected,
+                scope_id: current,
+                source_span: Some(*span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            });
+        }
+        self.walk(input, current);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Window`.
+    #[inline(never)]
+    fn walk_window(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        input: &'a RelPlan,
+        windows: &'a [crate::ir::plan::WindowCall],
+        computed: &'a [crate::ir::plan::ComputedItem],
+    ) {
+        let list = self.select_list(current);
+        if let Some(reads) = self.select_reads.get_mut(&list) {
+            for call in windows {
+                if reads.columns.contains(&call.output) {
+                    for expr in call.args.iter().chain(&call.partition_by) {
+                        reads.add(expr);
+                    }
+                    for key in &call.order_by {
+                        reads.add(&key.expr);
+                    }
+                }
+            }
+            reads.add_computed(computed);
+        }
+        self.emit_window_calls(current, context, windows);
+        self.walk(input, current);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Limit`.
+    #[inline(never)]
+    fn walk_limit(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        input: &'a RelPlan,
+        limit: &'a Option<ScalarExpr>,
+        offset: &'a Option<ScalarExpr>,
+        span: &'a Span,
+    ) {
+        if self.scope_mut(current).limit.is_none() {
+            let (limit_expr, offset_expr) = self.at_site(context, |w| {
+                (
+                    limit.as_ref().map(|e| w.project_scalar_expr(e)),
+                    offset.as_ref().map(|e| w.project_scalar_expr(e)),
+                )
+            });
+            self.scope_mut(current).limit = Some(LimitEvent {
+                limit: limit_expr,
+                offset: offset_expr,
+                source_span: Some(*span),
+            });
+        }
+        self.walk(input, current);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Join`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_join(
+        &mut self,
+        plan: &'a RelPlan,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        left: &'a RelPlan,
+        right: &'a RelPlan,
+        kind: &'a crate::ir::plan::JoinKind,
+        lateral: &'a bool,
+        natural: &'a bool,
+        implicit: &'a bool,
+        on: &'a Option<ScalarExpr>,
+        match_condition: &'a Option<ScalarExpr>,
+        span: &'a Span,
+        clause_span: &'a Span,
+    ) {
+        self.walk(left, current);
+        self.walk(right, current);
+        let on_predicate = on.as_ref().map(|e| {
+            self.project_scalar_expr_at(e, context, crate::facts::SubqueryPosition::JoinOn)
+        });
+        let filters_join = on.as_ref().map(predicate_filters_join).unwrap_or(false);
+        if let Some(predicate_expr) = on.as_ref() {
+            let projected = self.project_scalar_expr_at(
+                predicate_expr,
+                context,
+                crate::facts::SubqueryPosition::JoinOn,
+            );
+            let public_kind = project_join_kind(*kind, *lateral, *natural);
+            self.scope_mut(current)
+                .join_predicates
+                .push(JoinPredicateEvent {
+                    root: projected.clone(),
+                    scope_id: current,
+                    source_span: Some(*span),
+                });
+            self.scope_mut(current).predicates.push(PredicateNode {
+                kind: PredicateKind::JoinOn {
+                    join_kind: public_kind,
+                },
+                root: projected,
+                scope_id: current,
+                source_span: Some(*span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            });
+        }
+        if let Some(mc_expr) = match_condition.as_ref() {
+            let mc_span = mc_expr.span();
+            let projected = self.at_site(context, |w| w.project_scalar_expr(mc_expr));
+            self.scope_mut(current).predicates.push(PredicateNode {
+                kind: PredicateKind::AsofMatch,
+                root: projected,
+                scope_id: current,
+                source_span: Some(mc_span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            });
+        }
+        let functions = self.ctx.function_catalog;
+        if let (Some(l), Some(r)) = (
+            principal_source(left, functions),
+            principal_source(right, functions),
+        ) {
+            let right_source = join_right_source(&r, left, self.bindings);
+            let join_key = ReadSite {
+                node: plan,
+                at: ReadAt::JoinKey,
+            };
+            let on_columns = on
+                .as_ref()
+                .map(|e| self.extract_join_column_pairs(e, join_key))
+                .unwrap_or_default();
+            // Catalog-aware row-count estimates for the
+            // operands' principal base tables. Used by
+            // Q-JOIN-CROSS-CENH to size the cartesian product in
+            // its message; absent when no catalog is
+            // attached or the table has no row_count estimate.
+            let (left_row_count, right_row_count) = match self.ctx.catalog {
+                Some(cat) => (
+                    principal_scan_metadata_table_ref_with_ctes(left, &self.cte_bindings_in_scope)
+                        .and_then(|t| cat.table_row_count(t)),
+                    principal_scan_metadata_table_ref_with_ctes(right, &self.cte_bindings_in_scope)
+                        .and_then(|t| cat.table_row_count(t)),
+                ),
+                None => (None, None),
+            };
+            let cartesian_estimate = match (left_row_count, right_row_count) {
+                (Some(a), Some(b)) => Some(a.saturating_mul(b)),
+                _ => None,
+            };
+            // A column the join names no reference to is anchored at its
+            // clause.
+            let dropped_padded_columns = self
+                .reasoning
+                .dropped_padded_columns(plan)
+                .into_iter()
+                .map(|dropped| {
+                    let span = dropped.column_ref_span.or(Some(*clause_span));
+                    let mut column = self.column_ref_at(context, dropped.column, span);
+                    column.nullability = dropped.nullability;
+                    column
+                })
+                .collect();
+            self.scope_mut(current).joins.push(JoinEvent {
+                left: l.name,
+                right: r.name,
+                right_source,
+                kind: project_join_kind(*kind, *lateral, *natural),
+                on_columns,
+                on_predicate,
+                source_span: Some(*clause_span),
+                filters_join,
+                implicit: *implicit,
+                left_row_count,
+                right_row_count,
+                cartesian_estimate,
+                dropped_padded_columns,
+            });
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::SetOp`.
+    #[inline(never)]
+    fn walk_set_op(
+        &mut self,
+        current: ScopeIdentity,
+        op: &'a crate::ir::plan::SetOpKind,
+        inputs: &'a [Box<RelPlan>],
+        span: &'a Span,
+    ) {
+        self.scope_mut(current).set_operations.push(SetOpEvent {
+            kind: project_set_op_kind(*op),
+            branch_count: inputs.len() as u32,
+            source_span: Some(*span),
+        });
+        // Each branch has a select list of its own.
+        let enclosing = self.branches.get(&current).copied();
+        for input in inputs {
+            self.branches_entered += 1;
+            self.branches.insert(current, self.branches_entered);
+            self.walk(input, current);
+        }
+        match enclosing {
+            Some(branch) => self.branches.insert(current, branch),
+            None => self.branches.remove(&current),
+        };
+    }
+
+    /// [`Self::walk`] of a `RelPlan::WithScope`.
+    #[inline(never)]
+    fn walk_with_scope(
+        &mut self,
+        current: ScopeIdentity,
+        ctes: &'a [crate::ir::plan::CteBinding],
+        body: &'a RelPlan,
+    ) {
+        // Push each CTE binding onto the scope's accumulated
+        // outer-CTE list before walking its body, so a sibling
+        // CTE (and the WithScope's body) can resolve CteRefs
+        // to earlier-declared CTEs. Pop after walking the body
+        // so sibling-level WithScopes don't leak.
+        let pushed = ctes.len();
+        for cte in ctes {
+            self.cte_bindings_in_scope.push(cte);
+            let recursive = matches!(cte.body, CteBody::Recursive { .. });
+            let cte_scope = self.alloc_scope(
+                ScopeKind::Cte {
+                    name: PublicIdentName::new(cte.name.as_str()),
+                    recursive,
+                },
+                Some(cte.span),
+            );
+            match &cte.body {
+                CteBody::NonRecursive(body) => {
+                    self.walk(body, cte_scope);
+                }
+                CteBody::Recursive { anchor, step, .. } => {
+                    // An anchor's DISTINCT is over the anchor's rows only:
+                    // it marks the scope where the anchor holds one of the
+                    // scope's joins, never for a join of the step.
+                    let joins_before = self.scope_mut(cte_scope).joins.len();
+                    self.walk(anchor, cte_scope);
+                    let scope = self.scope_mut(cte_scope);
+                    if scope.joins.len() == joins_before {
+                        scope.has_distinct = false;
+                    }
+                    self.walk(step, cte_scope);
+                }
+            }
+        }
+        self.walk(body, current);
+        for _ in 0..pushed {
+            self.cte_bindings_in_scope.pop();
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::DerivedTable`.
+    #[inline(never)]
+    fn walk_derived_table(
+        &mut self,
+        current: ScopeIdentity,
+        input: &'a RelPlan,
+        alias: &'a Option<crate::context::node_metadata::IdentKey>,
+        columns: &'a [ColumnId],
+        body_columns: &'a [Option<ColumnId>],
+        span: &'a Span,
+    ) {
+        let alias_ident = alias
+            .as_ref()
+            .map(|a| PublicIdentName::new(a.as_str()))
+            .unwrap_or_else(|| PublicIdentName::new(""));
+        let dt_scope =
+            self.alloc_scope(ScopeKind::DerivedTable { alias: alias_ident }, Some(*span));
+        // The body columns the enclosing select list reads
+        // (`LATERAL (SELECT f.value AS v) x` read as `x.v`).
+        let list = self.select_list(current);
+        if let Some(reads) = self.select_reads.get(&list) {
+            let read: std::collections::HashSet<ColumnId> = columns
+                .iter()
+                .zip(body_columns)
+                .filter(|(column, _)| reads.columns.contains(column))
+                .filter_map(|(_, body)| *body)
+                .collect();
+            if !read.is_empty() {
+                self.derived_reads.insert(dt_scope, (list, read));
+            }
+        }
+        self.walk(input, dt_scope);
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Insert`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_insert(
+        &mut self,
+        current: ScopeIdentity,
+        target: &'a crate::context::node_metadata::TableRef,
+        target_columns: &'a [ColumnId],
+        unplaced_columns: &'a [ColumnId],
+        source: &'a crate::ir::plan::InsertSource,
+        on_conflict: &'a Option<crate::ir::plan::OnConflict>,
+        span: &'a Span,
+    ) {
+        use crate::ir::plan::ConflictAction;
+        let updated: &'a [crate::ir::plan::Assignment] =
+            match on_conflict.as_ref().map(|conflict| &conflict.action) {
+                Some(
+                    ConflictAction::DoUpdate { assignments, .. }
+                    | ConflictAction::MySqlDuplicateKeyUpdate { assignments },
+                ) => assignments,
+                Some(ConflictAction::DoNothing) | None => &[],
+            };
+        self.written_columns.extend(
+            target_columns
+                .iter()
+                .chain(unplaced_columns)
+                .map(|written| (target, *written)),
+        );
+        for assignment in updated {
+            self.publish_assignment(target, assignment, unplaced_columns);
+        }
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            target_catalog_metadata(target, self.ctx.catalog);
+        self.scope_mut(current).tables.push(TableEvent {
+            table: project_metadata_table_ref(target, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::InsertedInto,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        });
+        if let Some(plan) = insert_source_plan(source) {
+            self.walk(plan, current);
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Update`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_update(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        target: &'a crate::context::node_metadata::TableRef,
+        assignments: &'a [crate::ir::plan::Assignment],
+        from: &'a Option<Box<RelPlan>>,
+        predicate: &'a Option<ScalarExpr>,
+        span: &'a Span,
+    ) {
+        // Each table an assignment writes: in a multi-table UPDATE, any
+        // table listed before `SET`.
+        let mut updated: Vec<&'a legacy_meta::TableRef> = Vec::new();
+        for assignment in assignments {
+            let table = match self.ctx.scan_index {
+                Some(index) => index.written_table(assignment, target),
+                None => target,
+            };
+            self.publish_assignment(table, assignment, &[]);
+            if !updated.contains(&table) {
+                updated.push(table);
+            }
+        }
+        for table in updated {
+            let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+                target_catalog_metadata(table, self.ctx.catalog);
+            self.scope_mut(current).tables.push(TableEvent {
+                table: project_metadata_table_ref(table, Some(*span)),
+                scope_id: current,
+                source_span: Some(*span),
+                catalog_tags,
+                row_count,
+                column_count,
+                access_kind: TableAccessKind::Updated,
+                table_kind,
+                in_catalog,
+                searched_as,
+                temporary: false,
+            });
+        }
+        if let Some(from) = from {
+            self.walk(from, current);
+        }
+        if let Some(pred) = predicate {
+            let projected = self.at_site(context, |w| w.project_scalar_expr(pred));
+            self.scope_mut(current)
+                .where_predicates
+                .push(PredicateEvent {
+                    root: projected.clone(),
+                    scope_id: current,
+                    source_span: Some(*span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            self.scope_mut(current).predicates.push(PredicateNode {
+                kind: PredicateKind::UpdateWhere,
+                root: projected,
+                scope_id: current,
+                source_span: Some(*span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            });
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Delete`.
+    #[inline(never)]
+    fn walk_delete(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        target: &'a crate::context::node_metadata::TableRef,
+        using: &'a Option<Box<RelPlan>>,
+        predicate: &'a Option<ScalarExpr>,
+        span: &'a Span,
+    ) {
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            target_catalog_metadata(target, self.ctx.catalog);
+        self.scope_mut(current).tables.push(TableEvent {
+            table: project_metadata_table_ref(target, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::DeletedFrom,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        });
+        if let Some(using) = using {
+            self.walk(using, current);
+        }
+        if let Some(pred) = predicate {
+            let projected = self.at_site(context, |w| w.project_scalar_expr(pred));
+            self.scope_mut(current)
+                .where_predicates
+                .push(PredicateEvent {
+                    root: projected.clone(),
+                    scope_id: current,
+                    source_span: Some(*span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            self.scope_mut(current).predicates.push(PredicateNode {
+                kind: PredicateKind::DeleteWhere,
+                root: projected,
+                scope_id: current,
+                source_span: Some(*span),
+                null_effects: Vec::new(),
+                cross_scope_effects: Vec::new(),
+            });
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::Merge`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the variant's fields, as `walk` binds them
+    fn walk_merge(
+        &mut self,
+        current: ScopeIdentity,
+        context: ReadSite<'a>,
+        target: &'a crate::context::node_metadata::TableRef,
+        source: &'a RelPlan,
+        on: &'a ScalarExpr,
+        branches: &'a [crate::ir::plan::MergeBranch],
+        span: &'a Span,
+    ) {
+        for branch in branches {
+            use crate::ir::plan::MergeAction;
+            match &branch.action {
+                MergeAction::Insert {
+                    target_columns,
+                    values,
+                } => {
+                    for (position, written) in target_columns.iter().enumerate() {
+                        let read = values
+                            .get(position)
+                            .map(|value| self.referenced_columns(value))
+                            .unwrap_or_default();
+                        self.publish_written_column(target, *written, read, ValueSource::Known);
+                    }
+                }
+                MergeAction::Update { assignments } => {
+                    for assignment in assignments {
+                        self.publish_assignment(target, assignment, &[]);
+                    }
+                }
+                MergeAction::InsertStar { columns }
+                | MergeAction::InsertAllByName { columns }
+                | MergeAction::UpdateSetStar { columns }
+                | MergeAction::UpdateAllByName { columns } => {
+                    for column in columns {
+                        self.publish_written_column(
+                            target,
+                            column.written,
+                            column.source,
+                            ValueSource::Known,
+                        );
+                    }
+                }
+                MergeAction::Delete | MergeAction::DoNothing => {}
+            }
+        }
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            target_catalog_metadata(target, self.ctx.catalog);
+        self.scope_mut(current).tables.push(TableEvent {
+            table: project_metadata_table_ref(target, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::ReadAndWritten,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        });
+        self.walk(source, current);
+        let projected_on = self.at_site(context, |w| w.project_scalar_expr(on));
+        self.scope_mut(current)
+            .join_predicates
+            .push(JoinPredicateEvent {
+                root: projected_on.clone(),
+                scope_id: current,
+                source_span: Some(*span),
+            });
+        self.scope_mut(current).predicates.push(PredicateNode {
+            kind: PredicateKind::MergeOn,
+            root: projected_on,
+            scope_id: current,
+            source_span: Some(*span),
+            null_effects: Vec::new(),
+            cross_scope_effects: Vec::new(),
+        });
+        for branch in branches {
+            if let Some(branch_pred) = &branch.predicate {
+                let projected = self.at_site(context, |w| w.project_scalar_expr(branch_pred));
+                self.scope_mut(current).predicates.push(PredicateNode {
+                    kind: PredicateKind::MergeWhen {
+                        branch_kind: project_merge_branch_kind(branch.kind),
+                    },
+                    root: projected,
+                    scope_id: current,
+                    source_span: Some(branch.span),
+                    null_effects: Vec::new(),
+                    cross_scope_effects: Vec::new(),
+                });
+            }
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::CreateAsQuery`.
+    #[inline(never)]
+    fn walk_create_as_query(
+        &mut self,
+        current: ScopeIdentity,
+        target: &'a crate::context::node_metadata::TableRef,
+        body: &'a Option<Box<RelPlan>>,
+        span: &'a Span,
+    ) {
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            table_catalog_metadata(target, self.ctx.catalog);
+        self.scope_mut(current).tables.push(TableEvent {
+            table: project_metadata_table_ref(target, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::Written,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        });
+        if let Some(body) = body {
+            self.walk(body, current);
+        }
+    }
+
+    /// [`Self::walk`] of a `RelPlan::CreateTableForm`.
+    #[inline(never)]
+    fn walk_create_table_form(
+        &mut self,
+        current: ScopeIdentity,
+        target: &'a crate::context::node_metadata::TableRef,
+        span: &'a Span,
+    ) {
+        let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+            table_catalog_metadata(target, self.ctx.catalog);
+        self.scope_mut(current).tables.push(TableEvent {
+            table: project_metadata_table_ref(target, Some(*span)),
+            scope_id: current,
+            source_span: Some(*span),
+            catalog_tags,
+            row_count,
+            column_count,
+            access_kind: TableAccessKind::Written,
+            table_kind,
+            in_catalog,
+            searched_as,
+            temporary: false,
+        });
+    }
+
     // ── Per-node emit helpers ──────────────────────────────────────────────
 
     fn emit_project_items(
         &mut self,
         current: ScopeIdentity,
-        items: &[ProjectItem],
+        site: ReadSite<'a>,
+        input: &'a RelPlan,
+        items: &'a [ProjectItem],
         distinct_on: &[ScalarExpr],
     ) {
+        // The first item that is a bare read of a group key that took a
+        // select item's expression is that item, and is presented as the
+        // expression: its projection, kind and taint read what the query
+        // wrote. A later bare read is an alias of it and stays a column
+        // read.
+        let key_exprs =
+            crate::ir::derived_facts::collect_outer_scope_synthesized_outputs(input).key_exprs;
+        // A projection's own nullability is its column at the
+        // projecting node's output.
+        let output = ReadSite {
+            node: site.node,
+            at: ReadAt::Output,
+        };
         // Outer-only: only the outermost Project of a scope contributes
         // to `projections` / `star_projections` / `group_by`-via-DISTINCT-ON.
-        // Per-scope-set accumulators (`scalar_subqueries`,
-        // `lateral_flattens`) must still receive contributions from every
+        // Per-scope-set accumulators (`scalar_subqueries`) must still
+        // receive contributions from every
         // projection-item expression — notably, sibling SetOp arms walk
         // with a shared `current` scope and their projection expressions
         // are the only path that surfaces arm-local scalar subqueries.
@@ -13949,17 +15254,97 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         for item in items {
             match item {
                 ProjectItem::Expr(p) => {
+                    // An item its block computes before its calls is
+                    // presented as what the query wrote for it, read where
+                    // the block computes it: over the block's input rows.
+                    let computing = match &p.expr {
+                        ScalarExpr::Column { column, .. } => {
+                            input.computed_before_calls_at(*column)
+                        }
+                        ScalarExpr::OuterRef { .. }
+                        | ScalarExpr::PatternVarRef { .. }
+                        | ScalarExpr::Lit { .. }
+                        | ScalarExpr::Opaque { .. }
+                        | ScalarExpr::BinOp { .. }
+                        | ScalarExpr::LogicalChain { .. }
+                        | ScalarExpr::OperatorChain { .. }
+                        | ScalarExpr::UnaryOp { .. }
+                        | ScalarExpr::FuncCall { .. }
+                        | ScalarExpr::Case { .. }
+                        | ScalarExpr::Cast { .. }
+                        | ScalarExpr::InList { .. }
+                        | ScalarExpr::Between { .. }
+                        | ScalarExpr::Like { .. }
+                        | ScalarExpr::Exists { .. }
+                        | ScalarExpr::ScalarSubquery { .. }
+                        | ScalarExpr::QuantifiedCmp { .. }
+                        | ScalarExpr::RowCmp { .. }
+                        | ScalarExpr::WindowFn { .. }
+                        | ScalarExpr::FieldAccess { .. }
+                        | ScalarExpr::Lambda { .. } => None,
+                    };
+                    let (own, own_site) = match computing {
+                        Some((node, item)) => (
+                            &item.expr,
+                            ReadSite {
+                                node,
+                                at: ReadAt::Context,
+                            },
+                        ),
+                        None => (&p.expr, site),
+                    };
+                    // An item the query wrote as a key's expression is
+                    // that occurrence; the key presents its own.
+                    let again = self.written_again(own);
+                    let key = if again.is_some() {
+                        None
+                    } else if let ScalarExpr::Column { column, .. } = own {
+                        key_exprs
+                            .get(column)
+                            .filter(|_| !self.presented_keys.contains_key(column))
+                            .map(|&expr| (*column, expr))
+                    } else {
+                        None
+                    };
+                    let (written, read_at) = match (again, key) {
+                        (Some(written), _) => (written, site),
+                        (None, Some((_, expr))) => (expr, site),
+                        (None, None) => (own, own_site),
+                    };
                     let projected = self.project_scalar_expr_at(
-                        &p.expr,
+                        written,
+                        read_at,
                         crate::facts::SubqueryPosition::Projection,
                     );
+                    if let Some((key_output, _)) = key {
+                        self.presented_keys.insert(key_output, projected.clone());
+                    }
                     if outer_only_already_emitted {
                         continue;
                     }
-                    let alias = p.alias.as_ref().map(|a| PublicIdentName::new(a.as_str()));
-                    let kind = classify_projection_expr(&p.expr);
-                    let nullability = self.nullability_for(p.output);
-                    let mut taint_labels = self.taint_labels_for_expr(&p.expr);
+                    // The name a select item is given is written after its
+                    // expression: a string literal there is its name.
+                    let alias = p.alias.as_ref().map(|a| {
+                        PublicIdentName::new(a.as_str()).written_at(Span {
+                            start: p.expr.span().end,
+                            end: p.span.end.max(p.expr.span().end),
+                        })
+                    });
+                    let kind = classify_projection_expr(written);
+                    // Where analysis has no answer, a column the query's own
+                    // filter keeps only where it is not NULL is not NULL.
+                    let nullability = match self.nullability_at(output, p.output) {
+                        Nullability::Unknown if kept_not_null_below(output.node, written) => {
+                            Nullability::FilteredNonNullable
+                        }
+                        known @ (Nullability::Unknown
+                        | Nullability::CatalogNullable
+                        | Nullability::CatalogNonNullable
+                        | Nullability::FilteredNonNullable
+                        | Nullability::DerivedNonNullable { .. }
+                        | Nullability::DerivedNullable { .. }) => known,
+                    };
+                    let mut taint_labels = self.taint_labels_for_expr(written);
                     self.merge_ir_taint_for_output(p.output, &mut taint_labels);
                     let value_exposure = self.value_exposure_for_output(p.output);
                     self.scope_mut(current).projections.push(ProjectionEvent {
@@ -14040,7 +15425,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         // `projections`); the project_scalar_expr walk still runs so
         // any embedded subqueries surface on `scalar_subqueries`.
         for e in distinct_on {
-            let projected = self.project_scalar_expr(e);
+            let projected = self.at_site(site, |w| w.project_scalar_expr(e));
             if outer_only_already_emitted {
                 continue;
             }
@@ -14048,7 +15433,12 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
-    fn emit_aggregate_calls(&mut self, current: ScopeIdentity, calls: &[AggregateCall]) {
+    fn emit_aggregate_calls(
+        &mut self,
+        current: ScopeIdentity,
+        site: ReadSite<'a>,
+        calls: &[AggregateCall],
+    ) {
         for call in calls {
             let function = aggregate_function_for(
                 &call.func,
@@ -14056,15 +15446,16 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 call.args.len(),
                 self.ctx.function_catalog,
             );
-            let args = call
-                .args
-                .iter()
-                .map(|a| self.project_scalar_expr(a))
-                .collect::<Vec<_>>();
+            let args = self.at_site(site, |w| {
+                call.args
+                    .iter()
+                    .map(|a| w.project_scalar_expr(a))
+                    .collect::<Vec<_>>()
+            });
             // An aggregate runs on a nullable argument when either
             //   - an arg is the literal NULL, or
-            //   - an arg references a column the IR or the catalog
-            //     marks as nullable.
+            //   - an arg references a column that may be NULL because
+            //     the catalog declares a column it reads nullable.
             // The catalog-aware branch drives `Q-NULL-COUNT-CENH`
             // (`COUNT(nullable_col)` silently excludes NULL rows).
             let on_nullable_argument = call.args.iter().any(|a| {
@@ -14075,22 +15466,22 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     return true;
                 }
                 if let ScalarExpr::Column { column, .. } = a {
-                    return self.column_is_known_nullable(*column);
+                    return self.column_is_known_nullable(site, *column);
                 }
                 false
             });
             // Aggregate is non-deterministic iff any IR-side scalar
             // argument (or the optional FILTER predicate) directly
             // reaches a volatile `ResolvedFunc`, OR references a column
-            // in the scope's volatile set (`fused.volatile`) or an
-            // enclosing scope's (`outer_volatile`, for correlated args).
+            // the reasoning reports volatile; that set covers every
+            // scope of the statement, so a correlated argument resolves
+            // against its enclosing scope.
             // Subquery args are not descended into — volatility inside a
             // scalar subquery affects the subquery's own determinism.
             let deterministic = !call.args.iter().any(|a| {
                 crate::ir::volatile_expr::expr_is_volatile(
                     a,
                     self.reasoning.volatile_columns(),
-                    self.outer_volatile,
                     self.ctx.function_catalog,
                 )
             }) && !call
@@ -14100,22 +15491,24 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     crate::ir::volatile_expr::expr_is_volatile(
                         f,
                         self.reasoning.volatile_columns(),
-                        self.outer_volatile,
                         self.ctx.function_catalog,
                     )
                 })
                 .unwrap_or(false);
-            let filter = call.filter.as_ref().map(|e| self.project_scalar_expr(e));
-            let within_group = if call.within_group_order.is_empty() {
-                None
-            } else {
-                Some(
-                    call.within_group_order
-                        .iter()
-                        .map(|k| self.project_scalar_expr(&k.expr))
-                        .collect(),
-                )
-            };
+            let (filter, within_group) = self.at_site(site, |w| {
+                let filter = call.filter.as_ref().map(|e| w.project_scalar_expr(e));
+                let within_group = if call.within_group_order.is_empty() {
+                    None
+                } else {
+                    Some(
+                        call.within_group_order
+                            .iter()
+                            .map(|k| w.project_scalar_expr(&k.expr))
+                            .collect(),
+                    )
+                };
+                (filter, within_group)
+            });
             self.scope_mut(current).aggregates.push(AggregateEvent {
                 function,
                 args,
@@ -14130,7 +15523,16 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
-    fn emit_group_by(&mut self, current: ScopeIdentity, grouping: &GroupingSpec) {
+    /// The keys of `grouping`, the grouping of `aggregate`, as the scope's
+    /// `GROUP BY`, with the high-cardinality columns they read: a column
+    /// the block computes before its calls is read as its definition.
+    fn emit_group_by(
+        &mut self,
+        current: ScopeIdentity,
+        site: ReadSite<'a>,
+        aggregate: &RelPlan,
+        grouping: &GroupingSpec,
+    ) {
         if !self.scope_mut(current).group_by.is_empty() {
             return;
         }
@@ -14139,8 +15541,8 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             GroupingSpec::Standard(k) | GroupingSpec::Cube(k) | GroupingSpec::Rollup(k) => {
                 k.iter().collect()
             }
-            GroupingSpec::GroupingSets(sets) => sets.iter().flatten().collect(),
-            GroupingSpec::All(k) => k.iter().collect(),
+            GroupingSpec::GroupingSets(sets) => sets.keys.iter().collect(),
+            GroupingSpec::All { keys: k, .. } => k.iter().collect(),
         };
         // Collect the distinct high-cardinality columns across every
         // grouping key, deduplicated by ColumnId (two same-named
@@ -14152,7 +15554,18 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         let mut hicard_names: Vec<IdentName> = Vec::new();
         for k in keys {
             let mut cols = Vec::new();
-            Self::collect_referenced_columns(&k.expr, &mut cols);
+            self.collect_referenced_columns(&k.expr, &mut cols);
+            // A definition reads only the columns before it, so this ends.
+            let mut at = 0;
+            while let Some(&cid) = cols.get(at) {
+                match aggregate.computed_before_calls_at(cid) {
+                    Some((_, item)) => {
+                        cols.remove(at);
+                        self.collect_referenced_columns(&item.expr, &mut cols);
+                    }
+                    None => at += 1,
+                }
+            }
             for cid in cols {
                 if hicard_cids.contains(&cid) {
                     continue;
@@ -14164,7 +15577,10 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     }
                 }
             }
-            let projected = self.project_scalar_expr(&k.expr);
+            let projected = match self.presented_keys.get(&k.output) {
+                Some(presented) => presented.clone(),
+                None => self.at_site(site, |w| w.project_scalar_expr(&k.expr)),
+            };
             self.scope_mut(current).group_by.push(projected);
         }
         if !hicard_names.is_empty() {
@@ -14174,46 +15590,54 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
-    fn emit_window_calls(&mut self, current: ScopeIdentity, calls: &[WindowCall]) {
+    fn emit_window_calls(
+        &mut self,
+        current: ScopeIdentity,
+        site: ReadSite<'a>,
+        calls: &[WindowCall],
+    ) {
         for call in calls {
             let function =
                 window_function_for(&call.func, call.args.len(), self.ctx.function_catalog);
-            let args = call
-                .args
-                .iter()
-                .map(|a| self.project_scalar_expr(a))
-                .collect::<Vec<_>>();
-            let partition_by = call
-                .partition_by
-                .iter()
-                .map(|e| self.project_scalar_expr(e))
-                .collect::<Vec<_>>();
-            let order_by = call
-                .order_by
-                .iter()
-                .map(|k| self.project_order_by_event(k))
-                .collect::<Vec<_>>();
-            let frame = call.frame.as_ref().map(|f| self.project_window_frame(f));
+            let (args, partition_by, order_by, frame) = self.at_site(site, |w| {
+                let args = call
+                    .args
+                    .iter()
+                    .map(|a| w.project_scalar_expr(a))
+                    .collect::<Vec<_>>();
+                let partition_by = call
+                    .partition_by
+                    .iter()
+                    .map(|e| w.project_scalar_expr(e))
+                    .collect::<Vec<_>>();
+                let order_by = call
+                    .order_by
+                    .iter()
+                    .map(|k| w.project_order_by_event(k))
+                    .collect::<Vec<_>>();
+                let frame = call.frame.as_ref().map(|f| w.project_window_frame(f));
+                (args, partition_by, order_by, frame)
+            });
             // Window is non-deterministic iff its function resolves to
             // a volatile catalog entry, OR any of its IR-side scalar
             // args / partition keys / order keys reaches a volatile
             // catalog entry. Drives `Q-WIN-NONDET` and `Q-NONDET`.
             let fc = self.ctx.function_catalog;
-            let local = self.reasoning.volatile_columns();
-            let outer = self.outer_volatile;
+            let volatile = self.reasoning.volatile_columns();
             let deterministic =
                 !crate::ir::volatile_expr::resolved_func_is_volatile(&call.func, fc)
                     && !call
                         .args
                         .iter()
-                        .any(|a| crate::ir::volatile_expr::expr_is_volatile(a, local, outer, fc))
+                        .any(|a| crate::ir::volatile_expr::expr_is_volatile(a, volatile, fc))
                     && !call
                         .partition_by
                         .iter()
-                        .any(|p| crate::ir::volatile_expr::expr_is_volatile(p, local, outer, fc))
-                    && !call.order_by.iter().any(|k| {
-                        crate::ir::volatile_expr::expr_is_volatile(&k.expr, local, outer, fc)
-                    });
+                        .any(|p| crate::ir::volatile_expr::expr_is_volatile(p, volatile, fc))
+                    && !call
+                        .order_by
+                        .iter()
+                        .any(|k| crate::ir::volatile_expr::expr_is_volatile(&k.expr, volatile, fc));
             // High-cardinality PARTITION BY: at least one partition
             // key reaches a column the IR's `is_high_cardinality_column`
             // classifies as high-cardinality (name-pattern + catalog
@@ -14257,14 +15681,13 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         self.scope_mut(current).has_multiple_partition_schemes = signatures.len() >= 2;
     }
 
-    fn emit_order_by(&mut self, current: ScopeIdentity, keys: &[SortKey]) {
+    fn emit_order_by(&mut self, current: ScopeIdentity, site: ReadSite<'a>, keys: &[SortKey]) {
         if !self.scope_mut(current).order_by.is_empty() {
             return;
         }
-        let projected: Vec<OrderByEvent> = keys
-            .iter()
-            .map(|k| self.project_order_by_event(k))
-            .collect();
+        let projected: Vec<OrderByEvent> = self.at_site(site, |w| {
+            keys.iter().map(|k| w.project_order_by_event(k)).collect()
+        });
         self.scope_mut(current).order_by = projected;
     }
 
@@ -14320,17 +15743,23 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
 
     fn project_scalar_expr(&mut self, expr: &ScalarExpr) -> Expr {
         match expr {
-            ScalarExpr::Column { column, span } => Expr::Column {
-                column: self.column_ref_from_id(*column, Some(*span)),
-            },
+            ScalarExpr::Column { column, span } => {
+                match self.written_keys.get(&(*column, *span)).copied() {
+                    Some(written) => self.project_scalar_expr(written),
+                    None => Expr::Column {
+                        column: self.column_ref_from_id(*column, Some(*span)),
+                    },
+                }
+            }
             ScalarExpr::OuterRef { column, span, .. } => Expr::OuterColumn {
                 outer_column: OuterColumnRef {
                     column: self.column_ref_from_id(*column, Some(*span)),
                     depth: 1,
                 },
             },
-            ScalarExpr::Lit { value, .. } => Expr::Literal {
+            ScalarExpr::Lit { value, span } => Expr::Literal {
                 literal: project_lit(value),
+                origin: TextOrigin::at(*span),
             },
             ScalarExpr::BinOp {
                 op, left, right, ..
@@ -14354,6 +15783,24 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     operands: operands
                         .iter()
                         .map(|o| self.project_scalar_expr(o))
+                        .collect(),
+                },
+            },
+            // Projected flat for the same reason; each operator as the
+            // `BinOp` arm projects it.
+            ScalarExpr::OperatorChain {
+                operands,
+                operators,
+                ..
+            } => Expr::OperatorChain {
+                operator_chain: crate::facts::expr::OperatorChainExpr {
+                    operands: operands
+                        .iter()
+                        .map(|o| self.project_scalar_expr(o))
+                        .collect(),
+                    operators: operators
+                        .iter()
+                        .map(|op| project_binary_op_str(op.as_sql_str()))
                         .collect(),
                 },
             },
@@ -14409,11 +15856,16 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     opaque: OpaqueExpr {
                         reason: OpaqueExprReason::DialectSpecificFunction,
                         rendered: span_slice(*span, self.ctx.source).to_string(),
+                        origin: TextOrigin::at(*span),
                     },
                 },
             },
             ScalarExpr::FuncCall {
-                func, args, span, ..
+                func,
+                args,
+                named_args,
+                span,
+                ..
             } => {
                 let (is_temporal, is_deterministic, is_aggregate, is_window) =
                     classify_resolved_func(func, self.ctx.function_catalog);
@@ -14422,6 +15874,13 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                         name: resolved_func_name(func, self.ctx.function_catalog),
                         schema: None,
                         args: args.iter().map(|a| self.project_scalar_expr(a)).collect(),
+                        named_args: named_args
+                            .iter()
+                            .map(|(name, value)| NamedArgument {
+                                name: PublicIdentName::from_parts(name.as_str(), name.as_str()),
+                                value: self.project_scalar_expr(value),
+                            })
+                            .collect(),
                         is_temporal,
                         is_deterministic,
                         is_aggregate,
@@ -14578,26 +16037,9 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 let lhs_projected = Box::new(self.project_scalar_expr(left));
                 let rhs_projected = match right {
                     QuantifiedRhs::Subquery(subquery, correlates_with) => {
-                        // Pick the public SubqueryKind that best
-                        // describes the (op, quantifier, negated) tuple
-                        // so a rule predicating on `kind` still gets
-                        // the in-subquery vs not-in-subquery distinction
-                        // when applicable. The `QuantifiedCmp` shape
-                        // exposes the full typed structure regardless;
-                        // `kind` is the convenience discriminator.
-                        let kind = match (*op, *quantifier, *negated) {
-                            (crate::ir::scalar::ComparisonOp::Eq, Quantifier::Any, false) => {
-                                SubqueryKind::InSubquery
-                            }
-                            (crate::ir::scalar::ComparisonOp::Eq, Quantifier::Any, true)
-                            | (crate::ir::scalar::ComparisonOp::NotEq, Quantifier::All, false) => {
-                                SubqueryKind::NotInSubquery
-                            }
-                            _ => SubqueryKind::Scalar,
-                        };
                         let subquery_expr = self.build_subquery_expr(
                             subquery,
-                            kind,
+                            quantified_subquery_kind(*op, *quantifier, *negated),
                             !correlates_with.is_empty(),
                             *span,
                             Some(current_for_subquery_ref(self)),
@@ -14619,6 +16061,73 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                         rhs: rhs_projected,
                         source_span: Some(*span),
                     },
+                }
+            }
+            // The row is published as a call of `ROW` with its elements,
+            // the comparison as the one over a scalar subquery or the
+            // quantified one it states.
+            ScalarExpr::RowCmp {
+                op,
+                quantifier,
+                negated,
+                left,
+                left_span,
+                subquery,
+                correlates_with,
+                subquery_span,
+                span,
+            } => {
+                let row = Expr::FuncCall {
+                    func_call: FuncCallExpr {
+                        name: PublicIdentName::new("ROW"),
+                        schema: None,
+                        args: left.iter().map(|e| self.project_scalar_expr(e)).collect(),
+                        named_args: Vec::new(),
+                        is_temporal: false,
+                        is_deterministic: false,
+                        is_aggregate: false,
+                        is_window: false,
+                        catalog_resolved: false,
+                        source_span: Some(*left_span),
+                    },
+                };
+                let correlated = !correlates_with.is_empty();
+                let scope = Some(current_for_subquery_ref(self));
+                match quantifier {
+                    None => Expr::BinaryOp {
+                        binary_op: BinaryOpExpr {
+                            op: project_binary_op_str(op.as_sql_str()),
+                            left: Box::new(row),
+                            right: Box::new(self.project_subquery_expr(
+                                subquery,
+                                SubqueryKind::Scalar,
+                                correlated,
+                                *subquery_span,
+                                scope,
+                            )),
+                        },
+                    },
+                    Some(quantifier) => {
+                        let subquery = self.build_subquery_expr(
+                            subquery,
+                            quantified_subquery_kind(*op, *quantifier, *negated),
+                            correlated,
+                            *span,
+                            scope,
+                        );
+                        Expr::QuantifiedCmp {
+                            quantified_cmp: QuantifiedCmpExpr {
+                                op: project_comparison_op(*op),
+                                quantifier: project_quantifier(*quantifier),
+                                negated: *negated,
+                                lhs: Box::new(row),
+                                rhs: QuantifiedRhsExpr::Subquery {
+                                    subquery: Box::new(subquery),
+                                },
+                                source_span: Some(*span),
+                            },
+                        }
+                    }
                 }
             }
             ScalarExpr::WindowFn { call, .. } => Expr::Window {
@@ -14665,6 +16174,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                                 collection: Box::new(acc),
                                 index: Box::new(Expr::Literal {
                                     literal: LiteralValue::Integer { value: *i },
+                                    origin: TextOrigin::default(),
                                 }),
                             },
                         },
@@ -14682,6 +16192,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 opaque: OpaqueExpr {
                     reason: OpaqueExprReason::DialectSpecificFunction,
                     rendered: span_slice(*span, self.ctx.source).to_string(),
+                    origin: TextOrigin::at(*span),
                 },
             },
             ScalarExpr::PatternVarRef { column, span, .. } => Expr::Column {
@@ -14691,6 +16202,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 opaque: OpaqueExpr {
                     reason: classify_ir_opaque_reason(reason),
                     rendered: span_slice(*span, self.ctx.source).to_string(),
+                    origin: TextOrigin::at(*span),
                 },
             },
         }
@@ -14732,26 +16244,16 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             subquery,
             self.bindings,
             self.ctx.function_catalog,
-            self.ctx
-                .catalog
-                .map(|c| c as &dyn crate::ir::catalog_context::CatalogContext),
-            self.ctx.reasoning,
         );
-        // Extend the correlation-resolution context with THIS scope's
-        // volatile columns (plus any already inherited from grandparent
-        // scopes), so the inner walker can resolve the volatility of any
-        // correlated column the subquery references back into an enclosing
-        // scope. ColumnIds are global, so a union of all enclosing scopes'
-        // volatile sets suffices.
-        let mut outer_volatile = self.outer_volatile.clone();
-        outer_volatile.extend(self.reasoning.volatile_columns().iter().copied());
+        // The subquery's reasoning is a view of this one's statement.
+        let inner_reasoning = self.reasoning.nested(subquery);
         let inner_facts = project_query_facts_with_outer_ctes(
             subquery,
             self.bindings,
             &inner_derived,
             self.ctx,
             &self.cte_bindings_in_scope,
-            outer_volatile,
+            inner_reasoning.as_ref(),
         );
 
         // Surface a SubqueryRef witness in the enclosing scope so rules
@@ -14764,13 +16266,28 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         // is nested inside a function call.
         if let Some(scope) = scope_for_ref {
             let position = self.current_subquery_position;
-            self.scope_mut(scope).scalar_subqueries.push(SubqueryRef {
+            // A correlated subquery nested in this one runs once per row
+            // of its own block, at whatever depth: it is listed in this
+            // scope too, as it stands in its own.
+            let nested: Vec<SubqueryRef> = inner_facts
+                .scopes
+                .iter()
+                .flat_map(|inner| &inner.scalar_subqueries)
+                .filter(|nested| nested.correlated)
+                .map(|nested| SubqueryRef {
+                    scope_id: scope,
+                    ..nested.clone()
+                })
+                .collect();
+            let witnesses = &mut self.scope_mut(scope).scalar_subqueries;
+            witnesses.push(SubqueryRef {
                 kind,
                 correlated,
                 scope_id: scope,
                 source_span: Some(span),
                 position,
             });
+            witnesses.extend(nested);
         }
 
         SubqueryExpr {
@@ -14781,27 +16298,13 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
-    /// True iff `col` is known-nullable per the IR analysis or the
-    /// catalog. Used by aggregate emission to populate
-    /// [`AggregateEvent::on_nullable_argument`].
-    ///
-    /// Routed through [`Self::nullability_with_catalog_lineage`] — the
-    /// same lineage-aware classifier that [`Self::project_column_ref`]
-    /// uses for `ColumnRef.nullability`. That recovery is load-bearing:
-    /// nullability reasoning answers for the outermost
-    /// `output_schema`, so a `CteRef` / `DerivedTable` / set-op
-    /// pass-through projection whose lineage resolves to a
-    /// catalog-attested nullable base has no direct answer there or
-    /// in `column_metadata(col)`. Walking the global lineage
-    /// to the base and re-classifying as `CatalogNullable` keeps
-    /// `on_nullable_argument` honest across realistic dbt-shaped
-    /// `WITH stg AS (...) SELECT COUNT(col) FROM stg` chains.
-    fn column_is_known_nullable(&self, col: ColumnId) -> bool {
-        use crate::facts::catalog::Nullability;
-        matches!(
-            self.nullability_with_catalog_lineage(col),
-            Nullability::CatalogNullable | Nullability::DerivedNullable { .. }
-        )
+    /// True iff `col`, read at `site`, may be NULL because the catalog
+    /// declares a column it reads nullable: `ColumnRef.nullability` there
+    /// is `catalog_nullable`. A column NULL only where a join pads it or
+    /// an operator makes it is not. Used by aggregate emission to
+    /// populate [`AggregateEvent::on_nullable_argument`].
+    fn column_is_known_nullable(&self, site: ReadSite<'_>, col: ColumnId) -> bool {
+        matches!(self.nullability_at(site, col), Nullability::CatalogNullable)
     }
 
     /// True iff any partition-by key reaches a column the IR
@@ -14811,7 +16314,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     fn partition_keys_high_cardinality(&self, partition_by: &[ScalarExpr]) -> bool {
         let mut cols = Vec::new();
         for p in partition_by {
-            Self::collect_referenced_columns(p, &mut cols);
+            self.collect_referenced_columns(p, &mut cols);
         }
         cols.iter()
             .any(|cid| self.reasoning.is_high_cardinality_column(*cid))
@@ -14830,8 +16333,12 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             return Vec::new();
         };
         use crate::ir::CatalogContext;
+        let mut read: Vec<ColumnId> = Vec::new();
+        self.collect_referenced_columns(expr, &mut read);
         let mut cols: Vec<ColumnId> = Vec::new();
-        Self::collect_referenced_columns(expr, &mut cols);
+        for column in read {
+            self.collect_value_columns(column, &mut cols);
+        }
         let mut labels: Vec<crate::facts::catalog::TaintLabel> = Vec::new();
         for cid in cols {
             if let Some(meta) = catalog.column_metadata(cid) {
@@ -14845,6 +16352,38 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         labels
     }
 
+    /// The columns `column` may hold the value of: itself, or, where a
+    /// join merges it, those of the columns the join keeps: both for an
+    /// inner and a full join, the preserved side's for a join that keeps
+    /// one side.
+    fn collect_value_columns(&self, column: ColumnId, out: &mut Vec<ColumnId>) {
+        use crate::ir::column::MergedValue;
+        use crate::ir::ColumnOrigin;
+        match self.bindings.get(column).map(|binding| &binding.origin) {
+            Some(ColumnOrigin::Merged { value, .. }) => match value {
+                MergedValue::Side { kept, .. } => self.collect_value_columns(*kept, out),
+                MergedValue::Both { .. } | MergedValue::Either { .. } => {
+                    for side in value.sides() {
+                        self.collect_value_columns(side, out);
+                    }
+                }
+            },
+            Some(
+                ColumnOrigin::Table { .. }
+                | ColumnOrigin::Computed { .. }
+                | ColumnOrigin::SetOp { .. }
+                | ColumnOrigin::OuterRef { .. }
+                | ColumnOrigin::RecursiveRef { .. }
+                | ColumnOrigin::Unattributed { .. },
+            )
+            | None => {
+                if !out.contains(&column) {
+                    out.push(column);
+                }
+            }
+        }
+    }
+
     /// Merge the taint flowing into the projection's output `ColumnId`
     /// into `labels`. Taint reasoning propagates labels through
     /// aggregates, computed expressions, set ops, and cross-model
@@ -14853,43 +16392,149 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     /// per-`ColumnId` `column_metadata` channel is only seeded for
     /// `Scan` and `ModelRef` columns.
     ///
-    /// Keyed by the output column's binding `display_name` (the alias
-    /// if present, else the source column name); labels already present
-    /// are not duplicated. Silent when no catalog is attached, when the
-    /// output ColumnId has no binding, or when the name is missing from
-    /// the fold (inner-scope projections — the fold is clamped to the
-    /// outermost scope's output schema).
+    /// Asked of the output column itself, so two outputs of one name
+    /// each carry their own; labels already present are not duplicated.
     fn merge_ir_taint_for_output(
         &self,
         output: ColumnId,
         labels: &mut Vec<crate::facts::catalog::TaintLabel>,
     ) {
-        let Some(binding) = self.bindings.get(output) else {
-            return;
-        };
-        for projected in self.reasoning.output_taint_labels(&binding.display_name) {
-            if !labels.contains(&projected) {
-                labels.push(projected);
-            }
-        }
+        extend_absent(labels, self.reasoning.output_taint_labels(output));
     }
 
     /// The public value-exposure for a projection's output
-    /// column — the most-exposing class among its IR taint labels
-    /// (`Value` when untainted). Keyed by `display_name`, mirroring
-    /// [`Self::merge_ir_taint_for_output`].
+    /// column — the most-exposing class among its taint labels
+    /// (`Value` when untainted), asked of the column as
+    /// [`Self::merge_ir_taint_for_output`] asks.
     fn value_exposure_for_output(&self, output: ColumnId) -> crate::facts::catalog::ValueExposure {
-        let Some(binding) = self.bindings.get(output) else {
-            return crate::facts::catalog::ValueExposure::Value;
-        };
-        self.reasoning.output_value_exposure(&binding.display_name)
+        self.reasoning.output_value_exposure(output)
     }
 
-    fn collect_referenced_columns(expr: &ScalarExpr, out: &mut Vec<ColumnId>) {
+    /// Record and publish each column `assignment` writes of `table`,
+    /// column `i` taking position `i` of its value
+    /// ([`Self::publish_written_column`]). What a query's position reads,
+    /// and what a column an `INSERT` writes holds (an upsert's
+    /// `EXCLUDED.c`), is answered by reasoning alone. `unplaced` are the
+    /// columns an `INSERT` with no column list writes, placed at no
+    /// position of its source: a value that reads one has a source that is
+    /// not known.
+    fn publish_assignment(
+        &mut self,
+        table: &'a legacy_meta::TableRef,
+        assignment: &crate::ir::plan::Assignment,
+        unplaced: &[ColumnId],
+    ) {
+        use crate::ir::plan::AssignedValue;
+        for (position, written) in assignment.columns.iter().enumerate() {
+            let read = match &assignment.value {
+                AssignedValue::Row(values) => values
+                    .get(position)
+                    .map(|value| self.referenced_columns(value))
+                    .unwrap_or_default(),
+                AssignedValue::Query { .. } => Vec::new(),
+            };
+            let source = if read.iter().any(|column| unplaced.contains(column)) {
+                ValueSource::PartlyUnknown
+            } else {
+                ValueSource::Known
+            };
+            self.publish_written_column(table, *written, read, source);
+        }
+    }
+
+    /// The columns `expr` reads ([`Self::collect_referenced_columns`]).
+    fn referenced_columns(&self, expr: &ScalarExpr) -> Vec<ColumnId> {
+        let mut read = Vec::new();
+        self.collect_referenced_columns(expr, &mut read);
+        read
+    }
+
+    /// Record `written`, a column of `table` an `UPDATE` assignment, a
+    /// `MERGE` branch or an upsert's update action writes from a value
+    /// that reads the columns `read`, and publish it where the catalog
+    /// resolves the column: the tags the catalog attaches to it, the tags
+    /// of the columns its value is drawn from, and how much of them the
+    /// value exposes. A column the value reads is drawn from itself, the
+    /// columns a join merges into it, or the table column the plan pairs a
+    /// reference's column with; where its `source` is known, reasoning
+    /// adds the tags it finds on the written column's value and says the
+    /// exposure, which is otherwise `Value`.
+    fn publish_written_column(
+        &mut self,
+        table: &'a legacy_meta::TableRef,
+        written: ColumnId,
+        read: impl IntoIterator<Item = ColumnId>,
+        source: ValueSource,
+    ) {
+        use crate::facts::catalog::ValueExposure;
+        use crate::facts::query::WrittenColumnEvent;
+        use crate::ir::{CatalogContext, ColumnOrigin};
+        self.written_columns.push((table, written));
+        let Some(catalog) = self.ctx.catalog else {
+            return;
+        };
+        let Some(tags) = catalog.written_column_tags(written) else {
+            return;
+        };
+        let Some(binding) = self.bindings.get(written) else {
+            return;
+        };
+        let source_span = match &binding.origin {
+            ColumnOrigin::Computed { expr_span, .. } => Some(*expr_span),
+            ColumnOrigin::Table { .. }
+            | ColumnOrigin::Merged { .. }
+            | ColumnOrigin::SetOp { .. }
+            | ColumnOrigin::OuterRef { .. }
+            | ColumnOrigin::RecursiveRef { .. }
+            | ColumnOrigin::Unattributed { .. } => None,
+        };
+        let mut column_taint_labels = Vec::new();
+        extend_absent(&mut column_taint_labels, project_taint_labels(tags));
+        let mut drawn = Vec::new();
+        for column in read {
+            self.collect_value_columns(column, &mut drawn);
+        }
+        let mut value_taint_labels = Vec::new();
+        for column in drawn {
+            let source = self
+                .ctx
+                .scan_index
+                .and_then(|index| index.source_column(column, self.bindings))
+                .unwrap_or(column);
+            if let Some(meta) = catalog.column_metadata(source) {
+                extend_absent(&mut value_taint_labels, project_taint_labels(&meta.tags));
+            }
+        }
+        let value_exposure = match source {
+            ValueSource::Known => {
+                self.merge_ir_taint_for_output(written, &mut value_taint_labels);
+                self.value_exposure_for_output(written)
+            }
+            // Reasoning counts every column an unknown source may be.
+            ValueSource::PartlyUnknown => ValueExposure::Value,
+        };
+        self.written_tags.push(WrittenColumnEvent {
+            table: project_metadata_table_ref(table, None),
+            column: column_name(binding.display_name.as_str()),
+            column_taint_labels,
+            value_taint_labels,
+            value_exposure,
+            source_span,
+        });
+    }
+
+    /// The columns `expr` reads. A read of a group key the query wrote as
+    /// the key's expression reads what that expression reads.
+    fn collect_referenced_columns(&self, expr: &ScalarExpr, out: &mut Vec<ColumnId>) {
         match expr {
-            ScalarExpr::Column { column, .. } => {
-                if !out.contains(column) {
-                    out.push(*column);
+            ScalarExpr::Column { column, span } => {
+                match self.written_keys.get(&(*column, *span)).copied() {
+                    Some(written) => self.collect_referenced_columns(written, out),
+                    None => {
+                        if !out.contains(column) {
+                            out.push(*column);
+                        }
+                    }
                 }
             }
             ScalarExpr::OuterRef { column, .. } => {
@@ -14903,12 +16548,13 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 }
             }
             ScalarExpr::BinOp { left, right, .. } => {
-                Self::collect_referenced_columns(left, out);
-                Self::collect_referenced_columns(right, out);
+                self.collect_referenced_columns(left, out);
+                self.collect_referenced_columns(right, out);
             }
-            ScalarExpr::LogicalChain { operands, .. } => {
+            ScalarExpr::LogicalChain { operands, .. }
+            | ScalarExpr::OperatorChain { operands, .. } => {
                 for operand in operands {
-                    Self::collect_referenced_columns(operand, out);
+                    self.collect_referenced_columns(operand, out);
                 }
             }
             ScalarExpr::Like {
@@ -14917,21 +16563,21 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 escape,
                 ..
             } => {
-                Self::collect_referenced_columns(expr, out);
-                Self::collect_referenced_columns(pattern, out);
+                self.collect_referenced_columns(expr, out);
+                self.collect_referenced_columns(pattern, out);
                 if let Some(e) = escape {
-                    Self::collect_referenced_columns(e, out);
+                    self.collect_referenced_columns(e, out);
                 }
             }
-            ScalarExpr::UnaryOp { arg, .. } => Self::collect_referenced_columns(arg, out),
+            ScalarExpr::UnaryOp { arg, .. } => self.collect_referenced_columns(arg, out),
             ScalarExpr::FuncCall {
                 args, named_args, ..
             } => {
                 for a in args {
-                    Self::collect_referenced_columns(a, out);
+                    self.collect_referenced_columns(a, out);
                 }
                 for (_, a) in named_args {
-                    Self::collect_referenced_columns(a, out);
+                    self.collect_referenced_columns(a, out);
                 }
             }
             ScalarExpr::Case {
@@ -14941,51 +16587,56 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 ..
             } => {
                 if let Some(o) = operand.as_ref() {
-                    Self::collect_referenced_columns(o, out);
+                    self.collect_referenced_columns(o, out);
                 }
                 for (c, r) in branches {
-                    Self::collect_referenced_columns(c, out);
-                    Self::collect_referenced_columns(r, out);
+                    self.collect_referenced_columns(c, out);
+                    self.collect_referenced_columns(r, out);
                 }
                 if let Some(e) = else_.as_ref() {
-                    Self::collect_referenced_columns(e, out);
+                    self.collect_referenced_columns(e, out);
                 }
             }
-            ScalarExpr::Cast { expr, .. } => Self::collect_referenced_columns(expr, out),
+            ScalarExpr::Cast { expr, .. } => self.collect_referenced_columns(expr, out),
             ScalarExpr::InList { expr, list, .. } => {
-                Self::collect_referenced_columns(expr, out);
+                self.collect_referenced_columns(expr, out);
                 for e in list {
-                    Self::collect_referenced_columns(e, out);
+                    self.collect_referenced_columns(e, out);
                 }
             }
             ScalarExpr::Between {
                 expr, low, high, ..
             } => {
-                Self::collect_referenced_columns(expr, out);
-                Self::collect_referenced_columns(low, out);
-                Self::collect_referenced_columns(high, out);
+                self.collect_referenced_columns(expr, out);
+                self.collect_referenced_columns(low, out);
+                self.collect_referenced_columns(high, out);
             }
             ScalarExpr::QuantifiedCmp { left, right, .. } => {
-                Self::collect_referenced_columns(left, out);
+                self.collect_referenced_columns(left, out);
                 if let QuantifiedRhs::List(items) = right {
                     for e in items {
-                        Self::collect_referenced_columns(e, out);
+                        self.collect_referenced_columns(e, out);
                     }
+                }
+            }
+            ScalarExpr::RowCmp { left, .. } => {
+                for e in left {
+                    self.collect_referenced_columns(e, out);
                 }
             }
             ScalarExpr::WindowFn { call, .. } => {
                 for a in &call.args {
-                    Self::collect_referenced_columns(a, out);
+                    self.collect_referenced_columns(a, out);
                 }
                 for p in &call.partition_by {
-                    Self::collect_referenced_columns(p, out);
+                    self.collect_referenced_columns(p, out);
                 }
                 for k in &call.order_by {
-                    Self::collect_referenced_columns(&k.expr, out);
+                    self.collect_referenced_columns(&k.expr, out);
                 }
             }
-            ScalarExpr::FieldAccess { base, .. } => Self::collect_referenced_columns(base, out),
-            ScalarExpr::Lambda { body, .. } => Self::collect_referenced_columns(body, out),
+            ScalarExpr::FieldAccess { base, .. } => self.collect_referenced_columns(base, out),
+            ScalarExpr::Lambda { body, .. } => self.collect_referenced_columns(body, out),
             // Literals and subquery bodies do not contribute.
             ScalarExpr::Lit { .. }
             | ScalarExpr::Exists { .. }
@@ -15014,9 +16665,17 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     /// composite constraint only counts as `Matches` if every
     /// column of the source constraint is also covered by some pair
     /// in this join.
-    fn extract_join_column_pairs(&self, expr: &ScalarExpr) -> Vec<JoinColumnPair> {
+    fn extract_join_column_pairs(
+        &self,
+        expr: &ScalarExpr,
+        site: ReadSite<'_>,
+    ) -> Vec<JoinColumnPair> {
         let mut raw_pairs: Vec<(ColumnId, ColumnId, Span, Span)> = Vec::new();
         Self::collect_raw_join_pairs(expr, &mut raw_pairs);
+        let on: Vec<ColumnId> = raw_pairs
+            .iter()
+            .flat_map(|(lcol, rcol, _, _)| [*lcol, *rcol])
+            .collect();
 
         // Resolve lineage origins for each pair ONCE; the pool is
         // the union of those resolutions. Each resolution is then
@@ -15042,7 +16701,10 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         )> = std::collections::HashSet::new();
         for (l, r) in &resolved {
             for (t, k) in l.iter().chain(r.iter()) {
-                origins_pool.insert((t.clone(), crate::context::node_metadata::IdentKey::new(k)));
+                origins_pool.insert((
+                    t.clone(),
+                    crate::context::node_metadata::IdentKey::new_as(k, NameKind::Column),
+                ));
             }
         }
 
@@ -15050,8 +16712,8 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             .into_iter()
             .zip(resolved)
             .map(|((lcol, rcol, lspan, rspan), (l_origins, r_origins))| {
-                let left_ref = self.column_ref_from_id(lcol, Some(lspan));
-                let right_ref = self.column_ref_from_id(rcol, Some(rspan));
+                let left_ref = self.column_ref_at(site, lcol, Some(lspan));
+                let right_ref = self.column_ref_at(site, rcol, Some(rspan));
                 let type_compatibility =
                     compare_data_types(&left_ref.data_type, &right_ref.data_type);
                 let fk_relationship = compare_fk_relationship(
@@ -15062,10 +16724,18 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     &r_origins,
                     &origins_pool,
                 );
-                let unique_key_backed =
-                    self.reasoning.is_unique(lcol) || self.reasoning.is_unique(rcol);
+                // Pairs are in operand order; the reasoning finds each
+                // column's input of the join.
+                let left_key = self.reasoning.key_backed(site.node, lcol, &on);
+                let right_key = self.reasoning.key_backed(site.node, rcol, &on);
+                let unique_key_backed = left_key == Some(true) || right_key == Some(true);
+                // A column a table function yields is no catalog's to key.
+                let asked = |key: Option<bool>, col: ColumnId| {
+                    key.is_some() && !self.function_columns.contains(&col)
+                };
                 let unique_key_backing_known =
-                    self.ctx.catalog.is_some() && self.reasoning.uniqueness_known();
+                    self.ctx.catalog.is_some_and(|catalog| catalog.lists_keys())
+                        && (asked(left_key, lcol) || asked(right_key, rcol));
                 JoinColumnPair {
                     left: left_ref,
                     right: right_ref,
@@ -15121,6 +16791,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             // do not contribute a pair. The exhaustive arm avoids
             // a `_ =>` catch-all on the closed `ScalarExpr` enum.
             ScalarExpr::Column { .. }
+            | ScalarExpr::OperatorChain { .. }
             | ScalarExpr::OuterRef { .. }
             | ScalarExpr::Lit { .. }
             | ScalarExpr::UnaryOp { .. }
@@ -15133,6 +16804,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             | ScalarExpr::Exists { .. }
             | ScalarExpr::ScalarSubquery { .. }
             | ScalarExpr::QuantifiedCmp { .. }
+            | ScalarExpr::RowCmp { .. }
             | ScalarExpr::WindowFn { .. }
             | ScalarExpr::FieldAccess { .. }
             | ScalarExpr::Lambda { .. }
@@ -15141,23 +16813,24 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         }
     }
 
+    /// A reference to `id` read at the walker's current site.
     fn column_ref_from_id(&self, id: ColumnId, span: Option<Span>) -> ColumnRef {
+        self.column_ref_at(self.current_site, id, span)
+    }
+
+    fn column_ref_at(&self, site: ReadSite<'_>, id: ColumnId, span: Option<Span>) -> ColumnRef {
         let name = self
             .bindings
             .get(id)
             .map(|b| b.display_name.as_str())
             .unwrap_or("");
-        // Bare catalog lookup populates data_type and catalog_tags only.
-        // Nullability is routed through the lineage-aware classifier so
-        // CTE / DerivedTable / set-op pass-through projections recover
-        // their catalog-attested provenance — drives Q-JOIN-NULL-CENH
-        // and any future rule that predicates on `nullability.kind:
-        // catalog_nullable` through a projection chain.
+        // Bare catalog lookup populates data_type and catalog_tags only;
+        // nullability is the column's where `site` reads it.
         let (data_type, _direct_nullability, catalog_tags) =
             column_catalog_metadata(id, self.ctx.catalog);
-        let nullability = self.nullability_with_catalog_lineage(id);
+        let nullability = self.nullability_at(site, id);
         ColumnRef {
-            name: PublicIdentName::new(name),
+            name: column_name(name),
             table: None,
             source_span: span,
             data_type,
@@ -15227,6 +16900,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     }
 
     fn finalize(mut self, plan: &RelPlan, derived_facts: &DerivedFacts) -> QueryFacts {
+        self.settle_selected_functions();
         let has_sample = self.has_sample;
 
         // Per-column structural atoms + lattice anomalies. The IR pass
@@ -15244,7 +16918,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
         // by predicate span and attached to the matching
         // `PredicateEvent.null_effects`. Rules compose semantic
         // predicates (e.g. `Q-JOIN-LEFT-FILT`) from these typed
-        // primitives — no facts-layer signal categorisation.
+        // primitives — no facts-layer categorisation.
         let mut null_effects_by_span: std::collections::HashMap<
             Span,
             Vec<crate::facts::query::PredicateNullEffect>,
@@ -15268,6 +16942,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     column,
                     drops_null_row: raw.drops_null_row,
                     null_addressed: raw.null_addressed,
+                    drops_padded_row: raw.drops_padded_row,
                     aggregate_derived: raw.aggregate_derived,
                     inequality_compared: raw.inequality_compared,
                     null_literal_compared: raw.null_literal_compared,
@@ -15308,7 +16983,7 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             .tables_read
             .iter()
             .map(|t| {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
+                let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
                     table_catalog_metadata(t, self.ctx.catalog);
                 TableEvent {
                     table: project_metadata_table_ref(t, t.span),
@@ -15320,17 +16995,19 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     access_kind: TableAccessKind::Read,
                     table_kind,
                     in_catalog,
+                    searched_as,
+                    temporary: false,
                 }
             })
             .collect();
 
         let write_kind = root_write_access_kind(plan);
-        let writes_table = derived_facts
+        let writes_table: Vec<TableEvent> = derived_facts
             .tables_written
             .iter()
             .map(|t| {
-                let (catalog_tags, row_count, column_count, table_kind, in_catalog) =
-                    table_catalog_metadata(t, self.ctx.catalog);
+                let (catalog_tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+                    target_catalog_metadata(t, self.ctx.catalog);
                 TableEvent {
                     table: project_metadata_table_ref(t, t.span),
                     scope_id: ScopeIdentity::OUTER,
@@ -15341,6 +17018,8 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                     access_kind: write_kind,
                     table_kind,
                     in_catalog,
+                    searched_as,
+                    temporary: false,
                 }
             })
             .collect();
@@ -15380,8 +17059,12 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
 
         let table_hints = project_table_hints(plan);
 
-        let references_column =
-            project_column_references(self.bindings, self.ctx.catalog, self.ctx.scan_index);
+        let references_column = project_column_references(
+            self.bindings,
+            self.ctx.catalog,
+            self.ctx.scan_index,
+            &self.written_columns,
+        );
 
         // Saturating product across every `reads_table` row_count when
         // the statement has an implicit cross join. `None` when any
@@ -15411,12 +17094,19 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             };
 
         QueryFacts {
+            tables_used: tables_used(&reads_table, &writes_table),
             reads_table,
             writes_table,
             references_column,
+            written_columns: self.written_tags,
             scopes: self.scopes,
             has_where: derived_facts.has_where,
-            has_tautology_where: derived_facts.has_tautology_where,
+            has_tautology_where: crate::ir::always_true::has_tautology_where(
+                plan,
+                self.ctx.source,
+                self.bindings,
+                Some(self.reasoning),
+            ),
             has_limit: derived_facts.has_limit,
             has_qualify: derived_facts.has_qualify,
             has_having: derived_facts.having.is_some(),
@@ -15436,13 +17126,19 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
             stale_table_refs: Vec::new(),
             stale_column_refs: Vec::new(),
             merge,
+            target_rows: project_target_rows(plan, self.ctx.source, self.bindings),
+            overwrite: project_overwrite(plan),
             table_hints,
+            // Stated by `project_query_facts` for a statement compared with
+            // another version of it.
+            output_columns: Vec::new(),
             // Populated after this projection by the SELECT dispatch in
             // lib.rs (via `collect_openrowset_calls`). Default empty
             // here so non-SELECT paths and missing-walker paths still
             // construct correctly.
             openrowset_calls: Vec::new(),
             opendatasource_calls: Vec::new(),
+            function_calls: Vec::new(),
             // Populated by the caller from the statement-level
             // extraction. Default empty here.
             file_exports: Vec::new(),
@@ -15450,8 +17146,91 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
     }
 }
 
+/// The relation `plan` returns, or the one its `CREATE … AS` makes, with
+/// the names a `CREATE … (names) AS` gives its columns by position. `None`
+/// for a plan that returns no rows.
+pub fn returned_relation(
+    plan: &RelPlan,
+) -> Option<(&RelPlan, Option<&[crate::context::node_metadata::IdentKey]>)> {
+    match plan {
+        RelPlan::CreateAsQuery { body, columns, .. } => {
+            let (relation, _) = returned_relation(body.as_deref()?)?;
+            Some((relation, columns.as_deref()))
+        }
+        RelPlan::WithScope { body, .. } => returned_relation(body),
+        RelPlan::Project { .. }
+        | RelPlan::Filter { .. }
+        | RelPlan::Aggregate { .. }
+        | RelPlan::Window { .. }
+        | RelPlan::Sort { .. }
+        | RelPlan::Limit { .. }
+        | RelPlan::SetOp { .. }
+        | RelPlan::Join { .. }
+        | RelPlan::Scan { .. }
+        | RelPlan::Values { .. }
+        | RelPlan::CteRef { .. }
+        | RelPlan::ModelRef { .. }
+        | RelPlan::TableFunction { .. }
+        | RelPlan::DerivedTable { .. }
+        | RelPlan::TableSample { .. }
+        | RelPlan::Pivot { .. }
+        | RelPlan::Unpivot { .. }
+        | RelPlan::Unnest { .. }
+        | RelPlan::MatchRecognize { .. }
+        | RelPlan::ConnectBy { .. } => Some((plan, None)),
+        RelPlan::Insert { .. }
+        | RelPlan::Update { .. }
+        | RelPlan::Delete { .. }
+        | RelPlan::Merge { .. }
+        | RelPlan::MultiInsert { .. }
+        | RelPlan::Explain { .. }
+        | RelPlan::CreateTableForm { .. }
+        | RelPlan::ParseRecovery { .. }
+        | RelPlan::InvalidInput { .. }
+        | RelPlan::Opaque { .. } => None,
+    }
+}
+
+/// The public constraint arms of `constraints`, and `Unique` where the
+/// column is `unique`.
+fn project_constraint_set(
+    constraints: &crate::ir::constraint_types::IrColumnConstraints,
+    unique: bool,
+) -> crate::facts::diff::ConstraintFactSet {
+    use crate::facts::diff::{ConstraintFactArm, ConstraintFactSet};
+    use crate::facts::literal::LiteralValue;
+    let literal = |repr: &String| LiteralValue::Other { repr: repr.clone() };
+    let mut arms: Vec<ConstraintFactArm> = Vec::new();
+    if let Some(value) = &constraints.eq_value {
+        arms.push(ConstraintFactArm::Eq {
+            literal: literal(value),
+        });
+    }
+    if let Some(values) = &constraints.in_values {
+        arms.push(ConstraintFactArm::InSet {
+            values: values.iter().map(literal).collect(),
+        });
+    }
+    if constraints.is_not_null {
+        arms.push(ConstraintFactArm::IsNotNull);
+    }
+    if constraints.lower_bound.is_some() || constraints.upper_bound.is_some() {
+        arms.push(ConstraintFactArm::Range {
+            low: constraints.lower_bound.as_ref().map(literal),
+            high: constraints.upper_bound.as_ref().map(literal),
+        });
+    }
+    if unique {
+        arms.push(ConstraintFactArm::Unique);
+    }
+    ConstraintFactSet { arms }
+}
+
 /// Dedup schemas across `tables_read ∪ tables_written`, keyed on
-/// `IdentName.normalized` and preserving first-seen order.
+/// `IdentName.normalized` and preserving first-seen order. A table with a
+/// database and no schema (`d1..t`, or a bare name under `USE DATABASE
+/// d1`) is in that database's default schema, written `d1..`: the
+/// statement does not say which, so it never equals a named one.
 fn collect_schemas_touched(
     reads: &[crate::context::node_metadata::TableRef],
     writes: &[crate::context::node_metadata::TableRef],
@@ -15459,11 +17238,20 @@ fn collect_schemas_touched(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<IdentName> = Vec::new();
     for t in reads.iter().chain(writes.iter()) {
-        if let Some(raw) = t.schema.as_ref() {
-            let ident = IdentName::new(raw.clone());
-            if seen.insert(ident.normalized.clone()) {
-                out.push(ident);
+        let ident = match (t.schema.as_ref(), t.db.as_ref()) {
+            (Some(schema), _) => IdentName::new(schema.clone()),
+            (None, Some(db)) => {
+                let db = IdentName::new(db.clone());
+                IdentName::from_parts(format!("{}..", db.raw), format!("{}..", db.normalized))
             }
+            (None, None) => continue,
+        };
+        let ident = match t.span {
+            Some(span) => ident.written_at(span),
+            None => ident,
+        };
+        if seen.insert(ident.normalized.clone()) {
+            out.push(ident);
         }
     }
     out
@@ -15515,7 +17303,7 @@ fn empty_scope_facts(
         set_operations: Vec::new(),
         star_projections: Vec::new(),
         scalar_subqueries: Vec::new(),
-        lateral_flattens: Vec::new(),
+        table_functions: Vec::new(),
         has_distinct: false,
         has_multiple_partition_schemes: false,
         has_high_cardinality_group_by: false,
@@ -15535,12 +17323,12 @@ fn project_merge_branch(b: &crate::ir::plan::MergeBranch) -> crate::facts::query
     crate::facts::query::MergeBranchFacts {
         kind: project_merge_branch_kind(b.kind),
         action: match b.action {
-            MergeAction::Insert { .. } | MergeAction::InsertStar | MergeAction::InsertAllByName => {
-                MergeActionFacts::Insert
-            }
+            MergeAction::Insert { .. }
+            | MergeAction::InsertStar { .. }
+            | MergeAction::InsertAllByName { .. } => MergeActionFacts::Insert,
             MergeAction::Update { .. }
-            | MergeAction::UpdateSetStar
-            | MergeAction::UpdateAllByName => MergeActionFacts::Update,
+            | MergeAction::UpdateSetStar { .. }
+            | MergeAction::UpdateAllByName { .. } => MergeActionFacts::Update,
             MergeAction::Delete => MergeActionFacts::Delete,
             MergeAction::DoNothing => MergeActionFacts::DoNothing,
         },
@@ -15757,9 +17545,11 @@ fn compare_fk_relationship(
                         remote_table: &legacy_meta::TableRef,
                         remote_col: &str|
      -> bool {
-        edge.local_column_name == crate::context::node_metadata::IdentKey::new(local_col)
+        edge.local_column_name
+            == crate::context::node_metadata::IdentKey::new_as(local_col, NameKind::Column)
             && edge.ref_table == *remote_table
-            && edge.ref_column_name == crate::context::node_metadata::IdentKey::new(remote_col)
+            && edge.ref_column_name
+                == crate::context::node_metadata::IdentKey::new_as(remote_col, NameKind::Column)
     };
 
     // For each (left_origin, right_origin) pair, check whether
@@ -15803,6 +17593,15 @@ fn compare_fk_relationship(
     }
 }
 
+/// Append each of `items` that `list` does not already hold, in order.
+fn extend_absent<T: PartialEq>(list: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
+    for item in items {
+        if !list.contains(&item) {
+            list.push(item);
+        }
+    }
+}
+
 /// Project a catalog tag list onto the typed public `TaintLabel`
 /// taxonomy. Recognised governance classifications (PII, PHI,
 /// Confidential, Restricted, Internal, Public — matched
@@ -15834,7 +17633,7 @@ fn project_taint_labels(tags: &[crate::ir::TagRef]) -> Vec<crate::facts::catalog
 /// `DataTypeKind::Other(raw_uppercase)`. The original spelling is
 /// preserved on the `raw` field so customer predicates can match on
 /// dialect-specific shapes via `data_type.raw: { matches: ... }`.
-fn classify_catalog_data_type(raw: &str) -> crate::facts::literal::DataType {
+pub fn classify_catalog_data_type(raw: &str) -> crate::facts::literal::DataType {
     use crate::facts::literal::{DataType, DataTypeKind};
     let upper = raw.to_ascii_uppercase();
     let head = upper
@@ -15898,14 +17697,15 @@ fn classify_catalog_data_type(raw: &str) -> crate::facts::literal::DataType {
 /// The base-table columns a plan column traces back to.
 type ColumnOrigins = Vec<(legacy_meta::TableRef, String)>;
 
-/// `(catalog_tags, row_count, column_count, table_kind, in_catalog)` for a
-/// base table.
+/// `(catalog_tags, row_count, column_count, table_kind, in_catalog,
+/// searched_as)` for a base table.
 type TableCatalogMetadata = (
     Vec<CatalogTag>,
     Option<u64>,
     Option<u32>,
     Option<crate::facts::query::TableKind>,
     Option<bool>,
+    Option<String>,
 );
 
 /// Look up catalog-derived metadata for a base table. Each element is
@@ -15916,7 +17716,7 @@ fn table_catalog_metadata(
     catalog: Option<&crate::ir::IndexedCatalogContext>,
 ) -> TableCatalogMetadata {
     let Some(catalog) = catalog else {
-        return (Vec::new(), None, None, None, None);
+        return (Vec::new(), None, None, None, None, None);
     };
     use crate::ir::CatalogContext;
     let tags = catalog
@@ -15928,7 +17728,81 @@ fn table_catalog_metadata(
     let column_count = catalog.resolve_table_columns(table).map(|c| c.len() as u32);
     let table_kind = catalog.table_kind(table).map(project_table_kind);
     let in_catalog = catalog.table_in_catalog(table);
-    (tags, row_count, column_count, table_kind, in_catalog)
+    let searched_as = catalog.table_searched(table).map(|names| {
+        names
+            .iter()
+            .map(|name| {
+                [
+                    name.db.as_deref(),
+                    name.schema.as_deref(),
+                    Some(name.name.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(".")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    (
+        tags,
+        row_count,
+        column_count,
+        table_kind,
+        in_catalog,
+        searched_as,
+    )
+}
+
+/// The tables `reads` and `writes` hold, once each, a table in both as
+/// `writes` holds it, each at its first reference, in the order of those
+/// references ([`crate::facts::query::QueryFacts::tables_used`]).
+fn tables_used(reads: &[TableEvent], writes: &[TableEvent]) -> Vec<TableEvent> {
+    let mut used: Vec<TableEvent> = Vec::with_capacity(reads.len() + writes.len());
+    for event in writes.iter().chain(reads) {
+        match used
+            .iter_mut()
+            .find(|held| held.table.canonical == event.table.canonical)
+        {
+            Some(held) => {
+                let earlier = match (held.source_span, event.source_span) {
+                    (Some(first), Some(at)) => at.start < first.start,
+                    (None, Some(_)) => true,
+                    (Some(_), None) | (None, None) => false,
+                };
+                if earlier {
+                    held.source_span = event.source_span;
+                    held.table.source_span = event.source_span;
+                }
+            }
+            None => used.push(event.clone()),
+        }
+    }
+    used.sort_by_key(|event| event.source_span.map_or(u32::MAX, |at| at.start));
+    used
+}
+
+/// As [`table_catalog_metadata`], for a table a statement writes. The
+/// column count of a DML target the catalog resolves is the number of
+/// columns the catalog declares for it, whatever the statement reads.
+fn target_catalog_metadata(
+    table: &legacy_meta::TableRef,
+    catalog: Option<&crate::ir::IndexedCatalogContext>,
+) -> TableCatalogMetadata {
+    let (tags, row_count, column_count, table_kind, in_catalog, searched_as) =
+        table_catalog_metadata(table, catalog);
+    let declared = catalog
+        .and_then(|catalog| catalog.target_declared_columns(table))
+        .map(|names| names.len() as u32);
+    (
+        tags,
+        row_count,
+        declared.or(column_count),
+        table_kind,
+        in_catalog,
+        searched_as,
+    )
 }
 
 /// Project the IR-side onto the public taxonomy.
@@ -15958,34 +17832,89 @@ fn project_catalog_tag(t: &crate::ir::TagRef) -> CatalogTag {
 /// Project every `ColumnOrigin::Table` binding in the statement to a
 /// public [`ColumnReferenceEvent`], paired with the catalog-presence
 /// outcome the lowerer recorded at `seed_catalog_ctx_from_scan` time.
+/// A `ColumnOrigin::Unattributed` binding gives an event that names no
+/// table.
 ///
-/// Deduplicated by `(table, column_name)`: passthrough references
-/// across CTE / derived-table chains that share a single underlying
-/// `ColumnId` contribute one event regardless of how many syntactic
-/// reference sites reached the same id.
+/// Deduplicated by `(table, column_name)`, and for an unattributed
+/// column by its qualifier too, which the event does not carry: a bare
+/// name and the same name behind a qualifier are two events. A column read through a
+/// CTE or derived-table reference is the reference's own computed
+/// column, paired with the table column it is; that table column's
+/// binding contributes the one event, however many references read
+/// it.
 ///
 /// `in_catalog` is a tri-state: present (`Some(true)` when the column
 /// was found, `Some(false)` when it was absent) only when (a) a catalog
 /// is attached, (b) the column resolved to a scan source, and (c) the
-/// table itself was present in the catalog. Otherwise `None`.
+/// table itself was present in the catalog; or `Some(false)` for a
+/// column of no source that no source in scope can have, with a table
+/// the catalog knows among them. Otherwise `None`.
+///
+/// `written` holds each column a DML statement writes, with its target.
+/// Such a column is a computed column of the statement, not a table
+/// binding, so the loop over the bindings does not see it: where the
+/// catalog declares the column for the target and no binding of the
+/// target's column already gave the event, it is published here as a
+/// column of the target that is in the catalog.
 pub(crate) fn project_column_references(
     bindings: &crate::ir::column::BindingTable,
     catalog: Option<&crate::ir::catalog_context::IndexedCatalogContext>,
     scan_index: Option<&crate::ir::expression_fact::ScanIndex>,
+    written: &[(&legacy_meta::TableRef, ColumnId)],
 ) -> Vec<crate::facts::query::ColumnReferenceEvent> {
     use crate::ir::column::ColumnOrigin;
     let mut out: Vec<crate::facts::query::ColumnReferenceEvent> = Vec::new();
-    let mut seen: std::collections::HashSet<(Option<legacy_meta::TableRef>, String)> =
+    // (table, qualifier of an unattributed column, column name).
+    let mut seen: std::collections::HashSet<(Option<legacy_meta::TableRef>, Option<&str>, String)> =
+        std::collections::HashSet::new();
+    // The written columns the catalog declares for their target, and
+    // those an assignment writes by a name of the target's own that the
+    // target lacks, with whether the catalog has them.
+    let declared_written: Vec<(
+        &legacy_meta::TableRef,
+        ColumnId,
+        legacy_meta::IdentKey,
+        bool,
+    )> = match catalog {
+        Some(cat) => written
+            .iter()
+            .filter_map(|&(target, cid)| {
+                let name = legacy_meta::IdentKey::new_as(
+                    &bindings.get(cid)?.display_name,
+                    NameKind::Column,
+                );
+                if cat.column_in_catalog(cid) == Some(false) {
+                    return Some((target, cid, name, false));
+                }
+                cat.target_declared_columns(target)?
+                    .contains(&name)
+                    .then_some((target, cid, name, true))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    // (table, column) of every event given, kept only where a written
+    // column could repeat one.
+    let mut referenced: std::collections::HashSet<(legacy_meta::TableRef, legacy_meta::IdentKey)> =
         std::collections::HashSet::new();
 
     for (cid, binding) in bindings.iter() {
-        let ColumnOrigin::Table {
-            column_name,
-            span,
-            table_node,
-        } = &binding.origin
-        else {
-            continue;
+        let (column_name, span, table_node, qualifier) = match &binding.origin {
+            ColumnOrigin::Table {
+                column_name,
+                span,
+                table_node,
+            } => (column_name, span, Some(table_node), None),
+            ColumnOrigin::Unattributed {
+                qualifier,
+                name,
+                span,
+            } => (name, span, None, qualifier.as_deref()),
+            ColumnOrigin::Computed { .. }
+            | ColumnOrigin::Merged { .. }
+            | ColumnOrigin::SetOp { .. }
+            | ColumnOrigin::OuterRef { .. }
+            | ColumnOrigin::RecursiveRef { .. } => continue,
         };
 
         // IR-derived table identity: the `table_node` carried on every
@@ -15994,7 +17923,9 @@ pub(crate) fn project_column_references(
         // `ScanIndex` is built directly from the lowered `RelPlan`
         // (no catalog dependency); this resolves the column's owning
         // table even in catalog-less analysis.
-        let scan_table = scan_index.and_then(|idx| idx.get(table_node)).cloned();
+        let scan_table = table_node
+            .and_then(|node| scan_index.and_then(|idx| idx.get(node)))
+            .cloned();
 
         // Catalog-augmented bits (`in_catalog`, `is_ambiguous`) are
         // populated only when an external catalog was attached; the
@@ -16009,7 +17940,9 @@ pub(crate) fn project_column_references(
                         Some(true) => cat.column_in_catalog(*cid),
                         _ => None,
                     },
-                    None => None,
+                    // A column of no table: absent where every table in
+                    // scope the catalog knows lacks it.
+                    None => cat.column_in_catalog(*cid),
                 };
                 (cat_table, presence, cat.column_is_ambiguous(*cid))
             }
@@ -16026,17 +17959,49 @@ pub(crate) fn project_column_references(
         let public_table = table_ref
             .as_ref()
             .map(|t| project_metadata_table_ref(t, None));
-        let dedup_key = (table_ref, column_name.clone());
+        if !declared_written.is_empty() {
+            if let Some(table) = table_ref.as_ref() {
+                referenced.insert((
+                    table.clone(),
+                    legacy_meta::IdentKey::new_as(column_name, NameKind::Column),
+                ));
+            }
+        }
+        let dedup_key = (table_ref, qualifier, column_name.clone());
         if !seen.insert(dedup_key) {
             continue;
         }
 
-        let column = ColumnRef::minimal(PublicIdentName::new(column_name), public_table);
+        let column = ColumnRef::minimal(self::column_name(column_name), public_table);
         out.push(crate::facts::query::ColumnReferenceEvent {
             column,
             in_catalog,
             is_ambiguous,
             source_span: Some(*span),
+        });
+    }
+
+    for (target, cid, name, in_catalog) in declared_written {
+        let Some(binding) = bindings.get(cid) else {
+            continue;
+        };
+        let (ColumnOrigin::Computed { expr_span, .. } | ColumnOrigin::Merged { expr_span, .. }) =
+            &binding.origin
+        else {
+            continue;
+        };
+        if !referenced.insert((target.clone(), name)) {
+            continue;
+        }
+        let column = ColumnRef::minimal(
+            column_name(&binding.display_name),
+            Some(project_metadata_table_ref(target, None)),
+        );
+        out.push(crate::facts::query::ColumnReferenceEvent {
+            column,
+            in_catalog: Some(in_catalog),
+            is_ambiguous: false,
+            source_span: Some(*expr_span),
         });
     }
 
@@ -16116,26 +18081,46 @@ fn project_set_op_kind(ir: IrSetOpKind) -> PublicSetOpKind {
 }
 
 /// Public-typed variant of `crate::ir::derived_facts::principal_table` —
-/// resolves a relational subtree to its single principal base-table
-/// reference (left-recursive on joins, right-recursive on the right
-/// child for the `principal` heuristic). Returns `None` when no single
-/// base table is identifiable (TVFs, set-ops with no first-input table,
-/// DML, opaque fragments, …).
-fn principal_table_ref(plan: &RelPlan) -> Option<PublicTableRef> {
+/// resolves a relational subtree to its single principal source
+/// reference (right-recursive on joins for the `principal` heuristic): a
+/// base table, a CTE, or a table function named by its function.
+/// Returns `None` when no single source is identifiable (a function
+/// source that is no call, set-ops with no first-input table, DML,
+/// opaque fragments, …).
+fn principal_source<'a>(
+    plan: &'a RelPlan,
+    functions: &crate::ir::FunctionCatalog,
+) -> Option<PrincipalSource<'a>> {
     match plan {
-        RelPlan::Scan { table, span, .. } => Some(project_metadata_table_ref(table, Some(*span))),
-        RelPlan::CteRef { name, span, .. } => Some(PublicTableRef::new(
-            PublicIdentName::new(name.as_str()),
-            None,
-            None,
-            Some(*span),
-        )),
-        RelPlan::ModelRef { model, span, .. } => model
-            .base_tables
-            .first()
-            .map(|t| project_metadata_table_ref(t, Some(*span))),
-        RelPlan::Join { right, .. } => principal_table_ref(right),
-        RelPlan::SetOp { inputs, .. } => inputs.first().and_then(|p| principal_table_ref(p)),
+        RelPlan::Scan { table, span, .. } => Some(PrincipalSource {
+            name: project_metadata_table_ref(table, Some(*span)),
+            call: None,
+        }),
+        RelPlan::CteRef { name, span, .. } => Some(PrincipalSource {
+            name: PublicTableRef::new(PublicIdentName::new(name.as_str()), None, None, Some(*span)),
+            call: None,
+        }),
+        RelPlan::ModelRef { model, span, .. } => {
+            model.base_tables.first().map(|t| PrincipalSource {
+                name: project_metadata_table_ref(t, Some(*span)),
+                call: None,
+            })
+        }
+        RelPlan::TableFunction { call, span, .. } => {
+            call.called_function().map(|func| PrincipalSource {
+                name: PublicTableRef::new(
+                    resolved_func_name(func, functions),
+                    None,
+                    None,
+                    Some(*span),
+                ),
+                call: Some(call),
+            })
+        }
+        RelPlan::Join { right, .. } => principal_source(right, functions),
+        RelPlan::SetOp { inputs, .. } => {
+            inputs.first().and_then(|p| principal_source(p, functions))
+        }
         RelPlan::Project { input, .. }
         | RelPlan::Filter { input, .. }
         | RelPlan::Aggregate { input, .. }
@@ -16148,12 +18133,13 @@ fn principal_table_ref(plan: &RelPlan) -> Option<PublicTableRef> {
         | RelPlan::MatchRecognize { input, .. }
         | RelPlan::ConnectBy { input, .. }
         | RelPlan::Unnest { input, .. }
-        | RelPlan::DerivedTable { input, .. } => principal_table_ref(input),
-        RelPlan::Explain { body, .. } => principal_table_ref(body),
-        RelPlan::WithScope { body, .. } => principal_table_ref(body),
-        RelPlan::CreateAsQuery { body, .. } => body.as_deref().and_then(principal_table_ref),
+        | RelPlan::DerivedTable { input, .. } => principal_source(input, functions),
+        RelPlan::Explain { body, .. } => principal_source(body, functions),
+        RelPlan::WithScope { body, .. } => principal_source(body, functions),
+        RelPlan::CreateAsQuery { body, .. } => {
+            body.as_deref().and_then(|b| principal_source(b, functions))
+        }
         RelPlan::Values { .. }
-        | RelPlan::TableFunction { .. }
         | RelPlan::CreateTableForm { .. }
         | RelPlan::Insert { .. }
         | RelPlan::Update { .. }
@@ -16163,6 +18149,138 @@ fn principal_table_ref(plan: &RelPlan) -> Option<PublicTableRef> {
         | RelPlan::ParseRecovery { .. }
         | RelPlan::InvalidInput { .. }
         | RelPlan::Opaque { .. } => None,
+    }
+}
+
+/// A join operand's principal source: its published name, and the call
+/// when the source is a table function.
+struct PrincipalSource<'a> {
+    name: PublicTableRef,
+    call: Option<&'a ScalarExpr>,
+}
+
+/// What a join's right operand reads its rows from: a call is
+/// correlated when an argument (or an argument's subquery) reads a
+/// column the left operand yields.
+fn join_right_source(
+    right: &PrincipalSource<'_>,
+    left: &RelPlan,
+    bindings: &BindingTable,
+) -> PublicJoinSource {
+    let Some(call) = right.call else {
+        return PublicJoinSource::Table;
+    };
+    let mut reads = std::collections::HashSet::new();
+    collect_reads(call, &mut reads);
+    if reads.is_empty() {
+        return PublicJoinSource::TableFunction;
+    }
+    let left_columns: std::collections::HashSet<ColumnId> =
+        left.output_schema().into_iter().collect();
+    let left_sources = crate::ir::correlation::source_nodes(left);
+    let reads_left = reads.iter().any(|column| {
+        left_columns.contains(column)
+            || bindings
+                .get(*column)
+                .is_some_and(|binding| match &binding.origin {
+                    crate::ir::column::ColumnOrigin::Table { table_node, .. } => {
+                        left_sources.contains(table_node)
+                    }
+                    crate::ir::column::ColumnOrigin::Computed { producing_node, .. } => {
+                        left_sources.contains(producing_node)
+                    }
+                    crate::ir::column::ColumnOrigin::Merged { .. }
+                    | crate::ir::column::ColumnOrigin::SetOp { .. }
+                    | crate::ir::column::ColumnOrigin::OuterRef { .. }
+                    | crate::ir::column::ColumnOrigin::RecursiveRef { .. }
+                    | crate::ir::column::ColumnOrigin::Unattributed { .. } => false,
+                })
+    });
+    match reads_left {
+        true => PublicJoinSource::CorrelatedTableFunction,
+        false => PublicJoinSource::TableFunction,
+    }
+}
+
+/// Add each column `expr` reads to `into`, with each column its subqueries
+/// read of an enclosing query.
+fn collect_reads(expr: &ScalarExpr, into: &mut std::collections::HashSet<ColumnId>) {
+    struct Reads<'s>(&'s mut std::collections::HashSet<ColumnId>);
+    impl<'a> crate::ir::visitor::ScalarExprVisitor<'a> for Reads<'_> {
+        fn visit_scalar_expr(&mut self, expr: &'a ScalarExpr) {
+            if let ScalarExpr::Column { column, .. }
+            | ScalarExpr::OuterRef { column, .. }
+            | ScalarExpr::PatternVarRef { column, .. } = expr
+            {
+                self.0.insert(*column);
+            }
+            crate::ir::visitor::walk_scalar_expr_standalone(self, expr);
+        }
+        fn visit_scalar_subquery(&mut self, _plan: &'a RelPlan, correlates_with: &'a [ColumnId]) {
+            self.0.extend(correlates_with.iter().copied());
+        }
+    }
+    crate::ir::visitor::ScalarExprVisitor::visit_scalar_expr(&mut Reads(into), expr);
+}
+
+/// What a scope's select list reads.
+#[derive(Default)]
+struct SelectReads {
+    /// Each column it reads, and each its windows, aggregates and computed
+    /// items read for it.
+    columns: std::collections::HashSet<ColumnId>,
+    /// Its stars.
+    stars: Vec<StarCover>,
+}
+
+/// What a star of a select list ranges over.
+struct StarCover {
+    /// The name that qualifies it (`f.*`); none for a bare star, which
+    /// ranges over every source.
+    qualifier: Option<crate::context::node_metadata::IdentKey>,
+    /// The sources whose columns it was expanded into items for: what it
+    /// reads of them, the items read.
+    enumerated: Vec<crate::ast::NodeId>,
+}
+
+impl SelectReads {
+    /// Add what `expr`, read for the list, reads.
+    fn add(&mut self, expr: &ScalarExpr) {
+        collect_reads(expr, &mut self.columns);
+    }
+
+    /// Add what `expr` reads where the list reads `output`.
+    fn add_for(&mut self, output: ColumnId, expr: &ScalarExpr) {
+        if self.columns.contains(&output) {
+            self.add(expr);
+        }
+    }
+
+    /// Add what each of `computed` that the list reads reads, the later
+    /// first, as an entry reads only those before it.
+    fn add_computed(&mut self, computed: &[crate::ir::plan::ComputedItem]) {
+        for item in computed.iter().rev() {
+            self.add_for(item.output, &item.expr);
+        }
+    }
+
+    /// Whether the list reads a column of the table function source
+    /// `node`, whose columns `columns` lists, aliased `alias`: one of them,
+    /// or a star over the source that is not expanded into its columns.
+    fn reads_function(
+        &self,
+        columns: &[ColumnId],
+        alias: Option<&crate::context::node_metadata::IdentKey>,
+        node: crate::ast::NodeId,
+    ) -> bool {
+        let covers = |star: &StarCover| match &star.qualifier {
+            None => true,
+            Some(qualifier) => alias == Some(qualifier),
+        };
+        self.stars
+            .iter()
+            .any(|star| covers(star) && !star.enumerated.contains(&node))
+            || columns.iter().any(|column| self.columns.contains(column))
     }
 }
 
@@ -16204,27 +18322,27 @@ fn principal_scan_metadata_table_ref_with_ctes<'a>(
         RelPlan::Explain { body, .. } => {
             principal_scan_metadata_table_ref_with_ctes(body, cte_bindings)
         }
-        RelPlan::WithScope { body, .. } => {
-            // The caller (QueryWalker) already pushes the enclosing
-            // `WithScope.ctes` onto `cte_bindings_in_scope` BEFORE
-            // walking into Join operands, so the passed `cte_bindings`
-            // slice already covers any CteRef the body can reach.
-            // Inner WithScope nodes don't extend it here because that
-            // would require owning a per-call Vec (the &'a slice
-            // returned in `RelPlan::Scan` outlives any local
-            // extension). The pure-IR caller paths converge here too.
-            principal_scan_metadata_table_ref_with_ctes(body, cte_bindings)
+        RelPlan::WithScope { ctes, body, .. } => {
+            // The body reaches this scope's CTEs beside those around it;
+            // a reference resolves by its scope, so a CTE of an outer
+            // name stays apart from the outer one.
+            let in_scope: Vec<&'a crate::ir::plan::CteBinding> =
+                cte_bindings.iter().copied().chain(ctes.iter()).collect();
+            principal_scan_metadata_table_ref_with_ctes(body, &in_scope)
         }
         RelPlan::CreateAsQuery { body, .. } => body
             .as_deref()
             .and_then(|b| principal_scan_metadata_table_ref_with_ctes(b, cte_bindings)),
         RelPlan::ModelRef { model, .. } => model.base_tables.first(),
-        RelPlan::CteRef { name, .. } => {
-            // Descend through the named CTE's body so realistic
+        RelPlan::CteRef { scope, .. } => {
+            // Descend through the CTE's body so realistic
             // `WITH stg AS (...) ... CROSS JOIN stg` shapes can
             // resolve to the underlying base-table for catalog
             // row-count lookup. For recursive CTEs, use the anchor.
-            let binding = cte_bindings.iter().find(|b| b.name == *name)?;
+            // The binding is the one the reference was resolved to, by
+            // its scope: a CTE of the same name in another scope is
+            // another relation, and one whose body reads it would loop.
+            let binding = cte_bindings.iter().find(|b| b.scope == *scope)?;
             let body = match &binding.body {
                 crate::ir::plan::CteBody::NonRecursive(b) => b.as_ref(),
                 crate::ir::plan::CteBody::Recursive { anchor, .. } => anchor.as_ref(),
@@ -16325,7 +18443,9 @@ fn project_lit(lit: &Lit) -> LiteralValue {
         Lit::Typed { type_name, value } => LiteralValue::Other {
             repr: format!("{} '{}'", type_name, value),
         },
-        Lit::Variant(s) => LiteralValue::Other { repr: s.clone() },
+        Lit::Variant(s) | Lit::Variable { written: s, .. } => {
+            LiteralValue::Other { repr: s.clone() }
+        }
     }
 }
 
@@ -16361,7 +18481,6 @@ fn project_binary_op_str(op: &str) -> BinaryOp {
         "||" | "CONCAT" => BinaryOp::Concat,
         "&" => BinaryOp::BitAnd,
         "|" => BinaryOp::BitOr,
-        "XOR" => BinaryOp::BitXor,
         "<<" => BinaryOp::ShiftLeft,
         ">>" => BinaryOp::ShiftRight,
         "->" => BinaryOp::JsonGet,
@@ -16375,18 +18494,47 @@ fn project_binary_op_str(op: &str) -> BinaryOp {
 /// Map an IR to the public
 /// closed-enum [`UnaryOp`]. Closed-enum exhaustive; dialect-specific
 /// unary operators with no public equivalent (`AT LOCAL`, `COLLATE`,
-/// `PRIOR`, `**`) return `None` — caller falls back to `Expr::Opaque`.
+/// `PRIOR`, `**`, `~`, `|/`, `@`, `IS NOT TRUE`, `IS JSON`, …) return
+/// `None` — caller falls back to `Expr::Opaque`.
 fn project_unary_op_kind(op: crate::ir::scalar::UnaryOpKind) -> Option<UnaryOp> {
-    use crate::ir::scalar::UnaryOpKind;
+    use crate::ir::scalar::{IsPredicate, UnaryOpKind};
     match op {
         UnaryOpKind::Not => Some(UnaryOp::Not),
         UnaryOpKind::Neg => Some(UnaryOp::Negate),
         UnaryOpKind::Plus => Some(UnaryOp::Plus),
         UnaryOpKind::IsNull => Some(UnaryOp::IsNull),
         UnaryOpKind::IsNotNull => Some(UnaryOp::IsNotNull),
-        UnaryOpKind::AtLocal | UnaryOpKind::Collate | UnaryOpKind::Prior | UnaryOpKind::Spread => {
-            None
-        }
+        UnaryOpKind::Is(IsPredicate::True) => Some(UnaryOp::IsTrue),
+        UnaryOpKind::Is(IsPredicate::False) => Some(UnaryOp::IsFalse),
+        UnaryOpKind::AtLocal
+        | UnaryOpKind::Collate
+        | UnaryOpKind::Prior
+        | UnaryOpKind::Spread
+        | UnaryOpKind::BitwiseNot
+        | UnaryOpKind::SquareRoot
+        | UnaryOpKind::AbsoluteValue
+        | UnaryOpKind::Is(
+            IsPredicate::JsonValue
+            | IsPredicate::JsonArray
+            | IsPredicate::JsonObject
+            | IsPredicate::JsonScalar
+            | IsPredicate::NfcNormalized
+            | IsPredicate::NfdNormalized
+            | IsPredicate::NfkcNormalized
+            | IsPredicate::NfkdNormalized,
+        )
+        | UnaryOpKind::IsNot(
+            IsPredicate::True
+            | IsPredicate::False
+            | IsPredicate::JsonValue
+            | IsPredicate::JsonArray
+            | IsPredicate::JsonObject
+            | IsPredicate::JsonScalar
+            | IsPredicate::NfcNormalized
+            | IsPredicate::NfdNormalized
+            | IsPredicate::NfkcNormalized
+            | IsPredicate::NfkdNormalized,
+        ) => None,
     }
 }
 
@@ -16405,6 +18553,33 @@ fn project_comparison_op(op: crate::ir::scalar::ComparisonOp) -> PublicCompariso
     }
 }
 
+/// The public [`SubqueryKind`] of a quantified comparison's subquery: the
+/// in-subquery vs not-in-subquery distinction where the comparison is one
+/// (`= ANY`, `NOT IN`, `<> ALL`), else a scalar subquery. The comparison's
+/// published shape carries the full typed structure regardless.
+fn quantified_subquery_kind(
+    op: crate::ir::scalar::ComparisonOp,
+    quantifier: crate::ir::scalar::Quantifier,
+    negated: bool,
+) -> SubqueryKind {
+    use crate::ir::scalar::{ComparisonOp, Quantifier};
+    match (op, quantifier, negated) {
+        (ComparisonOp::Eq, Quantifier::Any, false) => SubqueryKind::InSubquery,
+        (ComparisonOp::Eq, Quantifier::Any, true)
+        | (ComparisonOp::NotEq, Quantifier::All, false) => SubqueryKind::NotInSubquery,
+        (
+            ComparisonOp::Eq
+            | ComparisonOp::NotEq
+            | ComparisonOp::Lt
+            | ComparisonOp::LtEq
+            | ComparisonOp::Gt
+            | ComparisonOp::GtEq,
+            Quantifier::Any | Quantifier::All,
+            false | true,
+        ) => SubqueryKind::Scalar,
+    }
+}
+
 /// Project an IR to the public
 /// [`PublicQuantifier`]. Closed-enum, total.
 fn project_quantifier(q: crate::ir::scalar::Quantifier) -> PublicQuantifier {
@@ -16418,7 +18593,7 @@ fn project_quantifier(q: crate::ir::scalar::Quantifier) -> PublicQuantifier {
 /// Canonical name string for a [`ResolvedFunc`]. Resolved calls
 /// consult the function catalog for the registered display name;
 /// unresolved calls surface the raw source spelling verbatim.
-fn resolved_func_canonical_name(
+pub(crate) fn resolved_func_canonical_name(
     func: &ResolvedFunc,
     catalog: &crate::ir::FunctionCatalog,
 ) -> String {
@@ -16468,6 +18643,21 @@ fn ir_scalar_signature(expr: &ScalarExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(",")
         ),
+        ScalarExpr::OperatorChain {
+            operands,
+            operators,
+            ..
+        } => {
+            let mut s = String::from("oc(");
+            for (k, operand) in operands.iter().enumerate() {
+                if let Some(op) = k.checked_sub(1).and_then(|k| operators.get(k)) {
+                    s.push_str(&format!(",{op},"));
+                }
+                s.push_str(&ir_scalar_signature(operand));
+            }
+            s.push(')');
+            s
+        }
         ScalarExpr::Like {
             kind,
             negated,
@@ -16499,7 +18689,8 @@ fn ir_scalar_signature(expr: &ScalarExpr) -> String {
             args,
             named_args,
             distinct,
-            ..
+            non_values,
+            span: _,
         } => {
             let func_name = match func {
                 ResolvedFunc::Resolved { id, .. } => format!("r{}", id),
@@ -16515,7 +18706,15 @@ fn ir_scalar_signature(expr: &ScalarExpr) -> String {
                 .map(|(k, v)| format!("{}={}", k.as_str(), ir_scalar_signature(v)))
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("f({},{},{},{})", func_name, distinct, args_sig, named_sig)
+            let mut non_values_sig = String::new();
+            for value in non_values {
+                non_values_sig.push(';');
+                value.fingerprint_into(&mut non_values_sig);
+            }
+            format!(
+                "f({},{},{},{},{})",
+                func_name, distinct, args_sig, named_sig, non_values_sig
+            )
         }
         ScalarExpr::Case {
             operand,
@@ -16542,7 +18741,7 @@ fn ir_scalar_signature(expr: &ScalarExpr) -> String {
             expr,
             target_type,
             try_cast,
-            ..
+            span: _,
         } => {
             let mut s = String::from("cs(");
             s.push_str(&ir_scalar_signature(expr));
@@ -16636,6 +18835,41 @@ fn ir_scalar_signature(expr: &ScalarExpr) -> String {
             s.push_str(&ir_scalar_signature(left));
             s.push(',');
             s.push_str(&right_sig);
+            s.push(')');
+            s
+        }
+        ScalarExpr::RowCmp {
+            op,
+            quantifier,
+            negated,
+            left,
+            correlates_with,
+            ..
+        } => {
+            let mut s = String::from("rc(");
+            op.fingerprint_into(&mut s);
+            s.push(',');
+            match quantifier {
+                Some(quantifier) => quantifier.fingerprint_into(&mut s),
+                None => s.push('-'),
+            }
+            s.push(',');
+            s.push(if *negated { '1' } else { '0' });
+            s.push_str(",[");
+            for (i, element) in left.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&ir_scalar_signature(element));
+            }
+            s.push_str("],");
+            s.push_str(&format!(
+                "S({:?})",
+                correlates_with
+                    .iter()
+                    .map(|c| c.as_u32())
+                    .collect::<Vec<_>>()
+            ));
             s.push(')');
             s
         }
@@ -16884,56 +19118,6 @@ fn predicate_filters_join(expr: &ScalarExpr) -> bool {
     }
 }
 
-/// Split a qualified name source slice into raw segments, preserving
-/// quoted segments as a unit. Returns `Vec<String>` so each segment
-/// can flow into `IdentName::new` (which normalizes internally).
-fn split_qualified_raw(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quote_close: Option<char> = None;
-
-    for ch in s.chars() {
-        match quote_close {
-            Some(close) => {
-                current.push(ch);
-                if ch == close {
-                    quote_close = None;
-                }
-            }
-            None => match ch {
-                '"' => {
-                    current.push(ch);
-                    quote_close = Some('"');
-                }
-                '`' => {
-                    current.push(ch);
-                    quote_close = Some('`');
-                }
-                '[' => {
-                    current.push(ch);
-                    quote_close = Some(']');
-                }
-                '.' => {
-                    let trimmed = current.trim();
-                    if !trimmed.is_empty() {
-                        parts.push(trimmed.to_string());
-                    }
-                    current.clear();
-                }
-                c if c.is_whitespace() => {
-                    // Skip top-level whitespace.
-                }
-                _ => current.push(ch),
-            },
-        }
-    }
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        parts.push(trimmed.to_string());
-    }
-    parts
-}
-
 // ---------------------------------------------------------------------------
 // Policy projection (CREATE / ALTER / DROP <policy-kind> POLICY).
 // ---------------------------------------------------------------------------
@@ -16943,7 +19127,7 @@ fn split_qualified_raw(s: &str) -> Vec<String> {
 /// catalog is not consulted; the typed plan carries everything the
 /// public schema needs.
 ///
-/// `origin` carries the dialect-of-origin signal (built at the
+/// `origin` carries the dialect of origin (built at the
 /// `analyze_ddl_facts` dispatch site from the originating `AstStmt`
 /// variant — see [`PolicyDialectOrigin`]). Only used by row-access
 /// policy projection, where PG and Snowflake / BigQuery share the same
@@ -17057,6 +19241,7 @@ pub fn derive_facts_from_policy_plan(
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -17171,7 +19356,7 @@ fn project_policy_facts(plan: &PolicyPlan, source: &str) -> PolicyFacts {
     };
     let renamed_to = plan
         .renamed_to_span
-        .map(|sp| IdentName::new(slice_span_text(source, sp).trim()));
+        .map(|sp| IdentName::new(slice_span_text(source, sp).trim()).written_at(sp));
     let set_tags = plan
         .set_tag_action_spans
         .iter()
@@ -17187,7 +19372,7 @@ fn project_policy_facts(plan: &PolicyPlan, source: &str) -> PolicyFacts {
         PolicyCommentAction::Set { value_span } => {
             // Best-effort: if the value isn't a quoted string literal,
             // fall back to the trimmed raw text rather than dropping the
-            // signal — rules predicate on `kind: set` regardless.
+            // value — rules predicate on `kind: set` regardless.
             let text = crate::ir::policy_plan::comment_text_from_value_span(*value_span, source)
                 .unwrap_or_else(|| slice_span_text(source, *value_span).trim().to_string());
             PolicyCommentChange::Set { text }
@@ -17223,7 +19408,7 @@ fn project_policy_variant(plan: &PolicyPlan, source: &str) -> PolicyVariantFacts
             PolicyVariantFacts::Network(project_network_shape(shape, source))
         }
         PolicyPlanVariant::Authentication(shape) => {
-            PolicyVariantFacts::Authentication(project_auth_shape(shape))
+            PolicyVariantFacts::Authentication(project_auth_shape(shape, source))
         }
         PolicyPlanVariant::Aggregation(shape) => {
             PolicyVariantFacts::Aggregation(project_aggregation_shape(shape))
@@ -17300,7 +19485,8 @@ fn project_masking_shape(s: &MaskingPolicyShape, source: &str) -> MaskingPolicyF
         .arguments
         .iter()
         .map(|a| crate::facts::policy::PolicyArgument {
-            name: IdentName::new(slice_span_text(source, a.name_span).trim()),
+            name: IdentName::new(slice_span_text(source, a.name_span).trim())
+                .written_at(a.name_span),
             data_type: ast_type_text_to_data_type(slice_span_text(source, a.type_span)),
         })
         .collect();
@@ -17448,7 +19634,8 @@ fn is_empty_string_literal(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Literal {
-            literal: LiteralValue::String { value }
+            literal: LiteralValue::String { value },
+            ..
         } if value.is_empty()
     )
 }
@@ -17458,7 +19645,8 @@ fn is_integer_literal(expr: &Expr, n: i64) -> bool {
     matches!(
         expr,
         Expr::Literal {
-            literal: LiteralValue::Integer { value }
+            literal: LiteralValue::Integer { value },
+            ..
         } if *value == n
     )
 }
@@ -17472,7 +19660,8 @@ fn project_row_access_shape(
         .arguments
         .iter()
         .map(|a| crate::facts::policy::PolicyArgument {
-            name: IdentName::new(slice_span_text(source, a.name_span).trim()),
+            name: IdentName::new(slice_span_text(source, a.name_span).trim())
+                .written_at(a.name_span),
             data_type: ast_type_text_to_data_type(slice_span_text(source, a.type_span)),
         })
         .collect();
@@ -17504,6 +19693,12 @@ fn project_row_access_shape(
         .map(|e| project_pg_policy_predicate(e, source, node_id));
     let permissiveness = s.permissiveness.map(project_pg_permissiveness_to_facts);
     let command = s.command.map(project_pg_command_to_facts);
+    let applies_to = s
+        .roles
+        .iter()
+        .filter_map(|span| source.get(span.start as usize..span.end as usize))
+        .map(IdentName::new)
+        .collect();
     RowAccessPolicyFacts {
         arguments,
         body,
@@ -17512,6 +19707,7 @@ fn project_row_access_shape(
         check_predicate,
         permissiveness,
         command,
+        applies_to,
         ..RowAccessPolicyFacts::default()
     }
 }
@@ -17622,6 +19818,7 @@ fn project_policy_body_with_constant_fold(
     if crate::ir::always_true::policy_body_is_always_true(expr, source, node_id, &[]) {
         return Expr::Literal {
             literal: super::literal::LiteralValue::Bool { value: true },
+            origin: TextOrigin::default(),
         };
     }
     // Recurse into structural sub-expressions so nested foldable
@@ -17665,6 +19862,7 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
         opaque: OpaqueExpr {
             reason,
             rendered: slice_span_text(source, span).to_string(),
+            origin: TextOrigin::at(span),
         },
     };
 
@@ -17696,6 +19894,7 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
 
         A::Literal { literal, .. } => Expr::Literal {
             literal: project_ast_literal_value(literal, source),
+            origin: TextOrigin::at(expr.span()),
         },
 
         A::Case {
@@ -17739,6 +19938,25 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
             None => opaque_for(*span, OpaqueExprReason::DialectSpecificFunction),
         },
 
+        A::OperatorChain {
+            operands,
+            operators,
+            span,
+            ..
+        } => match operators
+            .iter()
+            .map(|operator| project_ast_binary_op(operator.operator))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(operators) => Expr::OperatorChain {
+                operator_chain: crate::facts::expr::OperatorChainExpr {
+                    operands: operands.iter().map(|o| recur(o)).collect(),
+                    operators,
+                },
+            },
+            None => opaque_for(*span, OpaqueExprReason::DialectSpecificFunction),
+        },
+
         A::LogicalChain {
             operator, operands, ..
         } => Expr::LogicalChain {
@@ -17761,6 +19979,36 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
                 operand: Box::new(recur(expr)),
             },
         },
+
+        A::IsPredicate {
+            expr,
+            not_span,
+            predicate,
+            span,
+            ..
+        } => {
+            let published = match predicate {
+                AstIsPredicate::True => Some(UnaryOp::IsTrue),
+                AstIsPredicate::False => Some(UnaryOp::IsFalse),
+                AstIsPredicate::JsonValue
+                | AstIsPredicate::JsonArray
+                | AstIsPredicate::JsonObject
+                | AstIsPredicate::JsonScalar
+                | AstIsPredicate::NfcNormalized
+                | AstIsPredicate::NfdNormalized
+                | AstIsPredicate::NfkcNormalized
+                | AstIsPredicate::NfkdNormalized => None,
+            };
+            match published.filter(|_| not_span.is_none()) {
+                Some(op) => Expr::UnaryOp {
+                    unary_op: UnaryOpExpr {
+                        op,
+                        operand: Box::new(recur(expr)),
+                    },
+                },
+                None => opaque_for(*span, OpaqueExprReason::DialectSpecificFunction),
+            }
+        }
 
         A::IsDistinctFrom {
             left,
@@ -17916,6 +20164,7 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
                         opaque: OpaqueExpr {
                             reason: OpaqueExprReason::UnparsedFragment,
                             rendered: String::new(),
+                            origin: TextOrigin::default(),
                         },
                     }),
                 }
@@ -17925,6 +20174,7 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
                     name,
                     schema: None,
                     args: projected_args,
+                    named_args: Vec::new(),
                     is_temporal: false,
                     is_deterministic: true,
                     is_aggregate: false,
@@ -17969,9 +20219,23 @@ fn project_policy_body_expr(expr: &AstExpr, source: &str, arguments: &[IdentName
 
         A::ScriptingVarRef { name_span, .. } => Expr::Parameter {
             parameter: ParameterRef {
-                name: Some(IdentName::new(slice_span_text(source, *name_span).trim())),
+                name: Some(
+                    IdentName::new(slice_span_text(source, *name_span).trim())
+                        .written_at(*name_span),
+                ),
                 position: None,
                 kind: ParameterKind::Variable,
+            },
+        },
+
+        A::SessionVarRef { name_span, .. } => Expr::Parameter {
+            parameter: ParameterRef {
+                name: Some(
+                    IdentName::new(slice_span_text(source, *name_span).trim())
+                        .written_at(*name_span),
+                ),
+                position: None,
+                kind: ParameterKind::SessionVar,
             },
         },
 
@@ -18043,6 +20307,7 @@ fn project_ast_binary_op(op: BinaryOperator) -> Option<BinaryOp> {
         B::Multiply => BinaryOp::Mul,
         B::Divide => BinaryOp::Div,
         B::Modulo => BinaryOp::Mod,
+        B::IntegerDivide => BinaryOp::Other(IdentName::new("DIV")),
         B::Equal => BinaryOp::Eq,
         B::NotEqual => BinaryOp::Neq,
         B::NullSafeEqual => BinaryOp::IsNotDistinctFrom,
@@ -18050,8 +20315,9 @@ fn project_ast_binary_op(op: BinaryOperator) -> Option<BinaryOp> {
         B::LessThanOrEqual => BinaryOp::Lte,
         B::GreaterThan => BinaryOp::Gt,
         B::GreaterThanOrEqual => BinaryOp::Gte,
-        B::And => BinaryOp::And,
+        B::And | B::LogicalAnd => BinaryOp::And,
         B::Or | B::LogicalOr => BinaryOp::Or,
+        B::Xor => BinaryOp::Other(IdentName::new("XOR")),
         B::Concat => BinaryOp::Concat,
         B::Like => BinaryOp::Like,
         B::ILike => BinaryOp::ILike,
@@ -18063,8 +20329,23 @@ fn project_ast_binary_op(op: BinaryOperator) -> Option<BinaryOp> {
         B::LeftShift => BinaryOp::ShiftLeft,
         B::RightShift => BinaryOp::ShiftRight,
         B::BitwiseXor | B::BitwiseXorPg => BinaryOp::BitXor,
+        B::BitwiseAnd => BinaryOp::BitAnd,
+        B::BitwiseOr => BinaryOp::BitOr,
+        B::Exponent => BinaryOp::Pow,
+        B::QueryMatch => BinaryOp::Other(IdentName::new("@@")),
+        B::JsonExistsAny => BinaryOp::Other(IdentName::new("?|")),
+        B::JsonExistsAll => BinaryOp::Other(IdentName::new("?&")),
+        B::StartsWith => BinaryOp::Other(IdentName::new("^@")),
+        B::Overlaps => BinaryOp::Other(IdentName::new("OVERLAPS")),
+        B::SoundsLike => BinaryOp::Other(IdentName::new("SOUNDS LIKE")),
+        B::MemberOf => BinaryOp::Other(IdentName::new("MEMBER OF")),
         // Operators without a curated public counterpart — caller folds.
         B::Not
+        | B::BitwiseNot
+        | B::Assign
+        | B::SquareRoot
+        | B::AbsoluteValue
+        | B::BinaryCast
         | B::Distance
         | B::ArrayContainedBy
         | B::JsonPath
@@ -18089,7 +20370,10 @@ fn project_ast_literal_value(lit: &AstLiteral, source: &str) -> LiteralValue {
                 value: t.eq_ignore_ascii_case("true"),
             }
         }
-        AstLiteral::Number { span } => {
+        AstLiteral::Number { span }
+        | AstLiteral::Money {
+            amount_span: span, ..
+        } => {
             let t = slice_span_text(source, *span).trim();
             if let Ok(n) = t.parse::<i64>() {
                 LiteralValue::Integer { value: n }
@@ -18104,9 +20388,13 @@ fn project_ast_literal_value(lit: &AstLiteral, source: &str) -> LiteralValue {
         AstLiteral::String { span } | AstLiteral::StringWithJinja { span } => {
             let raw = slice_span_text(source, *span);
             LiteralValue::String {
-                value: unquote_string_literal(raw),
+                value: literal_value_or_text(raw),
             }
         }
+        AstLiteral::Adjacent { parts } => LiteralValue::String {
+            value: crate::ir::span_extract::joined_string_literal_value(parts, source)
+                .unwrap_or_else(|| slice_span_text(source, lit.span()).to_string()),
+        },
     }
 }
 
@@ -18136,6 +20424,7 @@ fn collect_terminal_returns(expr: &Expr, out: &mut Vec<Expr>) {
                 // sees the NULL as a counter-example.
                 None => out.push(Expr::Literal {
                     literal: LiteralValue::Null,
+                    origin: TextOrigin::default(),
                 }),
             }
         }
@@ -18143,8 +20432,35 @@ fn collect_terminal_returns(expr: &Expr, out: &mut Vec<Expr>) {
     }
 }
 
-fn project_auth_shape(s: &AuthenticationPolicyShape) -> AuthenticationPolicyFacts {
+fn project_auth_shape(s: &AuthenticationPolicyShape, source: &str) -> AuthenticationPolicyFacts {
+    use crate::facts::policy::{AuthMethod, MfaEnrollmentLevel};
+    let authentication_methods = s
+        .authentication_method_spans
+        .iter()
+        .filter_map(|sp| {
+            let value = literal_value_or_text(slice_span_text(source, *sp));
+            match value.to_ascii_uppercase().as_str() {
+                "PASSWORD" => Some(AuthMethod::Password),
+                "SAML" => Some(AuthMethod::Saml),
+                "OAUTH" => Some(AuthMethod::Oauth),
+                "KEYPAIR" => Some(AuthMethod::KeyPair),
+                "PROGRAMMATIC_ACCESS_TOKEN" => Some(AuthMethod::ProgrammaticAccessToken),
+                "ALL" => Some(AuthMethod::All),
+                _ => None,
+            }
+        })
+        .collect();
+    let mfa_enrollment = s
+        .mfa_enrollment_value_span
+        .map(|sp| literal_value_or_text(slice_span_text(source, sp)).to_ascii_uppercase())
+        .map_or(MfaEnrollmentLevel::Optional, |value| match value.as_str() {
+            "REQUIRED" => MfaEnrollmentLevel::Required,
+            "REQUIRED_PASSWORD_ONLY" => MfaEnrollmentLevel::RequiredPasswordOnly,
+            _ => MfaEnrollmentLevel::Optional,
+        });
     AuthenticationPolicyFacts {
+        authentication_methods,
+        mfa_enrollment,
         mfa_required: s.mfa_required,
         had_methods_change: s.had_methods_change,
         had_mfa_change: s.had_mfa_change,
@@ -18201,7 +20517,7 @@ fn project_network_shape(s: &NetworkPolicyShape, source: &str) -> NetworkPolicyF
         spans
             .iter()
             .map(|sp| {
-                let raw = unquote_string_literal(slice_span_text(source, *sp).trim());
+                let raw = literal_value_or_text(slice_span_text(source, *sp).trim());
                 let (cidr_prefix, is_private_range, is_zero_route) = classify_ip_entry(&raw);
                 IpListEntry {
                     raw,
@@ -18216,7 +20532,7 @@ fn project_network_shape(s: &NetworkPolicyShape, source: &str) -> NetworkPolicyF
         spans
             .iter()
             .map(|sp| {
-                let raw = unquote_string_literal(slice_span_text(source, *sp).trim());
+                let raw = literal_value_or_text(slice_span_text(source, *sp).trim());
                 ObjectRef {
                     kind: ObjectKind::NetworkRule,
                     name: TableRef::new(IdentName::new(raw), None, None, Some(*sp)),
@@ -18251,29 +20567,6 @@ fn project_network_shape(s: &NetworkPolicyShape, source: &str) -> NetworkPolicyF
     }
 }
 
-/// Strip surrounding `'…'` quotes and fold `''` escapes if present;
-/// otherwise return the input unchanged. Network-policy IP literals
-/// and rule names are quoted strings in Snowflake; the public schema
-/// surfaces the unquoted text.
-fn unquote_string_literal(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        raw[1..raw.len() - 1].replace("''", "'")
-    } else {
-        raw.to_string()
-    }
-}
-
-/// Decode a T-SQL string literal's inner text, lowercased. Strips an
-/// optional `N`/`n` nvarchar prefix, the surrounding single quotes, and
-/// un-escapes doubled quotes.
-fn decode_tsql_string_literal(raw: &str) -> String {
-    let body = raw
-        .strip_prefix('N')
-        .or_else(|| raw.strip_prefix('n'))
-        .unwrap_or(raw);
-    unquote_string_literal(body).to_ascii_lowercase()
-}
-
 /// Project an `EXEC <proc>` call's typed argument list into
 /// [`MssqlExecArgFacts`] — the recognition primitive rules predicate on.
 /// Dialect-neutral: records each argument's (optional) named-parameter
@@ -18284,7 +20577,8 @@ pub(crate) fn project_mssql_exec_args(
 ) -> Vec<crate::facts::ddl::MssqlExecArgFacts> {
     use crate::facts::ddl::{MssqlExecArgFacts, MssqlExecArgValueKind};
     args.iter()
-        .map(|arg| {
+        .enumerate()
+        .map(|(position, arg)| {
             let name = arg.name.as_ref().map(|id| {
                 source
                     .get(id.span.start as usize..id.span.end as usize)
@@ -18292,7 +20586,7 @@ pub(crate) fn project_mssql_exec_args(
                     .trim_start_matches('@')
                     .to_ascii_lowercase()
             });
-            let (value_kind, value_literal) = match &arg.value {
+            let (value_kind, value_literal, value_number) = match &arg.value {
                 AstExpr::Literal {
                     literal: AstLiteral::String { span },
                     ..
@@ -18302,26 +20596,43 @@ pub(crate) fn project_mssql_exec_args(
                         .unwrap_or("");
                     (
                         MssqlExecArgValueKind::StringLiteral,
-                        Some(decode_tsql_string_literal(raw)),
+                        Some(super::identity::WrittenText::at(
+                            literal_value_or_text(raw).to_ascii_lowercase(),
+                            *span,
+                        )),
+                        None,
                     )
                 }
                 AstExpr::Literal {
-                    literal: AstLiteral::Number { .. },
+                    literal: AstLiteral::Number { span },
                     ..
-                } => (MssqlExecArgValueKind::Number, None),
+                } => (
+                    MssqlExecArgValueKind::Number,
+                    None,
+                    source
+                        .get(span.start as usize..span.end as usize)
+                        .and_then(|raw| raw.trim().parse::<i64>().ok()),
+                ),
+                AstExpr::Literal {
+                    literal: AstLiteral::Money { .. },
+                    ..
+                } => (MssqlExecArgValueKind::Number, None, None),
                 AstExpr::Literal {
                     literal: AstLiteral::Null { .. },
                     ..
-                } => (MssqlExecArgValueKind::Null, None),
+                } => (MssqlExecArgValueKind::Null, None, None),
                 AstExpr::Ident { .. } | AstExpr::Placeholder { .. } => {
-                    (MssqlExecArgValueKind::Variable, None)
+                    (MssqlExecArgValueKind::Variable, None, None)
                 }
-                _ => (MssqlExecArgValueKind::Other, None),
+                _ => (MssqlExecArgValueKind::Other, None, None),
             };
             MssqlExecArgFacts {
                 name,
+                position: u32::try_from(position).unwrap_or(u32::MAX),
                 value_kind,
                 value_literal,
+                value_number,
+                value_origin: super::identity::TextOrigin::at(arg.value.span()),
             }
         })
         .collect()
@@ -18418,17 +20729,10 @@ fn parse_one_tag_assignment(chunk: &str) -> Option<CatalogTag> {
     if key_str.is_empty() {
         return None;
     }
-    let value_trimmed = value.trim();
-    let value_unquoted = if value_trimmed.len() >= 2
-        && value_trimmed.starts_with('\'')
-        && value_trimmed.ends_with('\'')
-    {
-        Some(value_trimmed[1..value_trimmed.len() - 1].replace("''", "'"))
-    } else if !value_trimmed.is_empty() {
-        Some(value_trimmed.to_string())
-    } else {
-        None
-    };
+    let value_unquoted = string_literal_value(value).or_else(|| {
+        let text = value.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    });
     Some(CatalogTag {
         key: IdentName::new(key_str),
         value: value_unquoted,
@@ -18547,6 +20851,7 @@ pub fn derive_facts_from_integration_plan(plan: &IntegrationPlan, source: &str) 
         create_trigger: None,
         view: None,
         external_function: None,
+        trigger_body: None,
     };
     StatementFacts {
         kind,
@@ -18703,7 +21008,7 @@ fn project_integration_facts(
     };
     let renamed_to = plan
         .renamed_to_name_span
-        .map(|sp| IdentName::new(slice_span_text(source, sp).trim()));
+        .map(|sp| IdentName::new(slice_span_text(source, sp).trim()).written_at(sp));
     IntegrationFacts {
         kind,
         action,
@@ -18806,22 +21111,243 @@ fn project_security_integration_shape(
     }
 }
 
-/// Strip a single pair of surrounding `'…'` / `"…"` quotes from a
-/// security-integration property value and upper-case it, for case- and
-/// quote-insensitive rule matching. Quote bytes are ASCII, so the slice
-/// is char-boundary safe.
+/// A security-integration property's value, upper-cased, for case- and
+/// quote-insensitive rule matching.
 fn normalize_secintg_property_value(value: &str) -> String {
-    let t = value.trim();
-    let bytes = t.as_bytes();
-    let inner = if bytes.len() >= 2
-        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
-            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
-    {
-        &t[1..t.len() - 1]
-    } else {
-        t
+    literal_value_or_name(value).to_ascii_uppercase()
+}
+
+// ── The rows a write reaches — public projection ──
+
+/// How the `UPDATE` or `DELETE` `plan` reaches the rows of the tables it
+/// writes; `None` for any other statement. A predicate is judged always
+/// true by its shape alone.
+/// What the statement's `INSERT OVERWRITE` replaces, through its `WITH`
+/// and an `EXPLAIN`; `None` for any other statement.
+fn project_overwrite(plan: &RelPlan) -> Option<crate::facts::query::OverwriteFacts> {
+    use crate::facts::query::OverwriteFacts;
+    use crate::ir::plan::OverwriteScope;
+    let mut statement = plan;
+    while let RelPlan::WithScope { body, .. } | RelPlan::Explain { body, .. } = statement {
+        statement = body;
+    }
+    let RelPlan::Insert { overwrite, .. } = statement else {
+        return None;
     };
-    inner.to_ascii_uppercase()
+    overwrite.map(|scope| match scope {
+        OverwriteScope::Table => OverwriteFacts::Table,
+        OverwriteScope::Partitions => OverwriteFacts::Partitions,
+    })
+}
+
+fn project_target_rows(
+    plan: &RelPlan,
+    source: &str,
+    bindings: &BindingTable,
+) -> Option<crate::facts::query::TargetRowsFacts> {
+    use crate::facts::query::{TargetJoin, TargetRowsFacts, WrittenRowsFacts};
+    let mut ctes: Vec<&crate::ir::plan::CteBinding> = Vec::new();
+    let mut statement = plan;
+    loop {
+        if let RelPlan::WithScope {
+            ctes: bound, body, ..
+        } = statement
+        {
+            ctes.extend(bound);
+            statement = body;
+        } else if let RelPlan::Explain { body, .. } = statement {
+            statement = body;
+        } else {
+            break;
+        }
+    }
+    // The source of each table written: the target's row (`None` where the
+    // target stands beside the list), and each other source written.
+    let mut written: Vec<Option<crate::ast::NodeId>> = Vec::new();
+    let (sources, top) = if let RelPlan::Update {
+        from,
+        target_node,
+        target_row,
+        assignments,
+        top,
+        ..
+    } = statement
+    {
+        for assignment in assignments {
+            let row = match assignment.written_node == *target_node {
+                true => *target_row,
+                false => Some(assignment.written_node),
+            };
+            if !written.contains(&row) {
+                written.push(row);
+            }
+        }
+        (from.as_deref(), top.as_ref())
+    } else if let RelPlan::Delete {
+        using,
+        target_row,
+        deleted_sources,
+        top,
+        ..
+    } = statement
+    {
+        written.push(*target_row);
+        written.extend(deleted_sources.iter().map(|node| Some(*node)));
+        (using.as_deref(), top.as_ref())
+    } else {
+        return None;
+    };
+    let written = written
+        .into_iter()
+        .map(|row| {
+            let row = sources.zip(row).and_then(|(sources, row)| {
+                let (matched, _) = joins_keep_matched(sources, row, source, bindings)?;
+                Some((matched, sources.joined_source(row)?))
+            });
+            let join = match row {
+                None => TargetJoin::NotASource,
+                Some((false, _)) => TargetJoin::AllRows,
+                Some((true, _)) => TargetJoin::MatchedRows,
+            };
+            let through_query = row.and_then(|(_, row)| query_rows(row, &ctes, source, bindings));
+            WrittenRowsFacts {
+                join,
+                through_query,
+            }
+        })
+        .collect();
+    let cap = top.map(|top| crate::facts::query::RowCapFacts {
+        percent: top.percent,
+        count: written_count(&top.count),
+        offset_only: false,
+    });
+    Some(TargetRowsFacts { written, cap })
+}
+
+/// The number `count` writes, where it is a numeric literal.
+fn written_count(count: &crate::ir::scalar::ScalarExpr) -> Option<f64> {
+    let crate::ir::scalar::ScalarExpr::Lit {
+        value: Lit::Integer(text) | Lit::Float(text),
+        ..
+    } = count
+    else {
+        return None;
+    };
+    text.parse().ok()
+}
+
+/// Whether some join of `plan` over its source `row` keeps only the rows
+/// of `row` its condition matches, with the rows of `plan`, which a join
+/// above it reads; `None` where `row` is none of the sources `plan` joins.
+/// The rows of each join are those of the side holding `row` grown by the
+/// other side's, so a chain of joins is read once.
+fn joins_keep_matched<'b>(
+    plan: &RelPlan,
+    row: crate::ast::NodeId,
+    source: &str,
+    bindings: &'b BindingTable,
+) -> Option<(bool, crate::ir::queries::LeftRows<'b>)> {
+    let RelPlan::Join {
+        left,
+        right,
+        kind,
+        on,
+        match_condition,
+        using,
+        ..
+    } = plan
+    else {
+        return (plan.node_id() == row)
+            .then(|| (false, crate::ir::queries::LeftRows::of(plan, bindings)));
+    };
+    let (below, side, side_rows) = match joins_keep_matched(left, row, source, bindings) {
+        Some((below, rows)) => (below, left.as_ref(), rows),
+        None => {
+            let (below, rows) = joins_keep_matched(right, row, source, bindings)?;
+            (below, right.as_ref(), rows)
+        }
+    };
+    let on_left = std::ptr::eq(side, left.as_ref());
+    // A condition that is always true matches every pair of rows.
+    let conditioned = match on.as_ref().or(match_condition.as_ref()) {
+        Some(condition) => {
+            !crate::ir::always_true::is_always_true(condition, source, None, bindings, None)
+        }
+        None => !using.is_empty(),
+    };
+    // A right side drops a row of the left where it can yield none for
+    // it: what can drop its rows reads that row (`CROSS APPLY`,
+    // `LATERAL`), or it yields none for any. However the join is spelled.
+    let lateral_drops = on_left
+        && right.row_yield(&side_rows, source, bindings) == crate::ir::queries::RowYield::MayBeNone;
+    let here = match kind {
+        IrJoinKind::Inner | IrJoinKind::LeftSemi | IrJoinKind::RightSemi => {
+            conditioned || lateral_drops
+        }
+        IrJoinKind::Cross => lateral_drops,
+        IrJoinKind::FullOuter => false,
+        IrJoinKind::LeftOuter | IrJoinKind::Asof => !on_left && conditioned,
+        IrJoinKind::RightOuter => on_left && conditioned,
+        IrJoinKind::LeftAnti | IrJoinKind::RightAnti => true,
+    };
+    Some((below || here, side_rows.joined(plan, side)))
+}
+
+/// What the query `row`, a write's target row, does to the rows of the
+/// table it reads: `None` where `row` is a table's own rows. A CTE it
+/// reads through is looked up among `ctes`; a query whose rows are no one
+/// table's adds nothing past it.
+fn query_rows(
+    row: &RelPlan,
+    ctes: &[&crate::ir::plan::CteBinding],
+    source: &str,
+    bindings: &BindingTable,
+) -> Option<crate::facts::query::TargetQueryFacts> {
+    use crate::ir::queries::RowStep;
+    if !matches!(row, RelPlan::DerivedTable { .. } | RelPlan::CteRef { .. }) {
+        return None;
+    }
+    let mut facts = crate::facts::query::TargetQueryFacts::default();
+    let mut query = row;
+    // Each CTE is entered once: a body that names an earlier CTE moves on.
+    for _ in 0..=ctes.len() {
+        let Some(steps) = query.one_table_steps() else {
+            break;
+        };
+        let mut next = None;
+        for step in steps {
+            match step {
+                RowStep::Where(predicate) => {
+                    if !crate::ir::always_true::is_always_true(
+                        predicate, source, None, bindings, None,
+                    ) {
+                        facts.where_filters = true;
+                    }
+                }
+                RowStep::Limit { count, percent } => {
+                    facts.caps.push(crate::facts::query::RowCapFacts {
+                        percent,
+                        count: count.and_then(written_count),
+                        offset_only: count.is_none(),
+                    })
+                }
+                RowStep::Table(_) => {}
+                RowStep::Cte { scope, .. } => {
+                    next = ctes.iter().find(|cte| cte.scope == scope).and_then(|cte| {
+                        match &cte.body {
+                            CteBody::NonRecursive(body) => Some(body.as_ref()),
+                            CteBody::Recursive { .. } => None,
+                        }
+                    });
+                }
+            }
+        }
+        match next {
+            Some(body) => query = body,
+            None => break,
+        }
+    }
+    Some(facts)
 }
 
 // ── T-SQL table hints — public projection ──

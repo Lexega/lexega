@@ -1,15 +1,31 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-// Signal matching — end-to-end SQL tests verifying that statement-level
-// security/governance signals fire (or don't) for the expected rule IDs.
+// Finding matching — end-to-end SQL tests verifying that statement-level
+// security/governance findings fire (or don't) for the expected rule IDs.
 
 use lexega_core::api::analyze_risk;
+
+fn context_ids(sql: &str) -> Vec<String> {
+    let report = analyze_risk(sql).expect("analyze_risk");
+    report
+        .context
+        .iter()
+        .filter_map(|s| s.rule_id().map(String::from))
+        .collect()
+}
+
+/// Rule ids across findings and context.
+fn entry_ids(sql: &str) -> Vec<String> {
+    let mut ids = rule_ids(sql);
+    ids.extend(context_ids(sql));
+    ids
+}
 
 fn rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk(sql).expect("analyze_risk");
     report
-        .signals
+        .findings
         .iter()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()
@@ -19,7 +35,7 @@ fn rule_ids(sql: &str) -> Vec<String> {
 #[test]
 fn test_encryption_disabled_fires() {
     let sql = "ALTER STAGE my_stage SET ENCRYPTION = (TYPE = 'NONE');";
-    let fired = rule_ids(sql);
+    let fired = entry_ids(sql);
     assert!(
         fired.contains(&"SNW-STG-ENC-OFF".to_string()),
         "SNW-STG-ENC-OFF must fire for ENCRYPTION NONE. Got: {:?}",
@@ -36,12 +52,13 @@ fn test_encryption_disabled_fires() {
 #[test]
 fn test_encryption_enabled_fires() {
     let sql = "ALTER STAGE my_stage SET ENCRYPTION = (TYPE = 'AWS_SSE_KMS' KMS_KEY_ID = 'my-key');";
-    let fired = rule_ids(sql);
+    let context = context_ids(sql);
     assert!(
-        fired.contains(&"SNW-STG-ENC-ON".to_string()),
+        context.contains(&"SNW-STG-ENC-ON".to_string()),
         "SNW-STG-ENC-ON must fire when KMS encryption is set. Got: {:?}",
-        fired
+        context
     );
+    let fired = entry_ids(sql);
     assert!(
         !fired.contains(&"SNW-STG-ENC-OFF".to_string()),
         "SNW-STG-ENC-OFF must NOT fire when encryption is enabled. Got: {:?}",
@@ -65,12 +82,12 @@ fn test_credential_change_fires() {
     );
 }
 
-// Wildcard: any encryption-surface signal fires for both enc-on and enc-off SQL,
+// Wildcard: any encryption-surface finding fires for both enc-on and enc-off SQL,
 // but not for unrelated statements (e.g. a SELECT).
 #[test]
 fn test_encryption_surface_not_on_unrelated_stmt() {
     let sql = "SELECT id, name FROM users WHERE id = 1;";
-    let fired = rule_ids(sql);
+    let fired = entry_ids(sql);
     assert!(
         !fired.contains(&"SNW-STG-ENC-OFF".to_string()),
         "SNW-STG-ENC-OFF must NOT fire on a plain SELECT. Got: {:?}",
@@ -85,9 +102,9 @@ fn test_encryption_surface_not_on_unrelated_stmt() {
 
 // Cross-category: a GRANT fires governance/privilege rules, not encryption rules.
 #[test]
-fn test_governance_signal_not_encryption() {
+fn test_governance_finding_not_encryption() {
     let sql = "GRANT ALL PRIVILEGES ON DATABASE prod TO ROLE PUBLIC;";
-    let fired = rule_ids(sql);
+    let fired = entry_ids(sql);
     let has_governance = fired
         .iter()
         .any(|r| r.starts_with("GRT-") || r.starts_with("SNW-GRT-"));

@@ -115,6 +115,18 @@ impl<'a> Parser<'a> {
             }
 
             // Bare ANALYZE: EXPLAIN ANALYZE SELECT ...
+            // MySQL's `[ANALYZE] FORMAT = name` before the statement.
+            TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                if self.explain_format_end(self.idx).is_some() =>
+            {
+                let start = next.span.start;
+                let Some(end) = self.explain_format_end(self.idx) else {
+                    return Ok(None);
+                };
+                let last = self.tokens[end - 1].span.end;
+                self.idx = end;
+                Ok(Some(Span { start, end: last }))
+            }
             TokenKind::Identifier { .. }
                 if next.lexeme(self.source).eq_ignore_ascii_case("ANALYZE")
                     || next.lexeme(self.source).eq_ignore_ascii_case("ANALYSE") =>
@@ -140,6 +152,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Check if a token can start an inner statement for EXPLAIN.
+    /// The index past `[ANALYZE] FORMAT = name` at `i` where a statement
+    /// EXPLAIN reads follows it.
+    fn explain_format_end(&self, i: usize) -> Option<usize> {
+        let at = self.words_end(i, &["ANALYZE"]).unwrap_or(i);
+        let format = self.words_end(at, &["FORMAT"])?;
+        let end = self
+            .eq_value_end(format)
+            .filter(|&end| end == format + 2 && self.is_word_at(format + 1))?;
+        self.tokens
+            .get(end)
+            .is_some_and(|t| self.is_explain_inner_stmt_start(t))
+            .then_some(end)
+    }
+
     fn is_explain_inner_stmt_start(&self, tok: &crate::lexer::Token) -> bool {
         use crate::lexer::Keyword;
         matches!(

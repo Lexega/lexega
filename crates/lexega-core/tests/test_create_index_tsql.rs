@@ -15,8 +15,10 @@ use lexega_core::{
 
 fn check(sql: &str, d: dialect::DialectRef) {
     // Round-trip byte-exact.
-    let mut config = FormatterConfig::default();
-    config.dialect = d.clone();
+    let config = FormatterConfig {
+        dialect: d.clone(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");

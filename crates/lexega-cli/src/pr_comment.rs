@@ -178,6 +178,19 @@ impl PRContext {
 /// Comment marker to identify Lexega comments for upsert
 const COMMENT_MARKER: &str = "<!-- lexega-review-comment -->";
 
+/// The longest comment body posted, in bytes. GitHub takes a body of at most
+/// 65,536 characters, and no text has more characters than bytes.
+const MAX_COMMENT_BYTES: usize = 65_536;
+
+/// What a comment cut to [`MAX_COMMENT_BYTES`] ends with.
+const CUT_NOTE: &str = "\n\n_The report is longer than a pull-request comment may be and is cut here: `review` with `--format markdown` prints all of it._\n";
+
+/// Comments asked for per page of a listing: the most GitHub and GitLab give.
+const COMMENTS_PER_PAGE: usize = 100;
+
+/// The most pages of comments read in search of an earlier review comment.
+const MAX_COMMENT_PAGES: usize = 50;
+
 /// Extra (non-secret) headers required by the GitHub API.
 const GITHUB_API_HEADERS: &[&str] = &[
     "Accept: application/vnd.github+json",
@@ -232,18 +245,11 @@ fn curl_transport(
 ) -> Result<(u16, Vec<u8>), String> {
     use std::io::Write;
 
-    // pid alone is not unique: concurrent callers in one process (tests) collide.
-    static CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let temp_dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let body_path = temp_dir.join(format!("lexega-pr-response-{}-{}.json", pid, seq));
-    let payload_path = temp_dir.join(format!("lexega-pr-payload-{}-{}.json", pid, seq));
-    let cleanup = || {
-        let _ = std::fs::remove_file(&body_path);
-        let _ = std::fs::remove_file(&payload_path);
-    };
+    // The request and the response are files in a private directory that is
+    // removed on every way out of this function.
+    let staged = crate::io::StagedUpload::new()
+        .map_err(|e| format!("Failed to make a private staging directory: {}", e))?;
+    let body_path = staged.path("response.json");
 
     let body_path_str = body_path.to_str().ok_or_else(|| {
         format!(
@@ -270,14 +276,15 @@ fn curl_transport(
         args.push((*header).to_string());
     }
     if let Some(p) = payload {
+        let payload_path = staged
+            .write("payload.json", p.to_string().as_bytes())
+            .map_err(|e| format!("Failed to write request payload: {}", e))?;
         let payload_path_str = payload_path.to_str().ok_or_else(|| {
             format!(
                 "Temp path is not valid UTF-8 (cannot pass to curl): {}",
                 payload_path.display()
             )
         })?;
-        std::fs::write(&payload_path, p.to_string())
-            .map_err(|e| format!("Failed to write request payload: {}", e))?;
         args.push("-H".to_string());
         args.push("Content-Type: application/json".to_string());
         args.push("--data-binary".to_string());
@@ -294,7 +301,6 @@ fn curl_transport(
     {
         Ok(c) => c,
         Err(e) => {
-            cleanup();
             return Err(format!("Failed to execute curl: {}", e));
         }
     };
@@ -311,13 +317,11 @@ fn curl_transport(
     let output = match child.wait_with_output() {
         Ok(o) => o,
         Err(e) => {
-            cleanup();
             return Err(format!("Failed to wait for curl: {}", e));
         }
     };
 
     if !output.status.success() {
-        cleanup();
         return Err(format!(
             "curl request failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -330,11 +334,9 @@ fn curl_transport(
     let body = match std::fs::read(&body_path) {
         Ok(b) => b,
         Err(e) => {
-            cleanup();
             return Err(format!("Failed to read response body file: {}", e));
         }
     };
-    cleanup();
 
     let status_text = String::from_utf8_lossy(&output.stdout);
     let status: u16 = status_text.trim().parse().map_err(|_| {
@@ -433,7 +435,7 @@ fn api_error_message(label: &str, status: u16, value: &serde_json::Value) -> Str
 
 /// Post or update a PR comment with the given markdown content
 pub fn post_pr_comment(ctx: &PRContext, markdown: &str) -> Result<(), String> {
-    let body = format!("{}\n{}", COMMENT_MARKER, markdown);
+    let body = comment_body(markdown);
 
     match ctx.platform {
         CiPlatform::GitHub => post_github_comment(ctx, &body),
@@ -441,6 +443,21 @@ pub fn post_pr_comment(ctx: &PRContext, markdown: &str) -> Result<(), String> {
         CiPlatform::Bitbucket => post_bitbucket_comment(ctx, &body),
         CiPlatform::AzureDevOps => post_azure_devops_comment(ctx, &body),
     }
+}
+
+/// The marked comment body for `markdown`, cut after its last whole line
+/// that fits where it is longer than a comment may be.
+fn comment_body(markdown: &str) -> String {
+    let room = MAX_COMMENT_BYTES - COMMENT_MARKER.len() - 1;
+    if markdown.len() <= room {
+        return format!("{}\n{}", COMMENT_MARKER, markdown);
+    }
+    // A line ends at an ASCII byte, so the cut falls between characters.
+    let cut = markdown.as_bytes()[..room - CUT_NOTE.len()]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1);
+    format!("{}\n{}{}", COMMENT_MARKER, &markdown[..cut], CUT_NOTE)
 }
 
 fn post_github_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
@@ -452,7 +469,7 @@ fn post_github_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
 
     let payload = serde_json::json!({ "body": body });
 
-    if let Some(comment_id) = find_existing_comment(ctx, &list_url)? {
+    if let Some(comment_id) = find_marked_comment(ctx, &list_url, GITHUB_API_HEADERS)? {
         // Update existing comment
         let update_url = format!(
             "{}/repos/{}/issues/comments/{}",
@@ -484,7 +501,7 @@ fn post_gitlab_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
 
     let payload = serde_json::json!({ "body": body });
 
-    if let Some(note_id) = find_existing_gitlab_note(ctx, &list_url)? {
+    if let Some(note_id) = find_marked_comment(ctx, &list_url, &[])? {
         // Update existing note
         let update_url = format!(
             "{}/projects/{}/merge_requests/{}/notes/{}",
@@ -550,49 +567,35 @@ fn post_azure_devops_comment(ctx: &PRContext, body: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn find_existing_comment(ctx: &PRContext, list_url: &str) -> Result<Option<u64>, String> {
-    let value = api_call(ctx, "GET", list_url, GITHUB_API_HEADERS, None)?;
-
-    let comments = value.as_array().ok_or_else(|| {
-        format!(
-            "Unexpected GitHub API response shape (expected array): {}",
-            json_snippet(&value)
-        )
-    })?;
-
-    for comment in comments {
-        if let Some(body) = comment.get("body").and_then(|b| b.as_str()) {
-            if body.contains(COMMENT_MARKER) {
-                if let Some(id) = comment.get("id").and_then(|id| id.as_u64()) {
-                    return Ok(Some(id));
-                }
-            }
+/// The id of the earlier review comment among those `list_url` lists, a
+/// GitHub issue's comments or a GitLab merge request's notes, read a page
+/// at a time until a page is short.
+fn find_marked_comment(
+    ctx: &PRContext,
+    list_url: &str,
+    headers: &[&str],
+) -> Result<Option<u64>, String> {
+    for page in 1..=MAX_COMMENT_PAGES {
+        let url = format!("{}?per_page={}&page={}", list_url, COMMENTS_PER_PAGE, page);
+        let value = api_call(ctx, "GET", &url, headers, None)?;
+        let comments = value.as_array().ok_or_else(|| {
+            format!(
+                "Unexpected {} API response shape (expected array): {}",
+                platform_label(&ctx.platform),
+                json_snippet(&value)
+            )
+        })?;
+        let marked = comments.iter().find_map(|comment| {
+            comment
+                .get("body")
+                .and_then(|b| b.as_str())
+                .filter(|body| body.contains(COMMENT_MARKER))
+                .and_then(|_| comment.get("id").and_then(|id| id.as_u64()))
+        });
+        if marked.is_some() || comments.len() < COMMENTS_PER_PAGE {
+            return Ok(marked);
         }
     }
-
-    Ok(None)
-}
-
-fn find_existing_gitlab_note(ctx: &PRContext, list_url: &str) -> Result<Option<u64>, String> {
-    let value = api_call(ctx, "GET", list_url, &[], None)?;
-
-    let notes = value.as_array().ok_or_else(|| {
-        format!(
-            "Unexpected GitLab API response shape (expected array): {}",
-            json_snippet(&value)
-        )
-    })?;
-
-    for note in notes {
-        if let Some(body) = note.get("body").and_then(|b| b.as_str()) {
-            if body.contains(COMMENT_MARKER) {
-                if let Some(id) = note.get("id").and_then(|id| id.as_u64()) {
-                    return Ok(Some(id));
-                }
-            }
-        }
-    }
-
     Ok(None)
 }
 
@@ -756,7 +759,7 @@ mod tests {
         let requests = server.finish();
         assert_eq!(
             request_line(&requests, 0),
-            "GET /repos/owner/repo/issues/5/comments HTTP/1.1"
+            "GET /repos/owner/repo/issues/5/comments?per_page=100&page=1 HTTP/1.1"
         );
         assert!(requests[0].contains("Authorization: Bearer test-secret-token"));
         assert!(requests[0].contains("Accept: application/vnd.github+json"));

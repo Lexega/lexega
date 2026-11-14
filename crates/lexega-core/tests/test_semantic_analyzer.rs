@@ -19,14 +19,13 @@ fn test_cartesian_join_stays_silent_without_catalog() {
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    let cartesian_signals: Vec<_> = report
-        .signals
-        .iter()
+    let cartesian_findings: Vec<_> = report
+        .entries()
         .filter(|f| matches!(f, RuleMatch::Analysis(p) if p.matched_rule == "Q-JOIN-CROSS-CENH"))
         .collect();
 
     assert!(
-        cartesian_signals.is_empty(),
+        cartesian_findings.is_empty(),
         "Q-JOIN-CROSS-CENH should stay silent without catalog row counts"
     );
 }
@@ -42,11 +41,11 @@ fn test_large_table_without_filter() {
     // verifies that the analysis runs.
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Without catalog, we won't get signals about table size
+    // Without catalog, we won't get findings about table size
     // But semantic info should show has_where=false
     assert_eq!(
-        report.summary.total_reported_signals, 0,
-        "No signals without catalog"
+        report.summary.total_reported_findings, 0,
+        "No findings without catalog"
     );
 }
 
@@ -61,16 +60,15 @@ fn test_temporal_query_detection() {
     let report = analyze_risk(sql).expect("should analyze");
 
     // Should detect temporal pattern
-    let temporal_signals: Vec<_> = report
-        .signals
-        .iter()
+    let temporal_findings: Vec<_> = report
+        .entries()
         .filter(|f| match f {
             RuleMatch::Analysis(p) => p.matched_rule == "INFO-Q-PRED-TEMPORAL",
         })
         .collect();
 
     assert!(
-        temporal_signals.len() > 0,
+        !temporal_findings.is_empty(),
         "Should detect temporal query pattern"
     );
 }
@@ -87,26 +85,27 @@ fn test_join_with_condition_ok() {
     let report = analyze_risk(sql).expect("should analyze");
 
     // Should NOT flag proper join with ON condition
-    let cartesian_signals: Vec<_> = report
-        .signals
-        .iter()
+    let cartesian_findings: Vec<_> = report
+        .entries()
         .filter(|f: &&RuleMatch| match f {
             RuleMatch::Analysis(p) => p.matched_rule == "Q-SCAN-NOFILT",
         })
         .collect();
 
-    assert_eq!(cartesian_signals.len(), 0, "Should not flag proper join");
+    assert_eq!(cartesian_findings.len(), 0, "Should not flag proper join");
 
     // Should detect temporal pattern in WHERE clause
-    let temporal_signals: Vec<_> = report
-        .signals
-        .iter()
+    let temporal_findings: Vec<_> = report
+        .entries()
         .filter(|f| match f {
             RuleMatch::Analysis(p) => p.matched_rule == "INFO-Q-PRED-TEMPORAL",
         })
         .collect();
 
-    assert!(temporal_signals.len() > 0, "Should detect temporal pattern");
+    assert!(
+        !temporal_findings.is_empty(),
+        "Should detect temporal pattern"
+    );
 }
 
 #[test]
@@ -129,13 +128,86 @@ fn test_aggregate_with_group_by() {
     assert!(report.summary.statements_analyzed >= 1);
 
     // Should detect temporal pattern
-    let temporal_signals: Vec<_> = report
-        .signals
-        .iter()
+    let temporal_findings: Vec<_> = report
+        .entries()
         .filter(|f| match f {
             RuleMatch::Analysis(p) => p.matched_rule == "INFO-Q-PRED-TEMPORAL",
         })
         .collect();
 
-    assert!(temporal_signals.len() > 0, "Should detect temporal pattern");
+    assert!(
+        !temporal_findings.is_empty(),
+        "Should detect temporal pattern"
+    );
+}
+
+#[test]
+fn many_occurrences_of_one_rule_are_aggregated_in_linear_time() {
+    // One rule raised on 30,000 statements, each with its own evidence: the
+    // report folds them into one finding holding every evidence once.
+    use lexega_core::analyzer::{AnalysisFinding, AnalysisReport};
+    let measure = |n: usize| {
+        let mut report = AnalysisReport::new();
+        report.findings = (0..n)
+            .map(|line| {
+                let value = serde_json::json!({
+                    "message": "an unbounded write",
+                    "risk_level": "High",
+                    "matched_rule": "DML-WRITE-UNBOUNDED",
+                    "finding_type": "governance",
+                    "evidence": [{
+                        "type": "RuleMatch",
+                        "finding_type": "governance",
+                        "rule_id": "DELETE",
+                        "line_number": line,
+                        "statement_preview": "DELETE FROM orders",
+                    }],
+                });
+                RuleMatch::Analysis(
+                    serde_json::from_value::<AnalysisFinding>(value).expect("a finding"),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        report.deduplicate_with_per_statement_rules(&std::collections::HashSet::new());
+        let elapsed = started.elapsed();
+        let [RuleMatch::Analysis(finding)] = report.findings.as_slice() else {
+            panic!("one finding: {:?}", report.findings.len());
+        };
+        assert_eq!(finding.evidence.len(), n);
+        elapsed
+    };
+    let small = measure(7_500);
+    let large = measure(30_000);
+    assert!(
+        large < small * 8 + std::time::Duration::from_millis(500),
+        "four times the input took {large:?} against {small:?}"
+    );
+}
+
+#[test]
+fn a_join_written_inside_another_is_analysed_as_if_parenthesised() {
+    let rules = |sql: &str| {
+        let report = analyze_risk(sql).expect("should analyze");
+        assert_eq!(report.summary.statements_partial, 0, "{sql}");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+        let mut ids: Vec<String> = report
+            .entries()
+            .map(|RuleMatch::Analysis(p)| p.matched_rule.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    let nested = rules(
+        "SELECT o.id FROM users k, accounts t \
+         JOIN orders o JOIN orders p ON p.user_id = o.id ON o.id = t.id",
+    );
+    assert!(nested.iter().any(|id| id == "Q-SCAN-NOFILT"), "{nested:?}");
+    assert_eq!(
+        nested,
+        rules(
+            "SELECT o.id FROM users k, accounts t \
+             JOIN (orders o JOIN orders p ON p.user_id = o.id) ON o.id = t.id"
+        )
+    );
 }

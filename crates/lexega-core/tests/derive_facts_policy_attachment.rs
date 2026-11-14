@@ -35,6 +35,7 @@ fn project_first(src: &str) -> StatementFacts {
 
 #[test]
 fn alter_user_set_authpol_yields_user_set_target_authpol() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_first("ALTER USER alice SET AUTHENTICATION POLICY = my_pol;");
     assert_eq!(facts.kind, StatementKind::AlterUser);
     let pa = facts
@@ -59,6 +60,7 @@ fn alter_user_set_authpol_yields_user_set_target_authpol() {
 
 #[test]
 fn alter_user_unset_authpol_has_no_policy() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_first("ALTER USER alice UNSET AUTHENTICATION POLICY;");
     assert_eq!(facts.kind, StatementKind::AlterUser);
     let pa = facts.policy_attachment.unwrap();
@@ -72,6 +74,7 @@ fn alter_user_unset_authpol_has_no_policy() {
 
 #[test]
 fn alter_user_qualified_policy_keeps_database_and_schema() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts =
         project_first("ALTER USER alice SET AUTHENTICATION POLICY = sec.policies.strict_pol;");
     let pa = facts.policy_attachment.unwrap();
@@ -84,6 +87,7 @@ fn alter_user_qualified_policy_keeps_database_and_schema() {
 
 #[test]
 fn alter_user_quoted_user_name_parses() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_first("ALTER USER \"Bob\" SET AUTHENTICATION POLICY = my_pol;");
     let pa = facts.policy_attachment.unwrap();
     assert_eq!(pa.principal_kind, PolicyAttachmentPrincipalKind::User);
@@ -97,6 +101,7 @@ fn alter_user_quoted_user_name_parses() {
 
 #[test]
 fn alter_account_set_authpol_has_no_principal_name() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let facts = project_first("ALTER ACCOUNT SET AUTHENTICATION POLICY = acct_pol;");
     assert_eq!(facts.kind, StatementKind::AlterAccount);
     let pa = facts.policy_attachment.unwrap();
@@ -122,6 +127,7 @@ fn alter_account_unset_authpol_has_neither_name_nor_policy() {
 
 #[test]
 fn source_span_covers_entire_statement() {
+    let _folding = lexega_core::set_normalization_dialect("snowflake");
     let sql = "ALTER USER alice SET AUTHENTICATION POLICY = my_pol;";
     let facts = project_first(sql);
     let span = facts.source_span.expect("source_span populated");

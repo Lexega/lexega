@@ -16,18 +16,18 @@ use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-SHARE-SETPERM";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -50,12 +50,12 @@ fn test_basic_detection() {
 fn test_risk_level_is_high() {
     let report = analyze_risk("GRANT SET SHARE PERMISSION ON METASTORE TO share_admins;")
         .expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
     assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
 }
 
@@ -126,7 +126,7 @@ fn test_revoke_does_not_trigger() {
 
 // ─── Mixed Script Survival ───
 
-/// SHARE-SETPERM signal must survive alongside other DDL in multi-statement scripts.
+/// SHARE-SETPERM finding must survive alongside other DDL in multi-statement scripts.
 #[test]
 fn test_mixed_ddl_and_grant() {
     let sql = r#"
@@ -152,7 +152,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {
@@ -167,7 +167,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
 
 // ─── GRANT TO PUBLIC ───
 
-/// GRANT TO PUBLIC should fire SHARE-SETPERM and potentially a public-grant signal.
+/// GRANT TO PUBLIC should fire SHARE-SETPERM and potentially a public-grant finding.
 #[test]
 fn test_grant_to_public_fires_privilege_rule() {
     let sql = "GRANT SET SHARE PERMISSION ON METASTORE TO PUBLIC;";

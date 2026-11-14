@@ -14,18 +14,31 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
+}
+
+/// Rule ids across findings and context.
+fn analyze_and_get_entries(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    let mut ids = extract_rule_ids(&report.findings);
+    ids.extend(extract_rule_ids(&report.context));
+    ids
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -45,9 +58,11 @@ fn test_dmf_attach_formatting() {
 
 #[test]
 fn test_dmf_add_fires_rule() {
-    let rules = analyze_and_get_rules("ALTER TABLE t1 ADD DATA METRIC FUNCTION dmf1 ON (c1);");
-    assert!(rules.contains("TBL-DMF-ADD"), "got {rules:?}");
+    let sql = "ALTER TABLE t1 ADD DATA METRIC FUNCTION dmf1 ON (c1);";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("TBL-DMF-ADD"), "got {context:?}");
     // Must NOT be mis-parsed as an ADD COLUMN.
+    let rules = analyze_and_get_entries(sql);
     assert!(
         !rules.contains("TBL-COL-ADD"),
         "ADD DATA METRIC FUNCTION must not parse as ADD COLUMN, got {rules:?}"
@@ -66,7 +81,7 @@ fn test_dmf_drop_fires_rule() {
 
 #[test]
 fn test_dmf_qualified_name_and_multi_column() {
-    let rules = analyze_and_get_rules(
+    let rules = analyze_and_get_context(
         "ALTER TABLE t ADD DATA METRIC FUNCTION my_db.my_sch.dmf ON (a, b, c);",
     );
     assert!(rules.contains("TBL-DMF-ADD"), "got {rules:?}");
@@ -78,8 +93,10 @@ fn test_dmf_qualified_name_and_multi_column() {
 fn test_real_add_column_still_works() {
     // A genuine ADD COLUMN must still parse as a column add (the DMF branch
     // is gated on DATA + METRIC lookahead).
-    let rules = analyze_and_get_rules("ALTER TABLE t1 ADD COLUMN data_col NUMBER;");
-    assert!(rules.contains("TBL-COL-ADD"), "got {rules:?}");
+    let sql = "ALTER TABLE t1 ADD COLUMN data_col NUMBER;";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("TBL-COL-ADD"), "got {context:?}");
+    let rules = analyze_and_get_entries(sql);
     assert!(!rules.contains("TBL-DMF-ADD"), "got {rules:?}");
 }
 

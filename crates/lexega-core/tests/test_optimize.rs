@@ -74,7 +74,7 @@ fn test_optimize_zorder_single_column() {
 }
 
 // ============================================================================
-// Risk analysis tests — verify signals are generated correctly
+// Risk analysis tests — verify findings are generated correctly
 // ============================================================================
 
 #[test]
@@ -82,9 +82,9 @@ fn test_optimize_risk_analysis_basic() {
     let sql = "OPTIMIZE my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    // Signals are deduplicated by rule — check evidence count
+    // Findings are deduplicated by rule — check evidence count
     let total_evidence: usize = report
-        .signals
+        .context
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-OPT"))
         .map(|s| match s {
@@ -93,7 +93,7 @@ fn test_optimize_risk_analysis_basic() {
         .sum();
     assert!(
         total_evidence >= 1,
-        "OPTIMIZE should generate a signal. Got {} evidence.",
+        "OPTIMIZE should generate a finding. Got {} evidence.",
         total_evidence
     );
 }
@@ -104,7 +104,7 @@ fn test_optimize_risk_analysis_with_zorder() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     let total_evidence: usize = report
-        .signals
+        .context
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-OPT"))
         .map(|s| match s {
@@ -113,7 +113,7 @@ fn test_optimize_risk_analysis_with_zorder() {
         .sum();
     assert!(
         total_evidence >= 1,
-        "OPTIMIZE with ZORDER should generate a signal. Got {} evidence.",
+        "OPTIMIZE with ZORDER should generate a finding. Got {} evidence.",
         total_evidence
     );
 }
@@ -127,9 +127,9 @@ fn test_optimize_multi_statement() {
     "#;
     let report = analyze_risk(sql).expect("analysis should succeed");
 
-    // Signals are deduplicated by rule — test evidence_count, not signal count
+    // Findings are deduplicated by rule — test evidence_count, not finding count
     let total_evidence: usize = report
-        .signals
+        .context
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-OPT"))
         .map(|s| match s {

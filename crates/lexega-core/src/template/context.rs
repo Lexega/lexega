@@ -27,6 +27,24 @@ pub struct VariableContext {
     sources: HashMap<String, VariableSource>,
 }
 
+/// What a SnowSQL config gave [`VariableContext::load_from_snowsql_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnowsqlConfigRead {
+    /// It has a `[variables]` section, which was read.
+    Variables,
+    /// It has none, so it supplies no variable.
+    NoVariablesSection,
+}
+
+/// The section of a SnowSQL config a line falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IniSection {
+    BeforeAny,
+    Variables,
+    Options,
+    Other,
+}
+
 /// Source of a template variable
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariableSource {
@@ -143,6 +161,19 @@ impl CommandLineOnlyKey {
 pub struct LexegaConfig {
     #[serde(default)]
     pub template: Option<TemplateConfig>,
+    /// `[session]`: the namespace a run starts in.
+    #[serde(default)]
+    pub session: Option<SessionSettings>,
+}
+
+/// `[session]` in .lexega.toml: where a table named without a database or
+/// schema is looked for until the script's own `USE` or `SET search_path`
+/// changes it, as the command line's `--default-schema` says it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSettings {
+    /// `SCHEMA` or `DATABASE.SCHEMA`, each part as SQL writes it.
+    pub default_schema: Option<String>,
 }
 
 /// Render a variable value as substitution text — a JSON string emits its
@@ -273,7 +304,10 @@ impl VariableContext {
     /// SnowSQL only substitutes when `variable_substitution` is enabled, so an
     /// explicit `variable_substitution = false` in `[options]` discards this
     /// config's variables (they would be inert at the warehouse).
-    pub fn load_from_snowsql_config(&mut self, path: &Path) -> Result<(), ContextError> {
+    pub fn load_from_snowsql_config(
+        &mut self,
+        path: &Path,
+    ) -> Result<SnowsqlConfigRead, ContextError> {
         let content = fs::read_to_string(path).map_err(|e| {
             ContextError::new(format!(
                 "Failed to read SnowSQL config {}: {}",
@@ -281,44 +315,82 @@ impl VariableContext {
                 e
             ))
         })?;
-        self.load_snowsql_variables_section(&content);
-        Ok(())
+        self.load_snowsql_variables_section(crate::extract::strip_bom(&content))
+            .map_err(|problem| {
+                ContextError::new(format!(
+                    "SnowSQL config {} is malformed: {}",
+                    path.display(),
+                    problem
+                ))
+            })
     }
 
-    /// Parse the `[variables]` section out of SnowSQL INI config text. Malformed
-    /// lines are skipped (no hard error — matches the lexer's permissive spirit).
+    /// Parse the `[variables]` section out of SnowSQL INI config text. A line
+    /// that is no section header, comment or `key = value` pair (`:` also
+    /// delimits, as in configparser) is an error where the section is read or
+    /// precedes every section; other sections are not checked.
     /// Keys are lowercased (configparser semantics; SnowSQL names are
     /// case-insensitive). A bare value is JSON-coerced like `--var` (so `n=5` is a
     /// number); an explicitly quoted value stays a string. A whitespace-preceded
     /// `#`/`;` starts an inline comment; one glued to the value is literal.
-    fn load_snowsql_variables_section(&mut self, content: &str) {
-        let mut in_variables = false;
-        let mut in_options = false;
+    fn load_snowsql_variables_section(
+        &mut self,
+        content: &str,
+    ) -> Result<SnowsqlConfigRead, String> {
+        let mut section = IniSection::BeforeAny;
+        let mut saw_variables = false;
         // `[options]` may follow `[variables]`, so collect first and only commit
         // if substitution isn't explicitly disabled.
         let mut substitution_disabled = false;
         let mut pending: Vec<(String, Value)> = Vec::new();
-        for line in content.lines() {
+        for (index, line) in content.lines().enumerate() {
+            let number = index + 1;
             let trimmed = line.trim();
             // Full-line INI comments and blank lines.
             if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
                 continue;
             }
             // Section header (case-insensitive).
-            if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if trimmed.starts_with('[') {
+                let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+                else {
+                    return Err(format!(
+                        "line {number}: the section header '{trimmed}' is not closed with ']'"
+                    ));
+                };
                 let name = inner.trim();
-                in_variables = name.eq_ignore_ascii_case("variables");
-                in_options = name.eq_ignore_ascii_case("options");
+                section = if name.eq_ignore_ascii_case("variables") {
+                    saw_variables = true;
+                    IniSection::Variables
+                } else if name.eq_ignore_ascii_case("options") {
+                    IniSection::Options
+                } else {
+                    IniSection::Other
+                };
                 continue;
             }
-            let Some((key, value)) = trimmed.split_once('=') else {
+            if section == IniSection::BeforeAny {
+                return Err(format!(
+                    "line {number}: '{trimmed}' comes before any [section]"
+                ));
+            }
+            let read_here = matches!(section, IniSection::Variables | IniSection::Options);
+            let Some(at) = trimmed.find(['=', ':']) else {
+                if read_here {
+                    return Err(format!(
+                        "line {number}: '{trimmed}' is neither a [section], a key = value pair nor a comment"
+                    ));
+                }
                 continue;
             };
-            let key = key.trim();
+            let (key, value) = (trimmed[..at].trim(), &trimmed[at + 1..]);
             if key.is_empty() {
+                if read_here {
+                    return Err(format!("line {number}: '{trimmed}' has no key"));
+                }
                 continue;
             }
-            if in_options {
+            if section == IniSection::Options {
                 // Honor an explicit `variable_substitution = false`.
                 if key.eq_ignore_ascii_case("variable_substitution") {
                     let (v, _) = strip_ini_quotes(strip_inline_comment(value).trim());
@@ -331,7 +403,7 @@ impl VariableContext {
                 }
                 continue;
             }
-            if !in_variables {
+            if section != IniSection::Variables {
                 continue;
             }
             let (value, quoted) = strip_ini_quotes(strip_inline_comment(value).trim());
@@ -344,12 +416,15 @@ impl VariableContext {
             };
             pending.push((key.to_ascii_lowercase(), parsed));
         }
-        if substitution_disabled {
-            return;
+        if !saw_variables {
+            return Ok(SnowsqlConfigRead::NoVariablesSection);
         }
-        for (key, value) in pending {
-            self.set(key, value, VariableSource::SnowsqlConfig);
+        if !substitution_disabled {
+            for (key, value) in pending {
+                self.set(key, value, VariableSource::SnowsqlConfig);
+            }
         }
+        Ok(SnowsqlConfigRead::Variables)
     }
 
     /// Load from .lexega.toml config file
@@ -418,7 +493,7 @@ impl VariableContext {
         let content = fs::read_to_string(&profiles_path)
             .map_err(|e| ContextError::new(format!("Failed to read dbt profiles.yml: {}", e)))?;
 
-        let profiles: serde_json::Value = serde_yaml_ng::from_str(&content)
+        let profiles: serde_json::Value = super::load_yaml_text(&content)
             .map_err(|e| ContextError::new(format!("Failed to parse dbt profiles.yml: {}", e)))?;
 
         // Extract variables from the specified profile and target
@@ -631,6 +706,43 @@ suffix = "%%"
         assert!(sub.command_line_only_keys().is_empty());
     }
 
+    // The `[template.dbt]` profile's `vars` are read as dbt reads
+    // `profiles.yml`: a merge key gives a target the entries it does not
+    // write itself, and a key named twice takes its later entry.
+    #[test]
+    fn a_dbt_profiles_merge_keys_and_doubled_keys_are_read_as_dbt_reads_them() {
+        let dir =
+            std::env::temp_dir().join(format!("lexega-core-dbt-profile-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("profiles.yml"),
+            "defaults: &defaults\n  type: snowflake\n  vars:\n    region: EU\np:\n  outputs:\n    dev:\n      <<: *defaults\n      schema: s\n    ci:\n      type: snowflake\n      vars:\n        region: US\n        region: APAC\n",
+        )
+        .unwrap();
+        std::env::set_var("DBT_PROFILES_DIR", &dir);
+        let read = |target: &str| {
+            let config = dir.join(format!("{target}.lexega.toml"));
+            fs::write(
+                &config,
+                format!("[template.dbt]\nprofile = \"p\"\ntarget = \"{target}\"\n"),
+            )
+            .unwrap();
+            let mut ctx = VariableContext::new();
+            ctx.load_from_config_file(&config)
+                .map(|()| ctx.get("region").cloned())
+                .map_err(|e| e.message)
+        };
+        let read = [read("dev"), read("ci")];
+        std::env::remove_var("DBT_PROFILES_DIR");
+        assert_eq!(
+            read,
+            [
+                Ok(Some(Value::String("EU".to_string()))),
+                Ok(Some(Value::String("APAC".to_string())))
+            ]
+        );
+    }
+
     #[test]
     fn test_cli_args_parsing() {
         let mut ctx = VariableContext::new();
@@ -671,7 +783,8 @@ tablename=CENUSTRACKONE
 db=PROD
 ";
         let mut ctx = VariableContext::new();
-        ctx.load_snowsql_variables_section(config);
+        ctx.load_snowsql_variables_section(config)
+            .expect("a well-formed config");
 
         assert_eq!(
             ctx.get("tablename"),
@@ -688,7 +801,8 @@ db=PROD
     fn snowsql_config_strips_matching_quotes() {
         let config = "[variables]\nq1=\"DOUBLE\"\nq2='SINGLE'\nbare=PLAIN\nmismatch=\"x'\n";
         let mut ctx = VariableContext::new();
-        ctx.load_snowsql_variables_section(config);
+        ctx.load_snowsql_variables_section(config)
+            .expect("a well-formed config");
 
         assert_eq!(ctx.get("q1"), Some(&Value::String("DOUBLE".to_string())));
         assert_eq!(ctx.get("q2"), Some(&Value::String("SINGLE".to_string())));
@@ -710,7 +824,8 @@ db=PROD
             Value::String("FROM_DBT".to_string()),
             VariableSource::DbtProfile,
         );
-        ctx.load_snowsql_variables_section("[variables]\ndb=FROM_CONFIG\n");
+        ctx.load_snowsql_variables_section("[variables]\ndb=FROM_CONFIG\n")
+            .expect("a well-formed config");
         assert_eq!(
             ctx.get("db"),
             Some(&Value::String("FROM_CONFIG".to_string()))
@@ -731,14 +846,16 @@ db=PROD
         let mut ctx = VariableContext::new();
         ctx.load_snowsql_variables_section(
             "[variables]\nx=A\n[options]\nvariable_substitution = False\n",
-        );
+        )
+        .expect("a well-formed config");
         assert_eq!(ctx.get("x"), None);
 
         // Enabled (or absent) keeps them.
         let mut on = VariableContext::new();
         on.load_snowsql_variables_section(
             "[options]\nvariable_substitution=true\n[variables]\nx=A\n",
-        );
+        )
+        .expect("a well-formed config");
         assert_eq!(on.get("x"), Some(&Value::String("A".to_string())));
     }
 
@@ -747,7 +864,8 @@ db=PROD
         let mut ctx = VariableContext::new();
         ctx.load_snowsql_variables_section(
             "[variables]\ncount=5\nratio=1.5\nflag=true\nname=PROD\nquoted=\"5\"\n",
-        );
+        )
+        .expect("a well-formed config");
         assert_eq!(ctx.get("count"), Some(&Value::Number(5.into())));
         assert_eq!(ctx.get("flag"), Some(&Value::Bool(true)));
         assert_eq!(ctx.get("name"), Some(&Value::String("PROD".to_string())));
@@ -761,7 +879,8 @@ db=PROD
         let mut ctx = VariableContext::new();
         ctx.load_snowsql_variables_section(
             "[variables]\nDB=PROD\ngrantee=PUBLIC ; role note\nTbl=CUSTOMERS  # the table\nglued=a#b\n",
-        );
+        )
+        .expect("a well-formed config");
         assert_eq!(ctx.get("db"), Some(&Value::String("PROD".to_string())));
         assert_eq!(
             ctx.get("grantee"),
@@ -780,7 +899,37 @@ db=PROD
         // configparser collapses `DB` and `db`; lowercasing makes the later line
         // win by file order instead of HashMap iteration order.
         let mut ctx = VariableContext::new();
-        ctx.load_snowsql_variables_section("[variables]\nDB=first\ndb=second\n");
+        ctx.load_snowsql_variables_section("[variables]\nDB=first\ndb=second\n")
+            .expect("a well-formed config");
         assert_eq!(ctx.get("db"), Some(&Value::String("second".to_string())));
+    }
+
+    #[test]
+    fn snowsql_config_says_when_it_has_no_variables_and_refuses_what_it_cannot_read() {
+        let mut ctx = VariableContext::new();
+        assert_eq!(
+            ctx.load_snowsql_variables_section("[connections]\naccountname = x\n  continued\n"),
+            Ok(SnowsqlConfigRead::NoVariablesSection)
+        );
+        assert_eq!(
+            ctx.load_snowsql_variables_section("[variables]\nschema: prod\n"),
+            Ok(SnowsqlConfigRead::Variables)
+        );
+        assert_eq!(ctx.get("schema"), Some(&Value::String("prod".to_string())));
+        for (config, line) in [
+            ("[variables]\nschema prod\n", 2),
+            ("[variables\nschema=prod\n", 1),
+            ("schema=prod\n[variables]\n", 1),
+            ("[variables]\n=prod\n", 2),
+            ("[options]\nvariable_substitution\n", 2),
+        ] {
+            let error = VariableContext::new()
+                .load_snowsql_variables_section(config)
+                .expect_err("malformed");
+            assert!(
+                error.starts_with(&format!("line {line}:")),
+                "{config:?}: {error}"
+            );
+        }
     }
 }

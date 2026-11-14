@@ -3,7 +3,7 @@
 
 //! Node metadata types
 
-use crate::ir::normalize_identifier;
+use crate::ir::{normalize_identifier, normalize_identifier_as, NameKind};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -12,21 +12,29 @@ use serde::{Deserialize, Serialize};
 
 /// A normalized identifier key for case-insensitive HashMap lookups.
 ///
-/// Snowflake identifiers are case-insensitive unless quoted. This newtype
-/// ensures all HashMap keys are properly normalized via `normalize_identifier()`,
-/// making it impossible to accidentally use inconsistent casing.
+/// Names compare as the thread's dialect compares a name of their kind.
+/// This newtype ensures all HashMap keys are properly normalized via
+/// `normalize_identifier_as()`, making it impossible to accidentally use
+/// inconsistent casing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IdentKey(String);
 
 impl IdentKey {
-    /// Create a new normalized identifier key.
-    /// The input is normalized according to Snowflake rules:
-    /// - Unquoted identifiers → UPPERCASE
-    /// - Quoted identifiers → preserve case (in SnowflakeDefault mode)
+    /// Create a new normalized identifier key for a relation's name, an
+    /// alias or a CTE's name: unquoted names fold as the dialect folds
+    /// them; a quoted name keeps its case where the dialect makes a quoted
+    /// relation name's case significant.
     #[inline]
     pub fn new(s: &str) -> Self {
         Self(normalize_identifier(s))
+    }
+
+    /// Create a new normalized identifier key for a name of `kind`; a
+    /// column's name is keyed with [`NameKind::Column`].
+    #[inline]
+    pub fn new_as(s: &str, kind: NameKind) -> Self {
+        Self(normalize_identifier_as(s, kind))
     }
 
     /// Create from an already-normalized string (use with caution).
@@ -113,11 +121,7 @@ pub struct TableRef {
 impl PartialEq for TableRef {
     fn eq(&self, other: &Self) -> bool {
         // Compare using normalize_identifier which handles quote detection and case normalization
-        let server_eq = match (&self.server, &other.server) {
-            (Some(a), Some(b)) => normalize_identifier(a) == normalize_identifier(b),
-            (None, None) => true,
-            _ => false,
-        };
+        let server_eq = self.same_server(other);
 
         let db_eq = match (&self.db, &other.db) {
             (Some(a), Some(b)) => normalize_identifier(a) == normalize_identifier(b),
@@ -177,6 +181,16 @@ impl TableRef {
         normalize_identifier(&self.name)
     }
 
+    /// Whether `other` names an object of the same server: both carry
+    /// the same server part, or neither carries one.
+    pub(crate) fn same_server(&self, other: &Self) -> bool {
+        match (&self.server, &other.server) {
+            (Some(a), Some(b)) => normalize_identifier(a) == normalize_identifier(b),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+
     pub fn with_schema(mut self, schema: String) -> Self {
         self.schema = Some(schema);
         self
@@ -228,6 +242,67 @@ impl TableRef {
     }
 }
 
+/// A table's identity: each part its reference names, folded as the
+/// identifier normaliser folds it ([`IdentKey`]). Shown as its folded parts
+/// joined by `.`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TableKey {
+    server: Option<IdentKey>,
+    db: Option<IdentKey>,
+    schema: Option<IdentKey>,
+    name: IdentKey,
+}
+
+impl TableKey {
+    /// The key of the table `table` names.
+    pub fn of(table: &TableRef) -> Self {
+        Self {
+            server: table.server.as_deref().map(IdentKey::new),
+            db: table.db.as_deref().map(IdentKey::new),
+            schema: table.schema.as_deref().map(IdentKey::new),
+            name: IdentKey::new(&table.name),
+        }
+    }
+
+    /// The folded name, the last part.
+    pub(crate) fn name(&self) -> &IdentKey {
+        &self.name
+    }
+
+    /// Whether every part `reader` names is this table's.
+    pub(crate) fn names(&self, reader: &Self) -> bool {
+        let part = |own: &Option<IdentKey>, read: &Option<IdentKey>| {
+            read.as_ref().is_none_or(|read| own.as_ref() == Some(read))
+        };
+        self.name == reader.name
+            && part(&self.schema, &reader.schema)
+            && part(&self.db, &reader.db)
+            && part(&self.server, &reader.server)
+    }
+
+    /// Whether `other` writes no part of its name that this one writes
+    /// otherwise.
+    pub fn agrees_with(&self, other: &Self) -> bool {
+        let part = |own: &Option<IdentKey>, theirs: &Option<IdentKey>| match (own, theirs) {
+            (Some(own), Some(theirs)) => own == theirs,
+            (Some(_), None) | (None, Some(_)) | (None, None) => true,
+        };
+        self.name == other.name
+            && part(&self.schema, &other.schema)
+            && part(&self.db, &other.db)
+            && part(&self.server, &other.server)
+    }
+}
+
+impl std::fmt::Display for TableKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for part in [&self.server, &self.db, &self.schema].into_iter().flatten() {
+            write!(f, "{part}.")?;
+        }
+        write!(f, "{}", self.name)
+    }
+}
+
 /// Source type for a column reference
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
@@ -264,7 +339,7 @@ pub struct StarRenameMapping {
 /// Captures a SELECT star projection (`*` or `t.*`) along with any Snowflake star modifiers.
 ///
 /// This is used to deepen risk semantics (e.g., catalog-backed expansion) without needing
-/// to infer modifiers from string signals.
+/// to infer modifiers from strings.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct StarProjectionInfo {
@@ -296,14 +371,14 @@ pub struct StarProjectionInfo {
 
     /// Whether this star projection includes a `REPLACE (...)` modifier.
     ///
-    /// We currently treat this as a signal to disable catalog-backed expansion
+    /// We currently treat this as a reason to disable catalog-backed expansion
     /// (to avoid emitting incorrect per-column refs).
     #[serde(default)]
     pub has_replace: bool,
 
     /// Whether this star projection includes a `RENAME (...)` modifier.
     ///
-    /// We currently treat this as a signal to disable catalog-backed expansion
+    /// We currently treat this as a reason to disable catalog-backed expansion
     /// (to avoid emitting incorrect per-column refs).
     #[serde(default)]
     pub has_rename: bool,
@@ -777,6 +852,9 @@ pub enum ExpressionFact {
         name: String,
         /// Argument expressions
         args: Vec<ExpressionFact>,
+        /// The arguments that are no values: a type, a date or time part,
+        /// a keyword
+        non_values: Vec<crate::ir::scalar::NonValueArg>,
         /// True if DISTINCT modifier used
         is_distinct: bool,
     },
@@ -808,6 +886,14 @@ pub enum ExpressionFact {
         /// Operator: "AND" or "OR"
         operator: String,
         /// All operands in chain
+        operands: Vec<ExpressionFact>,
+    },
+    /// A run of three or more operands joined by operators of one
+    /// precedence level (`a + b - c`), computed from the left
+    OperatorChain {
+        /// The operator between each two operands, as text (+, -, ||, …)
+        operators: Vec<String>,
+        /// The operands in source order
         operands: Vec<ExpressionFact>,
     },
     /// IN list expression (expr IN (val1, val2, ...))
@@ -889,19 +975,22 @@ impl PartialEq for ExpressionFact {
                 },
             ) => v1 == v2 && k1 == k2,
 
-            // Function: compare name, args (order matters), and is_distinct
+            // Function: compare name, args (order matters), the arguments
+            // that are no values, and is_distinct
             (
                 ExpressionFact::Function {
                     name: n1,
                     args: a1,
+                    non_values: v1,
                     is_distinct: d1,
                 },
                 ExpressionFact::Function {
                     name: n2,
                     args: a2,
+                    non_values: v2,
                     is_distinct: d2,
                 },
-            ) => n1 == n2 && d1 == d2 && a1 == a2,
+            ) => n1 == n2 && d1 == d2 && a1 == a2 && v1 == v2,
 
             // Case: compare branches and else in order
             (
@@ -1083,6 +1172,18 @@ impl PartialEq for ExpressionFact {
             // Opaque: compare text
             (ExpressionFact::Opaque { text: t1 }, ExpressionFact::Opaque { text: t2 }) => t1 == t2,
 
+            // A run of operators: in order (no chain operator is symmetric)
+            (
+                ExpressionFact::OperatorChain {
+                    operators: o1,
+                    operands: e1,
+                },
+                ExpressionFact::OperatorChain {
+                    operators: o2,
+                    operands: e2,
+                },
+            ) => o1 == o2 && e1 == e2,
+
             // Different variants: not equal
             _ => false,
         }
@@ -1118,12 +1219,14 @@ impl std::hash::Hash for ExpressionFact {
             ExpressionFact::Function {
                 name,
                 args,
+                non_values,
                 is_distinct,
             } => {
                 name.hash(state);
                 is_distinct.hash(state);
                 // Args are order-sensitive in PartialEq, so hash in order
                 args.hash(state);
+                non_values.hash(state);
             }
             ExpressionFact::Case {
                 when_branches,
@@ -1160,6 +1263,13 @@ impl std::hash::Hash for ExpressionFact {
             ExpressionFact::UnaryOp { operator, operand } => {
                 operator.hash(state);
                 operand.hash(state);
+            }
+            ExpressionFact::OperatorChain {
+                operators,
+                operands,
+            } => {
+                operators.hash(state);
+                operands.hash(state);
             }
             ExpressionFact::LogicalChain { operator, operands } => {
                 operator.hash(state);
@@ -1251,6 +1361,7 @@ impl ExpressionFact {
             ExpressionFact::Function {
                 name,
                 args,
+                non_values: _,
                 is_distinct,
             } => {
                 let args_text = args
@@ -1289,6 +1400,22 @@ impl ExpressionFact {
             }
             ExpressionFact::LogicalChain { operator, operands } => {
                 format!("({} {} terms)", operator, operands.len())
+            }
+            ExpressionFact::OperatorChain {
+                operators,
+                operands,
+            } => {
+                let mut text = operands
+                    .first()
+                    .map(ExpressionFact::display_text)
+                    .unwrap_or_default();
+                for (operator, operand) in operators.iter().zip(operands.iter().skip(1)) {
+                    text.push(' ');
+                    text.push_str(operator);
+                    text.push(' ');
+                    text.push_str(&operand.display_text());
+                }
+                text
             }
             ExpressionFact::InList {
                 expr,
@@ -1386,7 +1513,8 @@ impl ExpressionFact {
             ExpressionFact::UnaryOp { operand, .. } => {
                 operand.collect_column_refs(refs);
             }
-            ExpressionFact::LogicalChain { operands, .. } => {
+            ExpressionFact::LogicalChain { operands, .. }
+            | ExpressionFact::OperatorChain { operands, .. } => {
                 for op in operands {
                     op.collect_column_refs(refs);
                 }
@@ -1828,11 +1956,25 @@ pub struct PredicateFact {
     /// Internal-only identity — never serialised to JSON / YAML.
     #[serde(default, skip)]
     pub column_id: Option<crate::ir::column::ColumnId>,
+
+    /// The variable, or the named or numbered parameter, the atom reads in
+    /// place of a column: one compared with itself, with a literal, an
+    /// `IN` list or a `BETWEEN` of literals. `None` for a column's atom.
+    /// Never serialised.
+    #[serde(skip)]
+    pub variable: Option<IdentKey>,
+
+    /// The field path the atom reads below its column; empty where it
+    /// reads the whole column. Never serialised.
+    #[serde(skip)]
+    pub field_path: crate::ir::scalar::FieldPath,
 }
 
 impl PartialEq for PredicateFact {
     fn eq(&self, other: &Self) -> bool {
         self.column == other.column
+            && self.field_path == other.field_path
+            && self.variable == other.variable
             && self.operator == other.operator
             && self.literal_value == other.literal_value
             && self.has_temporal == other.has_temporal
@@ -1865,29 +2007,11 @@ impl PredicateFact {
     /// semantically identical so a pure stylistic rewrite does not
     /// fire `DIFF-WHERE-COND-CHG`.
     pub fn negation_canonical(&self) -> Self {
-        use crate::ir::scalar::ComparisonOp;
         if !self.is_negated {
             return self.clone();
         }
         let inverted = match self.operator {
-            PredicateOp::Compare(ComparisonOp::Eq) => {
-                Some(PredicateOp::Compare(ComparisonOp::NotEq))
-            }
-            PredicateOp::Compare(ComparisonOp::NotEq) => {
-                Some(PredicateOp::Compare(ComparisonOp::Eq))
-            }
-            PredicateOp::Compare(ComparisonOp::Lt) => {
-                Some(PredicateOp::Compare(ComparisonOp::GtEq))
-            }
-            PredicateOp::Compare(ComparisonOp::LtEq) => {
-                Some(PredicateOp::Compare(ComparisonOp::Gt))
-            }
-            PredicateOp::Compare(ComparisonOp::Gt) => {
-                Some(PredicateOp::Compare(ComparisonOp::LtEq))
-            }
-            PredicateOp::Compare(ComparisonOp::GtEq) => {
-                Some(PredicateOp::Compare(ComparisonOp::Lt))
-            }
+            PredicateOp::Compare(op) => Some(PredicateOp::Compare(op.negated())),
             PredicateOp::IsNull => Some(PredicateOp::IsNotNull),
             PredicateOp::IsNotNull => Some(PredicateOp::IsNull),
             PredicateOp::In => Some(PredicateOp::NotIn),
@@ -2114,7 +2238,7 @@ pub struct LimitFact {
 // These fact types capture RAW policy configuration values from CREATE/ALTER
 // statements. They are populated without making policy decisions
 // (e.g., "is 8 characters too short?"). The analyzer reads these facts and
-// applies thresholds/rules to emit risk signals.
+// applies thresholds/rules to emit risk findings.
 
 /// Password policy configuration (structured fact from CREATE/ALTER PASSWORD POLICY)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2441,6 +2565,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_symmetric_binary_op_hash_eq() {
+        let _folding = crate::ir::normalize::default_folding();
         let ab = ExpressionFact::BinaryOp {
             left: Box::new(col("a")),
             operator: "=".to_string(),
@@ -2461,6 +2586,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_nonsymmetric_binary_op_hash_differs() {
+        let _folding = crate::ir::normalize::default_folding();
         let ab = ExpressionFact::BinaryOp {
             left: Box::new(col("a")),
             operator: "<".to_string(),
@@ -2484,6 +2610,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_logical_chain_order_independent_hash() {
+        let _folding = crate::ir::normalize::default_folding();
         let ab = ExpressionFact::LogicalChain {
             operator: "AND".to_string(),
             operands: vec![col("a"), col("b"), col("c")],
@@ -2506,6 +2633,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_in_list_order_independent_hash() {
+        let _folding = crate::ir::normalize::default_folding();
         let v12 = ExpressionFact::InList {
             expr: Box::new(col("x")),
             values: vec![lit("1", "number"), lit("2", "number"), lit("3", "number")],
@@ -2586,6 +2714,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_different_variants_hash_differ() {
+        let _folding = crate::ir::normalize::default_folding();
         let column = col("x");
         let literal = lit("x", "string");
         assert_ne!(column, literal);
@@ -2602,6 +2731,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_hashset_dedup_symmetric() {
+        let _folding = crate::ir::normalize::default_folding();
         use std::collections::HashSet;
         let ab = ExpressionFact::BinaryOp {
             left: Box::new(col("a")),
@@ -2621,6 +2751,7 @@ mod expression_fact_hash_tests {
 
     #[test]
     fn test_hashset_set_difference() {
+        let _folding = crate::ir::normalize::default_folding();
         use std::collections::HashSet;
         let baseline: HashSet<ExpressionFact> = vec![col("id"), col("name")].into_iter().collect();
 
@@ -2631,6 +2762,7 @@ mod expression_fact_hash_tests {
                 name: "UPPER".to_string(),
                 args: vec![col("name")],
                 is_distinct: false,
+                non_values: Vec::new(),
             },
         ]
         .into_iter()

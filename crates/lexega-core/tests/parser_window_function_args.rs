@@ -119,7 +119,8 @@ fn test_ntile_various_bucket_sizes() {
     ];
 
     for (sql, expected_buckets) in test_cases {
-        let script = parse_sql(sql).expect(&format!("NTILE({}) should parse", expected_buckets));
+        let script =
+            parse_sql(sql).unwrap_or_else(|_| panic!("NTILE({}) should parse", expected_buckets));
         assert_eq!(script.stmts.len(), 1);
     }
 }

@@ -10,11 +10,12 @@
 //! The same YAML schema serves customer rule files; load_v1_rules in
 //! `super::loader` is the one customer-facing parse path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 use super::engine::Rule;
-use super::loader::{load_v1_rules_from_json, LoadError};
+use super::lists::ValueLists;
+use super::loader::{load_builtin_rules_json, BuiltinCorpus, LoadError};
 
 /// Build-time-precompiled corpus, transcoded from `builtin_rules.yaml` to
 /// JSON by `build.rs`. Parsing JSON on startup is far faster than parsing
@@ -28,7 +29,16 @@ const BUILTIN_V1_RULES_JSON: &[u8] =
 #[cfg(test)]
 const BUILTIN_V1_RULES_YAML: &str = include_str!("../../../../rules/builtin_rules.yaml");
 
-static BUILTIN_V1_RULES: OnceLock<Result<Vec<Rule>, LoadError>> = OnceLock::new();
+static BUILTIN_V1_RULES: OnceLock<Result<BuiltinCorpus, LoadError>> = OnceLock::new();
+
+/// The built-in corpus, loaded once on first call from
+/// `BUILTIN_V1_RULES_JSON` and cached for the lifetime of the process.
+fn builtin_corpus() -> Result<&'static BuiltinCorpus, LoadError> {
+    BUILTIN_V1_RULES
+        .get_or_init(|| load_builtin_rules_json(BUILTIN_V1_RULES_JSON))
+        .as_ref()
+        .map_err(LoadError::clone)
+}
 
 /// Return the built-in fact-based rule corpus.
 ///
@@ -41,13 +51,17 @@ static BUILTIN_V1_RULES: OnceLock<Result<Vec<Rule>, LoadError>> = OnceLock::new(
 /// `build_v1_rule_corpus`, every public `analyze_*_facts` entry
 /// point) rather than crash the analyzer with a panic.
 pub fn all_builtin_rules() -> Result<&'static [Rule], LoadError> {
-    BUILTIN_V1_RULES
-        .get_or_init(|| {
-            load_v1_rules_from_json(BUILTIN_V1_RULES_JSON).and_then(|rs| rs.into_strict_rules())
-        })
-        .as_ref()
-        .map(|v| v.as_slice())
-        .map_err(|e| e.clone())
+    builtin_corpus().map(|corpus| corpus.rules.as_slice())
+}
+
+/// The built-in lists, as the built-in file's `lists:` defines them.
+pub(crate) fn builtin_lists() -> Result<&'static ValueLists, LoadError> {
+    builtin_corpus().map(|corpus| &corpus.lists)
+}
+
+/// The ids of the built-in rules that name a list.
+pub(crate) fn builtin_list_rule_ids() -> Result<&'static BTreeSet<String>, LoadError> {
+    builtin_corpus().map(|corpus| &corpus.list_rule_ids)
 }
 
 /// The built-in corpus as JSON bytes, for surfaces that navigate the raw
@@ -98,6 +112,8 @@ pub fn former_ids_for(canonical_id: &str) -> &'static [String] {
 
 #[cfg(test)]
 mod tests {
+    use super::super::lists::define_builtin_lists;
+    use super::super::loader::load_builtin_rules_yaml;
     use super::*;
 
     /// The precompiled JSON blob must load to exactly the same corpus as
@@ -106,7 +122,6 @@ mod tests {
     /// analyzes with a corpus that differs from `builtin_rules.yaml`.
     #[test]
     fn precompiled_json_matches_yaml_source() {
-        use super::super::loader::load_v1_rules;
         use std::collections::BTreeMap;
 
         let dbg = |rs: &[Rule]| -> BTreeMap<String, String> {
@@ -116,9 +131,19 @@ mod tests {
         };
 
         let from_json = all_builtin_rules().expect("precompiled JSON corpus loads");
-        let from_yaml = load_v1_rules(BUILTIN_V1_RULES_YAML)
-            .and_then(|rs| rs.into_strict_rules())
-            .expect("YAML source corpus loads");
+        let yaml_corpus =
+            load_builtin_rules_yaml(BUILTIN_V1_RULES_YAML).expect("YAML source corpus loads");
+        assert_eq!(
+            builtin_lists().expect("precompiled JSON corpus loads"),
+            &yaml_corpus.lists,
+            "lists differ between precompiled JSON and YAML source"
+        );
+        assert_eq!(
+            builtin_list_rule_ids().expect("precompiled JSON corpus loads"),
+            &yaml_corpus.list_rule_ids,
+            "list-naming rule ids differ between precompiled JSON and YAML source"
+        );
+        let from_yaml = yaml_corpus.rules;
 
         let json_map = dbg(from_json);
         let yaml_map = dbg(&from_yaml);
@@ -142,6 +167,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn builtin_lists_are_the_spec_defaults() {
+        let entries = serde_json::from_value(serde_json::json!({
+            "credential_dummies": {"values": [
+                "", "REPLACE_ME", "CHANGEME", "CHANGE_ME", "PLACEHOLDER", "TODO", "DUMMY", "XXX", "TBD"
+            ]},
+            "credential_references": {"patterns": [
+                "${*}", "{{*}}", "$(*)", "vault:*", "arn:aws:secretsmanager:*", "arn:aws:ssm:*"
+            ]},
+        }))
+        .expect("list entries deserialize");
+        let expected = define_builtin_lists(entries).expect("lists define");
+        let lists = builtin_lists().expect("built-in corpus loads");
+        assert_eq!(lists, &expected);
+        assert_eq!(
+            lists.names().collect::<Vec<_>>(),
+            ["credential_dummies", "credential_references"]
+        );
+    }
+
+    #[test]
+    fn builtin_list_rule_ids_are_the_twenty_four() {
+        let expected: BTreeSet<String> = [
+            "CRED-AWS-LEAK",
+            "CRED-PWD-LEAK",
+            "CRED-APIKEY-LEAK",
+            "CRED-CONNSTR-LEAK",
+            "CRED-DUMMY-VALUE",
+            "BQ-EXPORT-PWD-LEAK",
+            "BQ-EXPORT-APIKEY-LEAK",
+            "BQ-EXPORT-CONNSTR-LEAK",
+            "BQ-LOAD-PWD-LEAK",
+            "BQ-LOAD-APIKEY-LEAK",
+            "BQ-LOAD-CONNSTR-LEAK",
+            "BQ-EXTTBL-PWD-LEAK",
+            "BQ-EXTTBL-APIKEY-LEAK",
+            "BQ-EXTTBL-CONNSTR-LEAK",
+            "BQ-MODEL-PWD-LEAK",
+            "BQ-MODEL-APIKEY-LEAK",
+            "BQ-MODEL-CONNSTR-LEAK",
+            "MSSQL-OPENROWSET-INLINE-CRED",
+            "MSSQL-OPENDATASOURCE-INLINE-CRED",
+            "MSSQL-KEY-OPEN-INLINE-PASSWORD",
+            "MSSQL-KEY-BACKUP-INLINE-PASSWORD",
+            "MSSQL-SIGNATURE-INLINE-PASSWORD",
+            "MSSQL-SERVICE-MASTER-KEY-INLINE-PASSWORD",
+            "MSSQL-LINKEDSRV-LOGIN-CRED",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            builtin_list_rule_ids().expect("built-in corpus loads"),
+            &expected
+        );
+    }
+
+    #[test]
+    fn builtin_list_rule_ids_follow_the_corpus() {
+        let corpus = load_builtin_rules_yaml(
+            r#"
+lists:
+  refs: {patterns: ["vault:*"]}
+rules:
+  - id: NAMES-A-LIST
+    risk_level: low
+    message: "names a list"
+    triggers:
+      all_of:
+        - kind: use
+        - not:
+            use_stmt.target.raw: { not_in_list: refs }
+  - id: NAMES-NO-LIST
+    risk_level: low
+    message: "names no list"
+    triggers:
+      kind: use
+"#,
+        )
+        .expect("test corpus loads");
+        assert_eq!(corpus.rules.len(), 2);
+        assert_eq!(
+            corpus.list_rule_ids,
+            BTreeSet::from(["NAMES-A-LIST".to_string()])
+        );
+        assert_eq!(corpus.lists.names().collect::<Vec<_>>(), ["refs"]);
     }
 
     #[test]

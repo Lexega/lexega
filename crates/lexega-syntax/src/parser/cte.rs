@@ -103,29 +103,36 @@ pub(crate) fn try_parse_single_cte(
         }
     }
 
-    // CTE name (identifier)
-    let name_tok = p.advance().ok_or_else(|| {
-        ParseError::new(
-            p.current_span(),
-            crate::error::ParseErrorKind::InvalidSyntax {
-                message: "WITH clause requires CTE name".to_string(),
-            },
-        )
-    })?;
-    // Use parser helper `can_be_identifier_token` to allow all keywords that
-    // Snowflake permits as identifiers
-    // This includes contextual keywords like GROUPING, FINAL, FIRST, LAST, etc.
-    let name = if p.can_be_identifier_token(name_tok) {
-        crate::ast::AstIdentifier {
-            node_id: p.id_gen.next(),
-            span: name_tok.span,
+    // CTE name (identifier); a template may write some of it (`c_{{ s }}`).
+    let name = match p.parse_templated_identifier() {
+        Some(name) => name,
+        None => {
+            let name_tok = p.advance().ok_or_else(|| {
+                ParseError::new(
+                    p.current_span(),
+                    crate::error::ParseErrorKind::InvalidSyntax {
+                        message: "WITH clause requires CTE name".to_string(),
+                    },
+                )
+            })?;
+            // Use parser helper `can_be_identifier_token` to allow all keywords that
+            // Snowflake permits as identifiers
+            // This includes contextual keywords like GROUPING, FINAL, FIRST, LAST, etc.
+            if p.can_be_identifier_token(name_tok) {
+                crate::ast::AstIdentifier {
+                    node_id: p.id_gen.next(),
+                    span: name_tok.span,
+                    kind: crate::ast::AstIdentifierKind::Name,
+                    templated: None,
+                }
+            } else {
+                return Err(ParseError::unexpected_token(
+                    name_tok.span,
+                    vec!["CTE name (identifier)".to_string()],
+                    Parser::token_description(name_tok, p.source),
+                ));
+            }
         }
-    } else {
-        return Err(ParseError::unexpected_token(
-            name_tok.span,
-            vec!["CTE name (identifier)".to_string()],
-            Parser::token_description(name_tok, p.source),
-        ));
     };
 
     // Optional column list: (col1, col2, ...)
@@ -163,6 +170,8 @@ pub(crate) fn try_parse_single_cte(
                         column_list.push(crate::ast::AstIdentifier {
                             node_id: p.id_gen.next(),
                             span: col_tok.span,
+                            kind: crate::ast::AstIdentifierKind::Name,
+                            templated: None,
                         });
                     } else {
                         return Err(ParseError::unexpected_token(

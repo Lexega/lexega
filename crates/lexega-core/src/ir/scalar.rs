@@ -41,11 +41,16 @@ use crate::lexer::Span;
 pub struct ScopeId(pub u32);
 
 /// Resolved SQL type. Placeholder with no concrete variants.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SqlType {
     /// Temporary: just the catalog-reported type string, uppercased.
     /// Replaced by a proper enum before analyses consume it.
     pub repr: String,
+    /// The length, precision and scale written after the name, as
+    /// `(10,2)` without spaces; empty where none is written or `repr`
+    /// already holds them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub params: String,
 }
 
 /// IR-level scalar expression. Smaller surface than `AstExpr`:
@@ -93,6 +98,22 @@ pub enum ScalarExpr {
         span: Span,
     },
 
+    /// A run of three or more operands joined by left-associative
+    /// operators of one precedence level, mirroring
+    /// `AstExpr::OperatorChain`: `a + b - c`, `x || y || z`. It means the
+    /// left fold `((a op1 b) op2 c) …`: `operators[i]` joins the fold of
+    /// `operands[..=i]` with `operands[i + 1]`, and
+    /// `operators.len() == operands.len() - 1`.
+    ///
+    /// Two operands are a [`ScalarExpr::BinOp`], so both spellings reach
+    /// every consumer. A consumer that reads what the operators do reads
+    /// the fold through `ScalarExpr::fold_chain`.
+    OperatorChain {
+        operands: Vec<ScalarExpr>,
+        operators: Vec<BinOpKind>,
+        span: Span,
+    },
+
     /// Unary operator. `op` is a closed-enum classification of the
     /// surface-level operator that the parser produced; see
     /// [`UnaryOpKind`] for the variant set. Typed so consumers
@@ -115,11 +136,16 @@ pub enum ScalarExpr {
     ///
     /// Lambda arguments (`x -> x + 1`) are not a separate slot: they
     /// ride in `args` as [`ScalarExpr::Lambda`] values.
+    ///
+    /// An argument that is no value (a type, a date or time part, a
+    /// keyword) reads no column and is in `non_values`, not `args`.
     FuncCall {
         func: super::plan::ResolvedFunc,
         args: Vec<ScalarExpr>,
         named_args: Vec<(crate::context::node_metadata::IdentKey, ScalarExpr)>,
         distinct: bool,
+        /// The arguments that are no values, by their written position.
+        non_values: Vec<NonValueArg>,
         span: Span,
     },
 
@@ -204,6 +230,29 @@ pub enum ScalarExpr {
         span: Span,
     },
 
+    /// A row of expressions compared with the rows a subquery yields:
+    /// `(a, b) = (SELECT x, y …)`, `(a, b) [NOT] IN (SELECT x, y …)`,
+    /// `(a, b) < ALL (SELECT x, y …)`. Element `i` is compared with the
+    /// subquery's column at position `i`.
+    RowCmp {
+        op: ComparisonOp,
+        /// `None` where the subquery yields the one row compared; `Some`
+        /// where each row it yields is (`IN` is `= ANY`).
+        quantifier: Option<Quantifier>,
+        /// `NOT IN`, as on [`QuantifiedCmp`](Self::QuantifiedCmp); false
+        /// without a quantifier.
+        negated: bool,
+        left: Vec<ScalarExpr>,
+        /// The row as written, parentheses or `ROW(…)` included.
+        left_span: Span,
+        subquery: Box<RelPlan>,
+        correlates_with: Vec<ColumnId>,
+        /// The subquery as written: with its parentheses where there is no
+        /// quantifier.
+        subquery_span: Span,
+        span: Span,
+    },
+
     /// Window-function invocation at scalar position. The [`WindowCall`] owns
     /// the partition/order/frame; the scalar expression just references it.
     WindowFn { call: Box<WindowCall>, span: Span },
@@ -264,6 +313,26 @@ pub struct LambdaParam {
     pub span: Span,
 }
 
+/// An argument of a [`ScalarExpr::FuncCall`] that is no value: the `INT`
+/// of `CONVERT(INT, x)`, the `day` of `DATEADD(day, 1, d)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct NonValueArg {
+    /// Its position among the call's written arguments.
+    pub position: usize,
+    pub value: NonValue,
+}
+
+/// What a [`NonValueArg`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum NonValue {
+    Type(SqlType),
+    Unit(crate::ast::DatePart),
+    Keyword(crate::ast::ArgKeyword),
+    /// A name that is no column: the `utf8mb4` of MySQL's
+    /// `CONVERT(s USING utf8mb4)`.
+    Name(crate::context::node_metadata::IdentKey),
+}
+
 /// Quantifier on a comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quantifier {
@@ -290,6 +359,9 @@ pub enum QuantifiedRhs {
 /// - `Collate` — `x COLLATE 'collation_name'`.
 /// - `Prior` — Oracle hierarchical `CONNECT BY PRIOR`.
 /// - `Spread` — Snowflake `**` spread operator.
+/// - `BitwiseNot` — prefix `~`.
+/// - `SquareRoot` / `AbsoluteValue` — PostgreSQL's prefix `|/` and `@`.
+/// - `Is` / `IsNot` — `IS [NOT] TRUE`, `FALSE`, `JSON …`, `… NORMALIZED`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOpKind {
     Not,
@@ -301,6 +373,11 @@ pub enum UnaryOpKind {
     Collate,
     Prior,
     Spread,
+    BitwiseNot,
+    SquareRoot,
+    AbsoluteValue,
+    Is(IsPredicate),
+    IsNot(IsPredicate),
 }
 
 impl UnaryOpKind {
@@ -319,6 +396,62 @@ impl UnaryOpKind {
             Self::Collate => "COLLATE",
             Self::Prior => "PRIOR",
             Self::Spread => "**",
+            Self::BitwiseNot => "~",
+            Self::SquareRoot => "|/",
+            Self::AbsoluteValue => "@",
+            Self::Is(predicate) => predicate.as_is_sql_str(),
+            Self::IsNot(predicate) => predicate.as_is_not_sql_str(),
+        }
+    }
+}
+
+/// What a [`UnaryOpKind::Is`] or [`UnaryOpKind::IsNot`] tests. Closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IsPredicate {
+    True,
+    False,
+    /// `IS JSON`, `IS JSON VALUE`.
+    JsonValue,
+    JsonArray,
+    JsonObject,
+    JsonScalar,
+    /// `IS NORMALIZED`, `IS NFC NORMALIZED`.
+    NfcNormalized,
+    NfdNormalized,
+    NfkcNormalized,
+    NfkdNormalized,
+}
+
+impl IsPredicate {
+    /// `IS <predicate>`.
+    fn as_is_sql_str(self) -> &'static str {
+        match self {
+            Self::True => "IS TRUE",
+            Self::False => "IS FALSE",
+            Self::JsonValue => "IS JSON",
+            Self::JsonArray => "IS JSON ARRAY",
+            Self::JsonObject => "IS JSON OBJECT",
+            Self::JsonScalar => "IS JSON SCALAR",
+            Self::NfcNormalized => "IS NFC NORMALIZED",
+            Self::NfdNormalized => "IS NFD NORMALIZED",
+            Self::NfkcNormalized => "IS NFKC NORMALIZED",
+            Self::NfkdNormalized => "IS NFKD NORMALIZED",
+        }
+    }
+
+    /// `IS NOT <predicate>`.
+    fn as_is_not_sql_str(self) -> &'static str {
+        match self {
+            Self::True => "IS NOT TRUE",
+            Self::False => "IS NOT FALSE",
+            Self::JsonValue => "IS NOT JSON",
+            Self::JsonArray => "IS NOT JSON ARRAY",
+            Self::JsonObject => "IS NOT JSON OBJECT",
+            Self::JsonScalar => "IS NOT JSON SCALAR",
+            Self::NfcNormalized => "IS NOT NFC NORMALIZED",
+            Self::NfdNormalized => "IS NOT NFD NORMALIZED",
+            Self::NfkcNormalized => "IS NOT NFKC NORMALIZED",
+            Self::NfkdNormalized => "IS NOT NFKD NORMALIZED",
         }
     }
 }
@@ -393,6 +526,20 @@ impl ComparisonOp {
             Self::GtEq => ">=",
         }
     }
+
+    /// The comparison `NOT (a op b)` is: `=` and `<>`, `<` and `>=`,
+    /// `<=` and `>`. Each holds where the other is false and both are
+    /// NULL where either operand is.
+    pub fn negated(self) -> Self {
+        match self {
+            Self::Eq => Self::NotEq,
+            Self::NotEq => Self::Eq,
+            Self::Lt => Self::GtEq,
+            Self::LtEq => Self::Gt,
+            Self::Gt => Self::LtEq,
+            Self::GtEq => Self::Lt,
+        }
+    }
 }
 
 impl std::fmt::Display for ComparisonOp {
@@ -419,6 +566,8 @@ pub enum BinOpKind {
     Mul,
     Div,
     Mod,
+    // Integer division (MySQL and Spark `DIV`): the quotient without its fraction
+    IntDiv,
     // Comparison (shares the closed taxonomy with QuantifiedCmp)
     Cmp(ComparisonOp),
     // Null-safe comparison
@@ -427,6 +576,8 @@ pub enum BinOpKind {
     // Logical connectives
     And,
     Or,
+    // Exclusive OR (MySQL `XOR`): NULL where an operand is
+    Xor,
     // String concatenation vs MySQL logical-or spelling (both `||`)
     Concat,
     LogicalOr,
@@ -455,6 +606,24 @@ pub enum BinOpKind {
     Shr,
     BitXor,
     BitXorPg,
+    BitAnd,
+    BitOr,
+    // PostgreSQL `^`
+    Exponent,
+    // PostgreSQL `@@`: a text-search vector matches a query, or a JSON path
+    // predicate holds
+    QueryMatch,
+    // PostgreSQL `?|` / `?&`: any / all of the keys are top-level keys
+    JsonExistsAny,
+    JsonExistsAll,
+    // PostgreSQL `^@`: the string starts with the other
+    StartsWith,
+    // `(s1, e1) OVERLAPS (s2, e2)`: two periods overlap
+    Overlaps,
+    // MySQL `a SOUNDS LIKE b`: `SOUNDEX(a) = SOUNDEX(b)`
+    SoundsLike,
+    // MySQL `a MEMBER OF (b)`: the value is an element of the JSON array
+    MemberOf,
 }
 
 impl BinOpKind {
@@ -468,11 +637,13 @@ impl BinOpKind {
             Self::Mul => "*",
             Self::Div => "/",
             Self::Mod => "%",
+            Self::IntDiv => "DIV",
             Self::Cmp(c) => c.as_sql_str(),
             Self::IsDistinctFrom => "IS DISTINCT FROM",
             Self::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
             Self::And => "AND",
             Self::Or => "OR",
+            Self::Xor => "XOR",
             Self::Concat => "||",
             Self::LogicalOr => "||",
             Self::AtTimeZone => "AT TIME ZONE",
@@ -494,6 +665,16 @@ impl BinOpKind {
             Self::Shr => ">>",
             Self::BitXor => "^",
             Self::BitXorPg => "#",
+            Self::BitAnd => "&",
+            Self::BitOr => "|",
+            Self::Exponent => "^",
+            Self::QueryMatch => "@@",
+            Self::JsonExistsAny => "?|",
+            Self::JsonExistsAll => "?&",
+            Self::StartsWith => "^@",
+            Self::Overlaps => "OVERLAPS",
+            Self::SoundsLike => "SOUNDS LIKE",
+            Self::MemberOf => "MEMBER OF",
         }
     }
 }
@@ -527,12 +708,12 @@ impl LikeKind {
 
     /// Map a source keyword (already trimmed and uppercased at the
     /// lowering boundary) to a typed kind. The parser only produces
-    /// `LIKE` / `ILIKE` / `RLIKE` for `AstExpr::Like`; anything else
-    /// is the standard `LIKE`.
+    /// `LIKE` / `ILIKE` / `RLIKE` / `REGEXP` for `AstExpr::Like`;
+    /// `REGEXP` is `RLIKE`, anything else is the standard `LIKE`.
     pub fn from_keyword(kw: &str) -> Self {
         match kw {
             "ILIKE" => Self::ILike,
-            "RLIKE" => Self::RLike,
+            "RLIKE" | "REGEXP" => Self::RLike,
             "SIMILAR TO" => Self::SimilarTo,
             _ => Self::Like,
         }
@@ -706,6 +887,19 @@ impl FieldPath {
         out.extend(suffix.0.iter().cloned());
         Self(out)
     }
+
+    /// The path as it follows a column's name: `.field` per field,
+    /// `[n]` per index, `[?]` per dynamic index; empty for the empty path.
+    pub(crate) fn suffix_text(&self) -> String {
+        self.0
+            .iter()
+            .map(|segment| match segment {
+                FieldPathSegment::Field(name) => format!(".{}", name.as_str()),
+                FieldPathSegment::Index(i) => format!("[{i}]"),
+                FieldPathSegment::Dynamic => "[?]".to_string(),
+            })
+            .collect()
+    }
 }
 
 /// Literal value.
@@ -732,6 +926,13 @@ pub enum Lit {
     },
     /// Snowflake variant literals: `PARSE_JSON('...')` lowered here.
     Variant(String),
+    /// A variable or routine parameter declared around the statement, or a
+    /// name the lexer marks as a variable (`@v`): `name` is its identity,
+    /// keyed as a column's name is, `written` the name as written.
+    Variable {
+        name: crate::context::node_metadata::IdentKey,
+        written: String,
+    },
 }
 
 impl ScalarExpr {
@@ -743,6 +944,7 @@ impl ScalarExpr {
             | ScalarExpr::Lit { span, .. }
             | ScalarExpr::BinOp { span, .. }
             | ScalarExpr::LogicalChain { span, .. }
+            | ScalarExpr::OperatorChain { span, .. }
             | ScalarExpr::UnaryOp { span, .. }
             | ScalarExpr::FuncCall { span, .. }
             | ScalarExpr::Case { span, .. }
@@ -753,11 +955,61 @@ impl ScalarExpr {
             | ScalarExpr::Exists { span, .. }
             | ScalarExpr::ScalarSubquery { span, .. }
             | ScalarExpr::QuantifiedCmp { span, .. }
+            | ScalarExpr::RowCmp { span, .. }
             | ScalarExpr::WindowFn { span, .. }
             | ScalarExpr::FieldAccess { span, .. }
             | ScalarExpr::Lambda { span, .. }
             | ScalarExpr::PatternVarRef { span, .. }
             | ScalarExpr::Opaque { span, .. } => *span,
         }
+    }
+
+    /// The function this expression calls, where it is a call.
+    pub(crate) fn called_function(&self) -> Option<&super::plan::ResolvedFunc> {
+        match self {
+            ScalarExpr::FuncCall { func, .. } => Some(func),
+            ScalarExpr::Column { .. }
+            | ScalarExpr::OuterRef { .. }
+            | ScalarExpr::Lit { .. }
+            | ScalarExpr::BinOp { .. }
+            | ScalarExpr::LogicalChain { .. }
+            | ScalarExpr::OperatorChain { .. }
+            | ScalarExpr::UnaryOp { .. }
+            | ScalarExpr::Case { .. }
+            | ScalarExpr::Cast { .. }
+            | ScalarExpr::InList { .. }
+            | ScalarExpr::Between { .. }
+            | ScalarExpr::Like { .. }
+            | ScalarExpr::Exists { .. }
+            | ScalarExpr::ScalarSubquery { .. }
+            | ScalarExpr::QuantifiedCmp { .. }
+            | ScalarExpr::RowCmp { .. }
+            | ScalarExpr::WindowFn { .. }
+            | ScalarExpr::FieldAccess { .. }
+            | ScalarExpr::Lambda { .. }
+            | ScalarExpr::PatternVarRef { .. }
+            | ScalarExpr::Opaque { .. } => None,
+        }
+    }
+
+    /// The left fold of the run of operators `operators` joins `operands`
+    /// with ([`ScalarExpr::OperatorChain`]): `first` reads the first
+    /// operand, then `step` the fold so far, each operator and the operand
+    /// right of it, in order. `None` where the run has no operand.
+    pub(crate) fn fold_chain<T>(
+        operands: &[ScalarExpr],
+        operators: &[BinOpKind],
+        first: impl FnOnce(&ScalarExpr) -> T,
+        mut step: impl FnMut(T, BinOpKind, &ScalarExpr) -> T,
+    ) -> Option<T> {
+        let (head, rest) = operands.split_first()?;
+        Some(
+            operators
+                .iter()
+                .zip(rest)
+                .fold(first(head), |folded, (op, operand)| {
+                    step(folded, *op, operand)
+                }),
+        )
     }
 }

@@ -13,15 +13,15 @@ fn risk_flags_update_without_where_as_unbounded_write() {
     let sql = "UPDATE prod.analytics.users SET status = 'inactive'";
     let report = analyze_risk(sql).expect("risk analysis should succeed");
 
-    // DML-WRITE-UNBOUNDED is now a AnalysisSignal with unbounded_write enrichment
+    // DML-WRITE-UNBOUNDED is now a AnalysisFinding with unbounded_write enrichment
     assert!(
-        report.signals.iter().any(|f| {
+        report.findings.iter().any(|f| {
             matches!(
                 f,
                 lexega_core::analyzer::RuleMatch::Analysis(g)
                     if g.matched_rule == "DML-WRITE-UNBOUNDED" || g.unbounded_write == Some(true)
             )
         }),
-        "Expected unbounded write signal (DML-WRITE-UNBOUNDED or unbounded_write=true)"
+        "Expected unbounded write finding (DML-WRITE-UNBOUNDED or unbounded_write=true)"
     );
 }

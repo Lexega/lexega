@@ -45,13 +45,10 @@ fn governance_golden_has_zero_opaque_statements() {
 /// `OpaqueContent` (or partially do). One entry per construct family.
 /// When you implement one, move its SQL into the golden fixture and
 /// remove the entry here — the assertion below forces the bookkeeping.
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    ("save transaction", "SAVE TRANSACTION before_purge;"),
-    (
-        "partition function",
-        "CREATE PARTITION FUNCTION pf_year (DATE) AS RANGE RIGHT FOR VALUES ('2024-01-01');",
-    ),
-];
+const KNOWN_GAPS: &[(&str, &str)] = &[(
+    "partition function",
+    "CREATE PARTITION FUNCTION pf_year (DATE) AS RANGE RIGHT FOR VALUES ('2024-01-01');",
+)];
 
 #[test]
 fn governance_known_gap_inventory() {

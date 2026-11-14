@@ -209,8 +209,10 @@ pub fn try_parse_script(source: &str, tokens: &[Token]) -> ParseResult<AstScript
 
 /// Analysis-pipeline parse entry: like [`try_parse_script_with_dialect`] /
 /// [`try_parse_script`] (per `dialect`), but installs the template layer's
-/// placeholder spans so credential-value captures can recognize a rendered
-/// placeholder as "not a statically-known literal".
+/// placeholder spans: what the render wrote for an expression it could not
+/// resolve. A credential-value capture holding one is no statically-known
+/// literal, and an object-name part holding one is a part a template writes
+/// ([`crate::ast::AstNamePiece::Rendered`]).
 pub fn try_parse_script_with_placeholders(
     source: &str,
     tokens: &[Token],

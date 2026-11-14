@@ -14,7 +14,7 @@
 //! `ddl`.
 //!
 //! The source literal is intentionally not surfaced: restore URLs commonly
-//! carry SAS credentials, and the governance signal — restoring from an
+//! carry SAS credentials, and the governance concern — restoring from an
 //! offsite object store — is fully captured by the device class.
 //!
 //! Predicate examples:

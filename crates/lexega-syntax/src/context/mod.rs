@@ -17,7 +17,7 @@
 
 // Re-exports
 pub use self::diagnostics::{Diagnostic, Severity};
-pub use self::formatted::{FormattedContext, FormattedContextError};
+pub use self::formatted::{CopiedSpan, FormattedContext, FormattedContextError};
 pub use self::span_map::{MappingKind, SpanMap, SpanMapError, SpanMapping};
 
 // Module declarations

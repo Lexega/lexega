@@ -98,8 +98,9 @@ pub fn lower_drop_notebook_to_notebook_plan(s: &AstDrop, source: &str) -> Notebo
     NotebookPlan {
         action: NotebookAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: NotebookOptions {
             or_replace: false,
             if_not_exists: false,

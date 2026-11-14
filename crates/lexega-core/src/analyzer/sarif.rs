@@ -3,14 +3,14 @@
 
 //! SARIF (Static Analysis Results Interchange Format) output support
 //!
-//! Converts AnalysisReport signals to SARIF 2.1.0 format for integration with
+//! Converts AnalysisReport findings to SARIF 2.1.0 format for integration with
 //! GitHub Security, GitLab SAST, Azure DevOps, and other SARIF-compatible tools.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-use super::{AnalysisReport, RiskLevel, RuleMatch};
+use super::{AnalysisReport, ConfidenceLevel, RenderCompleteness, RiskLevel, RuleMatch};
 
 /// The tool run a report is written up for: what the report itself does not
 /// carry.
@@ -24,6 +24,46 @@ pub struct ToolRun<'a> {
     pub base_path: Option<&'a str>,
     /// The sentence a run at reduced depth is reported with.
     pub depth_note: Option<&'a str>,
+    /// Files of a batch analyzed on their template text because it could
+    /// not be rendered. A one-file report whose summary says not rendered
+    /// names its own file without them.
+    pub unrendered_files: &'a [String],
+    /// SQL files of a batch it left unanalyzed (a template that could not be
+    /// rendered, a file that could not be read or analyzed, a symbolic link
+    /// the scan does not follow), each with why.
+    pub skipped_files: &'a [(String, String)],
+    /// SQL files of a batch it did not analyze because they hold dbt macro
+    /// definitions, not statements, each with what the run says of it.
+    pub macro_files: &'a [(String, String)],
+    /// What the run left undone that its findings do not show (templates
+    /// analyzed as written, a change not compared), a sentence each.
+    pub run_notes: &'a [String],
+}
+
+/// What a report says about a file analyzed on its template text.
+pub(crate) const NOT_RENDERED_NOTE: &str =
+    "Template could not be rendered; analysis ran on template text.";
+
+/// What a report says about a file of a batch it did not analyze.
+pub(crate) const NOT_ANALYZED_NOTE: &str = "File was not analyzed; no finding is reported for it.";
+
+/// The files `report` was analyzed on unrendered template text for: none
+/// unless its summary says not rendered. A report that names neither those
+/// nor a batch's skipped files is of one source, which it names.
+pub(crate) fn unrendered_files<'r>(report: &'r AnalysisReport, run: &ToolRun<'r>) -> Vec<&'r str> {
+    match report.summary.render_completeness {
+        RenderCompleteness::NotRendered
+            if run.unrendered_files.is_empty() && run.skipped_files.is_empty() =>
+        {
+            vec![report.source_file_path.as_deref().unwrap_or("input.sql")]
+        }
+        RenderCompleteness::NotRendered => {
+            run.unrendered_files.iter().map(String::as_str).collect()
+        }
+        RenderCompleteness::Full
+        | RenderCompleteness::PartialLowImpactOnly
+        | RenderCompleteness::Partial => Vec::new(),
+    }
 }
 
 /// SARIF schema version we produce
@@ -44,10 +84,36 @@ pub struct SarifReport {
 pub struct SarifRun {
     pub tool: SarifTool,
     pub results: Vec<SarifResult>,
+    /// The unit every region's columns count in.
+    #[serde(rename = "columnKind")]
+    pub column_kind: SarifColumnKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocations: Option<Vec<SarifInvocation>>,
     #[serde(rename = "originalUriBaseIds", skip_serializing_if = "Option::is_none")]
     pub original_uri_base_ids: Option<HashMap<String, SarifArtifactLocation>>,
+    /// How completely the run's templates rendered, and the confidence that
+    /// leaves the analysis.
+    pub properties: SarifRunProperties,
+}
+
+/// The unit a run's region columns count in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SarifColumnKind {
+    /// UTF-16 code units, the unit GitHub code scanning reads.
+    #[serde(rename = "utf16CodeUnits")]
+    Utf16CodeUnits,
+}
+
+/// The run's property bag.
+#[derive(Debug, Clone, Serialize)]
+pub struct SarifRunProperties {
+    /// The least complete render of the run's files: a file left unanalyzed
+    /// because it did not render counts as not rendered.
+    #[serde(rename = "renderCompleteness")]
+    pub render_completeness: RenderCompleteness,
+    /// The lowest confidence of the files analyzed.
+    #[serde(rename = "analysisConfidence")]
+    pub analysis_confidence: ConfidenceLevel,
 }
 
 /// Tool information
@@ -136,6 +202,9 @@ pub struct SarifMessage {
 pub struct SarifLocation {
     #[serde(rename = "physicalLocation")]
     pub physical_location: SarifPhysicalLocation,
+    /// What is said of this location in particular.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<SarifMessage>,
 }
 
 /// Physical location (file + region)
@@ -201,6 +270,10 @@ pub struct SarifNotification {
     pub descriptor: SarifNotificationDescriptor,
     pub level: String,
     pub message: SarifMessage,
+    /// The files the notification is about. Omitted when it is about the
+    /// run as a whole.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<SarifLocation>,
 }
 
 /// Identifies the kind of a [`SarifNotification`].
@@ -211,6 +284,37 @@ pub struct SarifNotificationDescriptor {
 
 /// `descriptor.id` of the notification a run at reduced depth carries.
 pub const DEPTH_NOTIFICATION_ID: &str = "analysis-depth";
+
+/// `descriptor.id` of the notification a file analyzed on its template text
+/// carries.
+pub(crate) const NOT_RENDERED_NOTIFICATION_ID: &str = "template-not-rendered";
+
+/// `descriptor.id` of the notification naming the files of a batch it did not
+/// analyze, each location saying why.
+pub(crate) const NOT_ANALYZED_NOTIFICATION_ID: &str = "file-not-analyzed";
+
+/// `descriptor.id` of each notification saying what the run left undone.
+pub(crate) const RUN_LIMITED_NOTIFICATION_ID: &str = "run-limited";
+
+/// `descriptor.id` of the notification naming a file of a batch it did not
+/// analyze because it holds macro definitions.
+pub(crate) const MACRO_FILE_NOTIFICATION_ID: &str = "macro-file-not-analyzed";
+
+/// Where `path` is, as a SARIF artifact location: an absolute path as a
+/// `file://` URI, a relative one against `uri_base_id`.
+fn artifact_location(path: String, uri_base_id: &Option<String>) -> SarifArtifactLocation {
+    if path.starts_with('/') {
+        SarifArtifactLocation {
+            uri: format!("file://{}", path),
+            uri_base_id: None,
+        }
+    } else {
+        SarifArtifactLocation {
+            uri: path,
+            uri_base_id: uri_base_id.clone(),
+        }
+    }
+}
 
 impl SarifMessage {
     pub fn new(text: impl Into<String>) -> Self {
@@ -308,24 +412,24 @@ pub fn severity_label_from_security_score(score: f64) -> &'static str {
     }
 }
 
-/// Extract rule ID from a signal
-pub(super) fn get_rule_id(signal: &RuleMatch) -> String {
-    match signal {
+/// Extract rule ID from a finding
+pub(super) fn get_rule_id(finding: &RuleMatch) -> String {
+    match finding {
         RuleMatch::Analysis(g) => g.matched_rule.clone(),
     }
 }
 
-/// Get line number from a signal (template line preferred for dbt models)
-pub(super) fn get_line_number(signal: &RuleMatch) -> Option<usize> {
+/// Get line number from a finding (template line preferred for dbt models)
+pub(super) fn get_line_number(finding: &RuleMatch) -> Option<usize> {
     // First try to parse from evidence location field (path:line:column format)
     // The location field already contains template line when available
-    if let Some((_, line, _)) = get_location_from_evidence(signal) {
-        return Some(line);
+    if let Some(place) = get_location_from_evidence(finding) {
+        return Some(place.line);
     }
 
     // Second: try template_line_number directly from evidence
     // This handles cases where location is not set but template_line_number exists
-    for evidence in signal.evidence() {
+    for evidence in finding.evidence() {
         if let super::RiskEvidence::RuleMatch {
             template_line_number: Some(line),
             ..
@@ -336,7 +440,7 @@ pub(super) fn get_line_number(signal: &RuleMatch) -> Option<usize> {
     }
 
     // Third: try line_number from evidence (rendered line, but still better than nothing)
-    for evidence in signal.evidence() {
+    for evidence in finding.evidence() {
         if let super::RiskEvidence::RuleMatch {
             line_number: Some(line),
             ..
@@ -346,84 +450,69 @@ pub(super) fn get_line_number(signal: &RuleMatch) -> Option<usize> {
         }
     }
 
-    // Final fallback to statement_line_number on AnalysisSignal
-    match signal {
+    // Final fallback to statement_line_number on AnalysisFinding
+    match finding {
         RuleMatch::Analysis(g) => g.statement_line_number,
     }
 }
 
-/// Extract file path, line, and column from signal evidence
-/// Parses the location field which has format: path:line:column
-pub(super) fn get_location_from_evidence(signal: &RuleMatch) -> Option<(String, usize, usize)> {
-    for evidence in signal.evidence() {
-        if let super::RiskEvidence::RuleMatch {
-            location: Some(loc),
-            ..
-        } = evidence
-        {
-            // Parse path:line:column format
-            // Find the last two colons (line and column)
-            if let Some(col_pos) = loc.rfind(':') {
-                if let Some(line_pos) = loc[..col_pos].rfind(':') {
-                    let path = &loc[..line_pos];
-                    let line_str = &loc[line_pos + 1..col_pos];
-                    let col_str = &loc[col_pos + 1..];
-
-                    if let (Ok(line), Ok(col)) =
-                        (line_str.parse::<usize>(), col_str.parse::<usize>())
-                    {
-                        return Some((path.to_string(), line, col));
-                    }
-                }
-            }
-        }
-    }
-    None
+/// Where an evidence item points: the file and line its `location` names,
+/// the column in UTF-16 code units where the item carries its position, and
+/// its statement preview.
+pub(super) struct EvidencePlace {
+    pub(super) path: String,
+    pub(super) line: usize,
+    pub(super) utf16_column: Option<usize>,
+    pub(super) preview: Option<String>,
 }
 
-/// Extract ALL locations from signal evidence (one per UNION branch, etc.)
-/// Returns Vec of (path, line, column, statement_preview)
-pub(super) fn get_all_locations_from_evidence(
-    signal: &RuleMatch,
-) -> Vec<(String, usize, usize, Option<String>)> {
-    let mut locations = Vec::new();
-
-    for evidence in signal.evidence() {
-        if let super::RiskEvidence::RuleMatch {
-            location: Some(loc),
-            statement_preview,
-            ..
-        } = evidence
-        {
-            // Parse path:line:column format
-            if let Some(col_pos) = loc.rfind(':') {
-                if let Some(line_pos) = loc[..col_pos].rfind(':') {
-                    let path = &loc[..line_pos];
-                    let line_str = &loc[line_pos + 1..col_pos];
-                    let col_str = &loc[col_pos + 1..];
-
-                    if let (Ok(line), Ok(col)) =
-                        (line_str.parse::<usize>(), col_str.parse::<usize>())
-                    {
-                        locations.push((path.to_string(), line, col, statement_preview.clone()));
-                    }
-                }
-            }
-        }
-    }
-
-    locations
+/// Where `evidence` points, read from its `location` (`path:line:column`)
+/// and its position.
+fn evidence_place(evidence: &super::RiskEvidence) -> Option<EvidencePlace> {
+    let super::RiskEvidence::RuleMatch {
+        location: Some(location),
+        position,
+        statement_preview,
+        ..
+    } = evidence
+    else {
+        return None;
+    };
+    let mut parts = location.rsplitn(3, ':');
+    let (_column, line, path) = (parts.next()?, parts.next()?, parts.next()?);
+    let line = position.map_or_else(|| line.parse().ok(), |at| Some(at.line))?;
+    Some(EvidencePlace {
+        path: path.to_string(),
+        line,
+        utf16_column: position.map(|at| at.utf16_column),
+        preview: statement_preview.clone(),
+    })
 }
 
-/// Get file path from signal evidence, with fallback to default
-pub(super) fn get_file_path_from_evidence(signal: &RuleMatch, default: &str) -> String {
+/// Where a finding's first located evidence points.
+pub(super) fn get_location_from_evidence(finding: &RuleMatch) -> Option<EvidencePlace> {
+    finding.evidence().iter().find_map(evidence_place)
+}
+
+/// Where each located evidence of a finding points (one per UNION branch,
+/// etc.).
+pub(super) fn get_all_locations_from_evidence(finding: &RuleMatch) -> Vec<EvidencePlace> {
+    finding
+        .evidence()
+        .iter()
+        .filter_map(evidence_place)
+        .collect()
+}
+
+/// Get file path from finding evidence, with fallback to default
+pub(super) fn get_file_path_from_evidence(finding: &RuleMatch, default: &str) -> String {
     // First try location field (has full path)
-    if let Some((path, _, _)) = get_location_from_evidence(signal) {
-        return path;
+    if let Some(place) = get_location_from_evidence(finding) {
+        return place.path;
     }
 
     // Then try source_file field
-    for evidence in signal.evidence() {
+    for evidence in finding.evidence() {
         if let super::RiskEvidence::RuleMatch {
             source_file: Some(file),
             ..
@@ -437,8 +526,8 @@ pub(super) fn get_file_path_from_evidence(signal: &RuleMatch, default: &str) -> 
 }
 
 /// Get statement preview from evidence
-pub(super) fn get_statement_preview(signal: &RuleMatch) -> Option<String> {
-    for evidence in signal.evidence() {
+pub(super) fn get_statement_preview(finding: &RuleMatch) -> Option<String> {
+    for evidence in finding.evidence() {
         if let super::RiskEvidence::RuleMatch {
             statement_preview, ..
         } = evidence
@@ -451,14 +540,14 @@ pub(super) fn get_statement_preview(signal: &RuleMatch) -> Option<String> {
     None
 }
 
-/// Get tags for a signal type
+/// Get tags for a finding type
 ///
-/// Uses enrichment fields to determine signal category rather than rule ID prefixes.
-/// This is more robust as it reflects actual signal characteristics.
-fn get_signal_tags(signal: &RuleMatch) -> Vec<String> {
-    match signal {
+/// Uses enrichment fields to determine finding category rather than rule ID prefixes.
+/// This is more robust as it reflects actual finding characteristics.
+fn get_finding_tags(finding: &RuleMatch) -> Vec<String> {
+    match finding {
         RuleMatch::Analysis(g) => {
-            // Diff signals (DIFF-* rule_ids) carry the
+            // Diff findings (DIFF-* rule_ids) carry the
             // `semantic-change` / `baseline` SARIF tags. The v1 fact
             // engine routes them through `RuleMatch::Analysis`, so we
             // discriminate by rule_id prefix.
@@ -468,21 +557,21 @@ fn get_signal_tags(signal: &RuleMatch) -> Vec<String> {
 
             let mut tags = vec!["governance".to_string()];
 
-            // Cost/performance signals have scan_type or affected_tables populated
+            // Cost/performance findings have scan_type or affected_tables populated
             if g.scan_type.is_some() || g.affected_tables.is_some() {
                 tags.push("performance".to_string());
                 tags.push("cost".to_string());
                 tags.push("query-pattern".to_string());
             }
 
-            // Blast radius signals have tables_modified or unbounded_write populated
+            // Blast radius findings have tables_modified or unbounded_write populated
             if g.tables_modified.is_some() || g.unbounded_write.is_some() {
                 tags.push("blast-radius".to_string());
                 tags.push("data-modification".to_string());
             }
 
-            // Security signals - check for security-related signal types
-            let sig_type = g.signal_type.to_lowercase();
+            // Security findings - check for security-related finding types
+            let sig_type = g.finding_type.to_lowercase();
             if sig_type.contains("privilege")
                 || sig_type.contains("grant")
                 || sig_type.contains("policy")
@@ -526,9 +615,9 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
         None
     };
 
-    for signal in &report.signals {
-        let rule_id = get_rule_id(signal);
-        let level = signal.risk_level();
+    for finding in &report.findings {
+        let rule_id = get_rule_id(finding);
+        let level = finding.risk_level();
 
         // Add rule if not already present
         if !rules_map.contains_key(&rule_id) {
@@ -539,13 +628,13 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
                     name: rule_id.clone(),
                     deprecated_ids: crate::rules::former_ids_for(&rule_id).to_vec(),
                     short_description: SarifMessage::new(&rule_id),
-                    full_description: Some(SarifMessage::new(signal.message())),
+                    full_description: Some(SarifMessage::new(finding.message())),
                     default_configuration: Some(SarifRuleConfiguration {
                         level: risk_level_to_sarif_level(level).to_string(),
                     }),
                     help: None,
                     properties: Some(SarifRuleProperties {
-                        tags: Some(get_signal_tags(signal)),
+                        tags: Some(get_finding_tags(finding)),
                         security_severity: Some(risk_level_to_security_severity(level).to_string()),
                         precision: Some("high".to_string()),
                     }),
@@ -553,43 +642,41 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
             );
         }
 
-        // Get all locations from evidence - for signals with multiple UNION branches,
+        // Get all locations from evidence - for findings with multiple UNION branches,
         // this will create one SARIF result per location
-        let all_locations = get_all_locations_from_evidence(signal);
+        let all_locations = get_all_locations_from_evidence(finding);
 
         if all_locations.len() > 1 {
             // Multiple locations - create one result per location
-            for (path, line, col, preview) in all_locations {
+            for EvidencePlace {
+                path,
+                line,
+                utf16_column,
+                preview,
+            } in all_locations
+            {
                 // Fingerprint the raw path, before any URI formatting: the
                 // GitLab emitter hashes the path as recorded in evidence,
                 // and identity must match across surfaces.
                 let fingerprint =
-                    finding_fingerprint(&rule_id, &path, preview.as_deref(), signal.message());
+                    finding_fingerprint(&rule_id, &path, preview.as_deref(), finding.message());
 
-                // For relative paths with base_path, use uriBaseId; for absolute paths, use file:// URI
-                let (signal_file_uri, base_id) = if path.starts_with('/') {
-                    (format!("file://{}", path), None)
-                } else {
-                    (path, uri_base_id.clone())
-                };
                 results.push(SarifResult {
                     rule_id: rule_id.clone(),
                     level: risk_level_to_sarif_level(level).to_string(),
-                    message: SarifMessage::new(signal.message()),
+                    message: SarifMessage::new(finding.message()),
                     locations: vec![SarifLocation {
                         physical_location: SarifPhysicalLocation {
-                            artifact_location: SarifArtifactLocation {
-                                uri: signal_file_uri,
-                                uri_base_id: base_id,
-                            },
+                            artifact_location: artifact_location(path, &uri_base_id),
                             region: Some(SarifRegion {
                                 start_line: line,
-                                start_column: Some(col),
+                                start_column: utf16_column,
                                 end_line: Some(line),
                                 end_column: None,
                                 snippet: preview.map(|s| SarifSnippet { text: s }),
                             }),
                         },
+                        message: None,
                     }],
                     fingerprints: None,
                     partial_fingerprints: fingerprint_map(fingerprint),
@@ -597,55 +684,47 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
             }
         } else {
             // Single location or fallback - original behavior
-            let region = if let Some((_, line, col)) = get_location_from_evidence(signal) {
+            let region = if let Some(place) = get_location_from_evidence(finding) {
                 Some(SarifRegion {
-                    start_line: line,
-                    start_column: Some(col),
-                    end_line: Some(line),
+                    start_line: place.line,
+                    start_column: place.utf16_column,
+                    end_line: Some(place.line),
                     end_column: None,
-                    snippet: get_statement_preview(signal).map(|s| SarifSnippet { text: s }),
+                    snippet: get_statement_preview(finding).map(|s| SarifSnippet { text: s }),
                 })
             } else {
-                get_line_number(signal).map(|line| SarifRegion {
+                get_line_number(finding).map(|line| SarifRegion {
                     start_line: line,
                     start_column: Some(1),
                     end_line: Some(line),
                     end_column: None,
-                    snippet: get_statement_preview(signal).map(|s| SarifSnippet { text: s }),
+                    snippet: get_statement_preview(finding).map(|s| SarifSnippet { text: s }),
                 })
             };
 
-            // Get per-signal file path (from evidence or fallback to report-level)
-            let signal_file_path = get_file_path_from_evidence(signal, &file_uri);
+            // Get per-finding file path (from evidence or fallback to report-level)
+            let finding_file_path = get_file_path_from_evidence(finding, &file_uri);
 
             // Fingerprint the raw path, before any URI formatting: identity
             // must match the GitLab emitter, which hashes the path as
             // recorded in evidence.
             let fingerprint = finding_fingerprint(
                 &rule_id,
-                &signal_file_path,
-                get_statement_preview(signal).as_deref(),
-                signal.message(),
+                &finding_file_path,
+                get_statement_preview(finding).as_deref(),
+                finding.message(),
             );
 
-            // For relative paths with base_path, use uriBaseId; for absolute paths, use file:// URI
-            let (signal_file_uri, base_id) = if signal_file_path.starts_with('/') {
-                (format!("file://{}", signal_file_path), None)
-            } else {
-                (signal_file_path, uri_base_id.clone())
-            };
             results.push(SarifResult {
                 rule_id: rule_id.clone(),
                 level: risk_level_to_sarif_level(level).to_string(),
-                message: SarifMessage::new(signal.message()),
+                message: SarifMessage::new(finding.message()),
                 locations: vec![SarifLocation {
                     physical_location: SarifPhysicalLocation {
-                        artifact_location: SarifArtifactLocation {
-                            uri: signal_file_uri,
-                            uri_base_id: base_id,
-                        },
+                        artifact_location: artifact_location(finding_file_path, &uri_base_id),
                         region,
                     },
+                    message: None,
                 }],
                 fingerprints: None,
                 partial_fingerprints: fingerprint_map(fingerprint),
@@ -715,6 +794,85 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
         map
     });
 
+    let unrendered = unrendered_files(report, run);
+    let tool_execution_notifications = run
+        .depth_note
+        .map(|note| SarifNotification {
+            descriptor: SarifNotificationDescriptor {
+                id: DEPTH_NOTIFICATION_ID.to_string(),
+            },
+            level: "note".to_string(),
+            message: SarifMessage::new(note),
+            locations: Vec::new(),
+        })
+        .into_iter()
+        .chain(run.run_notes.iter().map(|note| SarifNotification {
+            descriptor: SarifNotificationDescriptor {
+                id: RUN_LIMITED_NOTIFICATION_ID.to_string(),
+            },
+            level: "warning".to_string(),
+            message: SarifMessage::new(note),
+            locations: Vec::new(),
+        }))
+        .chain((!unrendered.is_empty()).then(|| {
+            SarifNotification {
+                descriptor: SarifNotificationDescriptor {
+                    id: NOT_RENDERED_NOTIFICATION_ID.to_string(),
+                },
+                level: "warning".to_string(),
+                message: SarifMessage::new(NOT_RENDERED_NOTE),
+                locations: unrendered
+                    .iter()
+                    .map(|path| SarifLocation {
+                        physical_location: SarifPhysicalLocation {
+                            artifact_location: artifact_location(path.to_string(), &uri_base_id),
+                            region: None,
+                        },
+                        message: None,
+                    })
+                    .collect(),
+            }
+        }))
+        .chain((!run.skipped_files.is_empty()).then(|| {
+            SarifNotification {
+                descriptor: SarifNotificationDescriptor {
+                    id: NOT_ANALYZED_NOTIFICATION_ID.to_string(),
+                },
+                level: "warning".to_string(),
+                message: SarifMessage::new(NOT_ANALYZED_NOTE),
+                locations: run
+                    .skipped_files
+                    .iter()
+                    .map(|(path, reason)| SarifLocation {
+                        physical_location: SarifPhysicalLocation {
+                            artifact_location: artifact_location(path.clone(), &uri_base_id),
+                            region: None,
+                        },
+                        message: Some(SarifMessage::new(reason.as_str())),
+                    })
+                    .collect(),
+            }
+        }))
+        .chain(
+            run.macro_files
+                .iter()
+                .map(|(path, note)| SarifNotification {
+                    descriptor: SarifNotificationDescriptor {
+                        id: MACRO_FILE_NOTIFICATION_ID.to_string(),
+                    },
+                    level: "note".to_string(),
+                    message: SarifMessage::new(note.as_str()),
+                    locations: vec![SarifLocation {
+                        physical_location: SarifPhysicalLocation {
+                            artifact_location: artifact_location(path.clone(), &uri_base_id),
+                            region: None,
+                        },
+                        message: None,
+                    }],
+                }),
+        )
+        .collect();
+
     SarifReport {
         schema: SARIF_SCHEMA.to_string(),
         version: SARIF_VERSION.to_string(),
@@ -728,24 +886,19 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
                 },
             },
             results,
+            column_kind: SarifColumnKind::Utf16CodeUnits,
             invocations: Some(vec![SarifInvocation {
                 execution_successful: true,
                 // The analysis report's timestamp is the closest match to
                 // SARIF's `endTimeUtc` (when the analysis completed).
                 end_time_utc: Some(report.timestamp.clone()),
-                tool_execution_notifications: run
-                    .depth_note
-                    .map(|note| SarifNotification {
-                        descriptor: SarifNotificationDescriptor {
-                            id: DEPTH_NOTIFICATION_ID.to_string(),
-                        },
-                        level: "note".to_string(),
-                        message: SarifMessage::new(note),
-                    })
-                    .into_iter()
-                    .collect(),
+                tool_execution_notifications,
             }]),
             original_uri_base_ids,
+            properties: SarifRunProperties {
+                render_completeness: report.summary.render_completeness.clone(),
+                analysis_confidence: report.summary.analysis_confidence.clone(),
+            },
         }],
     }
 }
@@ -753,13 +906,17 @@ pub fn to_sarif(report: &AnalysisReport, run: &ToolRun<'_>) -> SarifReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalysisSignal, RiskEvidence};
+    use crate::analyzer::{AnalysisFinding, RiskEvidence};
 
     const RUN: ToolRun<'static> = ToolRun {
         name: "sqlcheck",
         version: "1.0.0",
         base_path: None,
         depth_note: None,
+        unrendered_files: &[],
+        skipped_files: &[],
+        macro_files: &[],
+        run_notes: &[],
     };
 
     #[test]
@@ -767,13 +924,13 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/users.sql".to_string());
 
-        // Add a governance signal
-        report.signals.push(RuleMatch::Analysis(AnalysisSignal {
+        // Add a governance finding
+        report.findings.push(RuleMatch::Analysis(AnalysisFinding {
             message: "NULL-logic hazard: NOT IN with subquery".to_string(),
             risk_level: RiskLevel::Critical,
             matched_rule: "Q-NULL-NOTIN".to_string(),
-            signal_type: "null-logic-not-in".to_string(),
-            signals_merged: Some(1),
+            finding_type: "null-logic-not-in".to_string(),
+            findings_merged: Some(1),
             evidence_count: Some(1),
             scope: Some("statement".to_string()),
             statement_line_number: Some(15),
@@ -783,9 +940,9 @@ mod tests {
             contributors: None,
             parent_context: None,
             evidence: vec![RiskEvidence::RuleMatch {
-                signal_type: "SelectStatement".to_string(),
+                finding_type: "SelectStatement".to_string(),
                 resolution_status: None,
-                signal_value: "".to_string(),
+                rule_id: "".to_string(),
                 line_number: Some(15),
                 column_number: None,
                 template_line_number: None,
@@ -794,6 +951,7 @@ mod tests {
                 statement_preview: Some("SELECT * FROM users WHERE id NOT IN...".to_string()),
                 source_file: None,
                 location: None,
+                position: None,
                 assumed_role: None, // Test doesn't need role context
             }],
             scan_type: None,
@@ -854,6 +1012,172 @@ mod tests {
     }
 
     #[test]
+    fn a_run_says_which_files_it_analyzed_on_template_text() {
+        let mut report = AnalysisReport::new();
+        report.source_file_path = Some("models/a.sql".to_string());
+
+        let rendered = serde_json::to_value(to_sarif(&report, &RUN)).unwrap();
+        assert_eq!(
+            rendered["runs"][0]["properties"]["renderCompleteness"],
+            "full"
+        );
+        assert_eq!(
+            rendered["runs"][0]["properties"]["analysisConfidence"],
+            "high"
+        );
+        assert!(rendered["runs"][0]["invocations"][0]
+            .get("toolExecutionNotifications")
+            .is_none());
+
+        report.summary.render_completeness = RenderCompleteness::NotRendered;
+        report.summary.analysis_confidence = ConfidenceLevel::Low;
+        let one = serde_json::to_value(to_sarif(&report, &RUN)).unwrap();
+        assert_eq!(
+            one["runs"][0]["properties"]["renderCompleteness"],
+            "not_rendered"
+        );
+        assert_eq!(one["runs"][0]["properties"]["analysisConfidence"], "low");
+        let notifications = &one["runs"][0]["invocations"][0]["toolExecutionNotifications"];
+        assert_eq!(notifications.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            notifications[0]["descriptor"]["id"],
+            NOT_RENDERED_NOTIFICATION_ID
+        );
+        assert_eq!(notifications[0]["level"], "warning");
+        assert_eq!(notifications[0]["message"]["text"], NOT_RENDERED_NOTE);
+        assert_eq!(
+            notifications[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "models/a.sql"
+        );
+
+        let batch_files = ["models/b.sql".to_string(), "/repo/models/c.sql".to_string()];
+        report.source_file_path = None;
+        let batch = serde_json::to_value(to_sarif(
+            &report,
+            &ToolRun {
+                unrendered_files: &batch_files,
+                depth_note: Some("1 of 2 rules use analysis this build does not include."),
+                ..RUN
+            },
+        ))
+        .unwrap();
+        let notifications = &batch["runs"][0]["invocations"][0]["toolExecutionNotifications"];
+        assert_eq!(notifications[0]["descriptor"]["id"], DEPTH_NOTIFICATION_ID);
+        assert!(notifications[0].get("locations").is_none());
+        let uris: Vec<&str> = notifications[1]["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                l["physicalLocation"]["artifactLocation"]["uri"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(uris, ["models/b.sql", "file:///repo/models/c.sql"]);
+    }
+
+    #[test]
+    fn a_batch_names_the_files_it_could_not_render_as_not_analyzed() {
+        let mut report = AnalysisReport::new();
+        report.summary.render_completeness = RenderCompleteness::NotRendered;
+        report
+            .findings
+            .push(test_finding("R-1", 3, "DELETE FROM t"));
+        let skipped = [(
+            "/repo/models/m.sql".to_string(),
+            "Jinja rendering error: Division by zero".to_string(),
+        )];
+        let sarif = serde_json::to_value(to_sarif(
+            &report,
+            &ToolRun {
+                skipped_files: &skipped,
+                ..RUN
+            },
+        ))
+        .unwrap();
+        let notifications = sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .unwrap();
+        // No file of the batch was analyzed on its template text.
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert_eq!(
+            notifications[0]["descriptor"]["id"],
+            NOT_ANALYZED_NOTIFICATION_ID
+        );
+        assert_eq!(notifications[0]["level"], "warning");
+        assert_eq!(notifications[0]["message"]["text"], NOT_ANALYZED_NOTE);
+        let location = &notifications[0]["locations"][0];
+        assert_eq!(
+            location["physicalLocation"]["artifactLocation"]["uri"],
+            "file:///repo/models/m.sql"
+        );
+        assert_eq!(
+            location["message"]["text"],
+            "Jinja rendering error: Division by zero"
+        );
+        // A finding's location says nothing of its own.
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["locations"][0].get("message").is_none());
+    }
+
+    // Each macro file of a batch is a note of its own, on its file, with
+    // what the run says of it.
+    #[test]
+    fn a_batch_names_each_macro_file_it_did_not_analyze() {
+        let report = AnalysisReport::new();
+        let macros = [
+            (
+                "macros/a.sql".to_string(),
+                "in a macro path of dbt_project.yml: macro definitions, not statements".to_string(),
+            ),
+            ("/repo/macros/b.sql".to_string(), "b's note".to_string()),
+        ];
+        let sarif = serde_json::to_value(to_sarif(
+            &report,
+            &ToolRun {
+                macro_files: &macros,
+                ..RUN
+            },
+        ))
+        .unwrap();
+        let notes: Vec<(&str, &str, &str, &str)> = sarif["runs"][0]["invocations"][0]
+            ["toolExecutionNotifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|note| {
+                (
+                    note["descriptor"]["id"].as_str().unwrap(),
+                    note["level"].as_str().unwrap(),
+                    note["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                        .as_str()
+                        .unwrap(),
+                    note["message"]["text"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                (
+                    MACRO_FILE_NOTIFICATION_ID,
+                    "note",
+                    "macros/a.sql",
+                    "in a macro path of dbt_project.yml: macro definitions, not statements"
+                ),
+                (
+                    MACRO_FILE_NOTIFICATION_ID,
+                    "note",
+                    "file:///repo/macros/b.sql",
+                    "b's note"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn test_risk_level_mapping() {
         assert_eq!(risk_level_to_sarif_level(RiskLevel::Critical), "error");
         assert_eq!(risk_level_to_sarif_level(RiskLevel::High), "error");
@@ -861,13 +1185,13 @@ mod tests {
         assert_eq!(risk_level_to_sarif_level(RiskLevel::Low), "note");
     }
 
-    fn test_signal(rule: &str, line: usize, preview: &str) -> RuleMatch {
-        RuleMatch::Analysis(AnalysisSignal {
+    fn test_finding(rule: &str, line: usize, preview: &str) -> RuleMatch {
+        RuleMatch::Analysis(AnalysisFinding {
             message: format!("{} fired", rule),
             risk_level: RiskLevel::High,
             matched_rule: rule.to_string(),
-            signal_type: "test-signal".to_string(),
-            signals_merged: Some(1),
+            finding_type: "test-finding".to_string(),
+            findings_merged: Some(1),
             evidence_count: Some(1),
             scope: Some("statement".to_string()),
             statement_line_number: Some(line),
@@ -877,9 +1201,9 @@ mod tests {
             contributors: None,
             parent_context: None,
             evidence: vec![RiskEvidence::RuleMatch {
-                signal_type: "SelectStatement".to_string(),
+                finding_type: "SelectStatement".to_string(),
                 resolution_status: None,
-                signal_value: "".to_string(),
+                rule_id: "".to_string(),
                 line_number: Some(line),
                 column_number: None,
                 template_line_number: None,
@@ -888,6 +1212,7 @@ mod tests {
                 statement_preview: Some(preview.to_string()),
                 source_file: None,
                 location: None,
+                position: None,
                 assumed_role: None,
             }],
             scan_type: None,
@@ -910,13 +1235,54 @@ mod tests {
             .clone()
     }
 
+    // A region's column counts UTF-16 code units, which the run declares; the
+    // fingerprint holds no position.
+    #[test]
+    fn a_region_column_counts_utf16_code_units() {
+        let placed = |position: Option<crate::analyzer::TextPosition>| {
+            let mut finding = test_finding("Q-NULL-NEQ", 2, "select 1");
+            let RuleMatch::Analysis(analysis) = &mut finding;
+            if let RiskEvidence::RuleMatch {
+                location,
+                position: at,
+                ..
+            } = &mut analysis.evidence[0]
+            {
+                *location = Some("q.sql:2:36".to_string());
+                *at = position;
+            }
+            let mut report = AnalysisReport::new();
+            report.findings.push(finding);
+            to_sarif(&report, &RUN)
+        };
+        let sarif = placed(Some(crate::analyzer::TextPosition {
+            line: 2,
+            column: 36,
+            utf16_column: 37,
+        }));
+        let json = serde_json::to_value(&sarif).unwrap();
+        assert_eq!(json["runs"][0]["columnKind"], "utf16CodeUnits");
+        let region = &json["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(
+            (region["startLine"].as_u64(), region["startColumn"].as_u64()),
+            (Some(2), Some(37))
+        );
+        // Without its position the item's column in UTF-16 units is not known.
+        let unplaced = serde_json::to_value(placed(None)).unwrap();
+        let region =
+            &unplaced["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 2);
+        assert!(region.get("startColumn").is_none(), "{region}");
+        assert_eq!(fingerprint_of(&sarif, 0), fingerprint_of(&placed(None), 0));
+    }
+
     #[test]
     fn fingerprint_present_with_versioned_key_and_ordinal() {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
 
         let sarif = to_sarif(&report, &RUN);
         let fp = fingerprint_of(&sarif, 0);
@@ -930,8 +1296,8 @@ mod tests {
             let mut report = AnalysisReport::new();
             report.source_file_path = Some("models/a.sql".to_string());
             report
-                .signals
-                .push(test_signal("DML-WRITE-UNBOUNDED", line, "DELETE FROM t"));
+                .findings
+                .push(test_finding("DML-WRITE-UNBOUNDED", line, "DELETE FROM t"));
             to_sarif(&report, &RUN)
         };
 
@@ -944,8 +1310,8 @@ mod tests {
             let mut report = AnalysisReport::new();
             report.source_file_path = Some("models/a.sql".to_string());
             report
-                .signals
-                .push(test_signal("DML-WRITE-UNBOUNDED", 10, preview));
+                .findings
+                .push(test_finding("DML-WRITE-UNBOUNDED", 10, preview));
             to_sarif(&report, &RUN)
         };
 
@@ -960,11 +1326,11 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 50, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 50, "DELETE FROM t"));
 
         let sarif = to_sarif(&report, &RUN);
         let a = fingerprint_of(&sarif, 0);
@@ -979,11 +1345,11 @@ mod tests {
         let mut report = AnalysisReport::new();
         report.source_file_path = Some("models/a.sql".to_string());
         report
-            .signals
-            .push(test_signal("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
+            .findings
+            .push(test_finding("DML-WRITE-UNBOUNDED", 10, "DELETE FROM t"));
         report
-            .signals
-            .push(test_signal("GRT-ALL-PRIV", 20, "GRANT ALL ON t TO r"));
+            .findings
+            .push(test_finding("GRT-ALL-PRIV", 20, "GRANT ALL ON t TO r"));
 
         let sarif = to_sarif(&report, &RUN);
         assert_ne!(

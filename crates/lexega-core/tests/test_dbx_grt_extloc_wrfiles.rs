@@ -8,25 +8,25 @@
 /// YAML detail pattern: privilege=WRITE FILES* (glob — trailing wildcard)
 ///
 /// Key edge cases: bare "WRITE" alone must NOT match, multi-privilege split with
-/// READ FILES must trigger both RDFILES and WRFILES, GRANT TO PUBLIC fires dual signal.
+/// READ FILES must trigger both RDFILES and WRFILES, GRANT TO PUBLIC fires dual finding.
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-EXTLOC-WRFILES";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -52,12 +52,12 @@ fn test_risk_level_is_high() {
     let report =
         analyze_risk("GRANT WRITE FILES ON EXTERNAL LOCATION my_location TO data_writers;")
             .expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
     assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
 }
 
@@ -79,7 +79,7 @@ fn test_read_files_does_not_trigger() {
 }
 
 /// Bare "WRITE" on a TABLE is not "WRITE FILES" — must not match glob.
-/// Verified via CLI: "GRANT WRITE ON TABLE t TO r" → 0 DBX-GRT signals.
+/// Verified via CLI: "GRANT WRITE ON TABLE t TO r" → 0 DBX-GRT findings.
 #[test]
 fn test_bare_write_on_table_does_not_trigger() {
     let rules =
@@ -135,7 +135,7 @@ fn test_revoke_does_not_trigger() {
 // ─── Mixed Script ───
 
 #[test]
-fn test_grant_signal_survives_in_mixed_script() {
+fn test_grant_finding_survives_in_mixed_script() {
     let sql = r#"
         CREATE TABLE staging.events (id INT);
         GRANT WRITE FILES ON EXTERNAL LOCATION s3_output TO writers;
@@ -144,7 +144,7 @@ fn test_grant_signal_survives_in_mixed_script() {
     let rules = analyze_and_get_rules(sql);
     assert!(
         rules.contains(RULE_ID),
-        "WRFILES signal must survive mixed DDL — got: {rules:?}"
+        "WRFILES finding must survive mixed DDL — got: {rules:?}"
     );
 }
 
@@ -159,7 +159,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {
@@ -172,7 +172,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     );
 }
 
-// ─── GRANT TO PUBLIC (dual-signal) ───
+// ─── GRANT TO PUBLIC (dual-finding) ───
 
 /// WRITE FILES TO PUBLIC should fire BOTH the privilege rule AND public-grant rule.
 #[test]
@@ -187,10 +187,10 @@ fn test_grant_to_public_fires_both_privilege_and_public_rule() {
     // Public grant is always Critical; WRFILES is High → expect both
     assert!(
         report.summary.critical_count >= 1,
-        "Should have critical signal from PUBLIC grant"
+        "Should have critical finding from PUBLIC grant"
     );
     assert!(
         report.summary.high_count >= 1,
-        "Should have high signal from WRFILES privilege"
+        "Should have high finding from WRFILES privilege"
     );
 }

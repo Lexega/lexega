@@ -23,17 +23,18 @@ fn mssql_cfg() -> AnalysisConfig {
 fn rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, &mssql_cfg()).expect("should analyze");
     report
-        .signals
-        .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+        .entries()
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
 
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");

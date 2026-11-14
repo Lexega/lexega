@@ -15,7 +15,7 @@
 //!   AS → Keyword(As)
 //!   ALL → Keyword(All)
 //!   Type names (int, text, bool, numeric) → Identifier
-//!   $1, $2 → Literal(Position)
+//!   $1, $2 → Literal(Parameter)
 
 use lexega_syntax::{
     format_sql_with_config, parse_sql_with_dialect, verify_formatting_safe, AstStmt,
@@ -25,9 +25,10 @@ use lexega_syntax::{
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) -> String {
@@ -52,7 +53,7 @@ fn parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

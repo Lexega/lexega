@@ -14,8 +14,10 @@ use lexega_core::{
 };
 
 fn check(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::postgres();
+    let config = FormatterConfig {
+        dialect: dialect::postgres(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");

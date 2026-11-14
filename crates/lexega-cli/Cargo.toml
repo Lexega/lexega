@@ -1,9 +1,9 @@
 [package]
 name = "lexega-cli"
 # Released in lockstep with the Lexega engine; the two version numbers match.
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.99"
 description = "Command-line interface for the Lexega SQL governance recognition engine: format, analyze and review SQL before it runs"
 license = "BUSL-1.1"
 repository = "https://github.com/Lexega/lexega"
@@ -18,7 +18,7 @@ name = "lexega"
 path = "src/main.rs"
 
 [dependencies]
-lexega-core = { path = "../lexega-core", version = "2.0.0", features = ["cli"] }
+lexega-core = { path = "../lexega-core", version = "3.0.0", features = ["cli"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"

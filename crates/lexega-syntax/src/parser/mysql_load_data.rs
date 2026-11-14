@@ -10,8 +10,9 @@
 //!
 //! Distinct grammar from BigQuery's `LOAD DATA … FROM FILES(...)`. Recognition
 //! lifts the `LOCAL` modifier (client-side vs server-side file read — the
-//! security-relevant axis), the `INFILE` path, and the `INTO TABLE` target;
-//! the framing clauses (FIELDS / LINES / etc.) are consumed but not modelled.
+//! security-relevant axis), the `INFILE` path, `REPLACE`, and the `INTO TABLE`
+//! target; the framing clauses (FIELDS / LINES / etc.) are consumed but not
+//! modelled.
 //! Dispatched from the `LOAD` arm in `core.rs` when `is_mysql_load_data_at`
 //! sees an `INFILE` marker ahead — otherwise it is BigQuery's LOAD DATA.
 
@@ -121,6 +122,10 @@ impl<'a> Parser<'a> {
         // `INTO TABLE <name>` target. REPLACE/IGNORE, PARTITION, CHARACTER SET,
         // FIELDS/LINES, IGNORE n LINES, (cols), SET … are consumed.
         let mut target_table_span: Option<Span> = None;
+        // `REPLACE` / `IGNORE` is written before `INTO TABLE`.
+        let mut replace_span: Option<Span> = None;
+        // Where the `SET` clause's assignments start: the clause is last.
+        let mut set_from: Option<u32> = None;
         let mut depth: u32 = 0;
         loop {
             let (is_semi, is_eof, is_lparen, is_rparen, is_into) = match self.peek_non_trivia() {
@@ -133,6 +138,14 @@ impl<'a> Parser<'a> {
                     depth == 0 && matches!(t.kind, TokenKind::Keyword(Keyword::Into)),
                 ),
             };
+            if target_table_span.is_none()
+                && depth == 0
+                && self
+                    .peek_non_trivia()
+                    .is_some_and(|t| t.lexeme(self.source).eq_ignore_ascii_case("REPLACE"))
+            {
+                replace_span = self.peek_non_trivia().map(|t| t.span);
+            }
             if is_eof || (is_semi && depth == 0) {
                 break;
             }
@@ -145,6 +158,13 @@ impl<'a> Parser<'a> {
                 .advance()
                 .ok_or_eof(self.current_span(), vec![";".to_string()])?;
             end = tok.span.end;
+            if set_from.is_none()
+                && depth == 0
+                && target_table_span.is_some()
+                && matches!(tok.kind, TokenKind::Keyword(Keyword::Set))
+            {
+                set_from = self.peek_non_trivia().map(|t| t.span.start);
+            }
 
             // INTO TABLE <name> — lift the (optionally qualified) target.
             if is_into
@@ -154,28 +174,10 @@ impl<'a> Parser<'a> {
                     .unwrap_or(false)
             {
                 self.advance(); // TABLE
-                if let Some(mut ts) = self.peek_non_trivia().map(|t| t.span) {
-                    let nt = self
-                        .advance()
-                        .ok_or_eof(self.current_span(), vec!["table name".to_string()])?;
-                    end = nt.span.end;
-                    while self
-                        .peek_non_trivia()
-                        .map(|t| matches!(t.kind, TokenKind::Punctuation(Punctuation::Dot)))
-                        .unwrap_or(false)
-                    {
-                        self.advance(); // dot
-                        if let Some(part) = self.peek_non_trivia() {
-                            let pt_end = part.span.end;
-                            self.advance();
-                            ts = Span {
-                                start: ts.start,
-                                end: pt_end,
-                            };
-                            end = pt_end;
-                        }
-                    }
-                    target_table_span = Some(ts);
+                if let Some(table) = self.take_name_span(crate::parser::core::NamePosition::Object)
+                {
+                    end = table.end;
+                    target_table_span = Some(table);
                 }
             }
         }
@@ -187,7 +189,11 @@ impl<'a> Parser<'a> {
             keyword_span,
             local,
             infile_path_span,
+            replace_span,
             target_table_span,
+            set_span: set_from
+                .filter(|from| *from < end)
+                .map(|from| Span { start: from, end }),
         };
         Ok(AstStmt::MysqlLoadData(Box::new(ast)))
     }

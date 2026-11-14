@@ -272,6 +272,7 @@ pub fn format_alter_projection_policy(
             set_span,
             tag_span,
             assignments_span,
+            ..
         } => {
             if let Some(set_span) = set_span {
                 printer.push_span(*set_span);
@@ -287,6 +288,7 @@ pub fn format_alter_projection_policy(
             unset_span,
             tag_span,
             tags_span,
+            ..
         } => {
             if let Some(unset_span) = unset_span {
                 printer.push_span(*unset_span);

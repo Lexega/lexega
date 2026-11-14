@@ -12,6 +12,7 @@ use super::catalog::CatalogTag;
 use super::catalog::{TaintLabel, ValueExposure};
 use super::expr::Expr;
 use super::identity::{IdentName, ObjectKind, ObjectRef, TableRef};
+use super::key_management::PasswordLiteral;
 use super::literal::{DataType, LiteralValue};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +70,13 @@ pub struct DdlFacts {
     /// Contains body statement kinds (CREATE) and ALTER actions with per-action sub-facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procedure: Option<ProcedureFacts>,
+    /// Present for a T-SQL `CREATE`, `ALTER` or `CREATE OR ALTER TRIGGER`
+    /// (kind `create_trigger` / `alter_trigger`) whose body parsed. Carries
+    /// the trigger body's facts as `procedure.body` carries a procedure's:
+    /// the statement kinds and leaf-statement count of the body and its
+    /// dynamic-SQL call sites; `execute_as_mode` the mode its `WITH EXECUTE AS` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_body: Option<ProcedureBodyFacts>,
     /// Present for CREATE / ALTER / DROP TABLE, TRUNCATE, and DROP ALL ROW ACCESS
     /// POLICIES statements. Contains CREATE-time properties and ALTER actions
     /// (column changes, policy attachments, tags).
@@ -144,9 +152,10 @@ pub struct DdlFacts {
     /// indicated by `ddl.options.cascade`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerFacts>,
-    /// Present for PostgreSQL ALTER TABLE … ENABLE/DISABLE TRIGGER statements.
-    /// Contains the enable or disable action. Distinct from `trigger` (ALTER TRIGGER
-    /// rename/extension actions) because the two SQL forms have different action vocabularies.
+    /// Present for PostgreSQL ALTER TABLE … ENABLE/DISABLE TRIGGER and T-SQL
+    /// ENABLE/DISABLE TRIGGER … ON … statements. Contains the enable or disable
+    /// action. Distinct from `trigger` (ALTER TRIGGER rename/extension actions)
+    /// because the two SQL forms have different action vocabularies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_state: Option<TriggerStateFacts>,
     /// Present for PostgreSQL SET and RESET session configuration statements.
@@ -517,6 +526,14 @@ pub struct BqLiteralValue {
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_scheme: Option<CloudVendor>,
+    /// The password of each URL the literal writes with user information
+    /// (`mysql://user:password@host/db`),
+    /// decoded. Empty when it writes none, or when the engine rendered the
+    /// password from a template or substituted it for a deploy variable.
+    /// Masked in every report; a custom rule message that interpolates it
+    /// shows it unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_password_literals: Vec<PasswordLiteral>,
 }
 
 /// Cloud provider classification derived from URI scheme or credential type.
@@ -645,11 +662,20 @@ pub struct MssqlPrincipalFacts {
 pub struct PrincipalFacts {
     /// Which kind of principal this statement targets.
     pub kind: PrincipalKindFacts,
-    /// Inner content of a `PASSWORD = '<lit>'` / `IDENTIFIED BY '<lit>'`
+    /// Inner content of a `PASSWORD = '<lit>'` / `IDENTIFIED [WITH plugin] BY '<lit>'`
     /// clause (no surrounding quotes). Omitted when no password clause
     /// is present. Masked in the facts copies attached to reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_literal: Option<String>,
+    /// The statement writes a clause that sets the password — Snowflake
+    /// `PASSWORD = …`, T-SQL `WITH PASSWORD = …`, PostgreSQL and Redshift
+    /// `[ENCRYPTED] PASSWORD '…'`, MySQL `IDENTIFIED [WITH plugin] BY '…'`
+    /// or `IDENTIFIED BY RANDOM PASSWORD` — whatever the value is (a
+    /// literal, a reference, a dummy). `PASSWORD NULL`, `PASSWORD POLICY`,
+    /// `UNSET PASSWORD` and MySQL `IDENTIFIED WITH plugin [AS 'hash']` do
+    /// not set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub password_set: bool,
     /// MySQL `'user'@'host'` host literal (no surrounding quotes).
     /// Omitted for non-MySQL or unqualified forms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -745,6 +771,11 @@ pub struct SnowflakeUserFacts {
     /// `NETWORK_POLICY = <name>` — the network policy bound to the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_policy: Option<IdentName>,
+    /// `UNSET NETWORK_POLICY` — the user's network policy is removed, so
+    /// the account's policy (if any) is all that restricts the user's
+    /// source addresses.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub network_policy_unset: bool,
 }
 
 /// Snowflake `DEFAULT_SECONDARY_ROLES` scope: `('ALL')` activates every
@@ -899,6 +930,9 @@ pub struct SecurityObjectFacts {
 pub enum SecurityObjectKind {
     /// `MASTER KEY` — the database master key.
     MasterKey,
+    /// `DATABASE ENCRYPTION KEY` — the key of the database's transparent
+    /// data encryption.
+    DatabaseEncryptionKey,
     /// `SYMMETRIC KEY <name>`.
     SymmetricKey,
     /// `ASYMMETRIC KEY <name>`.
@@ -966,7 +1000,7 @@ pub struct MssqlExecFacts {
     /// Retained for coarse text matching; structural predicates should
     /// prefer the typed [`Self::args`] list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub args_text: Option<String>,
+    pub args_text: Option<super::identity::WrittenText>,
     /// Typed projection of the call arguments, in source order. Each
     /// entry carries the (optional) named-parameter name and the shape
     /// of the value, so rules can predicate structurally on "argument
@@ -980,7 +1014,7 @@ pub struct MssqlExecFacts {
 /// One argument of an `EXEC <proc> …` call, typed for structural
 /// predicate matching. Dialect-neutral recognition: the name and value
 /// shape are recorded; which names/values are dangerous is rule policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct MssqlExecArgFacts {
@@ -989,12 +1023,50 @@ pub struct MssqlExecArgFacts {
     /// argument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Zero-based position of the argument in the call's argument list,
+    /// named arguments included.
+    pub position: u32,
     /// Shape of the argument value.
     pub value_kind: MssqlExecArgValueKind,
     /// For a string-literal value, its decoded inner text lowercased
     /// (`cmdexec` from `N'CmdExec'`); `None` for non-string values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_literal: Option<String>,
+    pub value_literal: Option<super::identity::WrittenText>,
+    /// For an integer-literal value (`1` in `@configvalue = 1`), the
+    /// number; `None` for any other value, including decimals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_number: Option<i64>,
+    /// Where the source writes the value.
+    #[serde(skip)]
+    pub(crate) value_origin: super::identity::TextOrigin,
+}
+
+/// An argument as it serializes: its number left out where a report prints
+/// it and the source's text of the value is masked
+/// (`super::secrets::masked_in_print`).
+impl Serialize for MssqlExecArgFacts {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let number = self
+            .value_number
+            .filter(|_| !self.value_origin.masked_in_print());
+        let mut out = serializer.serialize_struct("MssqlExecArgFacts", 5)?;
+        match &self.name {
+            Some(name) => out.serialize_field("name", name)?,
+            None => out.skip_field("name")?,
+        }
+        out.serialize_field("position", &self.position)?;
+        out.serialize_field("value_kind", &self.value_kind)?;
+        match &self.value_literal {
+            Some(literal) => out.serialize_field("value_literal", literal)?,
+            None => out.skip_field("value_literal")?,
+        }
+        match number {
+            Some(number) => out.serialize_field("value_number", &number)?,
+            None => out.skip_field("value_number")?,
+        }
+        out.end()
+    }
 }
 
 /// Shape of an `EXEC` argument value.
@@ -1058,6 +1130,14 @@ pub struct StorageCredentialFacts {
     /// in the metadata comment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// The password of each URL the comment writes with user information
+    /// (`https://user:password@host`),
+    /// decoded. Empty when it writes none, or when the engine rendered the
+    /// password from a template or substituted it for a deploy variable.
+    /// Masked in every report; a custom rule message that interpolates it
+    /// shows it unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comment_url_password_literals: Vec<PasswordLiteral>,
 }
 
 /// Actions an `ALTER STORAGE CREDENTIAL` statement can apply.
@@ -1105,6 +1185,14 @@ pub enum StorageCredentialKindFacts {
 pub struct StorageCredentialProviderFacts {
     pub variant: StorageCredentialProviderVariantFacts,
     pub all_literal_values: Vec<StorageCredentialLiteral>,
+    /// The password of each URL a literal of the provider clause writes
+    /// with user information (`https://user:password@host`),
+    /// decoded. Empty when it writes none, or when the engine rendered the
+    /// password from a template or substituted it for a deploy variable.
+    /// Masked in every report; a custom rule message that interpolates it
+    /// shows it unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_password_literals: Vec<PasswordLiteral>,
 }
 
 /// One literal value from a credential provider clause.
@@ -1204,7 +1292,15 @@ pub struct StageDdlFacts {
     /// or `SET URL='…'` (ALTER). Omitted when the URL clause / SET
     /// URL action is absent or the value is not a string literal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url_literal: Option<String>,
+    pub url_literal: Option<super::identity::WrittenText>,
+    /// The password of the URL [`Self::url_literal`] writes with user
+    /// information (`s3://user:password@bucket/path`),
+    /// decoded. Empty when it writes none, or when the engine rendered the
+    /// password from a template or substituted it for a deploy variable.
+    /// Masked in every report; a custom rule message that interpolates it
+    /// shows it unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_password_literals: Vec<PasswordLiteral>,
     /// True when the statement sets `ENCRYPTION = (TYPE = 'NONE')`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub encryption_disabled: bool,
@@ -1220,7 +1316,8 @@ pub struct StageDdlFacts {
     /// True when an `ALTER STAGE … SET STORAGE_INTEGRATION = …` action is present.
     #[serde(default, skip_serializing_if = "is_false")]
     pub set_storage_integration: bool,
-    /// True for `COPY INTO <location> FROM <source>` whose source has no WHERE clause.
+    /// True for `COPY INTO <location> FROM <source>` whose source has no WHERE clause,
+    /// and for a Redshift `UNLOAD` whose query reads a table with no WHERE clause.
     /// Always `false` for CREATE / ALTER / DROP STAGE.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unbounded_export: bool,
@@ -1231,7 +1328,7 @@ pub struct StageDdlFacts {
     /// COPY INTO statement (either direction). Empty when none are present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub copy_options: Vec<CopyOption>,
-    /// For `COPY INTO <location>` (unload), the columns the source projects
+    /// For `COPY INTO <location>` and Redshift `UNLOAD` (unload), the columns the source projects
     /// out of the warehouse, each with its classification and value exposure.
     /// Lets a rule flag classified data leaving the warehouse. Empty for
     /// loads and for CREATE / ALTER / DROP STAGE.
@@ -2017,6 +2114,12 @@ pub struct SchemaFacts {
     /// How the schema was created (standard / clone). Absent for ALTER / DROP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_origin: Option<SchemaCreateOrigin>,
+    /// For DROP: the drop removes the objects the schema holds, by
+    /// `CASCADE` or by the dialect's default (Snowflake; MySQL, where a
+    /// schema is a database). False where the drop is refused while the
+    /// schema holds any object (`RESTRICT`, written or the default).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drops_contents: bool,
 }
 
 /// How a schema was created.
@@ -2127,7 +2230,8 @@ pub enum TriggerAlterAction {
     Other,
 }
 
-/// PostgreSQL ALTER TABLE … ENABLE/DISABLE TRIGGER statement properties.
+/// ENABLE/DISABLE TRIGGER statement properties: PostgreSQL ALTER TABLE …
+/// ENABLE/DISABLE TRIGGER and T-SQL ENABLE/DISABLE TRIGGER … ON ….
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -2135,14 +2239,15 @@ pub struct TriggerStateFacts {
     pub action: TriggerStateAction,
 }
 
-/// The trigger enable/disable action from ALTER TABLE … TRIGGER.
+/// The trigger enable/disable action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerStateAction {
-    /// `ALTER TABLE … DISABLE TRIGGER …`.
+    /// `ALTER TABLE … DISABLE TRIGGER …` or T-SQL `DISABLE TRIGGER … ON …`.
     Disable,
-    /// `ALTER TABLE … ENABLE [ALWAYS | REPLICA] TRIGGER …`.
+    /// `ALTER TABLE … ENABLE [ALWAYS | REPLICA] TRIGGER …` or T-SQL
+    /// `ENABLE TRIGGER … ON …`.
     Enable,
 }
 
@@ -2369,7 +2474,7 @@ pub enum ConnectionAlterAction {
 /// Registers a federated endpoint — a Hadoop cluster, an Azure blob /
 /// object store, a remote relational database, or a sharded database. The
 /// raw location string is intentionally not surfaced: PolyBase connection
-/// strings can embed credentials. The governance signal — an offsite
+/// strings can embed credentials. The governance concern — an offsite
 /// endpoint, possibly with a persisted credential — is captured by the
 /// scheme, type, and credential fields.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -2583,6 +2688,92 @@ pub struct ViewFacts {
     /// (PostgreSQL `WITH (check_option = ...)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_option: Option<ViewCheckOption>,
+    /// Snowflake `CREATE SECURE [MATERIALIZED] VIEW`: the view's definition
+    /// is shown only to its owner, and the optimizer keeps a query's
+    /// functions from seeing rows the view's filters hide.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub secure: bool,
+    /// `ALTER [MATERIALIZED] VIEW … ADD ROW ACCESS POLICY …`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub row_access_policy_added: bool,
+    /// `ALTER [MATERIALIZED] VIEW … DROP ROW ACCESS POLICY …` or
+    /// `… DROP ALL ROW ACCESS POLICIES`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub row_access_policy_removed: bool,
+    /// `ALTER [MATERIALIZED] VIEW … DROP ALL ROW ACCESS POLICIES`: every row access policy
+    /// on the view is detached (also sets `row_access_policy_removed`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drop_all_row_access_policies: bool,
+    /// `ALTER [MATERIALIZED] VIEW … ALTER COLUMN … SET MASKING POLICY …` or
+    /// `… SET PROJECTION POLICY …`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub masking_policy_added: bool,
+    /// `ALTER [MATERIALIZED] VIEW … ALTER COLUMN … UNSET MASKING POLICY` or
+    /// `… UNSET PROJECTION POLICY`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub masking_policy_removed: bool,
+    /// `ALTER VIEW … UNSET AGGREGATION POLICY` or
+    /// `ALTER VIEW … UNSET JOIN POLICY`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub aggregation_policy_removed: bool,
+    /// The action an `ALTER [MATERIALIZED] VIEW` performs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ViewAlterActionKind>,
+}
+
+/// The action an `ALTER VIEW` or `ALTER MATERIALIZED VIEW` statement
+/// performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", schemars(rename = "ViewAlterActionType"))]
+pub enum ViewAlterActionKind {
+    /// `SET OPTIONS (…)` (BigQuery) or `SET (…)` (PostgreSQL).
+    SetOptions,
+    /// BigQuery `ALTER COLUMN <col> SET OPTIONS (…)`.
+    SetColumnOptions,
+    /// `RENAME TO <new_name>`.
+    Rename,
+    /// `RENAME [COLUMN] <old> TO <new>`.
+    RenameColumn,
+    /// `SET SECURE`.
+    SetSecure,
+    /// `UNSET SECURE`.
+    UnsetSecure,
+    /// `SET COMMENT = …`.
+    SetComment,
+    /// `UNSET COMMENT`.
+    UnsetComment,
+    /// `SET CHANGE_TRACKING = …`.
+    SetChangeTracking,
+    /// `SET TAG …`.
+    SetTag,
+    /// `UNSET TAG …`.
+    UnsetTag,
+    /// `ADD ROW ACCESS POLICY …`.
+    AddRowAccessPolicy,
+    /// `DROP ROW ACCESS POLICY …`.
+    DropRowAccessPolicy,
+    /// `DROP ALL ROW ACCESS POLICIES`.
+    DropAllRowAccessPolicies,
+    /// `SET AGGREGATION POLICY …`.
+    SetAggregationPolicy,
+    /// `UNSET AGGREGATION POLICY`.
+    UnsetAggregationPolicy,
+    /// `SET JOIN POLICY …`.
+    SetJoinPolicy,
+    /// `UNSET JOIN POLICY`.
+    UnsetJoinPolicy,
+    /// A masking or projection policy or a tag set or unset on a column,
+    /// or a masking or projection policy on the view.
+    AlterColumn,
+    /// `ADD [COLUMN] …`.
+    AddColumn,
+    /// A data metric function or its schedule added, dropped, set or
+    /// unset.
+    DataMetricFunction,
+    /// An action not read (a new definition of the view among them).
+    Unknown,
 }
 
 /// Timing of a trigger relative to the row change.
@@ -2760,12 +2951,18 @@ pub struct FlowFacts {}
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct FunctionFacts {
-    /// Function body facts. Present only for CREATE FUNCTION with a parseable body.
+    /// Function body facts. Present only for a statement that defines the
+    /// body (CREATE FUNCTION, or a T-SQL ALTER FUNCTION restating it, kind
+    /// `alter_function`) with a parseable body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<FunctionBodyFacts>,
     /// ALTER actions in source order. Empty for CREATE.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<FunctionAlterAction>,
+    /// MySQL `SONAME 'lib'`: the shared library a loadable function is read
+    /// from. Such a function runs native code inside the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loadable_library: Option<String>,
     /// MySQL `DEFINER =` security context declared on `CREATE FUNCTION`.
     /// The body executes under this account's privileges regardless of
     /// the invoker. `None` when absent (`CURRENT_USER` / no clause).
@@ -2889,7 +3086,9 @@ pub enum FunctionPropertyKey {
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct ProcedureFacts {
-    /// Procedure body facts. Present only for CREATE PROCEDURE with a parseable body.
+    /// Procedure body facts. Present only for a statement that defines the
+    /// body (CREATE PROCEDURE, or a T-SQL ALTER PROCEDURE restating it, kind
+    /// `alter_procedure`) with a parseable body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<ProcedureBodyFacts>,
     /// ALTER actions in source order. Empty for CREATE / DROP.
@@ -2900,14 +3099,21 @@ pub struct ProcedureFacts {
     /// the invoker. `None` when absent (`CURRENT_USER` / no clause).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definer: Option<DefinerFacts>,
+    /// For a statement that defines the procedure: the rights it runs
+    /// with, the `EXECUTE AS` it names or else the dialect's default
+    /// (Snowflake runs a procedure as its owner). Omitted where neither
+    /// says, and for any other statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_as: Option<ProcedureExecuteAsMode>,
 }
 
-/// CREATE PROCEDURE body properties.
+/// Properties of a body: a procedure's (`ddl.procedure.body`) or a T-SQL
+/// trigger's (`ddl.trigger_body`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct ProcedureBodyFacts {
-    /// SQL statement kinds present anywhere in the procedure body.
+    /// SQL statement kinds present anywhere in the body.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statement_kinds: Vec<ProcedureBodyStatementKind>,
     /// Total count of leaf statements anywhere in the body,
@@ -2915,15 +3121,14 @@ pub struct ProcedureBodyFacts {
     /// `REPEAT` / `CASE` / `TRY-CATCH`.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub statements_count: usize,
-    /// Dynamic-SQL call sites in the procedure body. See
-    /// `DynamicSqlCall` for the per-call axes; same shape as
-    /// `function.body.dynamic_sql_calls`.
+    /// Dynamic-SQL call sites in the body. See `DynamicSqlCall` for the
+    /// per-call axes; same shape as `function.body.dynamic_sql_calls`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dynamic_sql_calls: Vec<DynamicSqlCall>,
     /// `EXECUTE AS { OWNER | CALLER | RESTRICTED CALLER }` clause
-    /// declared on the `CREATE PROCEDURE` statement (e.g. T-SQL
+    /// declared on the statement defining a procedure (e.g. T-SQL
     /// `WITH EXECUTE AS OWNER`, Snowflake `EXECUTE AS CALLER`). `None`
-    /// when the clause is absent.
+    /// when the clause is absent, and for a trigger's body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execute_as_mode: Option<ProcedureExecuteAsMode>,
 }
@@ -2938,6 +3143,14 @@ pub struct DynamicSqlCall {
     pub surface: DynamicSqlSurface,
     pub argument: DynamicSqlArg,
     pub parameterization: DynamicSqlParameterization,
+    /// The parameter of the procedure or function whose body makes the
+    /// call, where the argument is that parameter written alone (`EXEC
+    /// (@sql)`, `EXECUTE IMMEDIATE :q`, PL/pgSQL `EXECUTE q`, MySQL
+    /// `PREPARE s FROM p_sql`), or a variable holding a copy of it (`SET
+    /// @s = @sql; EXEC (@s)`): the routine runs the text its caller
+    /// passes. Absent for any other argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_parameter: Option<IdentName>,
     /// Inter-procedural taint provenance chain — empty for direct
     /// intra-procedural findings, populated when this call is the
     /// witness location for a finding whose dynamic-SQL sink lives
@@ -3037,7 +3250,9 @@ pub enum DynamicSqlSurface {
     MssqlSpExecutesql,
     /// PostgreSQL/MySQL `PREPARE`.
     Prepare,
-    /// PostgreSQL `dblink_exec(connstr, sql)` cross-server invocation.
+    /// A function that sends SQL text to another server to run: PostgreSQL's
+    /// `dblink_exec(connstr, sql)` and dblink's other functions, T-SQL's
+    /// `OPENQUERY` and `OPENROWSET`.
     DblinkExec,
     /// T-SQL `EXEC <named_proc> args` resolved to a procedure whose
     /// body contains a dynamic-SQL sink; the inter-procedural
@@ -3047,6 +3262,9 @@ pub enum DynamicSqlSurface {
     /// Dialect-neutral counterpart for `CALL <proc>(args)` —
     /// Snowflake, BigQuery, PostgreSQL, MySQL, Databricks.
     CallProcCall,
+    /// psql's `\gexec`: each value the query before it returns runs as a
+    /// statement, text the script does not hold.
+    PsqlGexec,
 }
 
 /// Structural shape of the SQL-being-executed argument.
@@ -3102,7 +3320,7 @@ pub enum DynamicSqlParameterization {
     NotApplicable,
 }
 
-/// SQL statement kinds recognized within a procedure body.
+/// SQL statement kinds recognized within a procedure or trigger body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -3293,6 +3511,13 @@ pub struct TableFacts {
     /// `CREATE OR REPLACE TABLE`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub or_replace: bool,
+    /// The table the statement names is a temporary table, which the
+    /// session that made it holds: one it creates `TEMP` / `TEMPORARY`, one
+    /// written as a temporary table's name (T-SQL `#t`, `##t`), or one an
+    /// earlier statement of the script created temporary and that is still
+    /// there. `ddl.options.temporary` is the `TEMPORARY` keyword alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub temporary: bool,
     /// `ALTER TABLE … ADD COLUMN …` action present.
     #[serde(default, skip_serializing_if = "is_false")]
     pub column_added: bool,
@@ -4083,7 +4308,9 @@ pub enum DdlAction {
 #[serde(rename_all = "snake_case")]
 pub struct DdlOptions {
     pub or_replace: bool,
-    /// T-SQL `CREATE OR ALTER TRIGGER`.
+    /// `CREATE OR ALTER`: a T-SQL procedure or function (kind
+    /// `create_procedure` / `create_function`), a Snowflake task or dynamic
+    /// table.
     pub or_alter: bool,
     pub if_exists: bool,
     pub if_not_exists: bool,

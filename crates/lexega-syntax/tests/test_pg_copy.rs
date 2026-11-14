@@ -21,16 +21,19 @@
 //!   ON_ERROR/ENCODING/LOG_VERBOSITY/REJECT_LIMIT → single Identifier tokens
 
 use lexega_syntax::{
-    format_sql_with_config, parse_sql_with_dialect, verify_formatting_safe, AstStmt,
-    FormatterConfig, PostgresDialect,
+    dialect_from_name, format_sql_with_config, parse_sql_with_dialect, verify_formatting_safe,
+    verify_formatting_safe_with_dialect, AstStmt, BigQueryDialect, DatabricksDialect, Dialect,
+    FormatterConfig, MsSqlDialect, MySqlDialect, PostgresDialect, RedshiftDialect,
+    SnowflakeDialect,
 };
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn pg_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = std::sync::Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: std::sync::Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) -> String {
@@ -55,7 +58,7 @@ fn parses_as(sql: &str, check: fn(&AstStmt) -> bool) -> bool {
             sql
         );
     }
-    script.stmts.iter().any(|s| check(s))
+    script.stmts.iter().any(check)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -568,4 +571,175 @@ fn test_copy_legacy_options_then_where() {
     let sql = "COPY t FROM '/f' WITH csv header WHERE id > 0";
     assert!(parses_as(sql, |s| matches!(s, AstStmt::PgCopy(_))));
     format_and_verify(sql);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The rows a COPY … FROM STDIN reads, written after it
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A `pg_dump` body: three tables' rows, each block holding text no SQL
+/// reader could read (quotes, comment openers, a dollar quote, a `;`).
+const DUMP: &str = "BEGIN;\n\
+COPY public.accounts (id, name) FROM stdin;\n\
+1\tO'Brien /* not a comment\n\
+\\.\n\
+\n\
+COPY public.users (id, email, pw) FROM stdin;  -- data follows\n\
+1\talice@example.com\t$$x -- y\n\
+2\tbob@example.com\tDROP TABLE t; '\n\
+\\.\n\
+\n\
+copy public.keys (id, k) from STDIN with (format csv);\n\
+1,\"a, b\"\n\
+\\.\n\
+SELECT 1;\n\
+COMMIT;\n";
+
+const DUMP_BLOCKS: [&str; 3] = [
+    "1\tO'Brien /* not a comment\n\\.",
+    "1\talice@example.com\t$$x -- y\n2\tbob@example.com\tDROP TABLE t; '\n\\.",
+    "1,\"a, b\"\n\\.",
+];
+
+/// Each `COPY` of `sql` read under `dialect`: its text and the rows it reads.
+fn copies_with_rows(sql: &str, dialect: &dyn Dialect) -> Vec<(String, String)> {
+    let script = parse_sql_with_dialect(sql, dialect).expect("should parse");
+    script
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            AstStmt::PgCopy(copy) => {
+                let head = &sql[copy.span.start as usize..copy.span.end as usize];
+                let rows = copy
+                    .data_span
+                    .map(|span| sql[span.start as usize..span.end as usize].to_string())
+                    .unwrap_or_default();
+                Some((head.to_string(), rows))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn format_under(sql: &str, dialect: &dyn Dialect) -> String {
+    let config = FormatterConfig {
+        dialect: dialect_from_name(dialect.name()).expect("dialect"),
+        ..Default::default()
+    };
+    let formatted = format_sql_with_config(sql, &config).expect("should format");
+    verify_formatting_safe_with_dialect(sql, &formatted, dialect)
+        .unwrap_or_else(|e| panic!("{}: {e}\n{formatted}", dialect.name()));
+    formatted
+}
+
+#[test]
+fn test_copy_from_stdin_reads_each_block_of_rows_in_every_dialect() {
+    let dialects: [&dyn Dialect; 7] = [
+        &SnowflakeDialect,
+        &PostgresDialect,
+        &RedshiftDialect,
+        &DatabricksDialect,
+        &MySqlDialect,
+        &MsSqlDialect,
+        &BigQueryDialect,
+    ];
+    let heads = [
+        "COPY public.accounts (id, name) FROM stdin",
+        "COPY public.users (id, email, pw) FROM stdin",
+        "copy public.keys (id, k) from STDIN with (format csv)",
+    ];
+    let expected: Vec<(String, String)> = heads
+        .iter()
+        .zip(DUMP_BLOCKS)
+        .map(|(head, rows)| (head.to_string(), rows.to_string()))
+        .collect();
+    for dialect in dialects {
+        assert_eq!(
+            copies_with_rows(DUMP, dialect),
+            expected,
+            "{}",
+            dialect.name()
+        );
+        let script = parse_sql_with_dialect(DUMP, dialect).expect("should parse");
+        assert!(
+            script
+                .stmts
+                .iter()
+                .all(|stmt| !matches!(stmt, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. })),
+            "{}: {:?}",
+            dialect.name(),
+            script.stmts
+        );
+        let formatted = format_under(DUMP, dialect);
+        for block in DUMP_BLOCKS {
+            assert!(
+                formatted.contains(&format!("\n{block}\n")),
+                "{}: {formatted}",
+                dialect.name()
+            );
+        }
+        assert_eq!(
+            copies_with_rows(&formatted, dialect),
+            expected
+                .iter()
+                .map(|(head, rows)| (
+                    head.replace("copy", "COPY").replace("from", "FROM"),
+                    rows.clone()
+                ))
+                .collect::<Vec<_>>(),
+            "{}: {formatted}",
+            dialect.name()
+        );
+    }
+}
+
+#[test]
+fn test_copy_rows_run_to_the_end_without_their_terminator() {
+    let sql = "COPY t (a) FROM stdin;\r\n1\tx'\r\n2\ty\r\n";
+    assert_eq!(
+        copies_with_rows(sql, &PostgresDialect),
+        vec![(
+            "COPY t (a) FROM stdin".to_string(),
+            "1\tx'\r\n2\ty\r\n".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_psql_copy_command_reads_its_line_and_its_rows() {
+    let sql = "\\copy public.users (id, pw) FROM stdin\n1\tit's\n\\.\nSELECT 4;\n";
+    for dialect in [&PostgresDialect as &dyn Dialect, &SnowflakeDialect] {
+        assert_eq!(
+            copies_with_rows(sql, dialect),
+            vec![(
+                "\\copy public.users (id, pw) FROM stdin".to_string(),
+                "1\tit's\n\\.".to_string()
+            )],
+            "{}",
+            dialect.name()
+        );
+        let script = parse_sql_with_dialect(sql, dialect).expect("should parse");
+        assert_eq!(
+            script.stmts.len(),
+            2,
+            "{}: {:?}",
+            dialect.name(),
+            script.stmts
+        );
+        let formatted = format_under(sql, dialect);
+        assert!(
+            formatted.starts_with("\\copy public.users (id, pw) FROM stdin\n1\tit's\n\\.\n"),
+            "{}: {formatted}",
+            dialect.name()
+        );
+    }
+}
+
+#[test]
+fn test_copy_from_a_file_reads_no_rows_after_it() {
+    let sql = "COPY t FROM '/f';\nSELECT 'x';\n";
+    assert_eq!(
+        copies_with_rows(sql, &PostgresDialect),
+        vec![("COPY t FROM '/f'".to_string(), String::new())]
+    );
 }

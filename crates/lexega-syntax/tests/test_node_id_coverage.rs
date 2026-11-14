@@ -193,35 +193,26 @@ impl NodeIdCollector {
                             self.collect_node_id(jinja_block.node_id, "JinjaBlock");
                             // Recursively visit items inside Jinja block
                             for inner_item in &jinja_block.then_items {
-                                match &inner_item.kind {
-                                    ProjectionItemKind::SelectItem(si) => {
-                                        self.collect_node_id(si.node_id, "AstSelectItem");
-                                        self.visit_expr(&si.expr);
-                                    }
-                                    _ => {}
+                                if let ProjectionItemKind::SelectItem(si) = &inner_item.kind {
+                                    self.collect_node_id(si.node_id, "AstSelectItem");
+                                    self.visit_expr(&si.expr);
                                 }
                             }
                             // Visit elif branches
                             for elif_branch in &jinja_block.elif_branches {
                                 for inner_item in &elif_branch.items {
-                                    match &inner_item.kind {
-                                        ProjectionItemKind::SelectItem(si) => {
-                                            self.collect_node_id(si.node_id, "AstSelectItem");
-                                            self.visit_expr(&si.expr);
-                                        }
-                                        _ => {}
+                                    if let ProjectionItemKind::SelectItem(si) = &inner_item.kind {
+                                        self.collect_node_id(si.node_id, "AstSelectItem");
+                                        self.visit_expr(&si.expr);
                                     }
                                 }
                             }
                             // Visit else branch
                             if let Some(else_branch) = &jinja_block.else_branch {
                                 for inner_item in &else_branch.items {
-                                    match &inner_item.kind {
-                                        ProjectionItemKind::SelectItem(si) => {
-                                            self.collect_node_id(si.node_id, "AstSelectItem");
-                                            self.visit_expr(&si.expr);
-                                        }
-                                        _ => {}
+                                    if let ProjectionItemKind::SelectItem(si) = &inner_item.kind {
+                                        self.collect_node_id(si.node_id, "AstSelectItem");
+                                        self.visit_expr(&si.expr);
                                     }
                                 }
                             }
@@ -266,9 +257,12 @@ impl NodeIdCollector {
                         self.push_context(&format!("GroupByElement[{}]", ei));
                         self.collect_node_id(element.node_id, "AstGroupElement");
                         let item_lists: Vec<&Vec<AstGroupItem>> = match &element.kind {
-                            AstGroupElementKind::Cube(items)
-                            | AstGroupElementKind::Rollup(items) => vec![items],
-                            AstGroupElementKind::GroupingSets(sets) => sets.iter().collect(),
+                            AstGroupElementKind::Cube { items, .. }
+                            | AstGroupElementKind::Rollup { items, .. } => vec![items],
+                            AstGroupElementKind::GroupingSets { sets, .. } => {
+                                sets.iter().map(|set| &set.items).collect()
+                            }
+                            AstGroupElementKind::EmptySet => Vec::new(),
                             AstGroupElementKind::Expr(item) => {
                                 self.collect_node_id(item.node_id, "AstGroupItem");
                                 self.visit_expr(&item.expr);
@@ -327,13 +321,10 @@ impl NodeIdCollector {
             self.push_context(&format!("Join[{}]", i));
             self.collect_node_id(join.node_id, "AstJoin");
             self.visit_table_ref(&join.right);
-            match &join.constraint {
-                AstJoinConstraint::On(expr) => {
-                    self.push_context("JoinOn");
-                    self.visit_expr(expr);
-                    self.pop_context();
-                }
-                _ => {}
+            if let AstJoinConstraint::On(expr) = &join.constraint {
+                self.push_context("JoinOn");
+                self.visit_expr(expr);
+                self.pop_context();
             }
             self.pop_context();
         }
@@ -365,6 +356,28 @@ impl NodeIdCollector {
                         AstFunctionArg::Lambda { body, .. } => self.visit_expr(body),
                         AstFunctionArg::AliasedArg { value, .. } => self.visit_expr(value),
                         AstFunctionArg::BulkArg { value, .. } => self.visit_expr(value),
+                        AstFunctionArg::Introduced { value, .. } => match value {
+                            lexega_syntax::ast::AstIntroducedValue::Expr(expr) => {
+                                self.visit_expr(expr)
+                            }
+                            lexega_syntax::ast::AstIntroducedValue::DataType { .. }
+                            | lexega_syntax::ast::AstIntroducedValue::Name(_) => {}
+                        },
+                        AstFunctionArg::Unparsed { .. }
+                        | AstFunctionArg::DataType { .. }
+                        | AstFunctionArg::NonValue { .. } => {}
+                        AstFunctionArg::Table {
+                            partition_by,
+                            order_by,
+                            ..
+                        } => {
+                            for expr in partition_by {
+                                self.visit_expr(expr);
+                            }
+                            for item in order_by {
+                                self.visit_expr(&item.expr);
+                            }
+                        }
                     }
                     self.pop_context();
                 }
@@ -605,5 +618,5 @@ fn test_node_id_non_zero() {
 
     // The collect_node_id function will panic if it finds a zero ID
     // If we reach here, all IDs are non-zero
-    assert!(collector.node_ids.len() > 0);
+    assert!(!collector.node_ids.is_empty());
 }

@@ -39,71 +39,40 @@
 
 use crate::ast::{
     AstAlterWarehouse, AstAlterWarehouseAction, AstAlterWarehouseActionKind, AstCreateWarehouse,
-    AstDropWarehouse, AstStmt, AstUnknownClause, UnknownKind,
+    AstDropWarehouse, AstStmt, AstTagRef, AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::parser::core::{parse_property_clause, Parser};
+use crate::parser::tag::TagListShape;
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
 
-/// Parse KEY = VALUE property clause, return span covering the full clause.
-/// Handles parenthesized values like RESOURCE_MONITOR = (...).
-fn parse_property_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
-    let key_tok = p
-        .advance()
-        .ok_or_eof(p.current_span(), vec!["property".to_string()])?;
-    let start = key_tok.span.start;
-    let mut end = key_tok.span.end;
-
-    // Expect =
-    if let Some(tok) = p.peek_non_trivia() {
-        if matches!(tok.kind, TokenKind::Operator(Operator::Eq)) {
-            let eq = p.advance().expect_invariant("= consumed after match");
-            end = eq.span.end;
-
-            // Value: string, identifier, number, boolean, or parenthesized
-            if let Some(val) = p.peek_non_trivia() {
-                if matches!(val.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                    p.advance(); // consume LParen
-                    end = skip_to_matching_paren(p)?;
-                } else {
-                    let v = p
-                        .advance()
-                        .expect_invariant("value consumed after = in property");
-                    end = v.span.end;
-                }
-            }
-        }
-    }
-
-    Ok(Span { start, end })
-}
-
 /// Parse TAG (key = 'value', ...) clause including the TAG keyword.
 /// Returns span covering the full TAG (...) construct.
-fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<Span> {
+fn parse_tag_clause(p: &mut Parser<'_>) -> ParseResult<(Span, Vec<AstTagRef>)> {
     let tag_tok = p
         .advance()
         .ok_or_eof(p.current_span(), vec!["TAG".to_string()])?;
     let start = tag_tok.span.start;
     let mut end = tag_tok.span.end;
+    let mut tags = Vec::new();
 
     // Expect parenthesized list
     if let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-            p.advance(); // LParen
-            end = skip_to_matching_paren(p)?;
+            (end, tags) = p.parse_tag_assignments_in_parens()?;
         }
     }
 
-    Ok(Span { start, end })
+    Ok((Span { start, end }, tags))
 }
 
 /// Skip to matching closing paren, return end position of RParen.
 fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
+    let from = p.idx;
     let mut depth = 1;
     while let Some(tok) = p.advance() {
         match tok.kind {
@@ -111,7 +80,11 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
             TokenKind::Punctuation(Punctuation::RParen) => {
                 depth -= 1;
                 if depth == 0 {
-                    return Ok(tok.span.end);
+                    let end = tok.span.end;
+                    // The text is not read: its secrets are recorded as
+                    // unparsed text's are.
+                    p.record_unparsed_secrets(from, p.idx);
+                    return Ok(end);
                 }
             }
             _ => {}
@@ -127,6 +100,7 @@ fn skip_to_matching_paren(p: &mut Parser<'_>) -> ParseResult<u32> {
 
 /// Skip to statement end (semicolon or EOF), return end position.
 fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
+    let from = p.idx;
     let mut end = p.current_span().end;
     while let Some(tok) = p.peek_non_trivia() {
         if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
@@ -143,6 +117,8 @@ fn skip_to_statement_end(p: &mut Parser<'_>) -> u32 {
             }
         }
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     end
 }
 
@@ -259,6 +235,7 @@ pub(crate) fn try_parse_create_warehouse(p: &mut Parser<'_>) -> ParseResult<AstS
     let mut max_cluster_count_span: Option<Span> = None;
     let mut scaling_policy_span: Option<Span> = None;
     let mut tag_span: Option<Span> = None;
+    let mut tags: Vec<AstTagRef> = Vec::new();
     let mut extras: Vec<AstUnknownClause> = Vec::new();
 
     while let Some(tok) = p.peek_non_trivia() {
@@ -271,8 +248,10 @@ pub(crate) fn try_parse_create_warehouse(p: &mut Parser<'_>) -> ParseResult<AstS
 
         // TAG keyword
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Tag)) {
-            tag_span = Some(parse_tag_clause(p)?);
-            span.end = tag_span.as_ref().unwrap().end;
+            let (clause, read) = parse_tag_clause(p)?;
+            tag_span = Some(clause);
+            tags = read;
+            span.end = clause.end;
             continue;
         }
 
@@ -366,6 +345,7 @@ pub(crate) fn try_parse_create_warehouse(p: &mut Parser<'_>) -> ParseResult<AstS
         max_cluster_count_span,
         scaling_policy_span,
         tag_span,
+        tags,
         extras,
     })))
 }
@@ -428,7 +408,9 @@ pub(crate) fn try_parse_alter_warehouse(p: &mut Parser<'_>) -> ParseResult<AstSt
     // Warehouse name (qualified identifier)
     let name_span = p.parse_qualified_name_span()?;
 
-    // Parse action
+    // Parse action; each parameter's value is recorded as every statement
+    // setting one records it.
+    p.record_setting_secrets(p.idx);
     let mut extras: Vec<AstUnknownClause> = Vec::new();
     let (action, action_span) = parse_alter_warehouse_action(p, &mut extras)?;
 
@@ -553,29 +535,17 @@ fn parse_alter_warehouse_action(
             if matches!(next.kind, TokenKind::Keyword(Keyword::Tag)) {
                 // SET TAG <tag_name> = '<value>' [, ...]
                 let tag_tok = p.advance().expect_invariant("TAG consumed");
-                let mut end = tag_tok.span.end;
-                if let Some(lparen) = p.peek_non_trivia() {
-                    if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        p.advance(); // LParen
-                        end = skip_to_matching_paren(p)?;
-                    } else {
-                        // No parens — consume tag assignments until semicolon
-                        while let Some(tok) = p.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            let t = p.advance().unwrap();
-                            end = t.span.end;
-                        }
-                    }
-                }
+                let (list_span, tags) =
+                    p.parse_tag_list_in_optional_parens(TagListShape::Assignments)?;
+                let assignments_span = Span {
+                    start: tag_tok.span.start,
+                    end: list_span.end,
+                };
                 AstAlterWarehouseActionKind::SetTag {
                     set_span: set_tok.span,
                     tag_span: tag_tok.span,
-                    assignments_span: Span {
-                        start: tag_tok.span.start,
-                        end,
-                    },
+                    assignments_span,
+                    tags,
                 }
             } else {
                 // SET property = value [property = value ...]
@@ -615,29 +585,16 @@ fn parse_alter_warehouse_action(
             if matches!(next.kind, TokenKind::Keyword(Keyword::Tag)) {
                 // UNSET TAG <tag_name> [, <tag_name> ...]
                 let tag_tok = p.advance().expect_invariant("TAG consumed");
-                let mut end = tag_tok.span.end;
-                if let Some(lparen) = p.peek_non_trivia() {
-                    if matches!(lparen.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        p.advance(); // LParen
-                        end = skip_to_matching_paren(p)?;
-                    } else {
-                        // No parens — consume tag names until semicolon
-                        while let Some(tok) = p.peek_non_trivia() {
-                            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi)) {
-                                break;
-                            }
-                            let t = p.advance().unwrap();
-                            end = t.span.end;
-                        }
-                    }
-                }
+                let (list_span, tags) = p.parse_tag_list_in_optional_parens(TagListShape::Names)?;
+                let names_span = Span {
+                    start: tag_tok.span.start,
+                    end: list_span.end,
+                };
                 AstAlterWarehouseActionKind::UnsetTag {
                     unset_span: unset_tok.span,
                     tag_span: tag_tok.span,
-                    names_span: Span {
-                        start: tag_tok.span.start,
-                        end,
-                    },
+                    names_span,
+                    tags,
                 }
             } else {
                 // UNSET property [, property ...]

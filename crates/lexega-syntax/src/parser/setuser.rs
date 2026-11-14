@@ -9,7 +9,7 @@
 //! argument, reverts to the original dbo context). It is a privilege-escalation
 //! / audit-evasion surface. Recognition captures the single governance-bearing
 //! element — the impersonated principal, when present. The trailing `WITH`
-//! options carry no governance signal and are scanned past.
+//! options carry nothing a rule reads and are scanned past.
 //!
 //! `SETUSER` is an Identifier in our lexer.
 
@@ -44,9 +44,16 @@ impl<'a> Parser<'a> {
         };
 
         // 3. Consume any trailing `WITH { NORESET | RESET }` to the depth-0
-        //    terminator. These carry no governance signal.
+        //    terminator. These carry nothing a rule reads.
+        // `[WITH NORESET]` ends the statement.
+        let grammar_end = self
+            .with_list_end(self.idx, |i| {
+                self.any_words_end(i, &[&["NORESET"], &["RESET"]])
+            })
+            .unwrap_or(self.idx);
+        let bound = self.clauses_bound(grammar_end);
         let mut depth: u32 = 0;
-        while let Some(tok) = self.peek_non_trivia() {
+        while let Some(tok) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             match tok.kind {
                 TokenKind::Punctuation(Punctuation::Semi) if depth == 0 => break,
                 TokenKind::Eof => break,

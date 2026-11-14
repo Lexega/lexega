@@ -10,7 +10,7 @@
 //! - DROP STORAGE CREDENTIAL with IF EXISTS
 //! - All three credential kinds: STORAGE, SERVICE, bare CREDENTIAL
 //! - Formatting (semantic preservation via verify_formatting_safe)
-//! - Risk analysis (signal generation via YAML rules DBX-CRED-NEW..DBX-CRED-NAME-CHG)
+//! - Risk analysis (finding generation via YAML rules DBX-CRED-NEW..DBX-CRED-NAME-CHG)
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk_with_policy_config;
@@ -48,9 +48,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
+        .findings
         .iter()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
@@ -313,87 +313,87 @@ fn format_drop_service_credential() {
 }
 
 // ============================================================================
-// Risk Analysis — Signal Generation
+// Risk Analysis — Finding Generation
 // ============================================================================
 
 #[test]
-fn signal_create_storage_credential() {
+fn finding_create_storage_credential() {
     let report = dbx_analyze("CREATE STORAGE CREDENTIAL my_cred;");
     assert!(
-        has_signal(&report, "DBX-CRED-NEW"),
+        has_finding(&report, "DBX-CRED-NEW"),
         "Should emit DBX-CRED-NEW (storage credential created)"
     );
     assert_eq!(report.summary.medium_count, 1);
 }
 
 #[test]
-fn signal_create_credential_bare() {
+fn finding_create_credential_bare() {
     let report = dbx_analyze("CREATE CREDENTIAL bare_cred;");
     assert!(
-        has_signal(&report, "DBX-CRED-NEW"),
+        has_finding(&report, "DBX-CRED-NEW"),
         "Bare CREDENTIAL should also emit DBX-CRED-NEW"
     );
 }
 
 #[test]
-fn signal_create_service_credential() {
+fn finding_create_service_credential() {
     let report = dbx_analyze("CREATE SERVICE CREDENTIAL svc_cred;");
     assert!(
-        has_signal(&report, "DBX-CRED-NEW"),
+        has_finding(&report, "DBX-CRED-NEW"),
         "SERVICE CREDENTIAL should also emit DBX-CRED-NEW"
     );
 }
 
 #[test]
-fn signal_drop_storage_credential() {
+fn finding_drop_storage_credential() {
     let report = dbx_analyze("DROP STORAGE CREDENTIAL old_cred;");
     assert!(
-        has_signal(&report, "DBX-CRED-DROP"),
+        has_finding(&report, "DBX-CRED-DROP"),
         "Should emit DBX-CRED-DROP (storage credential dropped)"
     );
-    assert!(report.summary.high_count >= 1);
+    assert!(report.summary.medium_count >= 1);
 }
 
 #[test]
-fn signal_alter_storage_credential_rename() {
+fn finding_alter_storage_credential_rename() {
     let report = dbx_analyze("ALTER STORAGE CREDENTIAL my_cred RENAME TO new_cred;");
     assert!(
-        has_signal(&report, "DBX-CRED-NAME-CHG"),
+        has_finding(&report, "DBX-CRED-NAME-CHG"),
         "Should emit DBX-CRED-NAME-CHG (storage credential renamed)"
     );
-    assert_eq!(report.summary.medium_count, 1);
+    assert_eq!(report.summary.low_count, 1);
 }
 
 #[test]
-fn signal_alter_storage_credential_owner() {
+fn finding_alter_storage_credential_owner() {
     let report = dbx_analyze("ALTER STORAGE CREDENTIAL my_cred SET OWNER TO data_team;");
     assert!(
-        has_signal(&report, "DBX-CRED-OWNER-CHG"),
+        has_finding(&report, "DBX-CRED-OWNER-CHG"),
         "Should emit DBX-CRED-OWNER-CHG (storage credential ownership changed)"
     );
-    assert!(report.summary.high_count >= 1);
+    assert!(report.summary.medium_count >= 1);
 }
 
 #[test]
-fn signal_alter_storage_credential_owner_no_set() {
+fn finding_alter_storage_credential_owner_no_set() {
     let report = dbx_analyze("ALTER STORAGE CREDENTIAL my_cred OWNER TO admin_group;");
     assert!(
-        has_signal(&report, "DBX-CRED-OWNER-CHG"),
+        has_finding(&report, "DBX-CRED-OWNER-CHG"),
         "OWNER TO without SET should also emit DBX-CRED-OWNER-CHG"
     );
 }
 
 #[test]
-fn signal_storage_credential_hardcoded_connection_string() {
+fn finding_storage_credential_hardcoded_connection_string() {
     let sql = "CREATE STORAGE CREDENTIAL my_cred COMMENT 'postgres://admin:SuperSecret123@db.internal:5432/warehouse';";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "CRED-CONNSTR-LEAK"),
+        has_finding(&report, "CRED-CONNSTR-LEAK"),
         "Hardcoded connection string in storage credential should trigger CRED-CONNSTR-LEAK"
     );
     assert!(
-        has_signal(&report, "CRED-PWD-LEAK"),
+        has_finding(&report, "CRED-PWD-LEAK"),
         "Connection string with embedded password should also trigger CRED-PWD-LEAK"
     );
 }
@@ -414,14 +414,14 @@ fn multi_statement_evidence_count() {
 
     // Should have 4 analyzed statements
     assert!(
-        report.summary.total_reported_signals >= 3,
-        "Should have at least 3 signals (2 create, 1 drop, 1 rename). Got: {}",
-        report.summary.total_reported_signals
+        report.summary.total_reported_findings >= 3,
+        "Should have at least 3 findings (2 create, 1 drop, 1 rename). Got: {}",
+        report.summary.total_reported_findings
     );
 
-    // Verify evidence count for deduplicated create signals
+    // Verify evidence count for deduplicated create findings
     let create_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "DBX-CRED-NEW"))
         .map(|s| match s {

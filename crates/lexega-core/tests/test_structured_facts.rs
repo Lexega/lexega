@@ -14,7 +14,7 @@ use lexega_core::api::analyze_risk;
 #[test]
 fn test_qualify_fact_extraction_compiles() {
     // This test verifies that the code compiles and runs without panic
-    // The actual data validation happens through the risk analysis signals
+    // The actual data validation happens through the risk analysis findings
 
     let sql = r#"
         SELECT 
@@ -36,7 +36,7 @@ fn test_qualify_fact_extraction_compiles() {
 
     // Smoke test: QUALIFY fact extraction runs without panicking.
     // Findings flow via rules.
-    let _ = _report.statement_signals.len();
+    let _ = _report.statement_traces.len();
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn test_where_literals_extraction_compiles() {
     let report = analyze_risk(sql).expect("should analyze");
 
     // Smoke test: WHERE column/literal extraction runs without panicking.
-    let _ = report.statement_signals.len();
+    let _ = report.statement_traces.len();
 }
 
 #[test]
@@ -131,8 +131,7 @@ fn test_set_operations_compiles() {
 fn test_no_regression() {
     // Comprehensive test ensuring fact extraction doesn't break existing functionality
 
-    let test_cases = vec![
-        // SELECT with QUALIFY
+    let test_cases = [
         "SELECT * FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY date) = 1;",
         // SELECT with WHERE
         "SELECT * FROM t WHERE status = 'active' AND count > 10;",

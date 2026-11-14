@@ -207,6 +207,9 @@ pub struct AstSelect {
     /// Span covering entire FETCH...ONLY clause if ANSI FETCH syntax was used
     /// When Some, formatter should emit original text instead of synthesizing LIMIT
     pub fetch_clause_span: Option<Span>,
+    /// `WITH TIES` ending the FETCH clause: the rows tied with the last
+    /// one on the ORDER BY are returned too.
+    pub fetch_with_ties_span: Option<Span>,
     /// Span covering OFFSET keyword and any following ROW/ROWS
     pub offset_keyword_span: Option<Span>,
     /// Span of the comma in the MySQL `LIMIT offset, count` form. When
@@ -220,23 +223,24 @@ pub struct AstSelect {
     /// Covers the entire clause: `FOR JSON PATH, ROOT('data'), INCLUDE_NULL_VALUES`
     /// or `FOR XML PATH('row'), ROOT('data'), TYPE, ELEMENTS XSINIL`.
     pub for_json_xml: Option<Span>,
-    /// Dialect-specific trailing clauses preserved as raw spans
-    /// (e.g., MSSQL OPTION(...)).
-    pub post_locking_extension_clauses: Box<Vec<Span>>,
+    /// T-SQL `OPTION (…)` query hints, each kept as written.
+    pub post_locking_extension_clauses: Box<Vec<AstQueryOptions>>,
     /// Optional WINDOW clause (named window definitions)
     /// Syntax: WINDOW w AS (...) [, w2 AS (...)]
     pub window_clause: Option<Box<AstWindowClause>>,
     /// Optional WITH clause (CTEs) that precedes the SELECT
     pub with_clause: Option<Box<AstWithClause>>,
+    /// MySQL's select options, each word as written (`HIGH_PRIORITY`,
+    /// `STRAIGHT_JOIN`, `SQL_CALC_FOUND_ROWS`, …), in order.
+    pub select_options: Vec<Span>,
     /// Optional INTO target. Mutually-exclusive variants:
-    /// - `ScriptingVars(Vec<Span>)` — Snowflake Scripting / Oracle PL/SQL /
-    ///   MySQL: `SELECT col INTO :var, :var2 FROM …`.
+    /// - `ScriptingVars { vars, strict_span }` — Snowflake Scripting / Oracle
+    ///   PL/SQL / MySQL / PL/pgSQL: `SELECT col INTO [STRICT] :var, :var2 FROM …`.
     /// - `NewTable(Box<AstSelectIntoNewTable>)` — MSSQL / PostgreSQL legacy
     ///   CTAS form: `SELECT col INTO new_tbl FROM …`. Semantically a
     ///   create-and-populate, equivalent to CREATE TABLE … AS SELECT.
     ///
-    /// Disambiguated at parse time by dialect (PL/pgSQL bodies live inside
-    /// `$$…$$` literals and do not reach the main SELECT parser).
+    /// Disambiguated at parse time: see [`AstSelectIntoTarget`].
     pub into_target: Option<Box<AstSelectIntoTarget>>,
     /// Optional semicolon token ID when SELECT appears in scripting context.
     /// Captured via peek (not consumed) - formatter emits it explicitly.
@@ -244,12 +248,39 @@ pub struct AstSelect {
     /// Optional syntax ID for parentheses when this SELECT is parenthesized in a set operation.
     /// Example: (SELECT ...) UNION (SELECT ...) - each SELECT has paren_syntax_id pointing to SyntaxSubquery.
     pub paren_syntax_id: Option<crate::syntax::SyntaxSubqueryId>,
-    /// When `Some`, this SELECT was written in MySQL's `TABLE tbl [ORDER BY
-    /// ...] [LIMIT ...]` surface syntax (sugar for `SELECT * FROM tbl ...`).
-    /// The span covers the `TABLE` keyword. Set only by the MySQL TABLE
-    /// parser; the formatter re-emits the original `TABLE` form from the
+    /// The parentheses around this query where its parser read them, from
+    /// the `(` through the `)`: the query's span as a statement.
+    pub paren_span: Option<Span>,
+    /// When `Some`, this SELECT was written in MySQL's or PostgreSQL's `TABLE
+    /// tbl [ORDER BY ...] [LIMIT ...]` surface syntax (sugar for `SELECT *
+    /// FROM tbl ...`). The span covers the `TABLE` keyword. Set only by the
+    /// TABLE parser; the formatter re-emits the original `TABLE` form from the
     /// statement span. All analysis treats it as the equivalent `SELECT *`.
     pub table_syntax_span: Option<Span>,
+    /// The `ORDER BY` / `LIMIT` / `OFFSET` written after the `)` of this
+    /// query where it is parenthesised and no set operator follows
+    /// (`(SELECT …) ORDER BY 1 LIMIT 5`): the whole query's, not the
+    /// clauses inside the parentheses.
+    pub outer_tail: Option<Box<AstQueryTail>>,
+}
+
+/// The `ORDER BY` / `LIMIT` / `OFFSET` / `FETCH` written after the `)` of a
+/// parenthesised query ([`AstSelect::outer_tail`]).
+#[derive(Debug, Clone)]
+pub struct AstQueryTail {
+    pub order_by: Option<Box<AstOrderBy>>,
+    pub limit: Option<Box<AstExpr>>,
+    pub offset: Option<Box<AstExpr>>,
+    pub limit_keyword_span: Option<Span>,
+    pub fetch_clause_span: Option<Span>,
+    /// `WITH TIES` ending the FETCH clause: the rows tied with the last
+    /// one on the ORDER BY are returned too.
+    pub fetch_with_ties_span: Option<Span>,
+    pub offset_keyword_span: Option<Span>,
+    /// Span of the comma in the MySQL `LIMIT offset, count` form.
+    pub limit_offset_comma_span: Option<Span>,
+    /// The parenthesised query and its tail: from the `(` through the tail.
+    pub query_span: Span,
 }
 
 /// Payload for [`AstTableRef::paren_group`]. Boxed off the parent to keep
@@ -266,6 +297,13 @@ pub struct ParenGroupInfo {
     /// `rparen_span` hold the braces. The join is otherwise identical to
     /// the parenthesised form; only the formatter consumes this.
     pub odbc_oj_span: Option<Span>,
+    /// `[AS] alias [(column, …)]` as written after the `)` of a group that
+    /// joins tables (PostgreSQL `(a JOIN b ON …) AS j (c1, …)`). The group
+    /// is then the derived table `(SELECT * FROM a JOIN b ON …) AS j (c1,
+    /// …)`: the reference's `subquery` is that `SELECT *`, not written, over
+    /// the group's tables, and its `alias` / `alias_columns` the written
+    /// ones.
+    pub alias_span: Option<Span>,
 }
 
 /// ODBC datetime/GUID escape kind: `{d '…'}` / `{t '…'}` / `{ts '…'}` /
@@ -308,16 +346,21 @@ pub struct AstOdbcCallEscape {
 /// 2. **NewTable** — MSSQL / PostgreSQL legacy CTAS shortcut that creates
 ///    and populates a new (possibly temp) table.
 ///
-/// Disambiguation is dialect-driven at parse time:
+/// Disambiguation at parse time:
 /// - MSSQL: always `NewTable` (no scripting-INTO form exists).
-/// - PostgreSQL: always `NewTable` (PL/pgSQL bodies are dollar-quoted
-///   string literals and never reach the main SELECT parser).
+/// - PostgreSQL / Redshift: `ScriptingVars` in a block read inside a
+///   dollar-quoted body (PL/pgSQL); `NewTable` elsewhere.
 /// - Snowflake / BigQuery / Databricks / MySQL: always `ScriptingVars`.
 #[derive(Debug, Clone)]
 pub enum AstSelectIntoTarget {
-    /// `INTO :var, :var2` or bare `INTO var, var2`. Each span covers one
-    /// target variable identifier (including the leading `:` if written).
-    ScriptingVars(Vec<Span>),
+    /// `INTO :var, :var2`, bare `INTO var, var2`, or PL/pgSQL `INTO STRICT
+    /// var`. Each span of `vars` covers one target variable identifier
+    /// (including the leading `:` if written); `strict_span` covers a
+    /// `STRICT` written before them.
+    ScriptingVars {
+        vars: Vec<Span>,
+        strict_span: Option<Span>,
+    },
     /// `INTO [TEMP|TEMPORARY|UNLOGGED] new_tbl [ON filegroup]`.
     /// Semantically a CREATE TABLE … AS SELECT.
     NewTable(Box<AstSelectIntoNewTable>),
@@ -359,7 +402,7 @@ impl AstSelectIntoTarget {
     /// scripting form iterate uniformly.
     pub fn scripting_vars(&self) -> &[Span] {
         match self {
-            AstSelectIntoTarget::ScriptingVars(v) => v.as_slice(),
+            AstSelectIntoTarget::ScriptingVars { vars, .. } => vars.as_slice(),
             AstSelectIntoTarget::NewTable(_) => &[],
             AstSelectIntoTarget::OutFile(_) => &[],
         }
@@ -368,7 +411,7 @@ impl AstSelectIntoTarget {
     /// End position of the INTO clause (used for SELECT span calculation).
     pub fn end_pos(&self) -> Option<u32> {
         match self {
-            AstSelectIntoTarget::ScriptingVars(v) => v.last().map(|s| s.end),
+            AstSelectIntoTarget::ScriptingVars { vars, .. } => vars.last().map(|s| s.end),
             AstSelectIntoTarget::NewTable(nt) => Some(
                 nt.on_filegroup
                     .as_ref()
@@ -527,6 +570,25 @@ pub struct AstCte {
     pub span: Span,
 }
 
+/// A template block whose text the template holds or passes on
+/// ([`AstScript::template_blocks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateBlock {
+    /// The text between the block's opening tag and its closing one, or the
+    /// end of the source where it is not closed.
+    pub body: Span,
+    pub holds: TemplateBlockHolds,
+}
+
+/// What a [`TemplateBlock`]'s text is to the template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateBlockHolds {
+    /// A value it holds or filters whole (`set`, `filter`).
+    Value,
+    /// Text a macro it calls is given (`call`): SQL the macro may run.
+    Caller,
+}
+
 /// A multi-statement script.
 ///
 /// Container for multiple SQL and/or Snowflake Scripting statements parsed
@@ -544,6 +606,71 @@ pub struct AstScript {
     /// found while parsing. Output surfaces mask these so a credential value
     /// is never reproduced in a finding preview / evidence / SARIF snippet.
     pub redaction_spans: Vec<Span>,
+    /// Byte-spans of the variables and placeholders written where a
+    /// statement takes a secret (`PASSWORD = @pw`, `= :pw`, `= ?`): the
+    /// name is shown, what the variable holds is the secret.
+    pub secret_places: Vec<Span>,
+    /// The template blocks whose text a template holds or passes on rather
+    /// than writes into the SQL (`{% set x %}…{% endset %}`,
+    /// `{% filter f %}…{% endfilter %}`, `{% call m() %}…{% endcall %}`),
+    /// in source order.
+    pub template_blocks: Vec<TemplateBlock>,
+    /// Byte-spans of the comments the lexer read in the source, in source
+    /// order. Output surfaces leave them out of every quote of a statement.
+    pub comment_spans: Vec<Span>,
+    /// Each dollar-quoted routine body (`AS $$ … $$`, `DO $$ … $$`),
+    /// delimiters included, that the parser read as the statements of a
+    /// routine whose language is SQL, in source order. Every other
+    /// dollar-quoted text is a string: a body in another language, one that
+    /// does not parse, or a value.
+    pub read_bodies: Vec<Span>,
+    /// Each value a statement gives a setting or a session variable (`SET
+    /// name = value`, `ALTER … SET name = value`, a routine's `SET` clause,
+    /// `ALTER SESSION SET`, a MySQL user variable), in source order.
+    pub setting_values: Vec<SettingValue>,
+    /// Each option a bulk load names with a value: those of T-SQL `BULK
+    /// INSERT … WITH (…)` and those `OPENROWSET(BULK …)` takes after its
+    /// file, in source order.
+    pub bulk_options: Vec<BulkOption>,
+    /// Each variable a statement takes a name from (`IDENTIFIER($v)`,
+    /// `IDENTIFIER(:v)`), in source order: the name is the variable's value.
+    pub held_names: Vec<Span>,
+    /// Statements the parser stopped reading before their end, at a token
+    /// it does not bind, in source order.
+    pub cut_statements: Vec<CutStatement>,
+}
+
+/// An option a bulk load names, with its value
+/// ([`AstScript::bulk_options`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkOption {
+    /// The option's name as written.
+    pub name: Span,
+    /// Its value as written: a literal, a word or a number.
+    pub value: Span,
+}
+
+/// A value a statement gives a setting or a session variable
+/// ([`AstScript::setting_values`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingValue {
+    /// The setting's name as written; `None` for a variable, whose name
+    /// names no setting.
+    pub setting: Option<Span>,
+    /// Each part of the value: a quoted string's text between its quotes,
+    /// and each other token that is a value (a number, a word).
+    pub parts: Vec<Span>,
+}
+
+/// A statement read up to a token the parser does not bind. The text from
+/// that token on is the statement's own; the script holds it as the
+/// `OpaqueContent` (`Error` in a body) node after the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutStatement {
+    /// The statement as read.
+    pub stmt: crate::ast::NodeId,
+    /// The unread rest of it.
+    pub tail: Span,
 }
 
 /// Snowflake Scripting Block statement: BEGIN...END with optional DECLARE and EXCEPTION
@@ -613,6 +740,9 @@ pub struct AstCaseStmt {
     pub case_span: Span,
     /// TokenId for the CASE keyword
     pub case_token: Option<crate::cst::TokenId>,
+    /// The simple CASE's operand; None for a searched CASE. An
+    /// `AstExpr::Error` over its text where it does not parse.
+    pub operand: Option<Box<AstExpr>>,
     /// Optional operand span for simple CASE; None for searched CASE.
     pub operand_span: Option<Span>,
     /// WHEN branches with condition/value and body spans.
@@ -653,6 +783,8 @@ pub struct AstForStmt {
     /// TokenId for the IN keyword
     pub in_token: Option<crate::cst::TokenId>,
     pub range_or_cursor_span: Span,
+    /// What the loop iterates, read from `range_or_cursor_span`.
+    pub iterates: AstForIterable,
     /// Span covering loop-body opener keyword (`DO` or `LOOP`)
     pub body_keyword_span: Span,
     /// TokenId for loop-body opener keyword (`DO` or `LOOP`)
@@ -666,6 +798,30 @@ pub struct AstForStmt {
     pub end_for_token: Option<crate::cst::TokenId>,
     /// TokenId for the semicolon after END FOR
     pub semicolon_token: Option<crate::cst::TokenId>,
+}
+
+/// What a FOR loop iterates: the header between `IN` (or `AS`) and `DO` /
+/// `LOOP`.
+#[derive(Debug, Clone)]
+pub enum AstForIterable {
+    /// A range of integers, `[REVERSE] low {TO | ..} high [BY step]`.
+    Range {
+        /// `REVERSE` is written before the bounds.
+        reverse: bool,
+        /// The first bound.
+        low: Box<AstExpr>,
+        /// The second bound.
+        high: Box<AstExpr>,
+        /// The `BY` step, where one is written.
+        step: Option<Box<AstExpr>>,
+    },
+    /// The rows of a query (written bare or in parentheses), or of the
+    /// dynamic SQL an `EXECUTE …` statement runs.
+    Query(Box<AstStmt>),
+    /// Anything else the loop reads one expression for: a cursor, a result
+    /// set, a cursor called with arguments. A header that does not parse is
+    /// an [`AstExpr::Error`] covering it.
+    Expr(Box<AstExpr>),
 }
 
 /// PostgreSQL PL/pgSQL `FOREACH target [SLICE n] IN ARRAY expr LOOP … END LOOP`.
@@ -772,6 +928,9 @@ pub struct AstRepeatStmt {
     pub until_span: Span,
     /// TokenId for the UNTIL keyword
     pub until_token: Option<crate::cst::TokenId>,
+    /// The condition after UNTIL; an `AstExpr::Error` over its text where it
+    /// does not parse.
+    pub until_condition: Box<AstExpr>,
     /// Span covering the UNTIL condition inside parentheses, including parens
     pub until_condition_span: Span,
     /// Span covering the END REPEAT keywords
@@ -810,6 +969,32 @@ pub struct AstLoopStmt {
     pub semicolon_token: Option<crate::cst::TokenId>,
 }
 
+/// What a sqlcmd command line does ([`AstStmt::SqlcmdCommand`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlcmdAction {
+    /// Sets or shows the client's state, sending nothing to the server:
+    /// `:setvar`, `:listvar`, `:on error`, `:out`, `:error`, `:perftrace`,
+    /// `:xml`, `:help`, `:list`, `:serverlist`, `:reset`, `:quit`, `:exit`
+    /// and `:exit()`. What its arguments name, as written: the variable
+    /// `:setvar` names, the file `:out`, `:error` or `:perftrace` writes
+    /// to, the choice `:on error` or `:xml` takes; never `:setvar`'s value.
+    Client { named: Option<Span> },
+    /// `:r file`: reads the file's statements and commands into the batch.
+    /// The file as written, where one is.
+    Include { file_span: Option<Span> },
+    /// `:connect server …`: runs the batch on `server`, where one is
+    /// written first as a name: not an option, nor a connection string.
+    Connect { server_span: Option<Span> },
+    /// `[:]!! command`: runs an operating-system command.
+    OsCommand,
+    /// `:ed`: runs the editor `SQLCMDEDITOR` names on the batch, which sends
+    /// what the editor leaves.
+    Edit,
+    /// `:exit(query)`: sends the query, inside the parentheses, with the
+    /// batch.
+    ExitQuery { query_span: Span },
+}
+
 /// A SQL or Snowflake Scripting statement.
 ///
 /// This enum represents all supported statement types including:
@@ -840,6 +1025,17 @@ pub enum AstStmt {
         /// Optional repeat count in `GO <count>`.
         count_span: Option<Span>,
     },
+    /// A sqlcmd command line (`:r file`, `:setvar name value`, `:on error
+    /// exit`, `:connect server`, `!! dir`, …), kept as written: the client
+    /// runs it, and sends to the server none of the line but the query of
+    /// `:exit(query)`.
+    SqlcmdCommand {
+        node_id: crate::ast::NodeId,
+        span: Span,
+        /// The command's name, `!!` for an operating-system command.
+        name_span: Span,
+        action: SqlcmdAction,
+    },
     /// T-SQL `RECONFIGURE [WITH OVERRIDE]` — applies pending
     /// `sp_configure` server option changes to the running configuration.
     Reconfigure {
@@ -847,6 +1043,14 @@ pub enum AstStmt {
         span: Span,
         /// Span of the `WITH OVERRIDE` clause, when present.
         with_override_span: Option<Span>,
+    },
+    /// T-SQL server command, kept as written: `CHECKPOINT [duration]`,
+    /// `KILL { session_id | 'uow' } [WITH { STATUSONLY | COMMIT | ROLLBACK }]`,
+    /// `KILL QUERY NOTIFICATION SUBSCRIPTION { ALL | id }`, `KILL STATS JOB id`,
+    /// `SHUTDOWN [WITH NOWAIT]`.
+    MssqlServerCommand {
+        node_id: crate::ast::NodeId,
+        span: Span,
     },
     /// MSSQL EXEC / EXECUTE procedure call
     /// Syntax: `EXEC[UTE] [@return_var =] [schema.]procedure_name [args] | EXEC[UTE] (string_expr)`
@@ -892,6 +1096,8 @@ pub enum AstStmt {
     /// MySQL SET statement family (variable assignment + NAMES / CHARSET /
     /// PASSWORD / ROLE / DEFAULT ROLE / TRANSACTION).
     MysqlSet(Box<AstMysqlSet>),
+    /// MySQL `UNLOCK {TABLES | TABLE}`: the session's table locks released.
+    MysqlUnlockTables(Box<AstMysqlUnlockTables>),
     /// MSSQL WAITFOR statement — delays execution.
     /// Syntax: WAITFOR DELAY 'time' | WAITFOR TIME 'time'
     MssqlWaitfor(Box<AstMssqlWaitfor>),
@@ -907,6 +1113,12 @@ pub enum AstStmt {
     /// MSSQL DROP TRIGGER statement
     /// Syntax: DROP TRIGGER [IF EXISTS] name [,...n] [ON {DATABASE|ALL SERVER}]
     DropMssqlTrigger(Box<AstDropMssqlTrigger>),
+    /// MSSQL ENABLE / DISABLE TRIGGER statement
+    /// Syntax: { ENABLE | DISABLE } TRIGGER { name [,...n] | ALL } ON { object | DATABASE | ALL SERVER }
+    MssqlTriggerState(Box<AstMssqlTriggerState>),
+    /// A savepoint: T-SQL `SAVE { TRAN | TRANSACTION } name`, `SAVEPOINT
+    /// name`, `RELEASE [SAVEPOINT] name`.
+    Savepoint(Box<AstSavepoint>),
     /// MSSQL BULK INSERT statement
     /// Syntax: BULK INSERT table FROM 'filepath' [WITH (options)]
     MssqlBulkInsert(Box<AstMssqlBulkInsert>),
@@ -1122,6 +1334,18 @@ pub enum AstStmt {
     /// EXPLAIN statement (PostgreSQL)
     /// Wraps an inner statement (SELECT, INSERT, UPDATE, DELETE) with optional analysis options.
     Explain(Box<AstExplain>),
+    /// A query psql's `\gexec` sends, which runs each value it returns.
+    PsqlGexec(Box<AstPsqlGexec>),
+    /// MySQL `DO expr [, …]`: each expression evaluated, the result discarded.
+    MysqlDo(Box<AstMysqlDo>),
+    /// Snowflake `EXECUTE TASK name [RETRY LAST]`: runs the task now.
+    ExecuteTask(Box<AstExecuteTask>),
+    /// MySQL `CREATE [AGGREGATE] FUNCTION name RETURNS type SONAME 'lib'`: a
+    /// function loaded from a shared library.
+    MysqlCreateLoadableFunction(Box<AstMysqlCreateLoadableFunction>),
+    /// A MySQL administration statement: table maintenance, FLUSH, KILL,
+    /// ALTER INSTANCE, XA, RENAME USER.
+    MysqlAdmin(Box<AstMysqlAdmin>),
     /// CREATE INDEX statement (PostgreSQL)
     CreateIndex(Box<AstCreateIndex>),
     /// CREATE SYNONYM statement (T-SQL): `CREATE SYNONYM name FOR object`
@@ -1130,6 +1354,8 @@ pub enum AstStmt {
     CommentOn(Box<AstCommentOn>),
     /// DO $$ anonymous block (PostgreSQL)
     DoBlock(Box<AstDoBlock>),
+    /// PL/pgSQL `PERFORM query`: a query run with its rows discarded
+    Perform(Box<AstPerform>),
     /// VACUUM statement (PostgreSQL)
     Vacuum(Box<AstVacuum>),
     /// ANALYZE (utility) statement (PostgreSQL)
@@ -1177,15 +1403,17 @@ pub enum AstStmt {
     /// REFRESH MATERIALIZED VIEW (PostgreSQL)
     PgRefreshMatview(Box<AstPgRefreshMatview>),
     /// LISTEN channel (PostgreSQL pub/sub)
-    PgListen(Box<AstPgSimpleUtility>),
+    PgListen(Box<AstPgListen>),
     /// NOTIFY channel [, 'payload'] (PostgreSQL pub/sub)
-    PgNotify(Box<AstPgSimpleUtility>),
+    PgNotify(Box<AstPgNotify>),
     /// UNLISTEN channel | * (PostgreSQL pub/sub)
-    PgUnlisten(Box<AstPgSimpleUtility>),
+    PgUnlisten(Box<AstPgUnlisten>),
     /// LOCK TABLE ... (PostgreSQL explicit locking)
-    PgLockTable(Box<AstPgSimpleUtility>),
+    PgLockTable(Box<AstPgLockTable>),
     /// CREATE [OR REPLACE] RULE ... (PostgreSQL rewrite rules)
-    PgCreateRule(Box<AstPgSimpleUtility>),
+    PgCreateRule(Box<AstPgCreateRule>),
+    /// T-SQL `CREATE RULE name AS <condition>`.
+    MssqlCreateRule(Box<AstMssqlCreateRule>),
     /// CREATE AGGREGATE (PostgreSQL extension authoring)
     PgCreateAggregate(Box<AstPgSimpleUtility>),
     /// CREATE OPERATOR (PostgreSQL extension authoring)
@@ -1201,7 +1429,7 @@ pub enum AstStmt {
     /// DISCARD ALL|PLANS|SEQUENCES|TEMP (PostgreSQL maintenance)
     PgDiscard(Box<AstPgSimpleUtility>),
     /// CLUSTER [table [USING index]] (PostgreSQL maintenance)
-    PgCluster(Box<AstPgSimpleUtility>),
+    PgCluster(Box<AstPgCluster>),
     /// CREATE/ALTER/DROP PUBLICATION (PostgreSQL logical replication)
     PgPublication(Box<AstPgSimpleUtility>),
     /// CREATE/ALTER/DROP SUBSCRIPTION (PostgreSQL logical replication)
@@ -1393,6 +1621,9 @@ pub enum AstStmt {
         span: Span,
         /// Span covering the variable name on the left-hand side.
         name_span: Span,
+        /// The subscripts written after the name, where any: an element or
+        /// a slice of it is assigned (PL/pgSQL `arr[1] :=`, `js['a'] :=`).
+        subscript_span: Option<Span>,
         /// Span covering the assignment operator (`:=` or `=`) when captured.
         assign_op_span: Option<Span>,
         /// Parsed right-hand side expression
@@ -1413,17 +1644,10 @@ pub enum AstStmt {
         declare_span: Option<Span>,
         /// TokenId for the DECLARE keyword
         declare_token: Option<crate::cst::TokenId>,
-        name: AstIdentifier,
-        /// Span covering the declared type, if present.
-        type_span: Option<Span>,
-        /// Span covering the DEFAULT keyword or := operator, if present
-        default_op_span: Option<Span>,
-        /// TokenId for the DEFAULT keyword or := operator
-        default_op_token: Option<crate::cst::TokenId>,
-        /// Parsed default expression, if present
-        default_expr: Option<Box<AstExpr>>,
-        /// Span covering the DEFAULT expression, if present.
-        default_expr_span: Option<Span>,
+        /// The variables declared, in written order; never empty. T-SQL
+        /// declares several in one statement (`DECLARE @x INT = 1, @c
+        /// CURSOR`); every other dialect's `DECLARE` holds one.
+        variables: Vec<AstDeclaredVariable>,
     },
     /// Table variable declaration: DECLARE @t TABLE(col INT, name VARCHAR(50))
     DeclareTable {
@@ -1441,6 +1665,9 @@ pub enum AstStmt {
         table_keyword_span: Span,
         /// Span covering the column definitions including parentheses: TABLE(...)
         table_body_span: Span,
+        /// The text of each column's `DEFAULT` value and computed
+        /// expression, as a `CREATE TABLE` column's is read.
+        column_defaults: Vec<Span>,
     },
     /// Cursor declaration: DECLARE cursor_name CURSOR FOR query_or_resultset;
     DeclareCursor {
@@ -1537,6 +1764,14 @@ pub enum AstStmt {
         using_span: Option<Span>,
         /// Optional message expression (BigQuery: USING MESSAGE = expr)
         message_expr: Option<Box<AstExpr>>,
+        /// The arguments after a PostgreSQL `'format'` string, in order.
+        /// Empty for every other payload and where an argument does not
+        /// parse.
+        message_args: Vec<AstExpr>,
+        /// PostgreSQL's `USING option = expr [, …]`, in order. Empty where
+        /// an option does not parse; BigQuery's `USING MESSAGE = expr` is
+        /// `message_expr`.
+        using_options: Vec<AstRaiseOption>,
     },
     /// Databricks SIGNAL statement: SIGNAL condition_name / SQLSTATE 'value'
     /// SET MESSAGE_TEXT = '...', MESSAGE_ARGUMENTS = (...)
@@ -1564,12 +1799,17 @@ pub enum AstStmt {
         /// TokenId for the terminating semicolon (if present)
         semicolon_token: Option<crate::cst::TokenId>,
     },
-    /// Databricks GET DIAGNOSTICS CONDITION statement
+    /// `GET [CURRENT | STACKED] DIAGNOSTICS [CONDITION n] var = item, …`:
+    /// Databricks's and MySQL's condition form and PL/pgSQL's statement and
+    /// exception form. The items stay text.
     GetDiagnostics {
         node_id: crate::ast::NodeId,
         span: Span,
-        /// Span covering entire GET DIAGNOSTICS CONDITION ... assignment list
+        /// Span covering entire GET DIAGNOSTICS ... assignment list
         diagnostics_span: Span,
+        /// Each target assigned, in order: a variable or a field of one, as
+        /// written.
+        targets: Vec<Span>,
         /// TokenId for the terminating semicolon (if present)
         semicolon_token: Option<crate::cst::TokenId>,
     },
@@ -1619,6 +1859,10 @@ pub enum AstStmt {
         break_token: Option<crate::cst::TokenId>,
         /// TokenId for the optional label target (e.g., `outer` in `LEAVE outer;`)
         label_token: Option<crate::cst::TokenId>,
+        /// PL/pgSQL `WHEN`, where written: the loop is left only where
+        /// `condition` holds.
+        when_span: Option<Span>,
+        condition: Option<Box<AstExpr>>,
         /// TokenId for the terminating semicolon (if present)
         semicolon_token: Option<crate::cst::TokenId>,
     },
@@ -1633,6 +1877,10 @@ pub enum AstStmt {
         continue_token: Option<crate::cst::TokenId>,
         /// TokenId for the optional label target (e.g., `inner` in `ITERATE inner;`)
         label_token: Option<crate::cst::TokenId>,
+        /// PL/pgSQL `WHEN`, where written: the next iteration starts only
+        /// where `condition` holds.
+        when_span: Option<Span>,
+        condition: Option<Box<AstExpr>>,
         /// TokenId for the terminating semicolon (if present)
         semicolon_token: Option<crate::cst::TokenId>,
     },
@@ -1661,15 +1909,26 @@ pub enum AstStmt {
         /// TokenId for the terminating semicolon (if present)
         semicolon_token: Option<crate::cst::TokenId>,
     },
-    /// FETCH cursor INTO variables statement
+    /// FETCH cursor INTO variables statement, and PostgreSQL's `MOVE`,
+    /// which moves the cursor as FETCH does and returns no row.
     FetchCursor {
         node_id: crate::ast::NodeId,
         span: Span,
-        /// Span covering the FETCH keyword
+        /// Span covering the FETCH keyword (MOVE's, where `move_span` is set)
         fetch_span: Span,
+        /// The `MOVE` keyword, where the statement is a MOVE.
+        move_span: Option<Span>,
+        /// The rows a `FETCH NEXT | PRIOR | FIRST | LAST | ABSOLUTE n |
+        /// RELATIVE n | ALL | FORWARD … | BACKWARD … FROM c` reads; `None`
+        /// where none is written.
+        orientation: Option<AstFetchOrientation>,
+        /// Span covering the orientation (`NEXT`, `ABSOLUTE 5`), if written.
+        orientation_span: Option<Span>,
         /// Span covering the cursor name identifier
         cursor_name_span: Span,
-        /// Span covering the INTO clause with target variables
+        /// Span covering the INTO clause with target variables; empty, at
+        /// the end of the cursor name, where no INTO is written (T-SQL
+        /// `FETCH NEXT FROM c` returns the row).
         into_clause_span: Span,
         /// Typed list of target variable identifiers (`@x`, `:y`, `z`)
         /// extracted from the INTO clause. Populated when the parser
@@ -1746,6 +2005,8 @@ pub enum AstStmt {
     BeginTransaction {
         node_id: crate::ast::NodeId,
         span: Span,
+        /// MySQL's `WITH CONSISTENT SNAPSHOT`, `READ WRITE`, `READ ONLY`.
+        characteristics: Vec<Span>,
     },
     /// COMMIT statement
     /// Syntax: `COMMIT [WORK]`
@@ -1788,8 +2049,11 @@ pub enum AstStmt {
     CopyIntoTable {
         node_id: crate::ast::NodeId,
         span: Span,
-        /// Span covering the target table name
-        table_name_span: Span,
+        /// The target table, without the column list that may follow it.
+        /// Where the tokens before `FROM` are not a name with an optional
+        /// column list, a reference with no parts whose span covers them
+        /// all.
+        table_name: AstObjectRef,
         /// Span covering the FROM clause (stage or location)
         from_span: Span,
         /// Optional span covering all copy options and file format specifications
@@ -1804,6 +2068,16 @@ pub enum AstStmt {
         /// for stage-name sources and subqueries. Used by content
         /// predicates (CRED-CONNSTR-LEAK) to match against the URL value.
         from_location_url: Option<String>,
+        /// The span of the string literal `from_location_url` is read from,
+        /// quotes included.
+        from_location_url_span: Option<Span>,
+        /// The stage a load reads from (`FROM @stage[/path]`). `None` for
+        /// a table, query or external-location source, and for a user
+        /// (`@~`) or table (`@%t`) stage, which the `from_span` holds.
+        from_stage: Option<Box<AstStageRef>>,
+        /// The file format `FILE_FORMAT = (FORMAT_NAME = name)` names; for
+        /// a name written as a string, a reference whose span is the string.
+        file_format_name: Option<Box<AstObjectRef>>,
         /// Decomposed `KEY = VALUE` pairs from any inline
         /// `CREDENTIALS=(...)` clause on the load — loading directly from
         /// an external location embeds credentials on the statement, same
@@ -1819,6 +2093,13 @@ pub enum AstStmt {
         span: Span,
         /// Span covering the target location (stage or external location)
         into_span: Span,
+        /// The stage an unload writes to (`INTO @stage[/path]`). `None` for
+        /// an external location and for a user (`@~`) or table (`@%t`)
+        /// stage, which the `into_span` holds.
+        into_stage: Option<Box<AstStageRef>>,
+        /// The file format `FILE_FORMAT = (FORMAT_NAME = name)` names; for
+        /// a name written as a string, a reference whose span is the string.
+        file_format_name: Option<Box<AstObjectRef>>,
         /// Span covering the FROM clause (table name or query)
         from_span: Span,
         /// Optional span covering all copy options and file format specifications
@@ -1828,6 +2109,9 @@ pub enum AstStmt {
         /// for non-string-literal location syntax. Used by content predicates
         /// (CRED-CONNSTR-LEAK) to match against the URL value.
         location_url: Option<String>,
+        /// The span of the string literal `location_url` is read from,
+        /// quotes included.
+        location_url_span: Option<Span>,
         /// Decomposed `KEY = VALUE` pairs from any inline
         /// `CREDENTIALS=(...)` clause within the statement body. Empty
         /// when no inline credentials clause is present (e.g. when
@@ -1853,11 +2137,22 @@ pub enum AstStmt {
         span: Span,
         /// Span covering the `('query')` source-query argument.
         query_span: Span,
+        /// The query the `('query')` string literal holds, read as SQL in
+        /// the statement's dialect: a `Subquery` whose spans are where its
+        /// text is written in the source. `None` where that text is not one
+        /// statement that parses whole, or a token of it is not written in
+        /// the source as it reads (a quote or escape inside an inner
+        /// literal): the query is then unread, its text only in
+        /// `query_span`.
+        source: Option<AstUnloadSource>,
         /// Span covering the `TO 'location'` destination clause.
         to_span: Span,
         /// Parsed destination URL when the `TO` target is a string literal
         /// (e.g. `'s3://bucket/path/'`), quotes stripped. `None` otherwise.
         location_url: Option<String>,
+        /// The span of the string literal `location_url` is read from,
+        /// quotes included.
+        location_url_span: Option<Span>,
         /// Inline credentials decomposed into typed `KEY = VALUE` pairs from
         /// `CREDENTIALS '...'` blobs or `ACCESS_KEY_ID`/`IAM_ROLE`/… options.
         /// Empty when the statement carries no inline secrets.
@@ -1875,11 +2170,16 @@ pub enum AstStmt {
         span: Span,
         /// Span covering the loaded-into `table_name [ (cols) ]`.
         table_span: Span,
+        /// Span covering the loaded-into `table_name`.
+        name_span: Span,
         /// Span covering the `FROM 'source'` clause.
         from_span: Span,
         /// Parsed data-source URL when the `FROM` target is a string literal
         /// (e.g. `'s3://bucket/path/'`), quotes stripped. `None` otherwise.
         location_url: Option<String>,
+        /// The span of the string literal `location_url` is read from,
+        /// quotes included.
+        location_url_span: Option<Span>,
         /// Inline credentials decomposed into typed `KEY = VALUE` pairs from
         /// `CREDENTIALS '...'` blobs or `ACCESS_KEY_ID`/`IAM_ROLE`/… options.
         /// Empty when the statement carries no inline secrets.
@@ -1968,8 +2268,7 @@ pub struct AstGrant {
 ///   [ CASCADE ] [ AS <principal> ]
 /// ```
 ///
-/// Object is captured span-only. Promote to typed fields when the first
-/// consumer needs the securable class or name.
+/// The securable is kept typed as a GRANT's object is.
 #[derive(Debug, Clone)]
 pub struct AstDeny {
     pub node_id: crate::ast::NodeId,
@@ -1978,8 +2277,8 @@ pub struct AstDeny {
     pub keyword_span: Span,
     /// Comma-separated privilege list (or `ALL [PRIVILEGES]`).
     pub privileges: AstPrivilegeList,
-    /// `ON [class::]securable` clause. Span-only: covers everything
-    /// between the trailing `ON` and the next clause (`TO`).
+    /// `ON [class::]securable` clause: everything between the trailing `ON`
+    /// and the next clause (`TO`), and the securable typed.
     pub object_span: Option<AstDenyObject>,
     /// One or more `TO <principal>` targets.
     pub grantees: Vec<AstGrantee>,
@@ -1991,13 +2290,15 @@ pub struct AstDeny {
     pub semicolon_token: Option<crate::cst::TokenId>,
 }
 
-/// `ON [class::]securable` clause within a DENY. Captured span-only —
-/// `keyword_span` covers the `ON` token, `target_span` covers the
-/// securable expression up to the next clause boundary.
+/// `ON [class::]securable` clause within a DENY. `keyword_span` covers the
+/// `ON` token, `target_span` the securable expression up to the next clause
+/// boundary, `object` the securable typed as a GRANT types it (absent where
+/// no name follows the class).
 #[derive(Debug, Clone)]
 pub struct AstDenyObject {
     pub keyword_span: Span,
     pub target_span: Span,
+    pub object: Option<AstGrantObject>,
 }
 
 /// `AS <principal_name>` delegation clause on a DENY.
@@ -2060,6 +2361,13 @@ pub enum AstGrantShape {
     DatabaseRole(AstRoleGrantBody),
     /// `GRANT OWNERSHIP ON <object> TO <role|database role> [COPY|REVOKE CURRENT GRANTS]`
     Ownership(AstOwnershipGrantBody),
+    /// `GRANT <role> [, …] TO <grantee> [, …] [WITH ADMIN OPTION]`: role
+    /// membership, written without `ROLE` and `ON`.
+    Membership {
+        /// The roles granted, one name each.
+        roles: Vec<Span>,
+        grantees: Vec<AstGrantee>,
+    },
     /// Span-only fallback — the body span is captured here when the
     /// typed parse fails.
     Unparsed { body_span: Span },
@@ -2074,6 +2382,13 @@ pub enum AstRevokeShape {
     Role(AstRoleGrantBody),
     /// `REVOKE DATABASE ROLE <db.name> FROM <grantee>`
     DatabaseRole(AstRoleGrantBody),
+    /// `REVOKE <role> [, …] FROM <grantee> [, …]`: role membership,
+    /// written without `ROLE` and `ON`.
+    Membership {
+        /// The roles revoked, one name each.
+        roles: Vec<Span>,
+        grantees: Vec<AstGrantee>,
+    },
     /// Span-only fallback — see `AstGrantShape::Unparsed`.
     Unparsed { body_span: Span },
 }
@@ -2103,6 +2418,8 @@ pub struct AstPrivilegeGrantBody {
     pub grantees: Vec<AstGrantee>,
     /// `WITH GRANT OPTION` trailing clause span.
     pub with_grant_option: Option<Span>,
+    /// T-SQL trailing `AS <principal>`.
+    pub as_principal: Option<AstDenyAs>,
 }
 
 /// `REVOKE <privilege list> ON <object> FROM <grantee>`. See
@@ -2113,6 +2430,8 @@ pub struct AstPrivilegeRevokeBody {
     pub privileges: AstPrivilegeList,
     pub objects: Vec<AstGrantObject>,
     pub grantees: Vec<AstGrantee>,
+    /// T-SQL trailing `AS <principal>`.
+    pub as_principal: Option<AstDenyAs>,
 }
 
 /// `GRANT/REVOKE [DATABASE] ROLE <name> TO/FROM <grantee>`.
@@ -2492,15 +2811,136 @@ pub struct AstProcedureParam {
     pub type_span: Option<Span>,
     pub mode: ProcedureParamMode,
     /// `DEFAULT <expr>` / `= <expr>` initializer. None when no
-    /// default is provided.
+    /// default is provided, or where its text is not one expression.
     pub default_expr: Option<Box<AstExpr>>,
+    /// The text of the initializer after `DEFAULT` / `=`, where one is
+    /// written.
+    pub default_span: Option<Span>,
+}
+
+/// A savepoint statement ([`AstStmt::Savepoint`]).
+#[derive(Debug, Clone)]
+pub struct AstSavepoint {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub action: AstSavepointAction,
+    /// The keywords before the name: `SAVEPOINT`, `SAVE TRAN`, `SAVE
+    /// TRANSACTION`, `RELEASE` or `RELEASE SAVEPOINT`.
+    pub keyword_span: Span,
+    /// The savepoint's name (T-SQL: a name or an `@variable` holding it).
+    pub name: AstIdentifier,
+}
+
+/// What a savepoint statement does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstSavepointAction {
+    /// `SAVEPOINT name`, T-SQL `SAVE TRAN name`: marks a point to roll back to.
+    Set,
+    /// `RELEASE [SAVEPOINT] name`: forgets it.
+    Release,
+}
+
+/// The row a cursor `FETCH` reads ([`AstStmt::FetchCursor`]).
+#[derive(Debug, Clone)]
+pub enum AstFetchOrientation {
+    Next,
+    Prior,
+    First,
+    Last,
+    /// `ABSOLUTE n`: the n-th row, counted from the end where n is negative.
+    Absolute(Box<AstExpr>),
+    /// `RELATIVE n`: n rows on from the current row.
+    Relative(Box<AstExpr>),
+    /// `ALL`: every row on from the current row.
+    All,
+    /// `FORWARD [n | ALL]`, and a count written alone: the next n rows (one
+    /// where no count is written).
+    Forward(Option<AstFetchCount>),
+    /// `BACKWARD [n | ALL]`: the n rows before the current row.
+    Backward(Option<AstFetchCount>),
+}
+
+/// How many rows a `FETCH FORWARD` / `BACKWARD` reads
+/// ([`AstFetchOrientation`]).
+#[derive(Debug, Clone)]
+pub enum AstFetchCount {
+    Count(Box<AstExpr>),
+    All,
+}
+
+/// One variable of a `DECLARE` ([`AstStmt::Declare`]): its name, its type
+/// and its initialiser.
+#[derive(Debug, Clone)]
+pub struct AstDeclaredVariable {
+    pub name: AstIdentifier,
+    /// Span covering the declared type (T-SQL's `AS` with it), if present.
+    pub type_span: Option<Span>,
+    /// Span covering the DEFAULT keyword or the `:=` / `=` operator, if present
+    pub default_op_span: Option<Span>,
+    /// TokenId for the DEFAULT keyword or the `:=` / `=` operator
+    pub default_op_token: Option<crate::cst::TokenId>,
+    /// Parsed default expression, if present. Names declared together
+    /// (`a, b INT DEFAULT 0`) share one: the first name holds it, every
+    /// name has its spans.
+    pub default_expr: Option<Box<AstExpr>>,
+    /// Span covering the DEFAULT keyword or operator and the expression, if present.
+    pub default_expr_span: Option<Span>,
+    /// The variable's definition, from its name to its type or initialiser.
+    pub span: Span,
+}
+
+/// The statement that defines a procedure, function or T-SQL trigger
+/// with its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstDefinitionVerb {
+    /// `CREATE`, also `CREATE OR REPLACE`.
+    Create,
+    /// T-SQL `ALTER`, restating the definition of a module that exists.
+    Alter,
+    /// T-SQL `CREATE OR ALTER`.
+    CreateOrAlter,
+}
+
+/// The language a routine body is written in, from its `LANGUAGE` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AstRoutineLanguage {
+    /// SQL and its procedural forms: `LANGUAGE SQL` (Snowflake Scripting,
+    /// PostgreSQL's `sql`, BigQuery, Databricks, MySQL) and, in PostgreSQL
+    /// and Redshift, `LANGUAGE PLPGSQL`. Also a routine with no `LANGUAGE`
+    /// clause: every dialect's default language is SQL (T-SQL has no
+    /// clause; Redshift and PostgreSQL require one unless the body is SQL).
+    Sql,
+    /// Any other language, named as written: `JAVASCRIPT`, `PYTHON`, `JAVA`,
+    /// `SCALA`, `plv8`, `plpython3u`, …
+    Other(String),
+}
+
+impl AstRoutineLanguage {
+    /// The language a `LANGUAGE` clause names in `dialect`: `value` is the
+    /// name without its quotes (`'plpgsql'` and `"plpgsql"` name PL/pgSQL),
+    /// `written` the name as written. PL/pgSQL is SQL where the dialect's
+    /// procedural SQL is it.
+    pub(crate) fn from_name(
+        value: &str,
+        written: &str,
+        dialect: &dyn crate::dialect::Dialect,
+    ) -> Self {
+        if dialect.routine_language_is_sql(value) {
+            Self::Sql
+        } else {
+            Self::Other(written.to_string())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AstCreateProcedureStmt {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// The `CREATE` keyword, or the `ALTER` of a T-SQL `ALTER PROC[EDURE]`.
     pub create_span: Span,
+    /// Which statement defines the procedure.
+    pub verb: AstDefinitionVerb,
     pub or_replace_span: Option<Span>,
     pub or_alter_span: Option<Span>,
     pub procedure_keyword_span: Span,
@@ -2513,8 +2953,16 @@ pub struct AstCreateProcedureStmt {
     /// invariant).
     pub params: Vec<AstProcedureParam>,
     pub returns_span: Span,
+    /// The language of the body: what its `LANGUAGE` clause names, before
+    /// or after the body, or `Sql` where none is written.
+    pub language: AstRoutineLanguage,
     pub body_span: Span,
     pub body_stmt: Option<Box<AstStmt>>,
+    /// The statements of a body written without `BEGIN … END` where
+    /// statement terminators are optional (T-SQL): every statement up to
+    /// the batch separator or the end of input. Empty for any other body;
+    /// `body_stmt` is then `None`. `body_span` covers them as written.
+    pub body_statements: Vec<AstStmt>,
     pub opening_delimiter_token: Option<crate::cst::TokenId>,
     pub closing_delimiter_token: Option<crate::cst::TokenId>,
     /// `WITH EXECUTE AS { OWNER | CALLER | SELF | 'user_name' }` clause
@@ -2526,13 +2974,31 @@ pub struct AstCreateProcedureStmt {
     /// invoker — the routine's privilege-delegation primitive. `None`
     /// when absent.
     pub definer: Option<AstDefiner>,
+    /// The entries of a PostgreSQL `SET search_path { TO | = } a, b`
+    /// option, before or after the body: the path the body runs under.
+    pub search_path: Option<Vec<Span>>,
+}
+
+/// What a function's `RETURNS` clause says one call returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstFunctionReturns {
+    /// One value: `RETURNS INT`.
+    Scalar,
+    /// A set of values of one type: `RETURNS SETOF INT`.
+    Set,
+    /// Rows of named columns: `RETURNS TABLE (n INT)`, `RETURNS TABLE<n INT64>`,
+    /// T-SQL's `RETURNS TABLE` and `RETURNS @t TABLE (n INT)`.
+    Table,
 }
 
 #[derive(Debug, Clone)]
 pub struct AstCreateFunctionStmt {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// The `CREATE` keyword, or the `ALTER` of a T-SQL `ALTER FUNCTION`.
     pub create_span: Span,
+    /// Which statement defines the function.
+    pub verb: AstDefinitionVerb,
     pub or_replace_span: Option<Span>,
     pub or_alter_span: Option<Span>,
     pub temp_keyword_span: Option<Span>,
@@ -2544,7 +3010,10 @@ pub struct AstCreateFunctionStmt {
     /// Typed parameter list. See [`AstCreateProcedureStmt::params`]
     /// for the same invariants.
     pub params: Vec<AstProcedureParam>,
-    pub returns_span: Span,
+    /// The `RETURNS` clause; `None` when none is written (a BigQuery or
+    /// Databricks function whose type follows from its body, a PostgreSQL
+    /// function with `OUT` parameters).
+    pub returns: Option<AstReturnsClause>,
     pub body_span: Span,
     pub body_stmt: Option<Box<AstStmt>>,
     pub opening_delimiter_token: Option<crate::cst::TokenId>,
@@ -2552,6 +3021,19 @@ pub struct AstCreateFunctionStmt {
     /// MySQL `DEFINER = { user | CURRENT_USER }` security-context clause.
     /// See [`AstCreateProcedureStmt::definer`]. `None` when absent.
     pub definer: Option<AstDefiner>,
+    /// The entries of a PostgreSQL `SET search_path { TO | = } a, b`
+    /// clause, the path the function's body runs under, each a name or a
+    /// string; `None` where no such clause is written.
+    pub search_path: Option<Vec<Span>>,
+}
+
+/// A function's `RETURNS` clause as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AstReturnsClause {
+    /// From `RETURNS` to the end of the return type.
+    pub span: Span,
+    /// What the clause says one call returns.
+    pub kind: AstFunctionReturns,
 }
 
 #[derive(Debug, Clone)]
@@ -2705,7 +3187,11 @@ pub struct CaseBranch {
     pub when_token: Option<crate::cst::TokenId>,
     /// Parsed WHEN condition expression for this branch.
     pub condition: Box<AstExpr>,
-    /// Span covering the original WHEN condition expression for formatting and diagnostics.
+    /// The values after the first in a simple CASE's WHEN list; empty for
+    /// one value and for a searched CASE.
+    pub more_values: Vec<AstExpr>,
+    /// Span covering the original WHEN condition expression (the whole list
+    /// of a simple CASE's WHEN) for formatting and diagnostics.
     pub condition_span: Span,
     pub then_span: Span,
     /// TokenId for the THEN keyword
@@ -2713,11 +3199,23 @@ pub struct CaseBranch {
     pub body: Vec<AstStmt>,
 }
 
+/// A table's column-list item `LIKE table [INCLUDING …]`.
+#[derive(Debug, Clone)]
+pub struct AstTableLikeItem {
+    /// The table whose columns it copies.
+    pub table: AstObjectRef,
+    /// The whole item, `LIKE` through its last option.
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct AstCreateTable {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
     pub keyword_span: Span,
+    /// Where the statement replaces a table that exists: the span of `OR
+    /// REPLACE` (or Databricks' `OR REFRESH`), or, for Databricks `REPLACE
+    /// TABLE`, of the leading `REPLACE`, the same span as `keyword_span`.
     pub or_replace_span: Option<Span>,
     /// Span covering the `PROCEDURE SCOPED` prefix of a Snowflake
     /// procedure-scoped temporary table (`CREATE [OR REPLACE] PROCEDURE
@@ -2725,7 +3223,14 @@ pub struct AstCreateTable {
     /// `None` for ordinary tables. The `TEMP`/`TEMPORARY` keyword itself lands
     /// in `temp_kind_span` as usual, so a scoped table is also temporary.
     pub scoped_span: Option<Span>,
+    /// Span of the modifiers between `CREATE [OR REPLACE]` and the table
+    /// kind: `[ LOCAL | GLOBAL ] { TEMP | TEMPORARY | VOLATILE }`, `TRANSIENT`,
+    /// and Databricks `[ STREAMING ] LIVE`. Text the formatter emits;
+    /// [`Self::persistence`] says what the modifiers make the table.
     pub temp_kind_span: Option<Span>,
+    /// How long the table lives, from its modifiers. `None` for a permanent
+    /// table, which a Databricks `LIVE` or `STREAMING` table is.
+    pub persistence: Option<AstTablePersistence>,
     /// Snowflake `ICEBERG` / `HYBRID` / `EVENT` table variant, declared
     /// between the temp modifier and `TABLE`. `None` for ordinary tables.
     pub table_kind: Option<AstTableKind>,
@@ -2733,7 +3238,12 @@ pub struct AstCreateTable {
     /// byte-exact formatting). Set iff `table_kind` is `Some`.
     pub table_kind_span: Option<Span>,
     pub table_keyword_span: Span,
-    pub name_span: Span,
+    /// Span of `IF NOT EXISTS` before the name.
+    pub if_not_exists_span: Option<Span>,
+    /// The table's name, after any `IF NOT EXISTS`. Where the tokens
+    /// before the column list or clause are not one name, a reference with
+    /// no parts whose span covers them all.
+    pub name: AstObjectRef,
     pub columns_span: Option<Span>,
     /// Span of the opening parenthesis for column definitions
     pub lparen_span: Option<Span>,
@@ -2742,6 +3252,21 @@ pub struct AstCreateTable {
     pub variant: AstCreateTableVariant,
     pub like_source_span: Option<Span>,
     pub clone_source_span: Option<Span>,
+    /// The table `LIKE table` copies the columns of.
+    pub like_source: Option<AstObjectRef>,
+    /// The table `[DEEP | SHALLOW] CLONE table` clones.
+    pub clone_source: Option<AstObjectRef>,
+    /// The table BigQuery's `COPY table` copies.
+    pub copy_source: Option<AstObjectRef>,
+    /// The parent `PARTITION OF parent` makes the table a partition of; its
+    /// clause (through the `FOR VALUES …` bound or `DEFAULT`) is
+    /// `partition_by_span`.
+    pub partition_of: Option<AstObjectRef>,
+    /// The tables PostgreSQL's `INHERITS (a, b)` names.
+    pub inherits: Vec<AstObjectRef>,
+    /// The column list's `LIKE table [INCLUDING …]` items, which are no
+    /// columns.
+    pub like_elements: Vec<AstTableLikeItem>,
     /// Databricks DEEP/SHALLOW clone kind
     pub clone_kind: Option<CloneKind>,
     /// Span for DEEP/SHALLOW keyword (Databricks)
@@ -2774,14 +3299,34 @@ pub struct AstCreateTable {
     pub data_retention_time_in_days_span: Option<Span>,
     pub max_data_extension_time_in_days_span: Option<Span>,
     pub default_ddl_collation_span: Option<Span>,
+    /// The `ROW ACCESS POLICY` clause written without `WITH`; Databricks'
+    /// `ROW FILTER` clause written without it.
     pub row_access_policy_span: Option<Span>,
+    /// The policy `ROW ACCESS POLICY name ON (…)` names, however it is written.
+    pub row_access_policy: Option<AstObjectRef>,
+    /// The columns of that policy's `ON (…)`.
+    pub row_access_policy_columns: Vec<Span>,
+    /// The `WITH AGGREGATION POLICY` clause or the `AGGREGATION POLICY` one.
     pub aggregation_policy_span: Option<Span>,
+    /// The policy `AGGREGATION POLICY name` names.
+    pub aggregation_policy: Option<AstObjectRef>,
+    /// The `WITH JOIN POLICY` clause or the `JOIN POLICY` one.
     pub join_policy_span: Option<Span>,
+    /// The policy `JOIN POLICY name` names.
+    pub join_policy: Option<AstObjectRef>,
+    /// Databricks `[WITH] ROW FILTER function ON (…)`: the function.
+    pub row_filter_function: Option<AstObjectRef>,
+    /// The columns of the row filter's `ON (…)`.
+    pub row_filter_columns: Vec<Span>,
     pub storage_lifecycle_policy_span: Option<Span>,
     pub tag_span: Option<Span>,
+    /// The tags of the WITH TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     pub enable_schema_evolution_span: Option<Span>,
     pub table_comment_span: Option<Span>,
+    /// The `WITH ROW ACCESS POLICY` clause; Databricks' `WITH ROW FILTER`.
     pub with_row_access_policy_span: Option<Span>,
+    /// The `WITH <option>` clause no other field holds (`WITH CONTACT = …`).
     pub with_contact_span: Option<Span>,
     pub using_template_span: Option<Span>,
     pub from_archive_span: Option<Span>,
@@ -2811,9 +3356,37 @@ pub struct AstCreateTableColumn {
     /// Storage keyword after the expression: `VIRTUAL` | `STORED` | `PERSISTED`.
     pub storage_keyword_span: Option<Span>,
     pub inline_constraint_id: Option<crate::syntax::SyntaxInlineConstraintId>,
+    /// The column's `[CONSTRAINT name] [FOREIGN KEY] REFERENCES t [(c)]`, as a
+    /// foreign key of this column; `references_columns` is empty where no
+    /// column list is written.
+    pub foreign_key: Option<AstConstraintDetails>,
+    /// The key the column's `[CONSTRAINT name] PRIMARY KEY` or `UNIQUE`
+    /// makes of it alone.
+    pub key: Option<AstColumnKey>,
+    /// Whether the column is declared `NOT NULL`, before or after its
+    /// constraint.
+    pub not_null: bool,
     pub masking_policy_span: Option<Span>,
+    /// The policy a `[WITH] MASKING POLICY name` or Databricks `MASK name`
+    /// clause names.
+    pub masking_policy: Option<AstObjectRef>,
+    /// The columns of the masking policy's `USING (…)` / `USING COLUMNS (…)`.
+    pub masking_policy_using: Vec<Span>,
+    /// The policy a `[WITH] PROJECTION POLICY name` clause names.
+    pub projection_policy: Option<AstObjectRef>,
     pub tag_span: Option<Span>,
+    /// The tags of the column's WITH TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     pub comment_span: Option<Span>,
+    /// The expression after `DEFAULT`, where its text is one.
+    pub default_expr: Option<Box<AstExpr>>,
+    /// The generated column's expression after `AS`, where its text is one.
+    pub virtual_expr: Option<Box<AstExpr>>,
+    /// The column's own `CHECK (…)` condition, parentheses included, where
+    /// its text is one expression.
+    pub check_expr: Option<Box<AstExpr>>,
+    /// The span of that `CHECK`'s parenthesized condition, where written.
+    pub check_span: Option<Span>,
 }
 
 impl AstCreateTableColumn {
@@ -2843,6 +3416,17 @@ pub struct AstCreateTableConstraint {
     pub full_span: Span,
     /// Parsed constraint details. None if parsing fell back to span-only.
     pub details: Option<AstConstraintDetails>,
+    /// Every expression the constraint holds (a `CHECK`'s condition, an
+    /// `EXCLUDE`'s elements and predicate, a T-SQL `DEFAULT … FOR`'s value),
+    /// where each is read; `None` where a part holding a literal is not.
+    pub expressions: Option<Vec<AstExpr>>,
+}
+
+/// A key a column's own constraint makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstColumnKey {
+    PrimaryKey,
+    Unique,
 }
 
 #[derive(Debug, Clone)]
@@ -2863,7 +3447,7 @@ pub enum AstConstraintKind {
     /// FOREIGN KEY (col1, ...) REFERENCES ref_table (ref_col1, ...)
     ForeignKey {
         columns: Vec<Span>,
-        references_table: Span,
+        references_table: AstObjectRef,
         references_columns: Vec<Span>,
     },
 }
@@ -2873,6 +3457,8 @@ pub enum AstCreateTableVariant {
     Plain,
     Like,
     Clone,
+    /// BigQuery `CREATE TABLE t COPY source`.
+    Copy,
     Ctas,
     UsingTemplate,
     FromArchive,
@@ -2914,6 +3500,16 @@ pub enum AstBackupMode {
 /// temp/transient modifier and the `TABLE` keyword:
 /// `CREATE { ICEBERG | HYBRID | EVENT } TABLE`. Absent (`None` on
 /// [`AstCreateTable::table_kind`]) for an ordinary table.
+/// A table that does not persist as an ordinary one does, by its modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstTablePersistence {
+    /// `TEMP`, `TEMPORARY` or `VOLATILE`, with or without `LOCAL` / `GLOBAL`:
+    /// the table lives for the session (or the procedure, when scoped).
+    Temporary,
+    /// Snowflake `TRANSIENT`: the table persists, without Fail-safe.
+    Transient,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AstTableKind {
     /// `CREATE ICEBERG TABLE` — data stored in an external EXTERNAL VOLUME.
@@ -2976,8 +3572,10 @@ pub struct AstCreateView {
     pub view_keyword_span: Span,
     /// Optional span covering IF NOT EXISTS clause
     pub if_not_exists_span: Option<Span>,
-    /// Span covering the view name
-    pub name_span: Span,
+    /// The view's name. Where the tokens before the column list or clause
+    /// are not one name, a reference with no parts whose span covers them
+    /// all.
+    pub name: AstObjectRef,
     /// Optional span covering the column list with optional comments/policies
     /// Format: `(col1 [COMMENT 'x'] [WITH] MASKING POLICY ..., col2, ...)`
     /// DEPRECATED: Use column_list_id for CST-based formatting
@@ -2989,12 +3587,22 @@ pub struct AstCreateView {
     pub columns: Vec<AstCreateViewColumn>,
     /// Optional span covering WITH ROW ACCESS POLICY clause (at view level)
     pub row_access_policy_span: Option<Span>,
+    /// The policy `ROW ACCESS POLICY name ON (…)` names.
+    pub row_access_policy: Option<AstObjectRef>,
+    /// The columns of that policy's `ON (…)`.
+    pub row_access_policy_columns: Vec<Span>,
     /// Optional span covering WITH AGGREGATION POLICY clause
     pub aggregation_policy_span: Option<Span>,
+    /// The policy `AGGREGATION POLICY name` names.
+    pub aggregation_policy: Option<AstObjectRef>,
     /// Optional span covering WITH JOIN POLICY clause
     pub join_policy_span: Option<Span>,
+    /// The policy `JOIN POLICY name` names.
+    pub join_policy: Option<AstObjectRef>,
     /// Optional span covering WITH TAG clause
     pub tag_span: Option<Span>,
+    /// The tags of the WITH TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     /// Optional span covering WITH CONTACT clause
     pub with_contact_span: Option<Span>,
     /// Optional span covering CHANGE_TRACKING = TRUE/FALSE
@@ -3066,10 +3674,18 @@ pub struct AstCreateViewColumn {
     pub comment_span: Option<Span>,
     /// Optional span covering MASKING POLICY clause
     pub masking_policy_span: Option<Span>,
+    /// The policy that clause names.
+    pub masking_policy: Option<AstObjectRef>,
+    /// The columns of the masking policy's `USING (…)`.
+    pub masking_policy_using: Vec<Span>,
     /// Optional span covering PROJECTION POLICY clause
     pub projection_policy_span: Option<Span>,
+    /// The policy that clause names.
+    pub projection_policy: Option<AstObjectRef>,
     /// Optional span covering TAG clause for this column
     pub tag_span: Option<Span>,
+    /// The tags of the column's TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
 }
 
 // ============================================================================
@@ -3111,16 +3727,20 @@ pub struct AstCreateDynamicTable {
     pub table_span: Span,
     /// Optional span covering IF NOT EXISTS clause
     pub if_not_exists_span: Option<Span>,
-    /// Span covering the table name
-    pub name_span: Span,
+    /// The table's name.
+    pub name: AstObjectRef,
     /// Optional span covering the column definitions (parenthesized list)
     pub columns_span: Option<Span>,
     /// Span covering TARGET_LAG = ...
     pub target_lag_span: Option<Span>,
     /// Span covering WAREHOUSE = ...
     pub warehouse_span: Option<Span>,
+    /// The warehouse `WAREHOUSE = name` names.
+    pub warehouse: Option<Span>,
     /// Optional span covering INITIALIZATION_WAREHOUSE = ...
     pub init_warehouse_span: Option<Span>,
+    /// The warehouse `INITIALIZATION_WAREHOUSE = name` names.
+    pub init_warehouse: Option<Span>,
     /// Optional span covering REFRESH_MODE = ...
     pub refresh_mode_span: Option<Span>,
     /// Optional span covering INITIALIZE = ...
@@ -3137,10 +3757,18 @@ pub struct AstCreateDynamicTable {
     pub copy_grants_span: Option<Span>,
     /// Optional span covering ROW ACCESS POLICY clause
     pub row_access_policy_span: Option<Span>,
+    /// The policy `ROW ACCESS POLICY name ON (…)` names.
+    pub row_access_policy: Option<AstObjectRef>,
+    /// The columns of that policy's `ON (…)`.
+    pub row_access_policy_columns: Vec<Span>,
     /// Optional span covering AGGREGATION POLICY clause
     pub aggregation_policy_span: Option<Span>,
+    /// The policy `AGGREGATION POLICY name` names.
+    pub aggregation_policy: Option<AstObjectRef>,
     /// Optional span covering TAG clause
     pub tag_span: Option<Span>,
+    /// The tags of the clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     /// Optional span covering REQUIRE USER
     pub require_user_span: Option<Span>,
     /// Optional span covering IMMUTABLE WHERE (...)
@@ -3221,6 +3849,8 @@ pub struct AstCreateTask {
     // --------------------------------
     /// Optional span covering `WAREHOUSE = <string>`
     pub warehouse_span: Option<Span>,
+    /// The warehouse `WAREHOUSE = name` names.
+    pub warehouse: Option<Span>,
     /// Optional span covering SCHEDULE = '...' (interval or CRON)
     pub schedule_span: Option<Span>,
     /// Optional span covering CONFIG = $$...$$
@@ -3267,12 +3897,18 @@ pub struct AstCreateTask {
     // --------------------------------
     /// Optional span covering WITH TAG (...)
     pub with_tag_span: Option<Span>,
+    /// The tags of the clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     /// Optional span covering AFTER task1 [, task2, ...]
     pub after_span: Option<Span>,
+    /// The tasks `AFTER` names, each read as an object name.
+    pub after: Vec<AstObjectRef>,
     /// Optional span covering `WHEN <condition>`
     pub when_span: Option<Span>,
     /// Optional span covering `EXECUTE AS OWNER|CALLER|USER <name>`
     pub execute_as_span: Option<Span>,
+    /// The user `EXECUTE AS USER name` names.
+    pub execute_as_user: Option<Span>,
 
     // --------------------------------
     // Body or Clone
@@ -3284,6 +3920,8 @@ pub struct AstCreateTask {
     pub body: Option<Result<Box<AstStmt>, Span>>,
     /// Optional span covering CLONE <source_task_name>
     pub clone_span: Option<Span>,
+    /// The task `CLONE` copies, read as an object name.
+    pub clone_source: Option<AstObjectRef>,
 
     // --------------------------------
     // Defensive Design
@@ -3396,6 +4034,8 @@ pub enum AstAlterTaskActionKind {
         tag_span: Span,
         /// Span covering tag assignments
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// SET FINALIZE = <root_task> - set finalizer task
     SetFinalize {
@@ -3416,6 +4056,8 @@ pub enum AstAlterTaskActionKind {
         tag_span: Span,
         /// Span covering tag names
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET FINALIZE - remove finalizer
     UnsetFinalize {
@@ -3506,6 +4148,8 @@ pub struct AstCreateWarehouse {
     pub scaling_policy_span: Option<Span>,
     /// Optional span covering TAG (key = 'value', ...)
     pub tag_span: Option<Span>,
+    /// The tags of the clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     /// Unknown properties — defensive design for future Snowflake additions
     pub extras: Vec<crate::ast::AstUnknownClause>,
 }
@@ -3572,12 +4216,16 @@ pub enum AstAlterWarehouseActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG (key, ...)
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         names_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -3688,12 +4336,16 @@ pub enum AstAlterPipeActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG (key, ...)
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         names_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `REFRESH [PREFIX = '<path>'] [MODIFIED_BEFORE = '<timestamp>']`
     Refresh {
@@ -3926,6 +4578,8 @@ pub enum AstAlterStreamActionKind {
         tag_span: Span,
         /// Span covering all tag assignments
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG <tag_name> [, ...]
     UnsetTag {
@@ -3933,6 +4587,8 @@ pub enum AstAlterStreamActionKind {
         tag_span: Span,
         /// Span covering all tag names
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -3979,6 +4635,8 @@ pub struct AstCreateStage {
     pub tag_clause: Option<Span>,
     /// Optional CLONE clause
     pub clone_clause: Option<Span>,
+    /// The stage the CLONE clause names.
+    pub clone_source: Option<AstObjectRef>,
 
     /// Unknown properties/clauses not recognized by parser (defensive design).
     ///
@@ -4074,17 +4732,21 @@ pub struct AstCopyOption {
 }
 
 /// The source side of a `COPY INTO <location> FROM <source>` (unload): a
-/// table reference or a parenthesized subquery. Captured structurally so
-/// the egress point can analyze the classification of the columns leaving
-/// the warehouse.
+/// table reference or a parenthesized subquery; and the query a Redshift
+/// `UNLOAD ('query')` holds. Captured structurally so the egress point can
+/// analyze the classification of the columns leaving the warehouse.
 #[derive(Debug, Clone)]
 pub enum AstUnloadSource {
     /// `FROM <db.schema.table>` — the whole table is unloaded.
     Table {
         /// Span covering the (possibly qualified) table name.
         name_span: Span,
+        /// The `SELECT * FROM <table>` the unload reads, its spans the
+        /// table name's: the columns it unloads are that query's.
+        query: Box<AstStmt>,
     },
-    /// `FROM (<query>)` — the subquery's projected columns are unloaded.
+    /// `FROM (<query>)` or `UNLOAD ('<query>')` — the query's projected
+    /// columns are unloaded.
     Subquery(Box<AstStmt>),
 }
 
@@ -4108,6 +4770,9 @@ pub struct AstStageFileFormatClause {
     pub keyword_span: Span,
     /// Format specification (FORMAT_NAME or TYPE with options)
     pub format_spec: AstStageFileFormatSpec,
+    /// The file format `FORMAT_NAME = name` names; for a name written as a
+    /// string, a reference whose span is the string.
+    pub file_format_name: Option<AstObjectRef>,
 }
 
 /// CREATE ROW ACCESS POLICY statement.
@@ -4224,8 +4889,12 @@ pub struct AstAlterTable {
     pub table_span: Span,
     /// Optional span covering IF EXISTS.
     pub if_exists_span: Option<Span>,
-    /// Span covering the table name / object reference.
-    pub name_span: Span,
+    /// The table's name. Where the tokens before the actions are not one
+    /// name, a reference with no parts whose span covers them all.
+    pub name: AstObjectRef,
+    /// The name as written, PostgreSQL's `ONLY` before it and `*` after it
+    /// included.
+    pub written_name_span: Span,
     /// Span covering the action list (everything after the table name).
     pub actions_span: Span,
     /// Parsed actions. When parsing is incomplete, this may be empty even if
@@ -4272,6 +4941,7 @@ pub struct SetColumnMaskingPolicyAction {
     pub masking_span: Option<Span>,
     pub policy_span: Option<Span>,
     pub policy_name_span: Span,
+    /// `USING (…)`, through its closing parenthesis.
     pub using_span: Option<Span>,
     pub force_span: Option<Span>,
 }
@@ -4289,6 +4959,30 @@ pub struct SetColumnProjectionPolicyAction {
     pub force_span: Option<Span>,
 }
 
+/// What an altered column's operation does to its NULL-ability
+/// ([`AstAlterTableActionKind::AlterColumn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstAlteredNullability {
+    /// The operation is the column's definition, a type first (T-SQL
+    /// `ALTER COLUMN v BIGINT [NOT] NULL`, MySQL `MODIFY v INT`): the
+    /// column is `NOT NULL` only where it writes `NOT NULL`.
+    Redefined { not_null: bool },
+    /// The operation changes the part of the column its first word names
+    /// (`TYPE`, `SET …`, `DROP …`, `COMMENT`, …), not its NULL-ability.
+    Kept,
+}
+
+/// What an `ALTER COLUMN` operation does to the column's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstAlteredType {
+    /// Leaves it: the operation changes another part of the column.
+    Kept,
+    /// Gives it the type written at `type_span` (`TYPE varchar(200)`, `SET
+    /// DATA TYPE VARCHAR`, T-SQL `ALTER COLUMN v NVARCHAR(200)`); `None`
+    /// where the type is not read.
+    Changed { type_span: Option<Span> },
+}
+
 /// ALTER TABLE action kinds.
 ///
 /// Most variants are intentionally span-first to avoid information loss and
@@ -4301,13 +4995,30 @@ pub enum AstAlterTableActionKind {
         to_span: Option<Span>,
         new_name_span: Span,
     },
-    /// `RENAME COLUMN <old> TO <new>`
+    /// `RENAME [COLUMN] <old> TO <new>`; `column_span` is `None` where
+    /// `COLUMN` is not written.
     RenameColumn {
         rename_span: Option<Span>,
         column_span: Option<Span>,
         old_name_span: Span,
         to_span: Option<Span>,
         new_name_span: Span,
+    },
+    /// `CHANGE [COLUMN] <old> <new> <definition>`: redefines a column,
+    /// renaming it where the two names differ. `definition_span` covers
+    /// what follows the new name. `CHANGE [COLUMN] <name>` followed by an
+    /// alter-column clause (`COMMENT '…'`, `FIRST`, `AFTER col`, `TYPE t`,
+    /// `{SET | DROP} {NOT NULL | DEFAULT | MASK}`, `SYNC IDENTITY`) is an
+    /// [`Self::AlterColumn`].
+    ChangeColumn {
+        change_span: Span,
+        column_span: Option<Span>,
+        old_name_span: Span,
+        new_name_span: Span,
+        definition_span: Span,
+        /// What the definition writes of NULL: `Some(false)` for `NOT
+        /// NULL`, `Some(true)` for `NULL`, `None` where it writes neither.
+        null_written: Option<bool>,
     },
     /// SWAP WITH <other_table>
     SwapWith {
@@ -4316,33 +5027,66 @@ pub enum AstAlterTableActionKind {
         other_table_span: Span,
     },
 
-    /// ADD COLUMN ... (details may be partially parsed).
+    /// `ADD [COLUMN | COLUMNS] [IF NOT EXISTS] <definition> [, …]` or
+    /// `ADD COLUMNS (<definition>, …)`.
     AddColumn {
         add_span: Option<Span>,
         column_span: Option<Span>,
+        /// `IF NOT EXISTS`, where written.
+        if_not_exists_span: Option<Span>,
+        /// The definitions; with their parentheses where `parenthesized`.
         columns_span: Span,
+        /// Whether the definitions are written in parentheses.
+        parenthesized: bool,
         columns: Vec<AstAlterTableColumnDef>,
     },
-    /// DROP COLUMN ...
+    /// `DROP COLUMN [IF EXISTS] <name> [, <name>]*` or `DROP COLUMNS (<name>, …)`
     DropColumn {
         drop_span: Option<Span>,
         column_span: Option<Span>,
         columns_span: Span,
+        /// Each dropped column's name; empty where the first is not a name.
         columns: Vec<Span>,
     },
-    /// ALTER COLUMN ... (details are currently stored as spans).
+    /// `{ALTER | MODIFY | CHANGE} [COLUMN] <name> <operation>`, or a later
+    /// `[COLUMN] <name> <operation>` item of a list of them, whose
+    /// `alter_span` is `None`. `operation_span` covers what follows the name.
     AlterColumn {
         alter_span: Option<Span>,
         column_span: Option<Span>,
         column_name_span: Span,
         operation_span: Span,
+        /// What the operation does to the column's NULL-ability.
+        nullability: AstAlteredNullability,
+        /// What the operation does to the column's type.
+        altered_type: AstAlteredType,
+        /// The default a `SET DEFAULT <expr>` operation gives the column.
+        default_span: Option<Span>,
+    },
+    /// `{ALTER | MODIFY} ( [COLUMN] <name> <operation>, … )`. `list_span`
+    /// covers the parentheses and what they hold.
+    AlterColumnList {
+        alter_span: Span,
+        list_span: Span,
+        /// Each item's column name.
+        columns: Vec<Span>,
     },
 
-    /// ADD CONSTRAINT ... (constraint text preserved span-first).
+    /// `ADD [CONSTRAINT [name]] ...` (constraint text preserved span-first);
+    /// `ADD FOREIGN KEY …` has no `constraint_span`.
     AddConstraint {
         add_span: Option<Span>,
         constraint_span: Option<Span>,
         details_span: Span,
+        /// The constraint read, where it is a primary key, unique or foreign
+        /// key constraint.
+        details: Option<AstConstraintDetails>,
+        /// Every expression the constraint holds, where each is read
+        /// ([`AstCreateTableConstraint::expressions`]).
+        expressions: Option<Vec<AstExpr>>,
+        /// The value a T-SQL `DEFAULT <value> FOR <column>` constraint gives
+        /// its column.
+        default_span: Option<Span>,
     },
     /// `DROP CONSTRAINT <name>`
     DropConstraint {
@@ -4483,6 +5227,10 @@ pub enum AstAlterTableActionKind {
         set_span: Option<Span>,
         mask_span: Option<Span>,
         function_name_span: Span,
+        /// `USING COLUMNS (other_column | literal, …)`: what the mask
+        /// function reads besides the masked column.
+        using_columns_span: Option<Span>,
+        using_columns: Vec<AstExpr>,
     },
 
     /// Databricks: ALTER COLUMN <col> DROP MASK
@@ -4513,12 +5261,16 @@ pub enum AstAlterTableActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG <tag_name> [, ...]
     UnsetTag {
         unset_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// `ALTER COLUMN <col> SET TAG <tag> = '<value>' [, ...]`
@@ -4529,6 +5281,8 @@ pub enum AstAlterTableActionKind {
         set_span: Option<Span>,
         tag_span: Option<Span>,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `ALTER COLUMN <col> UNSET TAG <tag> [, ...]`
     UnsetColumnTag {
@@ -4538,6 +5292,8 @@ pub enum AstAlterTableActionKind {
         unset_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     // ========================================================================
@@ -4682,6 +5438,8 @@ pub enum AstAlterTableActionKind {
         default_span: Option<Span>,
         /// Span covering the default expression
         expr_span: Span,
+        /// The default, where its text is one expression.
+        expr: Option<Box<AstExpr>>,
     },
 
     /// ALTER COLUMN <col> DROP DEFAULT — BigQuery drop column default
@@ -4721,12 +5479,137 @@ pub enum AstAlterTableActionKind {
         keyword_span: Span,
     },
 
+    /// `OWNER TO <principal>`
+    OwnerTo { owner: Span },
+    /// PG `SET SCHEMA <schema>`
+    SetSchema { schema: Span },
+    /// PG `ATTACH PARTITION <partition> { FOR VALUES … | DEFAULT }`
+    AttachPartition {
+        partition: AstObjectRef,
+        /// The bound written after the partition's name.
+        bound: Span,
+    },
+    /// PG `DETACH PARTITION <partition> [CONCURRENTLY | FINALIZE]`
+    DetachPartition {
+        partition: AstObjectRef,
+        /// The words written after the partition's name.
+        mode: Option<Span>,
+    },
+    /// T-SQL `SWITCH [PARTITION n] TO <target> [PARTITION n] [WITH (…)]`
+    SwitchTo { target: AstObjectRef },
+
     /// Action spans for governance / metadata features where detailed parsing
     /// is not yet implemented (complex policies, etc.).
     GovernanceSpan { span: Span },
 
     /// Unknown / unclassified action.
     Unknown { span: Span },
+
+    /// An action whose leading words say what it is; `span` covers the
+    /// whole action as written.
+    NamedAction {
+        kind: AstNamedTableAction,
+        span: Span,
+        /// The name a `DROP` of a constraint, index or key gives the object
+        /// it drops (`IF EXISTS` skipped), or the parent table `[NO]
+        /// INHERIT` names; `None` for any other action.
+        name_span: Option<Span>,
+    },
+}
+
+/// What a [`AstAlterTableActionKind::NamedAction`] is, by its leading words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstNamedTableAction {
+    /// `DROP CONSTRAINT [IF EXISTS] name …`, or a later `CONSTRAINT name`
+    /// item of a T-SQL `DROP` list.
+    DropConstraint,
+    /// `DROP {INDEX | KEY} name`
+    DropIndex,
+    /// `DROP FOREIGN KEY name`
+    DropForeignKey,
+    /// `DROP CHECK name`
+    DropCheck,
+    /// `DROP [IF EXISTS] PARTITION …`
+    DropPartition,
+    /// `DROP PERIOD FOR SYSTEM_TIME`
+    DropPeriod,
+    /// `ADD PRIMARY KEY …`
+    AddPrimaryKey,
+    /// `ADD UNIQUE …`
+    AddUnique,
+    /// `ADD CHECK (…)`
+    AddCheck,
+    /// `ADD {INDEX | KEY | FULLTEXT | SPATIAL} …`
+    AddIndex,
+    /// `ADD [IF NOT EXISTS] PARTITION …`
+    AddPartition,
+    /// `ADD PERIOD FOR SYSTEM_TIME (…)`
+    AddPeriod,
+    /// T-SQL `ADD DEFAULT value FOR column`
+    AddDefault,
+    /// `[WITH {CHECK | NOCHECK}] CHECK CONSTRAINT {name, … | ALL}`
+    CheckConstraint,
+    /// `[WITH {CHECK | NOCHECK}] NOCHECK CONSTRAINT {name, … | ALL}`
+    NocheckConstraint,
+    /// `ENABLE TRIGGER {name, … | ALL}`
+    EnableTrigger,
+    /// `DISABLE TRIGGER {name, … | ALL}`
+    DisableTrigger,
+    /// `{ENABLE | DISABLE} CHANGE_TRACKING …`
+    ChangeTracking,
+    /// `{ENABLE | DISABLE} FILETABLE_NAMESPACE`
+    FiletableNamespace,
+    /// `REBUILD [PARTITION = …] [WITH (…)]`
+    Rebuild,
+    /// `RENAME {INDEX | KEY} a TO b`
+    RenameIndex,
+    /// `RENAME CONSTRAINT a TO b`
+    RenameConstraint,
+    /// `ALTER INDEX name …`
+    AlterIndex,
+    /// `ALTER {CONSTRAINT | CHECK} name …`
+    AlterConstraint,
+    /// `VALIDATE CONSTRAINT name`
+    ValidateConstraint,
+    /// A table option set without `SET`: `ENGINE`, `AUTO_INCREMENT`,
+    /// `ROW_FORMAT`, `ALGORITHM`, `LOCK`, `[DEFAULT] CHARSET`,
+    /// `[DEFAULT] CHARACTER SET`, `[DEFAULT] COLLATE`, `COMMENT`,
+    /// `CONVERT TO CHARACTER SET`, `FORCE`, `ORDER BY`, a storage option
+    /// (`KEY_BLOCK_SIZE`, `CHECKSUM`, `COMPRESSION`, `ENCRYPTION`,
+    /// `STATS_PERSISTENT`, `PACK_KEYS`, `MAX_ROWS`, `MIN_ROWS`,
+    /// `AVG_ROW_LENGTH`, `DELAY_KEY_WRITE`, `INSERT_METHOD`) or `TABLESPACE`.
+    TableOption,
+    /// `INHERIT parent`
+    Inherit,
+    /// `NO INHERIT parent`
+    NoInherit,
+    /// `REPLICA IDENTITY …`
+    ReplicaIdentity,
+    /// `ALTER {DISTKEY | DISTSTYLE | [COMPOUND | INTERLEAVED] SORTKEY |
+    /// ENCODE} …`
+    Distribution,
+    /// A partition kept or moved: `{TRUNCATE | COALESCE | REORGANIZE |
+    /// ANALYZE | CHECK | OPTIMIZE | REPAIR | EXCHANGE | DISCARD | IMPORT |
+    /// ARCHIVE | UNARCHIVE} PARTITION …`, `{DISCARD | IMPORT} TABLESPACE`,
+    /// `REMOVE PARTITIONING`, `PARTITION BY …`, `RECOVER PARTITIONS`, `TOUCH`.
+    PartitionMaintenance,
+    /// `{ENABLE [ALWAYS | REPLICA] | DISABLE} RULE name`
+    RuleState,
+    /// `{ADD | DROP} SEARCH OPTIMIZATION [ON …]`
+    SearchOptimization,
+    /// `DROP UNIQUE (columns)`
+    DropUnique,
+    /// `RESET (storage_parameter, …)`
+    ResetOptions,
+    /// `ROW LEVEL SECURITY {ON | OFF} …`
+    RowLevelSecurity,
+    /// `{ENABLE | DISABLE} KEYS`
+    KeysState,
+    /// `DROP FEATURE name [TRUNCATE HISTORY]`
+    DropFeature,
+    /// `{ENABLE | DISABLE | INHERIT} PREDICTIVE OPTIMIZATION`, or
+    /// `PREDICTIVE OPTIMIZATION …`
+    PredictiveOptimization,
 }
 
 /// PG `ROW LEVEL SECURITY` toggle on `ALTER TABLE`.
@@ -4763,6 +5646,18 @@ pub struct AstAlterTableColumnDef {
     pub virtual_expr_span: Option<Span>,
     /// Storage keyword after the expression: `VIRTUAL` | `STORED` | `PERSISTED`.
     pub storage_keyword_span: Option<Span>,
+    /// The column's `REFERENCES t [(c)]`, as a foreign key of this column.
+    pub foreign_key: Option<AstConstraintDetails>,
+    /// The policy a `[WITH] MASKING POLICY name` clause names.
+    pub masking_policy: Option<AstObjectRef>,
+    /// The columns of the masking policy's `USING (…)`.
+    pub masking_policy_using: Vec<Span>,
+    /// The tags of the column's `[WITH] TAG (…)` clause, each name read as an
+    /// object name.
+    pub tags: Vec<AstTagRef>,
+    /// The definition read as a `CREATE TABLE` column is, for the
+    /// expressions it holds.
+    pub definition: Option<Box<AstCreateTableColumn>>,
 }
 
 // ============================================================================
@@ -4806,6 +5701,15 @@ pub struct AstAlterViewAction {
     pub kind: AstAlterViewActionKind,
 }
 
+/// The column policy an `UNSET … POLICY` action detaches.
+#[derive(Debug, Clone, Copy)]
+pub enum AstColumnPolicyUnset {
+    /// `UNSET MASKING POLICY`; `span` covers those words.
+    Masking { span: Span },
+    /// `UNSET PROJECTION POLICY`; `span` covers those words.
+    Projection { span: Span },
+}
+
 /// Kinds of ALTER VIEW actions.
 #[derive(Debug, Clone)]
 pub enum AstAlterViewActionKind {
@@ -4835,6 +5739,15 @@ pub enum AstAlterViewActionKind {
         action_span: Span,
     },
 
+    /// PostgreSQL `RENAME [COLUMN] <old> TO <new>`
+    RenameColumn {
+        action_span: Span,
+        /// The column renamed.
+        old_name_span: Span,
+        /// Its new name.
+        new_name_span: Span,
+    },
+
     /// SET SECURE
     SetSecure { action_span: Span },
 
@@ -4851,16 +5764,34 @@ pub enum AstAlterViewActionKind {
     SetChangeTracking { action_span: Span },
 
     /// SET TAG tag_name = 'tag_value' [, ...]
-    SetTag { action_span: Span },
+    SetTag {
+        action_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
+    },
 
     /// UNSET TAG tag_name [, ...]
-    UnsetTag { action_span: Span },
+    UnsetTag {
+        action_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
+    },
 
     /// `ADD ROW ACCESS POLICY <name> ON (col, ...)`
-    AddRowAccessPolicy { action_span: Span },
+    AddRowAccessPolicy {
+        action_span: Span,
+        /// The policy it names.
+        policy: Option<AstObjectRef>,
+        /// The columns of its `ON (…)`.
+        columns: Vec<Span>,
+    },
 
     /// `DROP ROW ACCESS POLICY <name>`
-    DropRowAccessPolicy { action_span: Span },
+    DropRowAccessPolicy {
+        action_span: Span,
+        /// The policy it names.
+        policy: Option<AstObjectRef>,
+    },
 
     /// DROP ALL ROW ACCESS POLICIES
     DropAllRowAccessPolicies { action_span: Span },
@@ -4879,7 +5810,24 @@ pub enum AstAlterViewActionKind {
 
     /// `{ ALTER | MODIFY } [COLUMN] <col> SET MASKING POLICY ... / UNSET MASKING POLICY`
     /// Also covers SET/UNSET PROJECTION POLICY, SET/UNSET TAG on columns.
-    AlterColumn { action_span: Span },
+    AlterColumn {
+        action_span: Span,
+        /// The column an `ALTER COLUMN <col> SET …` action names; `None` for
+        /// the actions that name none (`DROP COLUMN`, a policy on the view).
+        column: Option<Span>,
+        /// The policy a `SET MASKING POLICY <name>` action names.
+        masking_policy: Option<AstObjectRef>,
+        /// The columns of that policy's `USING (…)`.
+        masking_policy_using: Vec<Span>,
+        /// The policy a `SET PROJECTION POLICY <name>` action names.
+        projection_policy: Option<AstObjectRef>,
+        /// The tags of a `SET TAG` / `UNSET TAG` action, each name read as an
+        /// object name.
+        tags: Vec<AstTagRef>,
+        /// The policy an `UNSET MASKING POLICY` / `UNSET PROJECTION POLICY`
+        /// action detaches.
+        policy_unset: Option<AstColumnPolicyUnset>,
+    },
 
     /// `ADD [COLUMN] [IF NOT EXISTS] <col> <type> [WITH MASKING POLICY ...] ...`
     AddColumn { action_span: Span },
@@ -4897,8 +5845,9 @@ pub enum AstAlterViewActionKind {
 
 /// ALTER MATERIALIZED VIEW statement.
 ///
-/// BigQuery syntax:
-/// - `ALTER MATERIALIZED VIEW [IF EXISTS] <name> SET OPTIONS (...)`
+/// - BigQuery: `ALTER MATERIALIZED VIEW [IF EXISTS] <name> SET OPTIONS (...)`
+/// - Snowflake: `RENAME TO`, `{ SET | UNSET } SECURE`, `COMMENT`, `TAG`,
+///   and the policy actions `ALTER VIEW` has
 #[derive(Debug, Clone)]
 pub struct AstAlterMaterializedView {
     pub node_id: crate::ast::NodeId,
@@ -4933,6 +5882,77 @@ pub enum AstAlterMaterializedViewActionKind {
         set_span: Option<Span>,
         options_span: Option<Span>,
         options_list_span: Span,
+    },
+
+    /// Snowflake `ADD ROW ACCESS POLICY <name> ON (col, ...)`
+    AddRowAccessPolicy {
+        action_span: Span,
+        /// The policy it names.
+        policy: Option<AstObjectRef>,
+        /// The columns of its `ON (…)`.
+        columns: Vec<Span>,
+    },
+
+    /// Snowflake `DROP ROW ACCESS POLICY <name>`
+    DropRowAccessPolicy {
+        action_span: Span,
+        /// The policy it names.
+        policy: Option<AstObjectRef>,
+    },
+
+    /// Snowflake `DROP ALL ROW ACCESS POLICIES`
+    DropAllRowAccessPolicies { action_span: Span },
+
+    /// Snowflake `{ ALTER | MODIFY } [COLUMN] <col> SET MASKING POLICY ... /
+    /// UNSET MASKING POLICY` (also the projection forms).
+    AlterColumn {
+        action_span: Span,
+        /// The column the action names.
+        column: Option<Span>,
+        /// The policy a `SET MASKING POLICY <name>` action names.
+        masking_policy: Option<AstObjectRef>,
+        /// The policy a `SET PROJECTION POLICY <name>` action names.
+        projection_policy: Option<AstObjectRef>,
+        /// The policy an `UNSET … POLICY` action detaches.
+        policy_unset: Option<AstColumnPolicyUnset>,
+    },
+
+    /// PostgreSQL `RENAME [COLUMN] <old> TO <new>`
+    RenameColumn {
+        action_span: Span,
+        /// The column renamed.
+        old_name_span: Span,
+        /// Its new name.
+        new_name_span: Span,
+    },
+
+    /// `RENAME TO <new_name>`
+    RenameTo { action_span: Span },
+
+    /// Snowflake `SET SECURE`
+    SetSecure { action_span: Span },
+
+    /// Snowflake `UNSET SECURE`
+    UnsetSecure { action_span: Span },
+
+    /// Snowflake `SET COMMENT = '<string>'`
+    SetComment { action_span: Span },
+
+    /// Snowflake `UNSET COMMENT`
+    UnsetComment { action_span: Span },
+
+    /// Snowflake `SET TAG tag_name = 'tag_value' [, ...]`
+    SetTag {
+        action_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
+    },
+
+    /// Snowflake `UNSET TAG tag_name [, ...]`
+    UnsetTag {
+        action_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// Opaque remainder — for actions not yet parsed.
@@ -5209,12 +6229,16 @@ pub enum AstAlterDynamicTableActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG <tag_name> [, ...]
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `ALTER | MODIFY [COLUMN] <col> SET TAG <tag> = '<value>' [, ...]`
     SetColumnTag {
@@ -5224,6 +6248,8 @@ pub enum AstAlterDynamicTableActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `ALTER | MODIFY [COLUMN] <col> UNSET TAG <tag> [, ...]`
     UnsetColumnTag {
@@ -5233,6 +6259,8 @@ pub enum AstAlterDynamicTableActionKind {
         unset_span: Span,
         tag_span: Span,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     // ========================================================================
@@ -5368,12 +6396,16 @@ pub enum AstAlterFunctionActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG <tag_name> [, ...]
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     // ========================================================================
@@ -5528,12 +6560,16 @@ pub enum AstAlterProcedureActionKind {
         set_span: Span,
         tag_span: Span,
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG <tag_name> [, ...]
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     // ========================================================================
@@ -5626,6 +6662,8 @@ pub enum AstAlterRowAccessPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG <tag_name> [, ...]
@@ -5634,6 +6672,8 @@ pub enum AstAlterRowAccessPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag names to unset (comma-separated spans)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// `SET COMMENT = '<string>'`
@@ -5836,6 +6876,8 @@ pub enum AstAlterMaskingPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG <tag_name> [, ...]
@@ -5844,6 +6886,8 @@ pub enum AstAlterMaskingPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag names to unset (comma-separated spans)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// `SET COMMENT = '<string>'`
@@ -5957,6 +7001,8 @@ pub struct SetStageTagAction {
     pub tag_span: Option<Span>,
     /// Tag assignments as spans (covers "tag = 'value'" pairs)
     pub assignments_span: Span,
+    /// The tags, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
 }
 
 /// UNSET TAG action data (boxed in enum)
@@ -5966,6 +7012,8 @@ pub struct UnsetStageTagAction {
     pub tag_span: Option<Span>,
     /// Tag names to unset (comma-separated spans)
     pub tags_span: Span,
+    /// The tags, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
 }
 
 /// SET ENCRYPTION action data (boxed in enum)
@@ -6367,12 +7415,63 @@ pub struct AstUse {
     pub object_span: Span,
 }
 
-#[derive(Debug, Clone)]
+/// What a `DESCRIBE` describes, as the words after `DESCRIBE` say. `Other` is
+/// no object word: the tokens are a bare name (`DESC orders`) or not a name
+/// the parser types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AstDescribeKind {
     Table,
     View,
+    MaterializedView,
+    DynamicTable,
+    ExternalTable,
+    EventTable,
+    IcebergTable,
     Function,
     Procedure,
+    MaskingPolicy,
+    RowAccessPolicy,
+    AggregationPolicy,
+    ProjectionPolicy,
+    JoinPolicy,
+    NetworkPolicy,
+    PasswordPolicy,
+    SessionPolicy,
+    AuthenticationPolicy,
+    PackagesPolicy,
+    NetworkRule,
+    Stage,
+    FileFormat,
+    Stream,
+    Pipe,
+    Task,
+    Alert,
+    Sequence,
+    Schema,
+    Database,
+    Catalog,
+    Warehouse,
+    User,
+    Share,
+    Integration,
+    Secret,
+    Streamlit,
+    Service,
+    Connection,
+    Credential,
+    ExternalLocation,
+    Volume,
+    Provider,
+    Recipient,
+    Detail,
+    /// `DESCRIBE RESULT <query id>`: no object.
+    Result,
+    /// `DESCRIBE TRANSACTION <id>`: no object.
+    Transaction,
+    /// `DESCRIBE QUERY <statement>`: no object.
+    Query,
+    /// `DESCRIBE SEARCH OPTIMIZATION ON <table>`.
+    SearchOptimization,
     Other,
 }
 
@@ -6383,11 +7482,14 @@ pub struct AstDescribe {
     pub kind: AstDescribeKind,
     /// Span covering the DESCRIBE / DESC keyword.
     pub keyword_span: Span,
-    /// Span covering the object phrase immediately following
-    /// DESCRIBE, e.g. TABLE my_table, VIEW my_view, FUNCTION
-    /// my_func(NUMBER), etc. We intentionally keep this generic
-    /// and let downstream helpers interpret the text.
+    /// Span covering everything after DESCRIBE up to a `TYPE` clause:
+    /// the object words and the object, e.g. TABLE my_table, VIEW my_view,
+    /// FUNCTION my_func(NUMBER).
     pub object_span: Option<Span>,
+    /// The described object's name, after the object words and any
+    /// `EXTENDED` / `FORMATTED`. `None` for a kind that names no object
+    /// and where the tokens there are not a name.
+    pub object: Option<AstObjectRef>,
     /// Optional TYPE clause (e.g., "TYPE = COLUMNS" or "TYPE = STAGE")
     pub type_clause_span: Option<Span>,
 }
@@ -6402,8 +7504,38 @@ pub struct AstTruncate {
     pub table_span: Option<Span>,
     /// Optional span covering the IF EXISTS phrase.
     pub if_exists_span: Option<Span>,
-    /// Span covering the table name to truncate (possibly qualified).
-    pub target_table_span: Option<Span>,
+    /// PostgreSQL `TRUNCATE ONLY parent` of one table: the table alone,
+    /// none of a table that inherits from it. Span covers `ONLY`.
+    pub only_span: Option<Span>,
+    /// The table to truncate (possibly qualified), after any `ONLY`. Where
+    /// the tokens are not one name (a list of tables), a reference with no
+    /// parts whose span covers them all.
+    pub target_table: Option<AstObjectRef>,
+    /// Each table listed, in order. Empty where the tokens are no list of
+    /// names.
+    pub tables: Vec<AstTruncateTable>,
+}
+
+/// One table of a `TRUNCATE` list.
+#[derive(Debug, Clone)]
+pub struct AstTruncateTable {
+    /// PostgreSQL `ONLY` before it: the table alone, none of a table that
+    /// inherits from it. Span covers `ONLY`.
+    pub only_span: Option<Span>,
+    /// The table's name, without its `ONLY` or a `*` after it.
+    pub name: AstObjectRef,
+}
+
+/// One name of a `DROP` list.
+#[derive(Debug, Clone)]
+pub struct AstDropTarget {
+    /// The name, as the shared object-name reader reads it.
+    pub name: AstObjectRef,
+    /// A routine's argument list `(…)`, parentheses included.
+    pub signature: Option<Span>,
+    /// Each argument of the list, read as a routine's parameter: its mode,
+    /// its name where written, its type. Empty where there is no list.
+    pub params: Vec<AstProcedureParam>,
 }
 
 #[derive(Debug, Clone)]
@@ -6416,8 +7548,14 @@ pub struct AstDrop {
     pub object_type_span: Option<Span>,
     /// Optional span covering the IF EXISTS phrase.
     pub if_exists_span: Option<Span>,
-    /// Span covering the object name to drop (possibly qualified).
-    pub target_name_span: Option<Span>,
+    /// The object to drop (possibly qualified). Where the tokens are not
+    /// one name (a list of names, a routine's argument list), a reference
+    /// with no parts whose span covers them all.
+    pub target_name: Option<AstObjectRef>,
+    /// Each name of the list dropped (`DROP FUNCTION f(INT), g()`), the
+    /// name apart from its argument list. Empty where the statement's
+    /// tokens are not a list of names.
+    pub targets: Vec<AstDropTarget>,
     /// Optional span covering CASCADE or RESTRICT keyword.
     pub cascade_restrict_span: Option<Span>,
 }
@@ -6432,21 +7570,38 @@ pub struct AstInsert {
     pub into_span: Option<Span>,
     /// Optional span covering the OVERWRITE keyword, if present.
     pub overwrite_span: Option<Span>,
+    /// Databricks `TABLE` written before the target (`INSERT OVERWRITE
+    /// TABLE t`, `INSERT INTO TABLE t`).
+    pub table_keyword_span: Option<Span>,
     /// Optional span covering the REPLACE keyword after INSERT (Databricks INSERT REPLACE INTO).
     pub replace_span: Option<Span>,
-    /// Span covering the target table reference after INTO. This is
-    /// intentionally permissive and may include qualifiers and
-    /// quoting, e.g. db.schema."Table".
-    pub target_table_span: Option<Span>,
+    /// The target table after INTO, e.g. db.schema."Table". Where the
+    /// tokens before the column list are not `name [AS alias]`, a
+    /// reference with no parts whose span covers them all.
+    pub target_table: Option<AstObjectRef>,
+    /// Node id of the target table, distinct from the statement's.
+    pub target_node_id: crate::ast::NodeId,
+    /// Span of the alias when the target is `name AS alias`; `None`
+    /// otherwise, including when an alias is written in another shape.
+    pub target_alias_span: Option<Span>,
     /// Optional span covering the column list, including parentheses,
     /// e.g. "(col1, col2)".
     pub columns_span: Option<Span>,
+    /// The entries of the column list, each read as an expression: a
+    /// column's name, a name behind a qualifier, a field or element of a
+    /// column. Empty where there is no list or an entry is not one
+    /// expression.
+    pub columns: Vec<AstExpr>,
     /// Span covering everything after INSERT up to a semicolon or EOF.
     pub body_span: Option<Span>,
     /// Very shallow classification of the INSERT source: VALUES list
     /// vs. query-based insert. This remains generic and does not
     /// attempt to parse individual expressions.
     pub source_kind: AstInsertSourceKind,
+    /// Node id of the `VALUES` rows or the MySQL `SET` row the statement
+    /// inserts. Allocated for every source kind; it names a clause only
+    /// for those two.
+    pub values_node_id: crate::ast::NodeId,
     /// If source_kind is Values, span covering the entire VALUES clause.
     pub values_span: Option<Span>,
     /// Span covering just the VALUES keyword token (for trivia-preserving emission).
@@ -6465,6 +7620,9 @@ pub struct AstInsert {
     pub query_span: Option<Span>,
     /// If source_kind is Query, the parsed query (SELECT / WITH ...).
     pub query: Option<Box<AstStmt>>,
+    /// If source_kind is Execute, the parsed `EXEC[UTE]` statement whose
+    /// rows are inserted (an [`AstStmt::MssqlExec`]).
+    pub execute: Option<Box<AstStmt>>,
 
     // PostgreSQL extensions (always present, usually None)
     pub output: Option<AstOutputClause>,
@@ -6501,12 +7659,24 @@ pub struct AstInsert {
     pub partition_span: Option<Span>,
     /// Optional span covering the 8.0.19 row alias: AS alias [(col, ...)].
     pub row_alias_span: Option<Span>,
+    /// The row alias `row_alias_span` covers: its alias and column names.
+    pub row_alias: Option<AstInsertRowAlias>,
     /// If source_kind is SetAssignments, span covering SET col = expr, ...
     pub set_clause_span: Option<Span>,
     /// If source_kind is SetAssignments, parsed (column, value) assignments.
     pub set_assignments: Vec<(String, AstExpr)>,
     /// Optional ON DUPLICATE KEY UPDATE clause.
     pub on_duplicate_key_update: Option<AstOnDuplicateKeyUpdate>,
+}
+
+/// MySQL 8.0.19 row alias of an INSERT: `AS alias [(col, ...)]` after the
+/// VALUES rows.
+#[derive(Debug, Clone)]
+pub struct AstInsertRowAlias {
+    pub alias: AstIdentifier,
+    /// The names the alias gives the inserted columns, by position; empty
+    /// when no column list is written.
+    pub columns: Vec<AstIdentifier>,
 }
 
 /// MySQL INSERT/REPLACE priority modifier. Lexes as an identifier; reserved
@@ -6549,16 +7719,28 @@ pub struct AstReplaceInto {
     pub priority: Option<AstInsertPriority>,
     /// Optional span covering the INTO keyword (optional in MySQL).
     pub into_span: Option<Span>,
-    /// Span covering the target table reference (possibly qualified).
-    pub target_table_span: Option<Span>,
+    /// The target table (possibly qualified); as [`AstInsert::target_table`].
+    pub target_table: Option<AstObjectRef>,
+    /// Node id of the target table, distinct from the statement's.
+    pub target_node_id: crate::ast::NodeId,
+    /// Span of the alias when the target is `name AS alias`; `None`
+    /// otherwise, including when an alias is written in another shape.
+    pub target_alias_span: Option<Span>,
     /// Optional span covering PARTITION (p, ...) selection, parens included.
     pub partition_span: Option<Span>,
     /// Optional span covering the column list, parens included.
     pub columns_span: Option<Span>,
+    /// The entries of the column list, each read as an expression: a
+    /// column's name, a name behind a qualifier, a field or element of a
+    /// column. Empty where there is no list or an entry is not one
+    /// expression.
+    pub columns: Vec<AstExpr>,
     /// Span covering the source body (VALUES rows / query / SET assignments).
     pub body_span: Option<Span>,
     /// Source classification, shared with INSERT.
     pub source_kind: AstInsertSourceKind,
+    /// Node id of the `VALUES` rows or the `SET` row — see [`AstInsert`].
+    pub values_node_id: crate::ast::NodeId,
     /// If source_kind is Values, span covering the entire VALUES clause.
     pub values_span: Option<Span>,
     /// Span covering just the VALUES/VALUE keyword token.
@@ -6588,6 +7770,9 @@ pub enum AstInsertSourceKind {
     DefaultValues,
     /// MySQL: INSERT/REPLACE ... SET col = expr, ...
     SetAssignments,
+    /// T-SQL: `INSERT INTO t [(cols)] EXEC[UTE] …` — the rows the procedure
+    /// or the executed string returns ([`AstInsert::execute`]).
+    Execute,
 }
 
 #[derive(Debug, Clone)]
@@ -6602,12 +7787,21 @@ pub struct AstMultiInsertIntoClause {
     pub node_id: crate::ast::NodeId,
     /// Span covering the INTO keyword.
     pub into_span: Span,
-    /// Span covering the target table reference after INTO.
-    pub target_table_span: Option<Span>,
+    /// The target table after INTO; as [`AstInsert::target_table`].
+    pub target_table: Option<AstObjectRef>,
     /// Optional span covering the column list, including parentheses.
     pub columns_span: Option<Span>,
-    /// Optional span covering the VALUES clause for this INTO, if present.
-    pub values_span: Option<Span>,
+    /// The entries of the column list, each read as an expression: a
+    /// column's name, a name behind a qualifier, a field or element of a
+    /// column. Empty where there is no list or an entry is not one
+    /// expression.
+    pub columns: Vec<AstExpr>,
+    /// The `VALUES` keyword, when the clause writes rows.
+    pub values_keyword_span: Option<Span>,
+    /// The span of each parenthesised row of `VALUES`.
+    pub values_rows_spans: Vec<Span>,
+    /// The expressions of each row of `VALUES`, in the column list's order.
+    pub values_rows: Vec<Vec<AstExpr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -6670,6 +7864,11 @@ pub struct AstUpdate {
     pub top: Option<AstTop>,
     /// Parsed target table reference (can include alias, time travel, etc.).
     pub target_table: Option<Box<AstTableRef>>,
+    /// Node id of the target where the statement lists several tables
+    /// before `SET`: `target_table` carries a join chain or
+    /// `additional_targets` is not empty. `target_table.node_id` is then
+    /// the reference's id as one of those tables. `None` otherwise.
+    pub target_node_id: Option<crate::ast::NodeId>,
     /// Span covering the SET keyword + all assignments (legacy).
     pub set_span: Option<Span>,
     /// Span covering just the SET keyword token.
@@ -6702,6 +7901,8 @@ pub struct AstUpdate {
     pub returning: Option<AstReturning>,
     /// Optional WITH clause (CTEs) that precedes the UPDATE
     pub with_clause: Option<AstWithClause>,
+    /// T-SQL `OPTION (…)` query hints, each kept as written.
+    pub option_clauses: Vec<AstQueryOptions>,
     /// Optional semicolon token ID when UPDATE appears in scripting context
     pub semicolon_token: Option<crate::cst::TokenId>,
 }
@@ -6720,9 +7921,20 @@ pub struct AstDelete {
     pub from_keyword_span: Option<Span>,
     /// Parsed target table reference (can include alias, time travel, etc.).
     pub target_table: Option<Box<AstTableRef>>,
-    /// MySQL multi-table target list before FROM (`DELETE t1, t2 FROM ...`,
-    /// `DELETE t1.* FROM ...`). Each ref's span includes any trailing `.*`.
+    /// The targets written before FROM: MySQL's multi-table list (`DELETE
+    /// t1, t2 FROM ...`, `DELETE t1.* FROM ...`), T-SQL's one target (`DELETE
+    /// d FROM ...`, `DELETE db.s.t FROM ...`); or, under
+    /// `targets_follow_from`, MySQL's list between FROM and USING. Each
+    /// ref's span includes any trailing `.*`.
     pub targets: Vec<Box<AstTableRef>>,
+    /// MySQL's `DELETE FROM t1, t2 USING <list>`: `targets` are written
+    /// after FROM, and the list after USING is `target_table` with
+    /// `from_rest`, as the FROM list of `DELETE t1, t2 FROM <list>` is.
+    pub targets_follow_from: bool,
+    /// The FROM items after the first in MySQL's multi-table form, written
+    /// with commas (`DELETE o FROM orders o, users u WHERE …`): sources of
+    /// the delete, as `using`'s are.
+    pub from_rest: Vec<Box<AstTableRef>>,
     /// Optional USING clause with parsed table references and joins.
     pub using: Vec<Box<AstTableRef>>,
     /// Span covering just the USING keyword token.
@@ -6748,6 +7960,8 @@ pub struct AstDelete {
     pub returning: Option<AstReturning>,
     /// Optional WITH clause (CTEs) that precedes the DELETE
     pub with_clause: Option<AstWithClause>,
+    /// T-SQL `OPTION (…)` query hints, each kept as written.
+    pub option_clauses: Vec<AstQueryOptions>,
     /// Optional semicolon token ID when DELETE appears in scripting context
     pub semicolon_token: Option<crate::cst::TokenId>,
 }
@@ -6762,6 +7976,10 @@ pub enum AstMergeClauseKind {
 
 #[derive(Debug, Clone)]
 pub enum AstMergeActionKind {
+    /// `DO NOTHING`: the branch writes and returns nothing.
+    DoNothing {
+        span: Span,
+    },
     UpdateAllByName {
         update_span: Span,
         all_span: Span,
@@ -6787,6 +8005,11 @@ pub enum AstMergeActionKind {
     InsertStar {
         insert_span: Span,
     }, // INSERT *
+    /// BigQuery `INSERT ROW`: every column of the source row, in order,
+    /// into the target's columns in order. `insert_span` covers both words.
+    InsertRow {
+        insert_span: Span,
+    },
     InsertValues {
         insert_span: Span,          // INSERT (...) VALUES (...)
         columns_span: Option<Span>, // column list span (if present)
@@ -6825,8 +8048,22 @@ pub struct AstMerge {
     /// `MERGE` and the target table. Absent for BigQuery-style
     /// `MERGE target USING …`, present elsewhere.
     pub into_span: Option<Span>,
-    pub target_table_span: Option<Span>,
+    /// PostgreSQL `MERGE INTO ONLY parent`: the rows of the table alone,
+    /// none of a table that inherits from it. Span covers `ONLY`.
+    pub only_span: Option<Span>,
+    /// The target table. Where the tokens before `USING` are not
+    /// `name [[WITH (hints)] [AS] alias]`, a reference with no parts whose
+    /// span covers them all.
+    pub target_table: Option<AstObjectRef>,
+    /// Node id of the target table, distinct from the statement's.
+    pub target_node_id: crate::ast::NodeId,
+    /// Span of the alias when the target is `name [WITH (hints)] [AS] alias`;
+    /// `None` otherwise, including when an alias is written in another shape.
+    pub target_alias_span: Option<Span>,
     pub using_span: Option<Span>,
+    /// Node id of the `USING` clause, distinct from the statement's and
+    /// from a `using_table_ref`'s.
+    pub using_node_id: crate::ast::NodeId,
     /// Span covering just the USING keyword token (for trivia-preserving emission).
     pub using_keyword_span: Option<Span>,
     /// If USING is a direct table reference (not a subquery), the parsed table ref.
@@ -6836,24 +8073,23 @@ pub struct AstMerge {
     pub using_subquery: Option<Box<AstStmt>>,
     /// Alias for the USING source (the identifier after the subquery or table).
     pub using_alias_span: Option<Span>,
+    /// The column list after the USING subquery's alias, `USING (SELECT …)
+    /// s (p, q)`: the subquery's columns by position, renamed. Empty where
+    /// none is written.
+    pub using_alias_columns: Vec<AstIdentifier>,
     pub on_span: Option<Span>,
     /// Parsed ON condition expression (for semantic analysis like tautology detection).
     pub on_condition: Option<Box<AstExpr>>,
     pub clauses: Vec<AstMergeClause>,
     /// Optional OUTPUT clause (MSSQL): OUTPUT ... [INTO ...]
     pub output: Option<AstOutputClause>,
+    /// PostgreSQL `RETURNING …`: a row for each row the statement
+    /// inserts, updates or deletes.
+    pub returning: Option<AstReturning>,
+    /// T-SQL `OPTION (…)` query hints, each kept as written.
+    pub option_clauses: Vec<AstQueryOptions>,
     /// Optional semicolon token ID when MERGE appears in scripting context
     pub semicolon_token: Option<crate::cst::TokenId>,
-}
-
-impl AstInsert {
-    /// Attempt to slice out the target table name by scanning the
-    /// body for the first identifier after INTO. This is intentionally
-    /// conservative and may return None if the pattern does not match
-    /// simple "`INTO <ident>`" forms.
-    pub fn target_table_span(&self) -> Option<Span> {
-        self.target_table_span
-    }
 }
 
 /// Generates a `node_id` match expression for enums where ALL variants are
@@ -6911,10 +8147,10 @@ macro_rules! impl_ast_accessors {
 impl_ast_accessors!(AstStmt,
     struct_variants: [
         // DML / queries
-        Select, ValuesQuery, Insert, ReplaceInto, MultiInsert, Update, Delete, Merge,
+        Insert, ReplaceInto, MultiInsert, Update, Delete, Merge,
         // DDL
         CreateTable, CreateView, CreateDynamicTable, CreateTask, CreateStage,
-        CreateIndex, CreateSynonym, CommentOn, DoBlock, Vacuum, AnalyzeStmt, Explain,
+        CreateIndex, CreateSynonym, CommentOn, DoBlock, Perform, Vacuum, AnalyzeStmt, Explain, PsqlGexec, MysqlDo, ExecuteTask, MysqlCreateLoadableFunction, MysqlAdmin,
         // Policies (create)
         CreateRowAccessPolicy, CreateMaskingPolicy, CreateNetworkPolicy,
         CreateSessionPolicy, CreateAuthenticationPolicy, CreateApiIntegration,
@@ -7016,7 +8252,7 @@ impl_ast_accessors!(AstStmt,
         AlterIndex, Reindex,
         PgPrepare, PgExecute, PgDeallocate, PgCopy, PgRefreshMatview,
         PgListen, PgNotify, PgUnlisten, PgLockTable,
-        PgCreateRule, PgCreateAggregate, PgCreateOperator,
+        PgCreateRule, MssqlCreateRule, PgCreateAggregate, PgCreateOperator,
         PgAlterSystem, PgAlterTablespace, PgDropOwned, PgReassignOwned,
         PgDiscard, PgCluster, PgPublication, PgSubscription,
         CreatePrincipal, AlterPrincipal, DropPrincipal,
@@ -7074,11 +8310,14 @@ impl_ast_accessors!(AstStmt,
         MssqlRaiserror,
         MssqlSetOption,
         MysqlSet,
+        MysqlUnlockTables,
         MssqlWaitfor,
         MssqlGoto,
         MssqlLabel,
         CreateMssqlTrigger,
         DropMssqlTrigger,
+        MssqlTriggerState,
+        Savepoint,
         MssqlBulkInsert,
         MssqlCreateExternalModel,
         MssqlCreateExternalDataSource,
@@ -7110,14 +8349,31 @@ impl_ast_accessors!(AstStmt,
         ExecuteImmediate, BeginTransaction, Commit, Rollback,
         Call, CopyIntoTable, CopyIntoLocation, Unload, RedshiftCopy,
         JinjaPlaceholder,
-        Error, OpaqueContent, GoBatchSeparator, ClauseFragment,
-        Reconfigure, MssqlRevert,
+        Error, OpaqueContent, GoBatchSeparator, SqlcmdCommand, ClauseFragment,
+        Reconfigure, MssqlServerCommand, MssqlRevert,
     ],
     custom_span: {
+        // A parenthesised query spans its parentheses (and a `WITH` before
+        // them), and a tail after its `)` through the tail.
+        Select(s) => s
+            .outer_tail
+            .as_ref()
+            .map_or(with_parens(s.span, s.paren_span), |tail| {
+                with_parens(tail.query_span, s.paren_span)
+            }),
+        ValuesQuery(s) => s
+            .outer_tail
+            .as_ref()
+            .map_or(with_parens(s.span, s.paren_span), |tail| {
+                with_parens(tail.query_span, s.paren_span)
+            }),
         // SetSelect computes span from left/right operands, extended to
         // cover any trailing ORDER BY / LIMIT / OFFSET / FETCH on the whole
         // set operation.
         SetSelect(s) => {
+            if let Some(tail) = &s.outer_tail {
+                return with_parens(tail.query_span, s.paren_span);
+            }
             let left_span = s.left.span();
             let right_span = s.right.span();
             let mut end = right_span.end;
@@ -7133,10 +8389,477 @@ impl_ast_accessors!(AstStmt,
             for sp in [s.limit_keyword_span, s.fetch_clause_span, s.offset_keyword_span].into_iter().flatten() {
                 end = end.max(sp.end);
             }
-            Span { start: left_span.start, end }
+            with_parens(Span { start: left_span.start, end }, s.paren_span)
         }
     },
 );
+
+/// `span` widened to the parentheses around its query, where its parser
+/// read them.
+fn with_parens(span: Span, parens: Option<Span>) -> Span {
+    parens.map_or(span, |parens| Span {
+        start: span.start.min(parens.start),
+        end: span.end.max(parens.end),
+    })
+}
+
+/// Where a body a statement holds sits in it ([`AstStmt::bodies`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyRole {
+    /// A block's declarations: its `DECLARE` section.
+    Declarations,
+    /// A block's statements, or a T-SQL `TRY` block's.
+    Block,
+    /// One branch of a conditional: an `IF` or `ELSEIF`, a `CASE`'s `WHEN`,
+    /// a T-SQL `IF`'s statement.
+    Branch,
+    /// A conditional's `ELSE`.
+    Else,
+    /// The body of a `WHILE`, `FOR`, `FOREACH`, `LOOP` or `REPEAT` loop.
+    Loop,
+    /// The query a `FOR` loop iterates, run before its body.
+    LoopQuery,
+    /// A T-SQL `CATCH` block.
+    Catch,
+    /// The statements of a handler of a block's `EXCEPTION` section.
+    ExceptionHandler,
+    /// The statement a `DECLARE … HANDLER` runs.
+    HandlerAction,
+    /// The body of a procedure, function, trigger, event, task or `DO`
+    /// block, or the commands of a PostgreSQL rule.
+    Routine,
+    /// The `EXEC` a T-SQL `INSERT … EXEC` takes its rows from.
+    InsertExec,
+}
+
+/// A body a statement holds: its statements, and where it sits.
+#[derive(Debug, Clone, Copy)]
+pub struct StatementBody<'a> {
+    pub role: BodyRole,
+    pub stmts: &'a [AstStmt],
+}
+
+impl AstStmt {
+    /// The statement bodies this statement holds, in the order written:
+    /// the blocks, branches, loops and handlers of a scripting statement,
+    /// the body of a routine, trigger, event, task or `DO` block, the
+    /// commands of a PostgreSQL rule, and the
+    /// statement a statement runs as part of itself. A body that is a list
+    /// is given even where it is empty; one that was not parsed is not
+    /// given. A query a statement defines or holds as a value (a view's, a
+    /// cursor's, a prepared statement's) is no body.
+    pub fn bodies(&self) -> Vec<StatementBody<'_>> {
+        let mut bodies = Vec::new();
+        let mut push = |role: BodyRole, stmts| bodies.push(StatementBody { role, stmts });
+        match self {
+            AstStmt::Block(b) => {
+                push(BodyRole::Declarations, &b.decls);
+                push(BodyRole::Block, &b.body);
+                for handler in b.exception.iter().flat_map(|e| &e.handlers) {
+                    push(BodyRole::ExceptionHandler, &handler.body);
+                }
+            }
+            AstStmt::DeclareHandler(h) => {
+                push(
+                    BodyRole::HandlerAction,
+                    std::slice::from_ref(&*h.handler_action),
+                );
+            }
+            AstStmt::If(i) => {
+                for branch in &i.branches {
+                    push(BodyRole::Branch, &branch.body);
+                }
+                push(BodyRole::Else, &i.else_body);
+            }
+            AstStmt::CaseStmt(c) => {
+                for branch in &c.branches {
+                    push(BodyRole::Branch, &branch.body);
+                }
+                push(BodyRole::Else, &c.else_body);
+            }
+            AstStmt::MssqlIf(i) => {
+                push(BodyRole::Branch, &i.then_body);
+                push(BodyRole::Else, &i.else_body);
+            }
+            AstStmt::For(f) => {
+                match &f.iterates {
+                    AstForIterable::Query(query) => {
+                        push(BodyRole::LoopQuery, std::slice::from_ref(&**query))
+                    }
+                    AstForIterable::Range { .. } | AstForIterable::Expr(_) => {}
+                }
+                push(BodyRole::Loop, &f.body);
+            }
+            AstStmt::While(w) => push(BodyRole::Loop, &w.body),
+            AstStmt::ForEach(f) => push(BodyRole::Loop, &f.body),
+            AstStmt::Loop(l) => push(BodyRole::Loop, &l.body),
+            AstStmt::Repeat(r) => push(BodyRole::Loop, &r.body),
+            AstStmt::MssqlWhile(w) => push(BodyRole::Loop, &w.body),
+            AstStmt::MssqlTryCatch(t) => {
+                push(BodyRole::Block, &t.try_body);
+                push(BodyRole::Catch, &t.catch_body);
+            }
+            AstStmt::CreateProcedure(p) => {
+                if let Some(body) = p.body_stmt.as_deref() {
+                    push(BodyRole::Routine, std::slice::from_ref(body));
+                }
+                push(BodyRole::Routine, &p.body_statements);
+            }
+            AstStmt::CreateFunction(f) => push_routine(&mut push, f.body_stmt.as_deref()),
+            AstStmt::DoBlock(d) => push_routine(&mut push, d.body_stmt.as_deref()),
+            AstStmt::CreateEvent(e) => push_routine(&mut push, e.body_stmt.as_deref()),
+            AstStmt::AlterEvent(e) => push_routine(&mut push, e.body_stmt.as_deref()),
+            AstStmt::CreateMysqlTrigger(t) => push_routine(&mut push, t.body_stmt.as_deref()),
+            AstStmt::CreateTask(t) => {
+                if let Some(Ok(body)) = t.body.as_ref() {
+                    push_routine(&mut push, Some(&**body))
+                }
+            }
+            AstStmt::CreateMssqlTrigger(t) => push(BodyRole::Routine, &t.body),
+            AstStmt::PgCreateRule(r) => push(BodyRole::Routine, &r.actions),
+            AstStmt::Insert(i) => {
+                if let Some(exec) = i.execute.as_deref() {
+                    push(BodyRole::InsertExec, std::slice::from_ref(exec));
+                }
+            }
+            AstStmt::Select(_)
+            | AstStmt::Perform(_)
+            | AstStmt::SetSelect(_)
+            | AstStmt::ValuesQuery(_)
+            | AstStmt::ReplaceInto(_)
+            | AstStmt::MultiInsert(_)
+            | AstStmt::Update(_)
+            | AstStmt::Delete(_)
+            | AstStmt::Merge(_)
+            | AstStmt::Explain(_)
+            | AstStmt::PsqlGexec(_)
+            | AstStmt::MysqlDo(_)
+            | AstStmt::ExecuteTask(_)
+            | AstStmt::MysqlCreateLoadableFunction(_)
+            | AstStmt::MysqlAdmin(_)
+            | AstStmt::ExecuteImmediate { .. }
+            | AstStmt::ExecuteImmediateFrom(_)
+            | AstStmt::OpaqueContent { .. }
+            | AstStmt::ClauseFragment { .. }
+            | AstStmt::JinjaPlaceholder { .. }
+            | AstStmt::JinjaConditionalStmt(_)
+            | AstStmt::Error { .. }
+            | AstStmt::GoBatchSeparator { .. }
+            | AstStmt::SqlcmdCommand { .. }
+            | AstStmt::AlterAccount(_)
+            | AstStmt::AlterAggregationPolicy(_)
+            | AstStmt::AlterApiIntegration(_)
+            | AstStmt::AlterNotificationIntegration(_)
+            | AstStmt::CreateShare(_)
+            | AstStmt::AlterShare(_)
+            | AstStmt::CreateDatashare(_)
+            | AstStmt::AlterDatashare(_)
+            | AstStmt::CreateSecurityIntegration(_)
+            | AstStmt::AlterSecurityIntegration(_)
+            | AstStmt::AlterReplicationGroup(_)
+            | AstStmt::AlterFailoverGroup(_)
+            | AstStmt::AlterAuthenticationPolicy(_)
+            | AstStmt::AlterCatalog(_)
+            | AstStmt::AlterConnection(_)
+            | AstStmt::AlterDatabase(_)
+            | AstStmt::AlterDomain(_)
+            | AstStmt::AlterDynamicTable(_)
+            | AstStmt::AlterExternalAccessIntegration(_)
+            | AstStmt::AlterExternalLocation(_)
+            | AstStmt::AlterFunction(_)
+            | AstStmt::AlterIndex(_)
+            | AstStmt::AlterMaterializedView(_)
+            | AstStmt::AlterMaskingPolicy(_)
+            | AstStmt::AlterNetworkPolicy(_)
+            | AstStmt::AlterPasswordPolicy(_)
+            | AstStmt::AlterPgPolicy(_)
+            | AstStmt::AlterPgTrigger(_)
+            | AstStmt::AlterPipe(_)
+            | AstStmt::AlterProcedure(_)
+            | AstStmt::AlterProjectionPolicy(_)
+            | AstStmt::AlterJoinPolicy(_)
+            | AstStmt::AlterRowAccessPolicy(_)
+            | AstStmt::AlterSchema(_)
+            | AstStmt::AlterSequence(_)
+            | AstStmt::AlterSessionPolicy(_)
+            | AstStmt::AlterSession(_)
+            | AstStmt::AlterStage(_)
+            | AstStmt::AlterStorageCredential(_)
+            | AstStmt::AlterStorageIntegration(_)
+            | AstStmt::AlterStream(_)
+            | AstStmt::AlterTable(_)
+            | AstStmt::AlterTask(_)
+            | AstStmt::AlterType(_)
+            | AstStmt::AlterUser(_)
+            | AstStmt::AlterView(_)
+            | AstStmt::AlterVolume(_)
+            | AstStmt::AlterWarehouse(_)
+            | AstStmt::AnalyzeStmt(_)
+            | AstStmt::Await { .. }
+            | AstStmt::BeginTransaction { .. }
+            | AstStmt::BqAlterModel(_)
+            | AstStmt::BqAlterVectorIndex(_)
+            | AstStmt::BqAssert(_)
+            | AstStmt::BqCreateModel(_)
+            | AstStmt::BqCreateSearchIndex(_)
+            | AstStmt::BqCreateSnapshotTable(_)
+            | AstStmt::BqCreateVectorIndex(_)
+            | AstStmt::BqDropModel(_)
+            | AstStmt::BqDropSearchIndex(_)
+            | AstStmt::BqDropSnapshotTable(_)
+            | AstStmt::BqDropVectorIndex(_)
+            | AstStmt::BqExportData(_)
+            | AstStmt::BqExportModel(_)
+            | AstStmt::BqLoadData(_)
+            | AstStmt::MysqlLoadData(_)
+            | AstStmt::MysqlRenameTable(_)
+            | AstStmt::Break { .. }
+            | AstStmt::CacheTable(_)
+            | AstStmt::Call { .. }
+            | AstStmt::Cancel { .. }
+            | AstStmt::CloseCursor { .. }
+            | AstStmt::CommentOn(_)
+            | AstStmt::Commit { .. }
+            | AstStmt::Continue { .. }
+            | AstStmt::CopyIntoLocation { .. }
+            | AstStmt::Unload { .. }
+            | AstStmt::RedshiftCopy { .. }
+            | AstStmt::CopyIntoTable { .. }
+            | AstStmt::CreateAggregationPolicy(_)
+            | AstStmt::CreateApiIntegration(_)
+            | AstStmt::CreateNotificationIntegration(_)
+            | AstStmt::CreateAuthenticationPolicy(_)
+            | AstStmt::CreateCatalog(_)
+            | AstStmt::AlterUserMapping(_)
+            | AstStmt::DropUserMapping(_)
+            | AstStmt::CreateUserMapping(_)
+            | AstStmt::CreateForeignTable(_)
+            | AstStmt::ImportForeignSchema(_)
+            | AstStmt::CreateForeignServer(_)
+            | AstStmt::AlterForeignServer(_)
+            | AstStmt::MssqlAlterServerConfiguration(_)
+            | AstStmt::MssqlCreateExternalDataSource(_)
+            | AstStmt::MssqlAlterExternalDataSource(_)
+            | AstStmt::CreateConnection(_)
+            | AstStmt::CreateDatabase(_)
+            | AstStmt::CreateDomain(_)
+            | AstStmt::CreateDynamicTable(_)
+            | AstStmt::CreateExtension(_)
+            | AstStmt::CreateExternalAccessIntegration(_)
+            | AstStmt::CreateExternalLocation(_)
+            | AstStmt::CreateExternalSchema(_)
+            | AstStmt::CreateFlow(_)
+            | AstStmt::CreateIndex(_)
+            | AstStmt::CreateSynonym(_)
+            | AstStmt::CreateMaskingPolicy(_)
+            | AstStmt::CreateNetworkPolicy(_)
+            | AstStmt::CreatePasswordPolicy(_)
+            | AstStmt::CreatePgPolicy(_)
+            | AstStmt::CreatePgTrigger(_)
+            | AstStmt::CreatePipe(_)
+            | AstStmt::CreateProjectionPolicy(_)
+            | AstStmt::CreateJoinPolicy(_)
+            | AstStmt::CreateRowAccessPolicy(_)
+            | AstStmt::CreateSchema(_)
+            | AstStmt::CreateSequence(_)
+            | AstStmt::CreateSessionPolicy(_)
+            | AstStmt::CreateStage(_)
+            | AstStmt::CreateStorageCredential(_)
+            | AstStmt::CreateStorageIntegration(_)
+            | AstStmt::CreateStream(_)
+            | AstStmt::CreateTable(_)
+            | AstStmt::CreateTableFunction(_)
+            | AstStmt::CreateType(_)
+            | AstStmt::CreateView(_)
+            | AstStmt::CreateVolume(_)
+            | AstStmt::CreateWarehouse(_)
+            | AstStmt::DeclareCondition { .. }
+            | AstStmt::DeclareCursor { .. }
+            | AstStmt::DeclareTable { .. }
+            | AstStmt::Deny(_)
+            | AstStmt::AlterAuthorization(_)
+            | AstStmt::MssqlExecuteAs(_)
+            | AstStmt::MssqlRevert { .. }
+            | AstStmt::MssqlAuditDdl(_)
+            | AstStmt::MssqlSecurityObjectDdl(_)
+            | AstStmt::Describe(_)
+            | AstStmt::DescribeHistory(_)
+            | AstStmt::Drop(_)
+            | AstStmt::DropAggregationPolicy(_)
+            | AstStmt::DropAllRowAccessPolicies(_)
+            | AstStmt::DropApiIntegration(_)
+            | AstStmt::DropNotificationIntegration(_)
+            | AstStmt::DropAuthenticationPolicy(_)
+            | AstStmt::DropCatalog(_)
+            | AstStmt::DropConnection(_)
+            | AstStmt::DropDatabase(_)
+            | AstStmt::DropDomain(_)
+            | AstStmt::DropExternalAccessIntegration(_)
+            | AstStmt::DropExternalLocation(_)
+            | AstStmt::DropMaskingPolicy(_)
+            | AstStmt::DropMssqlTrigger(_)
+            | AstStmt::MssqlTriggerState(_)
+            | AstStmt::DropNetworkPolicy(_)
+            | AstStmt::DropPasswordPolicy(_)
+            | AstStmt::DropPgPolicy(_)
+            | AstStmt::DropPgTrigger(_)
+            | AstStmt::DropPipe(_)
+            | AstStmt::DropProjectionPolicy(_)
+            | AstStmt::DropJoinPolicy(_)
+            | AstStmt::DropRowAccessPolicy(_)
+            | AstStmt::DropSchema(_)
+            | AstStmt::DropSessionPolicy(_)
+            | AstStmt::DropStorageCredential(_)
+            | AstStmt::DropStorageIntegration(_)
+            | AstStmt::DropStream(_)
+            | AstStmt::DropTask(_)
+            | AstStmt::DropVolume(_)
+            | AstStmt::DropWarehouse(_)
+            | AstStmt::FetchCursor { .. }
+            | AstStmt::GetDiagnostics { .. }
+            | AstStmt::Grant(_)
+            | AstStmt::LetCursor { .. }
+            | AstStmt::MssqlAlterExternalModel(_)
+            | AstStmt::MssqlBulkInsert(_)
+            | AstStmt::MssqlCreateExternalModel(_)
+            | AstStmt::MssqlCreateVectorIndex(_)
+            | AstStmt::MssqlDropExternalModel(_)
+            | AstStmt::MssqlExec(_)
+            | AstStmt::MssqlGoto(_)
+            | AstStmt::MssqlLabel(_)
+            | AstStmt::MssqlPrint(_)
+            | AstStmt::MssqlRaiserror(_)
+            | AstStmt::MssqlSetOption(_)
+            | AstStmt::Reconfigure { .. }
+            | AstStmt::MssqlServerCommand { .. }
+            | AstStmt::MysqlUnlockTables(_)
+            | AstStmt::MssqlThrow(_)
+            | AstStmt::MssqlWaitfor(_)
+            | AstStmt::Null { .. }
+            | AstStmt::OpenCursor { .. }
+            | AstStmt::Optimize(_)
+            | AstStmt::AlterPrincipal(_)
+            | AstStmt::PgAlterRule(_)
+            | AstStmt::PgAlterSystem(_)
+            | AstStmt::PgAlterTableTriggerState(_)
+            | AstStmt::PgAlterTablespace(_)
+            | AstStmt::PgCluster(_)
+            | AstStmt::PgCopy(_)
+            | AstStmt::PgCreateAggregate(_)
+            | AstStmt::PgCreateOperator(_)
+            | AstStmt::CreatePrincipal(_)
+            | AstStmt::PgCreateTablespace(_)
+            | AstStmt::PgDeallocate(_)
+            | AstStmt::PgDiscard(_)
+            | AstStmt::PgDropExtension(_)
+            | AstStmt::PgDropIndex(_)
+            | AstStmt::PgDropOwned(_)
+            | AstStmt::DropPrincipal(_)
+            | AstStmt::PgDropRule(_)
+            | AstStmt::MssqlCreateRule(_)
+            | AstStmt::PgDropSequence(_)
+            | AstStmt::PgDropTablespace(_)
+            | AstStmt::PgDropType(_)
+            | AstStmt::PgExecute(_)
+            | AstStmt::PgListen(_)
+            | AstStmt::PgLockTable(_)
+            | AstStmt::PgNotify(_)
+            | AstStmt::PgPrepare(_)
+            | AstStmt::PgPublication(_)
+            | AstStmt::PgReassignOwned(_)
+            | AstStmt::PgRefreshMatview(_)
+            | AstStmt::PgSet(_)
+            | AstStmt::PgSubscription(_)
+            | AstStmt::PgUnlisten(_)
+            | AstStmt::PipeChain { .. }
+            | AstStmt::Raise { .. }
+            | AstStmt::Reindex(_)
+            | AstStmt::RepairTable(_)
+            | AstStmt::Resignal { .. }
+            | AstStmt::Restore(_)
+            | AstStmt::MssqlBackup(_)
+            | AstStmt::MssqlRestore(_)
+            | AstStmt::MssqlDbcc(_)
+            | AstStmt::MssqlKeyManagement(_)
+            | AstStmt::MssqlSecurityPolicy(_)
+            | AstStmt::MssqlKeyBackup(_)
+            | AstStmt::MssqlAssembly(_)
+            | AstStmt::MssqlAddSignature(_)
+            | AstStmt::MssqlSetuser(_)
+            | AstStmt::MssqlAlterServiceMasterKey(_)
+            | AstStmt::PgAlterDefaultPrivileges(_)
+            | AstStmt::Revoke(_)
+            | AstStmt::Rollback { .. }
+            | AstStmt::Savepoint(_)
+            | AstStmt::Show(_)
+            | AstStmt::Signal { .. }
+            | AstStmt::Truncate(_)
+            | AstStmt::UncacheTable(_)
+            | AstStmt::UndropDatabase(_)
+            | AstStmt::UndropSchema(_)
+            | AstStmt::UndropTable(_)
+            | AstStmt::UndropType(_)
+            | AstStmt::CreateTag(_)
+            | AstStmt::AlterTag(_)
+            | AstStmt::UndropTag(_)
+            | AstStmt::CreateFileFormat(_)
+            | AstStmt::AlterFileFormat(_)
+            | AstStmt::CreateSecret(_)
+            | AstStmt::AlterSecret(_)
+            | AstStmt::CreateNetworkRule(_)
+            | AstStmt::AlterNetworkRule(_)
+            | AstStmt::CreateResourceMonitor(_)
+            | AstStmt::AlterResourceMonitor(_)
+            | AstStmt::CreateComputePool(_)
+            | AstStmt::AlterComputePool(_)
+            | AstStmt::CreateGitRepository(_)
+            | AstStmt::CreateExternalFunction(_)
+            | AstStmt::AlterGitRepository(_)
+            | AstStmt::CreateImageRepository(_)
+            | AstStmt::AlterImageRepository(_)
+            | AstStmt::CreateStreamlit(_)
+            | AstStmt::AlterStreamlit(_)
+            | AstStmt::CreateService(_)
+            | AstStmt::AlterService(_)
+            | AstStmt::CreateNotebook(_)
+            | AstStmt::AlterNotebook(_)
+            | AstStmt::CreateSemanticView(_)
+            | AstStmt::AlterSemanticView(_)
+            | AstStmt::CreateCortexSearchService(_)
+            | AstStmt::AlterCortexSearchService(_)
+            | AstStmt::CreateApplication(_)
+            | AstStmt::AlterApplication(_)
+            | AstStmt::CreateApplicationPackage(_)
+            | AstStmt::AlterApplicationPackage(_)
+            | AstStmt::CreateListing(_)
+            | AstStmt::AlterListing(_)
+            | AstStmt::CreateManagedAccount(_)
+            | AstStmt::CreateAccount(_)
+            | AstStmt::StageFileCommand(_)
+            | AstStmt::CreateAlert(_)
+            | AstStmt::CreateDataMetricFunction(_)
+            | AstStmt::CreateReplicationFailoverGroup(_)
+            | AstStmt::AlterAlert(_)
+            | AstStmt::Use(_)
+            | AstStmt::Vacuum(_)
+            | AstStmt::CreateExternalTable(_)
+            | AstStmt::Assign { .. }
+            | AstStmt::Let { .. }
+            | AstStmt::Declare { .. }
+            | AstStmt::SetVariable { .. }
+            | AstStmt::MysqlSet(_)
+            | AstStmt::Return { .. } => {}
+        }
+        bodies
+    }
+}
+
+/// Give `body`, a routine's body of one statement, where it was parsed.
+fn push_routine<'a>(push: &mut impl FnMut(BodyRole, &'a [AstStmt]), body: Option<&'a AstStmt>) {
+    if let Some(body) = body {
+        push(BodyRole::Routine, std::slice::from_ref(body));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum AstSetOpKind {
@@ -7165,6 +8888,9 @@ pub struct AstSetSelect {
     /// Optional syntax ID for parentheses when this SetSelect is parenthesized.
     /// Example: ((SELECT ...) UNION (SELECT ...)) - the outer parens wrap the SetSelect.
     pub paren_syntax_id: Option<crate::syntax::SyntaxSubqueryId>,
+    /// The parentheses around this query where its parser read them, from
+    /// the `(` through the `)`: the query's span as a statement.
+    pub paren_span: Option<Span>,
     /// Trailing `ORDER BY` applying to the whole set operation
     /// (`(SELECT ...) UNION (SELECT ...) ORDER BY x`). A non-parenthesized
     /// operand cannot own a trailing clause in SQL, so it always belongs here,
@@ -7176,9 +8902,17 @@ pub struct AstSetSelect {
     pub offset: Option<Box<AstExpr>>,
     pub limit_keyword_span: Option<Span>,
     pub fetch_clause_span: Option<Span>,
+    /// `WITH TIES` ending the FETCH clause: the rows tied with the last
+    /// one on the ORDER BY are returned too.
+    pub fetch_with_ties_span: Option<Span>,
     pub offset_keyword_span: Option<Span>,
     /// Span of the comma in the MySQL `LIMIT offset, count` form.
     pub limit_offset_comma_span: Option<Span>,
+    /// The `ORDER BY` / `LIMIT` / `OFFSET` written after the `)` of this
+    /// query where it is parenthesised and no set operator follows
+    /// (`(SELECT …) ORDER BY 1 LIMIT 5`): the whole query's, not the
+    /// clauses inside the parentheses.
+    pub outer_tail: Option<Box<AstQueryTail>>,
 }
 
 /// Modifier for set operations (UNION/INTERSECT/EXCEPT).
@@ -7737,12 +9471,14 @@ pub struct AstStarProjection {
 pub struct AstObjectRef {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
-    /// Per-identifier-token spans for a structurally dotted name.
+    /// The parts of a structurally dotted name, each as written.
     ///
     /// When this `AstObjectRef` represents a plain qualified name
     /// like `db.schema.table` (or `schema.table`, or `table`), each
-    /// entry is the exact `Span` of one identifier token consumed
-    /// by the parser — by construction containing **no trivia**
+    /// entry is one part: an identifier token consumed by the parser,
+    /// unquoted words joined by `-` (`my-project`), or a part a template
+    /// writes some of ([`AstNamePart`]); its span by construction contains
+    /// **no trivia**
     /// (no whitespace, no `--` line comments, no `/* ... */` block
     /// comments). An entry is `None` for an *omitted* component in a
     /// T-SQL multi-part name with an empty slot — `master..tbl` parses
@@ -7754,14 +9490,20 @@ pub struct AstObjectRef {
     /// covers any trivia the lexer emitted between identifier
     /// tokens.
     ///
+    /// A table-valued function called in a FROM position after its
+    /// name (`schema.my_tvf(...)`, `ML.PREDICT(...)`) has the parts of
+    /// that name; its `span` covers the whole call.
+    ///
     /// `None` when the object reference is not a structurally-
     /// decomposable dotted name. The non-decomposable cases are:
     ///
     /// - The `IDENTIFIER(...)` construct (`identifier_arg` is
     ///   `Some` and carries the parsed argument expression).
-    /// - A table-valued function call used in a FROM-position
-    ///   (e.g. `FLATTEN(...)`, `UNNEST(...)`, `ML.PREDICT(...)`):
-    ///   the span covers the whole call, not a dotted name.
+    /// - A table-valued function call written `TABLE(...)` or `LATERAL
+    ///   fn(...)` (a one-part name), or a built-in table function of the
+    ///   dialect read as an expression (BigQuery's and PostgreSQL's `UNNEST(...)`,
+    ///   PostgreSQL's `generate_series(...)`): the span covers the whole
+    ///   call, not a dotted name.
     /// - A `LATERAL VIEW <func>(...)` form.
     /// - A derived-table / VALUES alias whose `span` covers a
     ///   parenthesized region rather than a dotted identifier.
@@ -7770,11 +9512,94 @@ pub struct AstObjectRef {
     /// In every `None` case, `span` is the only meaningful name
     /// payload; consumers should treat it as opaque and not
     /// attempt to dot-split it.
-    pub parts: Option<Vec<Option<Span>>>,
+    pub parts: Option<Vec<Option<AstNamePart>>>,
     /// Parsed argument for IDENTIFIER() function (e.g., IDENTIFIER('table_name') or IDENTIFIER(:var))
     /// When present, indicates this is an IDENTIFIER() construct with a parsed argument.
     /// The span field still covers the entire IDENTIFIER(...) construct.
     pub identifier_arg: Option<Box<crate::ast::AstExpr>>,
+    /// What kind of name the reference is, as the token that names the
+    /// object says.
+    pub name_kind: AstTableNameKind,
+}
+
+/// One tag of a tag list: `name = 'value'` (`SET TAG`, `WITH TAG`) or the
+/// bare `name` (`UNSET TAG`).
+#[derive(Debug, Clone)]
+pub struct AstTagRef {
+    /// The tag's name, as the shared object-name reader reads it.
+    pub name: AstObjectRef,
+    /// The value after `=`; `None` in an `UNSET TAG` list.
+    pub value: Option<Span>,
+}
+
+/// One part of an object name, as written. Closed enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AstNamePart {
+    /// A part written as one identifier token, quoted or not (`t`, `"T"`,
+    /// `[t]`, `#t`), or, first in a name, unquoted words joined by `-` and
+    /// written against each other (`my-project`).
+    Word(Span),
+    /// A part a template writes some of (`t_{{ s }}`, `{{ s }}`), at
+    /// `span`. A name that is one such part made of one template piece
+    /// (`{{ ref('m') }}`, a `{% if %}…{% endif %}` block) may render any
+    /// relation.
+    Templated { span: Span, name: AstTemplatedName },
+}
+
+impl AstNamePart {
+    /// Where the part is written.
+    pub fn span(&self) -> Span {
+        match self {
+            AstNamePart::Word(span) | AstNamePart::Templated { span, .. } => *span,
+        }
+    }
+}
+
+/// What kind of name an object reference is, as its token says. Closed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstTableNameKind {
+    /// A name the catalog resolves: a table, view or any other object.
+    Catalog,
+    /// T-SQL local temporary table (`#t`).
+    LocalTemp,
+    /// T-SQL global temporary table (`##t`).
+    GlobalTemp,
+    /// T-SQL table variable (`@t`).
+    TableVariable,
+    /// Snowflake stage (`@stage[/path]`).
+    Stage,
+    /// A call of a rowset function the dialect defines, which reads or
+    /// writes another server's rows (T-SQL `OPENQUERY(srv, 'q')`,
+    /// `OPENROWSET(…)`, `OPENDATASOURCE(…).db.schema.t`): no object the
+    /// catalog lists. The name covers the call as written.
+    Rowset,
+    /// A name a template writes some part of (`t_{{ s }}`,
+    /// `{{ ref('m') }}`, `{% if p %}a{% else %}b{% endif %}.t`): which
+    /// object it names is known only once the template is rendered.
+    Templated,
+}
+
+/// How a template writes a name part: its pieces, written against each
+/// other with nothing between them (`t_{{ s }}`, `{{ s }}_t`, `{{ s }}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstTemplatedName {
+    /// The pieces, in order; at least one is not a word.
+    pub pieces: Vec<AstNamePiece>,
+}
+
+/// One piece of a [`AstTemplatedName`]. Closed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstNamePiece {
+    /// Name characters as written (`t_`).
+    Word(Span),
+    /// A template as written: an expression with its delimiters
+    /// (`{{ s }}`), a deployment marker (`${NAME}`), or a `{% … %}` block
+    /// naming a table with the parts written after it
+    /// (`{% if p %}a{% endif %}.t`).
+    Template(Span),
+    /// In rendered text, what the render wrote for an expression it could
+    /// not resolve.
+    Rendered(Span),
 }
 
 #[derive(Debug, Clone)]
@@ -7845,6 +9670,38 @@ pub struct AstColumnRef {
 pub struct AstIdentifier {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// What the lexer marked the name as.
+    pub kind: AstIdentifierKind,
+    /// How a template writes the name, where it writes some of it
+    /// (`c_{{ s }}`); `None` for a name written whole.
+    pub templated: Option<Box<AstTemplatedName>>,
+}
+
+/// What the lexer marks a name as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstIdentifierKind {
+    /// A name, quoted or not.
+    Name,
+    /// `@name` or `@@name`, where the dialect lexes `@` as the start of a
+    /// name: a variable.
+    Variable,
+}
+
+impl AstIdentifierKind {
+    /// The kind of the name a token of `kind` writes.
+    pub(crate) fn of(kind: &crate::lexer::TokenKind) -> Self {
+        let variable = matches!(
+            kind,
+            crate::lexer::TokenKind::Identifier {
+                kind: crate::lexer::IdentifierKind::AtVariable,
+                ..
+            }
+        );
+        match variable {
+            true => Self::Variable,
+            false => Self::Name,
+        }
+    }
 }
 
 /// CONNECT BY clause for hierarchical queries.
@@ -7859,6 +9716,8 @@ pub struct AstConnectBy {
     pub start_with_condition: Option<AstExpr>,
     /// CONNECT BY keyword span
     pub connect_by_span: Span,
+    /// `NOCYCLE` keyword span, when written after `CONNECT BY`
+    pub nocycle: Option<Span>,
     /// List of conditions in CONNECT BY clause (joined by AND)
     /// Each condition is a comparison expression, typically with PRIOR
     pub conditions: Vec<AstExpr>,
@@ -7977,6 +9836,10 @@ pub struct AstSelectItem {
     /// always `None` for other dialects (they have no equivalent
     /// projection-assignment syntax).
     pub assign_target: Option<AstSelectItemAssignTarget>,
+    /// The `=` after [`Self::alias`] where the alias is written before the
+    /// expression: T-SQL `SELECT column_alias = expression` ("SELECT
+    /// Clause"). `None` for an alias written after it.
+    pub alias_first: Option<Span>,
     pub span: Span,
 }
 
@@ -7998,6 +9861,14 @@ pub struct AstIdentifierWithAs {
     pub ident: AstIdentifier,
 }
 
+/// One PostgreSQL `RAISE … USING option = expr`: the option's name
+/// (`MESSAGE`, `DETAIL`, `HINT`, `ERRCODE`, …) and its value.
+#[derive(Debug, Clone)]
+pub struct AstRaiseOption {
+    pub name_span: Span,
+    pub value: AstExpr,
+}
+
 /// One EXECUTE IMMEDIATE USING bind argument: `expr [AS alias]`
 /// (the alias form is BigQuery's named-binding surface).
 #[derive(Debug, Clone)]
@@ -8012,6 +9883,9 @@ pub struct AstExecuteUsingArg {
 pub struct AstValues {
     pub node_id: crate::ast::NodeId,
     pub rows: Vec<Vec<AstExpr>>,
+    /// MySQL's `ROW` before each row (`VALUES ROW(1, 'a')`), by row; `None`
+    /// for a row written without it.
+    pub row_keywords: Vec<Option<Span>>,
     pub span: Span,
     pub syntax_id: Option<crate::syntax::SyntaxValuesId>,
 }
@@ -8027,10 +9901,21 @@ pub struct AstValuesQuery {
     pub offset: Option<Box<AstExpr>>,
     pub limit_keyword_span: Option<Span>,
     pub fetch_clause_span: Option<Span>,
+    /// `WITH TIES` ending the FETCH clause: the rows tied with the last
+    /// one on the ORDER BY are returned too.
+    pub fetch_with_ties_span: Option<Span>,
     pub offset_keyword_span: Option<Span>,
     pub span: Span,
     /// For parenthesized usage in set operations: (VALUES (...) UNION ...)
     pub paren_syntax_id: Option<crate::syntax::SyntaxSubqueryId>,
+    /// The parentheses around this query where its parser read them, from
+    /// the `(` through the `)`: the query's span as a statement.
+    pub paren_span: Option<Span>,
+    /// The `ORDER BY` / `LIMIT` / `OFFSET` written after the `)` of this
+    /// query where it is parenthesised and no set operator follows
+    /// (`(SELECT …) ORDER BY 1 LIMIT 5`): the whole query's, not the
+    /// clauses inside the parentheses.
+    pub outer_tail: Option<Box<AstQueryTail>>,
 }
 
 /// Time travel parameter type for AT/BEFORE clauses
@@ -8239,15 +10124,17 @@ pub struct AstWithOffset {
 /// T-SQL table hint clause: `WITH (<hint> [, <hint>] ...)`
 ///
 /// Appears after a table reference (and optional alias) in FROM, UPDATE, DELETE.
-/// Example: `FROM Orders o WITH (NOLOCK, INDEX(idx_date))`
+/// Example: `FROM Orders o WITH (NOLOCK, INDEX(idx_date))`. After a table in
+/// FROM, a hint T-SQL takes without `WITH` may be written alone in
+/// parentheses: `FROM Orders o (NOLOCK)`.
 #[derive(Debug, Clone)]
 pub struct AstTableHintClause {
     pub node_id: crate::ast::NodeId,
-    /// Span of the WITH keyword
-    pub with_keyword_span: Span,
+    /// Span of the WITH keyword; `None` for a list written without it
+    pub with_keyword_span: Option<Span>,
     /// Individual parsed hints
     pub hints: Vec<AstTableHint>,
-    /// Full span from WITH through closing paren
+    /// Full span from WITH (or the `(` without it) through closing paren
     pub span: Span,
 }
 
@@ -8381,13 +10268,32 @@ pub struct AstTableRef {
     /// Span of LATERAL keyword when present (for correlated subqueries/table functions).
     pub lateral_keyword_span: Option<Span>,
     pub only_span: Option<Span>, // PostgreSQL: FROM ONLY parent_table (exclude child tables in inheritance)
+    /// Where the dialect reads it (Databricks), a streaming read of the
+    /// table `name` names: the text `STREAM name` or `STREAM ( name )`.
+    pub stream_span: Option<Span>,
     pub time_travel: Option<Box<AstTimeTravelClause>>, // Boxed: was 408 bytes
-    pub sample: Option<Box<AstSampleClause>>, // Boxed: was 792 bytes
-    pub changes: Option<Box<AstChangesClause>>, // Boxed: was 832 bytes
+    pub sample: Option<Box<AstSampleClause>>,          // Boxed: was 792 bytes
+    pub changes: Option<Box<AstChangesClause>>,        // Boxed: was 832 bytes
     pub stage_options: Option<Box<AstStageOptions>>, // Options for stage references: ( FILE_FORMAT => ..., PATTERN => ... )
-    pub table_function: Option<Box<AstExpr>>,        // TABLE(function_call) for UDTFs
+    /// The stage of a stage reference (`FROM @stage/path`); `name` holds
+    /// the whole reference as written.
+    pub stage: Option<Box<AstStageRef>>,
+    pub table_function: Option<Box<AstExpr>>, // TABLE(function_call) for UDTFs
     /// T-SQL TVF schema clause: `OPENJSON(...) WITH (colName type [path] [AS JSON], ...)`
     pub tvf_schema_span: Option<Span>,
+    /// The columns the table-valued function call declares, in order: those
+    /// of a T-SQL `OPENJSON(…) WITH (a int '$.a', …)` schema, or of a
+    /// `JSON_TABLE(…, '$[*]' COLUMNS (a INT PATH '$.a', …))` clause, its
+    /// nested `COLUMNS` lists' among them. `None` where the call declares
+    /// none, or its list is written in a grammar not read.
+    pub table_function_columns: Option<Box<Vec<AstTableFunctionColumn>>>,
+    /// PostgreSQL `AS t (a int, b text)` after a table function: the
+    /// column-definition list, from `(` through `)`, whose columns are
+    /// `table_function_columns`.
+    pub column_definitions_span: Option<Span>,
+    /// PostgreSQL `f(…) WITH ORDINALITY`: the function's rows numbered,
+    /// the number a column after its own.
+    pub with_ordinality_span: Option<Span>,
     pub with_offset: Option<Box<AstWithOffset>>, // Boxed: BigQuery: WITH OFFSET [AS alias] for UNNEST
     pub pivot: Option<Box<AstPivotClause>>,      // Boxed: PIVOT clause
     pub unpivot: Option<Box<AstUnpivotClause>>,  // Boxed: UNPIVOT clause
@@ -8403,6 +10309,44 @@ pub struct AstTableRef {
     pub syntax_id: Option<crate::syntax::SyntaxTableRefId>, // CST syntax node for alias AS keyword
     pub suffix_inline_fragments: Box<Vec<JinjaInlineFragment>>,
     pub joins: Box<Vec<Box<AstJoin>>>, // Boxed container to reduce AstTableRef inline size
+}
+
+/// One column a table-valued function call declares
+/// ([`AstTableRef::table_function_columns`]): `a int '$.a'`, `a INT PATH
+/// '$.a'`, `id FOR ORDINALITY`.
+#[derive(Debug, Clone)]
+pub struct AstTableFunctionColumn {
+    pub name: AstIdentifier,
+    /// What the column yields.
+    pub kind: AstTableFunctionColumnKind,
+    /// The whole definition, with what is written after the path
+    /// (`AS JSON`, `NULL ON EMPTY`, `DEFAULT '0' ON ERROR`).
+    pub span: Span,
+}
+
+/// What a declared table-function column yields. `path` is the JSON path
+/// string the column reads, where one is written.
+#[derive(Debug, Clone)]
+pub enum AstTableFunctionColumnKind {
+    /// The value its path finds, as `data_type`: T-SQL `a int '$.a'`,
+    /// MySQL / PostgreSQL `a INT PATH '$.a'`.
+    Value {
+        data_type: AstDataType,
+        path: Option<Span>,
+    },
+    /// The JSON text its path finds: T-SQL `b nvarchar(max) '$.b' AS
+    /// JSON`, PostgreSQL `b jsonb FORMAT JSON PATH '$.b'`.
+    Json {
+        data_type: AstDataType,
+        path: Option<Span>,
+    },
+    /// Whether its path finds a value: `e INT EXISTS PATH '$.e'`.
+    Exists {
+        data_type: AstDataType,
+        path: Option<Span>,
+    },
+    /// The row's number: `id FOR ORDINALITY`.
+    Ordinality,
 }
 
 /// MySQL table-ref partition selection: `tbl PARTITION (p0, p1)`.
@@ -8466,6 +10410,12 @@ pub enum AstJoinKind {
     NaturalLeftOuter,
     NaturalRightOuter,
     NaturalFullOuter,
+    /// `LEFT SEMI JOIN` / `SEMI JOIN` (Databricks): the left side's rows
+    /// that have a match, the left side's columns only.
+    LeftSemi,
+    /// `LEFT ANTI JOIN` / `ANTI JOIN` (Databricks): the left side's rows
+    /// that have no match, the left side's columns only.
+    LeftAnti,
 }
 
 #[derive(Debug, Clone)]
@@ -8496,12 +10446,64 @@ pub struct AstJoin {
     pub lateral_keyword_span: Option<Span>,
     /// Span of ASOF keyword when present.
     pub asof_keyword_span: Option<Span>,
+    /// Span of MySQL's `STRAIGHT_JOIN`, written in place of `JOIN`: an
+    /// inner join the optimizer reads in the written order.
+    pub straight_join_span: Option<Span>,
+    /// T-SQL join hint written before `JOIN` (`INNER HASH JOIN`): how the
+    /// server runs the join, not which rows it yields.
+    pub join_hint: Option<AstJoinHint>,
     pub match_condition: Option<Box<AstMatchCondition>>, // Required for ASOF JOIN
     pub prefix_inline_fragments: Vec<JinjaInlineFragment>,
     pub right: Box<AstTableRef>, // Boxed to reduce stack usage (was 2696 bytes inline)
     pub constraint: AstJoinConstraint,
     pub suffix_inline_fragments: Vec<JinjaInlineFragment>,
     pub span: Span,
+}
+
+/// A T-SQL join hint as written: the word and what it asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AstJoinHint {
+    pub kind: AstJoinHintKind,
+    pub span: Span,
+}
+
+/// How a T-SQL join hint asks the server to run a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstJoinHintKind {
+    /// `LOOP`: a nested-loops join.
+    Loop,
+    /// `HASH`: a hash join.
+    Hash,
+    /// `MERGE`: a merge join.
+    Merge,
+    /// `REMOTE`: the join run on the right table's server.
+    Remote,
+}
+
+/// T-SQL `OPTION (hint, …)` query hints, the clause kept as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstQueryOptions {
+    /// `OPTION ( … )`.
+    pub span: Span,
+    /// Each hint of the list, in source order.
+    pub hints: Vec<AstQueryHint>,
+}
+
+/// One hint of a T-SQL `OPTION (…)` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AstQueryHint {
+    pub kind: AstQueryHintKind,
+    pub span: Span,
+}
+
+/// What a T-SQL query hint asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstQueryHintKind {
+    /// `{ LOOP | MERGE | HASH } JOIN`: how every join of the query is run.
+    Join(AstJoinHintKind),
+    /// Any other hint (`MAXDOP 1`, `RECOMPILE`, `FORCE ORDER`, …), kept as
+    /// written in its span.
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -8559,12 +10561,34 @@ pub struct AstGroupElement {
 pub enum AstGroupElementKind {
     /// An ordinary grouping expression (column, expression, or positional ref).
     Expr(AstGroupItem),
-    /// CUBE(...) - all combinations of the listed items.
-    Cube(Vec<AstGroupItem>),
-    /// ROLLUP(...) - hierarchical (prefix) grouping sets.
-    Rollup(Vec<AstGroupItem>),
-    /// GROUPING SETS(...) - explicit list of grouping sets.
-    GroupingSets(Vec<Vec<AstGroupItem>>),
+    /// CUBE(...) - all combinations of the listed items; `parens` is the
+    /// list's `( … )`.
+    Cube {
+        items: Vec<AstGroupItem>,
+        parens: Span,
+    },
+    /// ROLLUP(...) - hierarchical (prefix) grouping sets; `parens` is the
+    /// list's `( … )`.
+    Rollup {
+        items: Vec<AstGroupItem>,
+        parens: Span,
+    },
+    /// GROUPING SETS(...) - explicit list of grouping sets; `parens` is the
+    /// list's `( … )`.
+    GroupingSets {
+        sets: Vec<AstGroupingSet>,
+        parens: Span,
+    },
+    /// `()` - the empty grouping set: one group of every row.
+    EmptySet,
+}
+
+/// One set of a `GROUPING SETS (…)` list.
+#[derive(Debug, Clone)]
+pub struct AstGroupingSet {
+    pub items: Vec<AstGroupItem>,
+    /// The set's `( … )`; `None` for one item written without them.
+    pub parens: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -8660,7 +10684,9 @@ pub struct AstTextSearchModifier {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum AstTextSearchModifierKind {
     /// `IN BOOLEAN MODE`
     Boolean,
@@ -8670,6 +10696,312 @@ pub enum AstTextSearchModifierKind {
     NaturalLanguageQueryExpansion,
     /// `WITH QUERY EXPANSION`
     QueryExpansion,
+}
+
+/// A date or time part, as a call's unit argument (`DATEADD(day, 1, d)`),
+/// EXTRACT's field or an INTERVAL's unit names it. Each dialect's spellings
+/// are read by [`crate::dialect::Dialect::date_part`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum DatePart {
+    Millennium,
+    Century,
+    Decade,
+    Year,
+    IsoYear,
+    YearOfWeek,
+    YearOfWeekIso,
+    Quarter,
+    Month,
+    Week,
+    IsoWeek,
+    /// BigQuery `WEEK(<weekday>)`: weeks starting on that day.
+    WeekStarting(Weekday),
+    Day,
+    DayOfWeek,
+    DayOfWeekIso,
+    DayOfYear,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    Nanosecond,
+    Epoch,
+    EpochMillisecond,
+    EpochMicrosecond,
+    EpochNanosecond,
+    Timezone,
+    TimezoneHour,
+    TimezoneMinute,
+    Julian,
+    Date,
+    Time,
+    DateTime,
+    SecondMicrosecond,
+    MinuteMicrosecond,
+    MinuteSecond,
+    HourMicrosecond,
+    HourSecond,
+    HourMinute,
+    DayMicrosecond,
+    DaySecond,
+    DayMinute,
+    DayHour,
+    YearMonth,
+}
+
+impl DatePart {
+    /// The part `word` names by its name or plural, the same in every
+    /// dialect. A dialect's abbreviations are its own
+    /// ([`crate::dialect::Dialect::date_part`]).
+    pub fn from_name(word: &str) -> Option<Self> {
+        let upper = crate::dialect::AsciiUpper::new(word);
+        Some(match upper.as_str() {
+            "MILLENNIUM" | "MILLENNIA" => Self::Millennium,
+            "CENTURY" | "CENTURIES" => Self::Century,
+            "DECADE" | "DECADES" => Self::Decade,
+            "YEAR" | "YEARS" => Self::Year,
+            "ISOYEAR" => Self::IsoYear,
+            "YEAROFWEEK" => Self::YearOfWeek,
+            "YEAROFWEEKISO" => Self::YearOfWeekIso,
+            "QUARTER" | "QUARTERS" => Self::Quarter,
+            "MONTH" | "MONTHS" => Self::Month,
+            "WEEK" | "WEEKS" => Self::Week,
+            "ISOWEEK" | "WEEKISO" | "ISO_WEEK" => Self::IsoWeek,
+            "DAY" | "DAYS" => Self::Day,
+            "DAYOFWEEK" | "WEEKDAY" => Self::DayOfWeek,
+            "DAYOFWEEKISO" | "DAYOFWEEK_ISO" | "ISODOW" => Self::DayOfWeekIso,
+            "DAYOFYEAR" => Self::DayOfYear,
+            "HOUR" | "HOURS" => Self::Hour,
+            "MINUTE" | "MINUTES" => Self::Minute,
+            "SECOND" | "SECONDS" => Self::Second,
+            "MILLISECOND" | "MILLISECONDS" => Self::Millisecond,
+            "MICROSECOND" | "MICROSECONDS" => Self::Microsecond,
+            "NANOSECOND" | "NANOSECONDS" => Self::Nanosecond,
+            "EPOCH" | "EPOCH_SECOND" | "EPOCH_SECONDS" => Self::Epoch,
+            "EPOCH_MILLISECOND" | "EPOCH_MILLISECONDS" => Self::EpochMillisecond,
+            "EPOCH_MICROSECOND" | "EPOCH_MICROSECONDS" => Self::EpochMicrosecond,
+            "EPOCH_NANOSECOND" | "EPOCH_NANOSECONDS" => Self::EpochNanosecond,
+            "TIMEZONE" => Self::Timezone,
+            "TIMEZONE_HOUR" => Self::TimezoneHour,
+            "TIMEZONE_MINUTE" => Self::TimezoneMinute,
+            "JULIAN" => Self::Julian,
+            "DATE" => Self::Date,
+            "TIME" => Self::Time,
+            "DATETIME" => Self::DateTime,
+            "SECOND_MICROSECOND" => Self::SecondMicrosecond,
+            "MINUTE_MICROSECOND" => Self::MinuteMicrosecond,
+            "MINUTE_SECOND" => Self::MinuteSecond,
+            "HOUR_MICROSECOND" => Self::HourMicrosecond,
+            "HOUR_SECOND" => Self::HourSecond,
+            "HOUR_MINUTE" => Self::HourMinute,
+            "DAY_MICROSECOND" => Self::DayMicrosecond,
+            "DAY_SECOND" => Self::DaySecond,
+            "DAY_MINUTE" => Self::DayMinute,
+            "DAY_HOUR" => Self::DayHour,
+            "YEAR_MONTH" => Self::YearMonth,
+            _ => return None,
+        })
+    }
+
+    /// The part an ODBC `SQL_TSI_<unit>` interval names
+    /// (`{fn TIMESTAMPADD(SQL_TSI_DAY, …)}`).
+    pub(crate) fn from_odbc_interval(word: &str) -> Option<Self> {
+        let upper = crate::dialect::AsciiUpper::new(word);
+        match upper.as_str().strip_prefix("SQL_TSI_")? {
+            "FRAC_SECOND" => Some(Self::Nanosecond),
+            unit @ ("SECOND" | "MINUTE" | "HOUR" | "DAY" | "WEEK" | "MONTH" | "QUARTER"
+            | "YEAR") => Self::from_name(unit),
+            _ => None,
+        }
+    }
+
+    /// Whether an INTERVAL literal's unit may be this part.
+    pub fn is_interval_unit(self) -> bool {
+        match self {
+            Self::Year
+            | Self::Quarter
+            | Self::Month
+            | Self::Week
+            | Self::Day
+            | Self::Hour
+            | Self::Minute
+            | Self::Second
+            | Self::Millisecond
+            | Self::Microsecond => true,
+            Self::Millennium
+            | Self::Century
+            | Self::Decade
+            | Self::IsoYear
+            | Self::YearOfWeek
+            | Self::YearOfWeekIso
+            | Self::IsoWeek
+            | Self::WeekStarting(_)
+            | Self::DayOfWeek
+            | Self::DayOfWeekIso
+            | Self::DayOfYear
+            | Self::Nanosecond
+            | Self::Epoch
+            | Self::EpochMillisecond
+            | Self::EpochMicrosecond
+            | Self::EpochNanosecond
+            | Self::Timezone
+            | Self::TimezoneHour
+            | Self::TimezoneMinute
+            | Self::Julian
+            | Self::Date
+            | Self::Time
+            | Self::DateTime
+            | Self::SecondMicrosecond
+            | Self::MinuteMicrosecond
+            | Self::MinuteSecond
+            | Self::HourMicrosecond
+            | Self::HourSecond
+            | Self::HourMinute
+            | Self::DayMicrosecond
+            | Self::DaySecond
+            | Self::DayMinute
+            | Self::DayHour
+            | Self::YearMonth => false,
+        }
+    }
+
+    /// Whether this is one of MySQL's compound interval units
+    /// (`HOUR_MINUTE`, `DAY_SECOND`, …).
+    pub(crate) fn is_compound_interval_unit(self) -> bool {
+        match self {
+            Self::SecondMicrosecond
+            | Self::MinuteMicrosecond
+            | Self::MinuteSecond
+            | Self::HourMicrosecond
+            | Self::HourSecond
+            | Self::HourMinute
+            | Self::DayMicrosecond
+            | Self::DaySecond
+            | Self::DayMinute
+            | Self::DayHour
+            | Self::YearMonth => true,
+            Self::Year
+            | Self::Quarter
+            | Self::Month
+            | Self::Week
+            | Self::Day
+            | Self::Hour
+            | Self::Minute
+            | Self::Second
+            | Self::Millisecond
+            | Self::Microsecond
+            | Self::Millennium
+            | Self::Century
+            | Self::Decade
+            | Self::IsoYear
+            | Self::YearOfWeek
+            | Self::YearOfWeekIso
+            | Self::IsoWeek
+            | Self::WeekStarting(_)
+            | Self::DayOfWeek
+            | Self::DayOfWeekIso
+            | Self::DayOfYear
+            | Self::Nanosecond
+            | Self::Epoch
+            | Self::EpochMillisecond
+            | Self::EpochMicrosecond
+            | Self::EpochNanosecond
+            | Self::Timezone
+            | Self::TimezoneHour
+            | Self::TimezoneMinute
+            | Self::Julian
+            | Self::Date
+            | Self::Time
+            | Self::DateTime => false,
+        }
+    }
+}
+
+/// A day of the week, as BigQuery's `WEEK(<weekday>)` names it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum Weekday {
+    Sunday,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+}
+
+impl Weekday {
+    pub fn from_name(word: &str) -> Option<Self> {
+        Some(match crate::dialect::AsciiUpper::new(word).as_str() {
+            "SUNDAY" => Self::Sunday,
+            "MONDAY" => Self::Monday,
+            "TUESDAY" => Self::Tuesday,
+            "WEDNESDAY" => Self::Wednesday,
+            "THURSDAY" => Self::Thursday,
+            "FRIDAY" => Self::Friday,
+            "SATURDAY" => Self::Saturday,
+            _ => return None,
+        })
+    }
+}
+
+/// The side `TRIM(<side> [chars] FROM s)` trims.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+impl TrimSide {
+    pub(crate) fn from_name(word: &str) -> Option<Self> {
+        Some(match crate::dialect::AsciiUpper::new(word).as_str() {
+            "BOTH" => Self::Both,
+            "LEADING" => Self::Leading,
+            "TRAILING" => Self::Trailing,
+            _ => return None,
+        })
+    }
+}
+
+/// A Unicode normalization form, as `NORMALIZE(s, NFKC)` names it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum NormalForm {
+    Nfc,
+    Nfd,
+    Nfkc,
+    Nfkd,
+}
+
+impl NormalForm {
+    pub(crate) fn from_name(word: &str) -> Option<Self> {
+        Some(match crate::dialect::AsciiUpper::new(word).as_str() {
+            "NFC" => Self::Nfc,
+            "NFD" => Self::Nfd,
+            "NFKC" => Self::Nfkc,
+            "NFKD" => Self::Nfkd,
+            _ => return None,
+        })
+    }
+}
+
+/// A keyword written as a call's argument: no value and no type.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum ArgKeyword {
+    Trim(TrimSide),
+    NormalForm(NormalForm),
+    /// The search modifier of MySQL `MATCH (…) AGAINST (…)`.
+    TextSearch(AstTextSearchModifierKind),
 }
 
 /// Data type representation for CAST and type conversion operations.
@@ -8722,6 +11054,14 @@ pub enum LogicalChainOperator {
     And,
 }
 
+/// An operator between two operands of an [`AstExpr::OperatorChain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AstChainOperator {
+    pub operator: BinaryOperator,
+    /// The operator token, as a [`AstExpr::BinaryOp`] holds it
+    pub syntax_id: crate::syntax::SyntaxBinaryOpId,
+}
+
 /// Binary operators used in binary operation expressions.
 ///
 /// Classifies operators by type (arithmetic, comparison, logical, string, pattern matching).
@@ -8740,8 +11080,10 @@ pub enum BinaryOperator {
     Multiply,
     /// Division: `/`
     Divide,
-    /// Modulo: `%`
+    /// Modulo: `%`, or `MOD` (MySQL)
     Modulo,
+    /// Integer division: `DIV` (MySQL, Databricks)
+    IntegerDivide,
 
     // Comparison operators
     /// Equal: `=`
@@ -8767,6 +11109,10 @@ pub enum BinaryOperator {
     Or,
     /// Logical NOT: `NOT`
     Not,
+    /// Logical AND: `&&` (MySQL)
+    LogicalAnd,
+    /// Logical exclusive OR: `XOR` (MySQL)
+    Xor,
 
     // String operators
     /// String concatenation: `||` (Snowflake, PostgreSQL)
@@ -8823,10 +11169,71 @@ pub enum BinaryOperator {
     LeftShift,
     /// Right shift: `>>`
     RightShift,
-    /// Bitwise XOR / Power: `^`
+    /// Bitwise XOR: `^` (MySQL, T-SQL, BigQuery, Databricks)
     BitwiseXor,
     /// Bitwise XOR (PostgreSQL): `#`
     BitwiseXorPg,
+    /// Bitwise AND: `&`
+    BitwiseAnd,
+    /// Bitwise OR: `|`
+    BitwiseOr,
+    /// Exponentiation: `^` (PostgreSQL)
+    Exponent,
+    /// Bitwise NOT: the prefix `~`. Like the prefix `NOT`, it is a binary
+    /// operation whose left operand is an empty literal.
+    BitwiseNot,
+    /// MySQL's assignment where a value stands, `@v := expr`: the value of
+    /// `expr` (the right operand), which the variable (the left) is assigned.
+    Assign,
+
+    // PostgreSQL text-search, JSON and string operators
+    /// Text-search or JSON path match: `@@`
+    QueryMatch,
+    /// Any of the keys exists: `?|`
+    JsonExistsAny,
+    /// All of the keys exist: `?&`
+    JsonExistsAll,
+    /// Starts with: `^@`
+    StartsWith,
+    /// Two periods overlap: `(s1, e1) OVERLAPS (s2, e2)`
+    Overlaps,
+    /// Square root: the prefix `|/`, with an empty left operand
+    SquareRoot,
+    /// Absolute value: the prefix `@`, with an empty left operand
+    AbsoluteValue,
+
+    // MySQL operators
+    /// `SOUNDEX(a) = SOUNDEX(b)`: `a SOUNDS LIKE b`
+    SoundsLike,
+    /// An element of a JSON array: `a MEMBER OF (b)`
+    MemberOf,
+    /// A cast to `BINARY`: the prefix `BINARY`, with an empty left operand
+    BinaryCast,
+}
+
+/// What an `IS [NOT]` predicate tests ([`AstExpr::IsPredicate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstIsPredicate {
+    /// `IS TRUE`
+    True,
+    /// `IS FALSE`
+    False,
+    /// `IS JSON`, `IS JSON VALUE`
+    JsonValue,
+    /// `IS JSON ARRAY`
+    JsonArray,
+    /// `IS JSON OBJECT`
+    JsonObject,
+    /// `IS JSON SCALAR`
+    JsonScalar,
+    /// `IS NORMALIZED`, `IS NFC NORMALIZED`
+    NfcNormalized,
+    /// `IS NFD NORMALIZED`
+    NfdNormalized,
+    /// `IS NFKC NORMALIZED`
+    NfkcNormalized,
+    /// `IS NFKD NORMALIZED`
+    NfkdNormalized,
 }
 
 /// - **Special**: CASE expressions, CAST, BETWEEN, IN, LIKE
@@ -8843,7 +11250,8 @@ pub enum AstExpr {
         node_id: crate::ast::NodeId,
         literal: AstLiteral,
     },
-    /// Placeholder for bind parameters: ?
+    /// Placeholder for bind parameters: `?`, a positional `:<n>`, or `$<n>`
+    /// where the dialect reads that as a parameter.
     /// Used in prepared statements and cursor declarations with bind parameters.
     Placeholder {
         node_id: crate::ast::NodeId,
@@ -9050,6 +11458,22 @@ pub enum AstExpr {
         /// Span covering the entire chain
         span: Span,
     },
+    /// A run of three or more operands joined by left-associative
+    /// operators of one precedence level: additive (`+`, `-`, `||` as
+    /// concatenation, `<->`), multiplicative (`*`, `/`, `%`, `DIV`, `MOD`),
+    /// bitwise (`<<`, `>>`, `^`, `#`, `&`, `|`) or `XOR`. It means the left
+    /// fold `((a op1 b) op2 c) …`. Two operands are a [`AstExpr::BinaryOp`].
+    ///
+    /// Invariant: `operators.len() == operands.len() - 1`.
+    OperatorChain {
+        node_id: crate::ast::NodeId,
+        /// The operands in left-to-right order
+        operands: Vec<Box<AstExpr>>,
+        /// `operators[i]` joins `operands[i]` and `operands[i + 1]`
+        operators: Vec<AstChainOperator>,
+        /// Span covering the entire chain
+        span: Span,
+    },
     /// EXISTS (subquery) predicate in WHERE/QUALIFY/etc.
     /// Structural tokens (EXISTS / parens) are owned by the syntax
     /// layer. `negated` carries the semantic NOT-EXISTS flag at the
@@ -9175,6 +11599,15 @@ pub enum AstExpr {
         name_span: Span,
         span: Span,
     },
+    /// Session variable reference, e.g. Snowflake's `$my_variable`, where
+    /// the dialect reads `$name` so
+    /// ([`crate::dialect::Dialect::dollar_name_is_session_variable`]).
+    /// `name_span` covers the name without its `$`.
+    SessionVarRef {
+        node_id: crate::ast::NodeId,
+        name_span: Span,
+        span: Span,
+    },
     /// Qualified star projection: table_name.* or alias.*
     /// Used in SELECT list to expand all columns from a specific table.
     /// Can include EXCLUDE, REPLACE, and RENAME modifiers like unqualified star.
@@ -9210,13 +11643,38 @@ pub enum AstExpr {
         expr: Box<AstExpr>,
         span: Span,
     },
-    /// `IS [NOT] NULL` predicate: `<expr> IS [NOT] NULL`
+    /// `CONNECT_BY_ROOT <expr>` (Snowflake): the value of `expr` at the
+    /// root of the hierarchy a `CONNECT BY` query's row descends from.
+    ConnectByRoot {
+        node_id: crate::ast::NodeId,
+        keyword_span: Span,
+        expr: Box<AstExpr>,
+        span: Span,
+    },
+    /// `IS [NOT] NULL` predicate: `<expr> IS [NOT] NULL`.
+    ///
+    /// PostgreSQL's postfix `<expr> ISNULL` and `<expr> NOTNULL` are this
+    /// node too. The one word is `is_span` or `not_span`, and a keyword the
+    /// spelling does not have is an empty span where it would stand.
+    /// `<expr> IS [NOT] UNKNOWN` is this node, `null_span` its `UNKNOWN`.
     IsNull {
         node_id: crate::ast::NodeId,
         expr: Box<AstExpr>,
         is_span: Span,
         not_span: Option<Span>,
         null_span: Span,
+        span: Span,
+    },
+    /// `<expr> IS [NOT] <predicate>`: `TRUE`, `FALSE`, `JSON [VALUE |
+    /// ARRAY | OBJECT | SCALAR]`, `[NFC | NFD | NFKC | NFKD] NORMALIZED`.
+    /// `predicate_span` covers the words after `IS [NOT]`.
+    IsPredicate {
+        node_id: crate::ast::NodeId,
+        expr: Box<AstExpr>,
+        is_span: Span,
+        not_span: Option<Span>,
+        predicate: AstIsPredicate,
+        predicate_span: Span,
         span: Span,
     },
     /// `IS [NOT] DISTINCT FROM` predicate: `<expr1> IS [NOT] DISTINCT FROM <expr2>`
@@ -9306,8 +11764,15 @@ pub enum AstExpr {
         syntax_id: crate::syntax::SyntaxExtractId,
         /// The date/time field to extract (e.g., DOW, YEAR, MONTH)
         field_span: Span,
+        /// The part the field names in the dialect
+        /// ([`crate::dialect::Dialect::date_part`]); `None` for a word it
+        /// names no part.
+        part: Option<DatePart>,
         /// The expression to extract from
         expr: Box<AstExpr>,
+        /// Where written in an ODBC escape, `{fn EXTRACT(…)}`: the span of
+        /// the expression inside the braces; `span` covers the braces.
+        odbc_fn: Option<Span>,
         span: Span,
     },
     /// POSITION expression: POSITION(needle IN haystack)
@@ -9320,6 +11785,9 @@ pub enum AstExpr {
         needle: Box<AstExpr>,
         /// The haystack expression (string to search in)
         haystack: Box<AstExpr>,
+        /// Where written in an ODBC escape, `{fn POSITION(…)}`: the span of
+        /// the expression inside the braces; `span` covers the braces.
+        odbc_fn: Option<Span>,
         span: Span,
     },
     /// Full-text search predicate: `MATCH (cols) AGAINST (expr [modifier])`
@@ -9348,10 +11816,10 @@ pub enum AstExpr {
     Trim {
         node_id: crate::ast::NodeId,
         syntax_id: crate::syntax::SyntaxTrimId,
-        /// Span of the trim-spec keyword (BOTH/LEADING/TRAILING); None when
-        /// unspecified. Mirrors EXTRACT's `field_span` — the formatter emits it
-        /// directly from source so original casing is preserved byte-exact.
-        spec_span: Option<Span>,
+        /// The side trimmed (BOTH / LEADING / TRAILING) and the span of its
+        /// keyword; None when unspecified. The formatter emits the keyword
+        /// from source, as EXTRACT's `field_span`.
+        spec: Option<(TrimSide, Span)>,
         /// Optional trim-characters expression (the set of characters to strip).
         chars: Option<Box<AstExpr>>,
         /// The source string being trimmed.
@@ -9417,9 +11885,10 @@ pub enum AstExpr {
         /// — parallel to `quantifier` (DISTINCT/ALL); the keyword token is owned by
         /// the syntax node (`approximate_keyword`). Lowered to `AggregateCall::approximate`.
         approximate: bool,
-        /// `true` when written as an ODBC escape `{fn F(args)}`; `span` then
-        /// includes the braces and the formatter re-emits the whole span.
-        odbc_fn: bool,
+        /// Where written as an ODBC escape `{fn F(args)}`: the span of the
+        /// call inside the braces; `span` then includes the braces and the
+        /// formatter re-emits the whole span.
+        odbc_fn: Option<Span>,
         /// Semantic function name (identifier node reused by other analyses).
         func_name: AstIdentifier,
         /// Optional DISTINCT or ALL quantifier inside the function call.
@@ -9632,6 +12101,51 @@ pub enum JinjaBody {
 }
 
 impl AstExpr {
+    /// The elements of this expression where it is a row: a parenthesised
+    /// list, or a `ROW(…)` call (any case) with positional arguments only
+    /// and no modifier. `source` is the text the expression was parsed from.
+    pub fn row_elements<'e>(&'e self, source: &str) -> Option<Vec<&'e AstExpr>> {
+        if let AstExpr::RowConstructor { elements, .. } = self {
+            return Some(elements.iter().collect());
+        }
+        let AstExpr::FunctionCall {
+            approximate: false,
+            odbc_fn: None,
+            func_name,
+            quantifier: None,
+            args,
+            order_by_span: None,
+            inline_order_by: None,
+            separator_span: None,
+            within_group: None,
+            filter: None,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if !source
+            .get(func_name.span.start as usize..func_name.span.end as usize)
+            .is_some_and(|name| name.eq_ignore_ascii_case("ROW"))
+        {
+            return None;
+        }
+        args.iter()
+            .map(|arg| match arg.as_ref() {
+                AstFunctionArg::Positional(element) => Some(element.as_ref()),
+                AstFunctionArg::Named { .. }
+                | AstFunctionArg::Lambda { .. }
+                | AstFunctionArg::AliasedArg { .. }
+                | AstFunctionArg::BulkArg { .. }
+                | AstFunctionArg::Unparsed { .. }
+                | AstFunctionArg::Table { .. }
+                | AstFunctionArg::DataType { .. }
+                | AstFunctionArg::NonValue { .. }
+                | AstFunctionArg::Introduced { .. } => None,
+            })
+            .collect()
+    }
+
     /// Returns the span covering this entire expression.
     pub fn span(&self) -> Span {
         match self {
@@ -9658,6 +12172,7 @@ impl AstExpr {
             AstExpr::InSubquery { span, .. } => *span,
             AstExpr::BinaryOp { span, .. } => *span,
             AstExpr::LogicalChain { span, .. } => *span,
+            AstExpr::OperatorChain { span, .. } => *span,
             AstExpr::ExistsSubquery { span, .. } => *span,
             AstExpr::Spread { span, .. } => *span,
             AstExpr::Array { span, .. } => *span,
@@ -9667,10 +12182,13 @@ impl AstExpr {
             AstExpr::TvfWithSchema { span, .. } => *span,
             AstExpr::QuantifiedSubquery { span, .. } => *span,
             AstExpr::ScriptingVarRef { span, .. } => *span,
+            AstExpr::SessionVarRef { span, .. } => *span,
             AstExpr::QualifiedStar { span, .. } => *span,
             AstExpr::UnqualifiedStar { span, .. } => *span,
             AstExpr::Prior { span, .. } => *span,
+            AstExpr::ConnectByRoot { span, .. } => *span,
             AstExpr::IsNull { span, .. } => *span,
+            AstExpr::IsPredicate { span, .. } => *span,
             AstExpr::IsDistinctFrom { span, .. } => *span,
             AstExpr::Like { span, .. } => *span,
             AstExpr::SimilarTo { span, .. } => *span,
@@ -9730,6 +12248,7 @@ impl AstExpr {
                 InSubquery,
                 BinaryOp,
                 LogicalChain,
+                OperatorChain,
                 ExistsSubquery,
                 Spread,
                 Array,
@@ -9739,10 +12258,13 @@ impl AstExpr {
                 TvfWithSchema,
                 QuantifiedSubquery,
                 ScriptingVarRef,
+                SessionVarRef,
                 QualifiedStar,
                 UnqualifiedStar,
                 Prior,
+                ConnectByRoot,
                 IsNull,
+                IsPredicate,
                 IsDistinctFrom,
                 Like,
                 SimilarTo,
@@ -9802,8 +12324,22 @@ pub enum AstLiteral {
     Number {
         span: Span,
     },
+    /// A money literal such as T-SQL `$100` or `$1.50`. `span` is the
+    /// literal as written, with a leading `+` where one is; `amount_span`
+    /// is the number after the currency sign.
+    Money {
+        span: Span,
+        amount_span: Span,
+    },
     String {
         span: Span,
+    },
+    /// String literals written one after another, which the dialect joins
+    /// into one ([`crate::dialect::Dialect::adjacent_string_literals_join`]):
+    /// MySQL `'a' 'b'`, Databricks `"a" "b"`, the value `'ab'`. Each part
+    /// is one literal as written.
+    Adjacent {
+        parts: Vec<Span>,
     },
     /// A string literal containing Jinja expressions, e.g., `'prefix{{ var }}suffix'`
     /// The span covers the entire string from opening to closing quote.
@@ -9822,7 +12358,12 @@ impl AstLiteral {
     pub fn span(&self) -> Span {
         match self {
             AstLiteral::Number { span } => *span,
+            AstLiteral::Money { span, .. } => *span,
             AstLiteral::String { span } => *span,
+            AstLiteral::Adjacent { parts } => Span {
+                start: parts.first().map_or(0, |part| part.start),
+                end: parts.last().map_or(0, |part| part.end),
+            },
             AstLiteral::StringWithJinja { span } => *span,
             AstLiteral::Boolean { span } => *span,
             AstLiteral::Null { span } => *span,
@@ -9950,6 +12491,69 @@ pub enum AstFunctionArg {
         /// The file-path expression (typically a string literal).
         value: Box<AstExpr>,
     },
+    /// An argument of a table-valued function called in `FROM`, written in
+    /// a grammar the expression reader does not read (BigQuery's `MODEL
+    /// d.m`, MySQL `JSON_TABLE`'s `'$[*]' COLUMNS (…)`): its text up to the
+    /// next `,` or `)` of the call.
+    Unparsed { span: Span },
+    /// An argument of a table-valued function called in `FROM` that is a
+    /// table: `TABLE name` (BigQuery `ML.PREDICT(MODEL m, TABLE t)`) or
+    /// `TABLE ( name )` (Databricks), with the `PARTITION BY` and `ORDER BY`
+    /// lists Databricks writes after it, read as a window's.
+    Table {
+        /// The `TABLE` keyword.
+        table_keyword: Option<Span>,
+        name: Box<AstObjectRef>,
+        partition_by: Vec<AstExpr>,
+        order_by: Vec<AstOrderItem>,
+        span: Span,
+    },
+    /// An argument the dialect says names a data type
+    /// ([`crate::dialect::Dialect::non_value_arguments`]): the `INT` of
+    /// T-SQL's `CONVERT(INT, x)`, the `SIGNED` of MySQL's
+    /// `CONVERT(x, SIGNED)`.
+    DataType { data_type: AstDataType, span: Span },
+    /// An argument the dialect says is no value and no type
+    /// ([`crate::dialect::Dialect::non_value_arguments`]): the `day` of
+    /// `DATEADD(day, 1, d)`, the `NFKC` of `NORMALIZE(s, NFKC)`.
+    NonValue { value: AstNonValue, span: Span },
+    /// An argument a keyword introduces in place of a comma
+    /// ([`crate::dialect::Dialect::introduced_arguments`]): `PLACING r` of
+    /// `OVERLAY(s PLACING r FROM 2)`, `USING utf8mb4` of MySQL's
+    /// `CONVERT(s USING utf8mb4)`.
+    Introduced {
+        keyword_span: Span,
+        value: AstIntroducedValue,
+    },
+}
+
+/// What follows the keyword of an [`AstFunctionArg::Introduced`].
+#[derive(Debug, Clone)]
+pub enum AstIntroducedValue {
+    /// A value: `PLACING r`, T-SQL's `USING 'en-US'`.
+    Expr(Box<AstExpr>),
+    /// A data type: `AS CHAR(4)`.
+    DataType { data_type: AstDataType, span: Span },
+    /// A name that is no value and no column: `USING utf8mb4`, `NAME n`.
+    Name(AstIdentifier),
+}
+
+impl AstIntroducedValue {
+    /// The span of what follows the keyword.
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Expr(value) => value.span(),
+            Self::DataType { span, .. } => *span,
+            Self::Name(name) => name.span,
+        }
+    }
+}
+
+/// What an [`AstFunctionArg::NonValue`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstNonValue {
+    Unit(DatePart),
+    Keyword(ArgKeyword),
 }
 
 #[derive(Debug, Clone)]
@@ -10124,6 +12728,8 @@ pub enum AstAlterNetworkPolicyActionKind {
         tag_span: Span,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG <tag_name> [, ...]
@@ -10132,6 +12738,8 @@ pub enum AstAlterNetworkPolicyActionKind {
         tag_span: Span,
         /// Tag names to unset (comma-separated spans)
         names_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -10432,6 +13040,8 @@ pub enum AstAlterSessionPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET SESSION_IDLE_TIMEOUT_MINS
@@ -10470,6 +13080,8 @@ pub enum AstAlterSessionPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag names to unset (comma-separated spans)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -10539,6 +13151,9 @@ pub struct AstCreateAuthenticationPolicy {
 
     /// AUTHENTICATION_METHODS = (...)
     pub authentication_methods_span: Option<Span>,
+    /// The span of each method `AUTHENTICATION_METHODS = (…)` lists, quotes
+    /// included; empty where the property is absent or lists none.
+    pub authentication_method_spans: Vec<Span>,
 
     /// CLIENT_TYPES = (...)
     pub client_types_span: Option<Span>,
@@ -10548,6 +13163,8 @@ pub struct AstCreateAuthenticationPolicy {
 
     /// MFA_ENROLLMENT = enum_value
     pub mfa_enrollment_span: Option<Span>,
+    /// The value of `MFA_ENROLLMENT = value`.
+    pub mfa_enrollment_value_span: Option<Span>,
 
     /// MFA_POLICY = (...)
     pub mfa_policy_span: Option<Span>,
@@ -10560,6 +13177,9 @@ pub struct AstCreateAuthenticationPolicy {
 
     /// SECURITY_INTEGRATIONS = (...) | all | none
     pub security_integrations_span: Option<Span>,
+    /// The integrations `SECURITY_INTEGRATIONS = (name, …)` lists; empty
+    /// for `ALL`, `NONE` or an empty list.
+    pub security_integrations: Vec<AstObjectRef>,
 
     /// COMMENT = 'string'
     pub comment_span: Option<Span>,
@@ -10683,6 +13303,8 @@ pub enum AstAlterAuthenticationPolicyActionKind {
         property_span: Span,
         eq_span: Option<Span>,
         value_span: Span,
+        /// The integrations listed; empty for `ALL`, `NONE` or an empty list.
+        integrations: Vec<AstObjectRef>,
     },
 
     /// `SET COMMENT = '<string>'`
@@ -10852,6 +13474,11 @@ pub enum AstAlterAccountActionKind {
         authentication_span: Span,
         policy_span: Span,
     },
+    /// `SET {PASSWORD | SESSION | PACKAGES} POLICY <policy_name>`
+    SetPolicy {
+        kind: AstAccountPolicyKind,
+        policy: AstObjectRef,
+    },
     /// `SET <property> = <value> [, ...]` (e.g. NETWORK_POLICY = 'pol',
     /// PERIODIC_DATA_REKEYING = FALSE, DATA_RETENTION_TIME_IN_DAYS = 0)
     Set {
@@ -10867,6 +13494,17 @@ pub enum AstAlterAccountActionKind {
         /// Spans of the unset property names.
         property_name_spans: Vec<Span>,
     },
+}
+
+/// Which policy `ALTER ACCOUNT SET … POLICY` attaches. Closed enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstAccountPolicyKind {
+    /// `PASSWORD POLICY`
+    Password,
+    /// `SESSION POLICY`
+    Session,
+    /// `PACKAGES POLICY`
+    Packages,
 }
 
 /// DROP AUTHENTICATION POLICY statement.
@@ -11120,6 +13758,8 @@ pub enum AstAlterApiIntegrationActionKind {
         set_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span, // Covers all tag assignments
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET API_KEY
@@ -11151,6 +13791,8 @@ pub enum AstAlterApiIntegrationActionKind {
         unset_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span, // Covers all tag names
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -11299,12 +13941,16 @@ pub enum AstAlterNotificationIntegrationActionKind {
         tag_span: Span,
         /// Span over the comma-separated tag assignments.
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `UNSET TAG <name> [, …]`
     UnsetTag {
         unset_span: Span,
         tag_span: Span,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// `RENAME TO <new_name>`
     Rename {
@@ -11403,8 +14049,32 @@ pub enum AstAlterShareActionKind {
         unset_span: Span,
         properties_span: Span,
     },
+    /// Databricks `ADD <object kind> name [AS alias] [PARTITION (…)] …`
+    AddObject {
+        add_span: Span,
+        kind: AstShareObjectKind,
+        kind_span: Span,
+        object: AstObjectRef,
+    },
+    /// Databricks `REMOVE <object kind> name`
+    RemoveObject {
+        remove_span: Span,
+        kind: AstShareObjectKind,
+        kind_span: Span,
+        object: AstObjectRef,
+    },
     /// Unrecognized action (defensive)
     Unknown(AstUnknownClause),
+}
+
+/// What a Databricks `ALTER SHARE … ADD | REMOVE` adds or removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstShareObjectKind {
+    Table,
+    Schema,
+    View,
+    Volume,
+    Model,
 }
 
 /// CREATE DATASHARE statement (Amazon Redshift).
@@ -12128,7 +14798,7 @@ pub struct AstSemanticViewTable {
 ///
 /// The TABLES block is decomposed into the base-table access surface; the
 /// RELATIONSHIPS / FACTS / DIMENSIONS / METRICS blocks are captured as opaque
-/// balanced-paren spans (presence is the recognition signal; their inner
+/// balanced-paren spans (presence is what is recognized; their inner
 /// expressions are not analyzed). Trailing properties are absorbed to the
 /// statement terminator.
 #[derive(Debug, Clone)]
@@ -12441,6 +15111,19 @@ pub struct AstStageFileCommand {
     pub kind: AstStageFileCommandKind,
     /// The `@<stage>` reference (the data source/target), when present.
     pub stage_ref_span: Option<Span>,
+    /// The stage the reference names. `None` where there is none, and for
+    /// a user (`@~`) or table (`@%t`) stage, which `stage_ref_span` holds.
+    pub stage: Option<AstStageRef>,
+}
+
+/// A Snowflake stage reference `@name[/path]`.
+#[derive(Debug, Clone)]
+pub struct AstStageRef {
+    /// The stage's name, without its `@`, as the shared reader reads an
+    /// object name; its name kind is [`AstTableNameKind::Stage`].
+    pub name: AstObjectRef,
+    /// The path written against the name, from its `/`.
+    pub path: Option<Span>,
 }
 
 /// Snowflake `CREATE [OR REPLACE] [SECURE] EXTERNAL FUNCTION <name> (<args>)
@@ -12574,6 +15257,9 @@ pub struct AstCreateAlert {
     pub if_span: Option<Span>,
     /// `( EXISTS ( <query> ) )` condition span (balanced parens).
     pub condition_span: Option<Span>,
+    /// The condition inside the parentheses; `None` where it did not parse
+    /// (`condition_span` still covers it).
+    pub condition: Option<Box<AstExpr>>,
     /// `THEN` keyword span.
     pub then_span: Option<Span>,
     /// The action SQL after THEN: `Ok` when parsed, `Err(span)` when the
@@ -12627,6 +15313,8 @@ pub enum AstAlterAlertActionKind {
     ModifyCondition {
         modify_span: Span,
         condition_span: Span,
+        /// The condition; `None` where its text did not parse.
+        condition: Option<Box<AstExpr>>,
     },
     /// MODIFY ACTION <action_statement>
     ModifyAction {
@@ -12703,9 +15391,17 @@ pub enum AstAlterJoinPolicyActionKind {
     /// UNSET COMMENT
     UnsetComment,
     /// `SET TAG <key> = '<value>' [, ...]`
-    SetTag { assignments_span: Span },
+    SetTag {
+        assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
+    },
     /// `UNSET TAG <key> [, ...]`
-    UnsetTag { tags_span: Span },
+    UnsetTag {
+        tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
+    },
 }
 
 /// DROP JOIN POLICY statement (Snowflake).
@@ -13165,6 +15861,8 @@ pub enum AstAlterPasswordPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     // ========================================================================
@@ -13248,6 +15946,8 @@ pub enum AstAlterPasswordPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag names to unset (comma-separated spans)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -13452,6 +16152,8 @@ pub enum AstAlterAggregationPolicyActionKind {
         tag_span: Option<Span>,
         /// Span covering tag assignments (comma-separated)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG <tag_name> [, ...]
@@ -13460,6 +16162,8 @@ pub enum AstAlterAggregationPolicyActionKind {
         tag_span: Option<Span>,
         /// Span covering tag names to unset
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -13639,6 +16343,8 @@ pub enum AstAlterProjectionPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag assignments as spans (covers "tag = 'value'" pairs)
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG <tag_name> [, ...]
@@ -13647,6 +16353,8 @@ pub enum AstAlterProjectionPolicyActionKind {
         tag_span: Option<Span>,
         /// Tag names to unset (comma-separated spans)
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// `SET COMMENT = '<string>'`
@@ -13884,6 +16592,8 @@ pub enum AstAlterStorageIntegrationActionKind {
         set_span: Option<Span>,
         tag_span: Span,
         tags_value_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET TAG tag_name [, ...]
@@ -13891,6 +16601,8 @@ pub enum AstAlterStorageIntegrationActionKind {
         unset_span: Option<Span>,
         tag_span: Span,
         tag_names_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 }
 
@@ -13966,12 +16678,18 @@ pub struct AstCreateExternalAccessIntegration {
     /// ALLOWED_NETWORK_RULES = ( rule_name, ... )
     /// Required for CREATE statement
     pub allowed_network_rules_span: Option<Span>,
+    /// The network rules `ALLOWED_NETWORK_RULES = (name, …)` lists.
+    pub allowed_network_rules: Vec<AstObjectRef>,
 
     /// ALLOWED_API_AUTHENTICATION_INTEGRATIONS = ( name | none )
     pub allowed_api_authentication_integrations_span: Option<Span>,
+    /// The integrations the property lists; empty for `NONE` or an empty list.
+    pub allowed_api_authentication_integrations: Vec<AstObjectRef>,
 
     /// ALLOWED_AUTHENTICATION_SECRETS = ( name | all | none )
     pub allowed_authentication_secrets_span: Option<Span>,
+    /// The secrets the property lists; empty for `ALL`, `NONE` or an empty list.
+    pub allowed_authentication_secrets: Vec<AstObjectRef>,
 
     /// ENABLED = TRUE | FALSE
     /// Required for CREATE statement
@@ -14034,6 +16752,8 @@ pub enum AstAlterExternalAccessIntegrationActionKind {
         property_span: Span,
         eq_span: Option<Span>,
         value_span: Span,
+        /// The network rules listed.
+        rules: Vec<AstObjectRef>,
     },
 
     /// SET ALLOWED_API_AUTHENTICATION_INTEGRATIONS = ( name | none )
@@ -14042,6 +16762,8 @@ pub enum AstAlterExternalAccessIntegrationActionKind {
         property_span: Span,
         eq_span: Option<Span>,
         value_span: Span,
+        /// The integrations listed; empty for `NONE` or an empty list.
+        integrations: Vec<AstObjectRef>,
     },
 
     /// SET ALLOWED_AUTHENTICATION_SECRETS = ( name | all | none )
@@ -14050,6 +16772,8 @@ pub enum AstAlterExternalAccessIntegrationActionKind {
         property_span: Span,
         eq_span: Option<Span>,
         value_span: Span,
+        /// The secrets listed; empty for `ALL`, `NONE` or an empty list.
+        secrets: Vec<AstObjectRef>,
     },
 
     /// SET ENABLED = TRUE | FALSE
@@ -14073,6 +16797,8 @@ pub enum AstAlterExternalAccessIntegrationActionKind {
         set_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// UNSET ALLOWED_NETWORK_RULES
@@ -14110,6 +16836,8 @@ pub enum AstAlterExternalAccessIntegrationActionKind {
         unset_span: Option<Span>,
         tag_span: Option<Span>,
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
 
     /// RENAME TO new_name
@@ -14145,12 +16873,115 @@ pub struct AstDropExternalAccessIntegration {
     pub integration_name_span: Span,
 }
 
-/// PostgreSQL RETURNING clause for INSERT/UPDATE/DELETE
+/// T-SQL `OUTPUT … [INTO target [(cols)]]` of an INSERT / UPDATE / DELETE /
+/// MERGE, with the client `OUTPUT …` an `INTO` may be followed by.
 #[derive(Debug, Clone)]
 pub struct AstOutputClause {
     pub node_id: crate::ast::NodeId,
     pub output_span: Span,
     pub span: Span,
+}
+
+/// A MySQL administration statement ([`AstStmt::MysqlAdmin`]).
+#[derive(Debug, Clone)]
+pub struct AstMysqlAdmin {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub kind: AstMysqlAdminKind,
+}
+
+/// What a MySQL administration statement does.
+#[derive(Debug, Clone)]
+pub enum AstMysqlAdminKind {
+    /// `{ANALYZE | OPTIMIZE | CHECK | CHECKSUM | REPAIR} [NO_WRITE_TO_BINLOG |
+    /// LOCAL] TABLE t, … [options]`.
+    TableMaintenance {
+        operation: AstMysqlTableOperation,
+        tables: Vec<Span>,
+        /// ANALYZE's `UPDATE | DROP HISTOGRAM ON …`, CHECK's, CHECKSUM's and
+        /// REPAIR's options.
+        options_span: Option<Span>,
+    },
+    /// `FLUSH [NO_WRITE_TO_BINLOG | LOCAL] option, …` or `FLUSH TABLES
+    /// [t, …] [WITH READ LOCK | FOR EXPORT]`; `tables` the ones named.
+    Flush { tables: Vec<Span> },
+    /// `KILL [CONNECTION | QUERY] id`.
+    Kill { id: Span },
+    /// `ALTER INSTANCE action`.
+    AlterInstance,
+    /// `XA {START | BEGIN | END | PREPARE | COMMIT | ROLLBACK | RECOVER} …`.
+    Xa,
+    /// `RENAME USER a TO b, …`.
+    RenameUser { renames: Vec<AstMysqlUserRename> },
+}
+
+/// The table operation of [`AstMysqlAdminKind::TableMaintenance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstMysqlTableOperation {
+    Analyze,
+    Optimize,
+    Check,
+    Checksum,
+    Repair,
+}
+
+/// One rename of `RENAME USER`: the accounts, each with its `@host`.
+#[derive(Debug, Clone, Copy)]
+pub struct AstMysqlUserRename {
+    pub from: Span,
+    pub to: Span,
+}
+
+/// MySQL `CREATE [AGGREGATE] FUNCTION [IF NOT EXISTS] name RETURNS {STRING |
+/// INTEGER | REAL | DECIMAL} SONAME 'lib'`
+/// ([`AstStmt::MysqlCreateLoadableFunction`]).
+#[derive(Debug, Clone)]
+pub struct AstMysqlCreateLoadableFunction {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub create_span: Span,
+    pub aggregate_span: Option<Span>,
+    pub function_span: Span,
+    pub if_not_exists_span: Option<Span>,
+    pub name: Span,
+    /// `RETURNS type`.
+    pub returns_span: Span,
+    pub soname_span: Span,
+    /// The shared library's name, the string literal.
+    pub library: Span,
+}
+
+/// Snowflake `EXECUTE TASK name [RETRY LAST]` ([`AstStmt::ExecuteTask`]).
+#[derive(Debug, Clone)]
+pub struct AstExecuteTask {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// `EXECUTE TASK`.
+    pub keyword_span: Span,
+    pub name: Span,
+    /// `RETRY LAST`: reruns the task's last failed graph run.
+    pub retry_last_span: Option<Span>,
+}
+
+/// MySQL `DO expr [, …]` ([`AstStmt::MysqlDo`]).
+#[derive(Debug, Clone)]
+pub struct AstMysqlDo {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub keyword_span: Span,
+    pub exprs: Vec<AstExpr>,
+}
+
+/// A query psql's `\gexec` sends: the query runs, then each value of each
+/// row it returns runs as a statement, text the script does not hold.
+#[derive(Debug, Clone)]
+pub struct AstPsqlGexec {
+    pub node_id: crate::ast::NodeId,
+    /// The query's span; the command follows it.
+    pub span: Span,
+    pub query: Box<AstStmt>,
+    /// The `\gexec` as written.
+    pub command_span: Span,
 }
 
 /// PostgreSQL RETURNING clause for INSERT/UPDATE/DELETE
@@ -14159,8 +16990,21 @@ pub struct AstReturning {
     pub node_id: crate::ast::NodeId,
     pub syntax_id: Option<crate::syntax::SyntaxReturningId>,
     pub returning_span: Span,
+    /// `WITH (OLD AS o, NEW AS n)` after `RETURNING` (PostgreSQL).
+    pub with_aliases: Option<AstReturningAliases>,
     pub items: Vec<AstReturningItem>,
     pub span: Span,
+}
+
+/// `WITH ( { OLD | NEW } AS name [, …] )` in a `RETURNING` clause: the names
+/// the list reads the row before and after the change under. A version
+/// given a name is no longer read as `old` / `new`.
+#[derive(Debug, Clone)]
+pub struct AstReturningAliases {
+    /// From `WITH` through `)`.
+    pub span: Span,
+    pub old: Option<AstIdentifier>,
+    pub new: Option<AstIdentifier>,
 }
 
 /// A single item in a RETURNING clause: expr [AS alias]
@@ -14208,6 +17052,8 @@ pub struct AstCreateDatabase {
     pub comment_span: Option<Span>,
     /// Optional TAG clause span
     pub tag_span: Option<Span>,
+    /// The tags of the TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
     /// Unknown properties/clauses (defensive design)
     pub extras: Vec<AstUnknownClause>,
 }
@@ -14320,6 +17166,8 @@ pub enum AstAlterDatabaseActionKind {
         tag_span: Span,
         /// Span covering tag assignments
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG tag [, ...]
     UnsetTag {
@@ -14327,6 +17175,8 @@ pub enum AstAlterDatabaseActionKind {
         tag_span: Span,
         /// Span covering tag names
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// SET COMMENT = '...'
     SetComment { set_span: Span, comment_span: Span },
@@ -14442,6 +17292,10 @@ pub struct AstCreateSchema {
     pub comment_span: Option<Span>,
     /// Optional TAG clause span
     pub tag_span: Option<Span>,
+    /// The tags of the TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
+    /// The role named by `AUTHORIZATION role` (PostgreSQL), as written.
+    pub authorization: Option<Span>,
     /// Unknown properties/clauses (defensive design)
     pub extras: Vec<AstUnknownClause>,
 }
@@ -14526,6 +17380,8 @@ pub enum AstAlterSchemaActionKind {
         tag_span: Span,
         /// Span covering tag assignments
         assignments_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// UNSET TAG tag [, ...]
     UnsetTag {
@@ -14533,6 +17389,8 @@ pub enum AstAlterSchemaActionKind {
         tag_span: Span,
         /// Span covering tag names
         tags_span: Span,
+        /// The tags, each name read as an object name.
+        tags: Vec<AstTagRef>,
     },
     /// SET COMMENT = '...'
     SetComment { set_span: Span, comment_span: Span },
@@ -14994,7 +17852,8 @@ pub enum AstConflictAction {
     DoNothing(Span),
     DoUpdate {
         do_update_span: Span,
-        set_items: Vec<(String, AstExpr)>,
+        /// `col = expr` and `(a, b) = (…)`, as an UPDATE's SET items are.
+        set_items: Vec<AstSetAssignment>,
         where_clause: Option<Box<AstExpr>>,
     },
 }
@@ -15067,6 +17926,11 @@ pub struct AstCreateIndex {
     pub using_method: Option<Span>,
     /// Span covering the parenthesized column list `(col1, col2 DESC, ...)`
     pub columns_span: Span,
+    /// The key expression of each element of the column list, in order,
+    /// without its `ASC` / `DESC`, `NULLS …`, operator class or `COLLATE`
+    /// (a MySQL prefix length `col(10)` is no call: the key is the column).
+    /// Empty where the list did not parse (`columns_span` still covers it).
+    pub column_exprs: Vec<AstExpr>,
     /// Span covering `INCLUDE (col, ...)` if present
     pub include_span: Option<Span>,
     /// Parsed WHERE predicate expression (uses the expression parser)
@@ -15132,6 +17996,21 @@ pub struct AstDoBlock {
     /// `None` for opaque/non-block bodies. Not used by the formatter, which
     /// emits [`Self::body_span`] verbatim.
     pub body_stmt: Option<Box<AstStmt>>,
+}
+
+/// PL/pgSQL `PERFORM query`
+///
+/// A `SELECT` with the word `PERFORM` written for `SELECT`: the query runs
+/// and its rows are discarded.
+#[derive(Debug, Clone)]
+pub struct AstPerform {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The query: an `AstStmt::Select` whose `select_span` is the `PERFORM`
+    /// word, or an `AstStmt::SetSelect` whose first operand is that select.
+    pub query: Box<AstStmt>,
+    /// The `;` that ends the statement.
+    pub semicolon_token: crate::cst::TokenId,
 }
 
 /// VACUUM statement (PostgreSQL + Databricks)
@@ -15286,6 +18165,10 @@ pub struct AstCreateSequence {
     pub name: Span,
     /// Span covering all options after the name (AS type, INCREMENT, etc.)
     pub options_span: Option<Span>,
+    /// The table of `OWNED BY table.column`.
+    pub owned_by_table: Option<AstObjectRef>,
+    /// The column of `OWNED BY table.column`.
+    pub owned_by_column: Option<Span>,
 }
 
 /// PostgreSQL ALTER SEQUENCE statement
@@ -15303,6 +18186,8 @@ pub struct AstAlterSequence {
     pub name: Span,
     /// Span covering all clauses after the name
     pub options_span: Option<Span>,
+    /// The sequence's new name, from `RENAME TO new_name`.
+    pub rename_to: Option<Span>,
 }
 
 // =============================================================================
@@ -15431,6 +18316,9 @@ pub struct AstCreatePgTrigger {
     pub for_each_span: Option<Span>,
     /// WHEN (condition) — the condition expression including parens
     pub when_condition: Option<Span>,
+    /// The expression inside `WHEN ( … )`; `None` where it did not parse
+    /// (`when_condition` still covers it).
+    pub when_expr: Option<Box<AstExpr>>,
     /// EXECUTE FUNCTION/PROCEDURE — span covering `EXECUTE FUNCTION|PROCEDURE`
     pub execute_span: Span,
     /// Function name span (schema-qualified)
@@ -15512,6 +18400,43 @@ pub enum PgAlterTableTriggerStateTarget {
     /// `TRIGGER USER` — applies to every user-defined trigger (excludes
     /// foreign-key constraint triggers).
     User,
+}
+
+/// PostgreSQL `CREATE RULE` statement.
+///
+/// ```sql
+/// CREATE [OR REPLACE] RULE name AS ON { SELECT | INSERT | UPDATE | DELETE }
+///     TO table_name [WHERE condition]
+///     DO [ALSO | INSTEAD] { NOTHING | command | ( command ; command ... ) }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AstPgCreateRule {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub or_replace: bool,
+    pub rule_name: Span,
+    /// The event's keyword: `SELECT`, `INSERT`, `UPDATE` or `DELETE`.
+    pub event: Span,
+    pub table_name: Span,
+    /// The `WHERE` condition, if any.
+    pub condition: Option<Box<AstExpr>>,
+    /// `true` for `DO INSTEAD`; `false` for `DO ALSO` and a bare `DO`.
+    pub instead: bool,
+    /// The commands the rule runs, in order; empty for `NOTHING`, and where
+    /// a command does not parse (the statement is then kept as written, its
+    /// commands unread).
+    pub actions: Vec<AstStmt>,
+}
+
+/// T-SQL `CREATE RULE name AS <condition>`: a value constraint, bound to
+/// columns or types, its condition over the `@variable` it names.
+#[derive(Debug, Clone)]
+pub struct AstMssqlCreateRule {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The rule's name, possibly schema-qualified.
+    pub name: Span,
+    pub condition: Box<AstExpr>,
 }
 
 /// PostgreSQL `DROP RULE` statement.
@@ -15700,8 +18625,13 @@ pub struct CreatePrincipalOptions {
     /// - Snowflake `PASSWORD = '<lit>'`
     /// - PG `[ENCRYPTED] PASSWORD '<lit>'`
     /// - MSSQL `WITH PASSWORD = '<lit>'`
-    /// - MySQL `IDENTIFIED BY '<lit>'`
+    /// - MySQL `IDENTIFIED [WITH plugin] BY '<lit>'`
     pub password_literal: Option<Span>,
+    /// A clause that sets the password is written (`PASSWORD = …`,
+    /// `[ENCRYPTED] PASSWORD '…'`, `IDENTIFIED [WITH plugin] BY '…'`,
+    /// `IDENTIFIED BY RANDOM PASSWORD`), whatever its value; `PASSWORD NULL`,
+    /// `PASSWORD POLICY` and `IDENTIFIED WITH plugin [AS 'hash']` are not.
+    pub password_set: bool,
     /// MSSQL-specific source classification (`FROM EXTERNAL PROVIDER`,
     /// `FOR LOGIN`, `WITHOUT LOGIN`, `WITH PASSWORD`, …). `None` for
     /// non-MSSQL dialects.
@@ -15766,8 +18696,49 @@ pub struct AstSnowflakeUserOptions {
     pub rsa_public_key_set: bool,
     /// `RSA_PUBLIC_KEY_2 = '<key>'` present — second (rotation) key.
     pub rsa_public_key_2_set: bool,
-    /// `NETWORK_POLICY = <name>` — bound network policy. Value span.
-    pub network_policy: Option<Span>,
+    /// `NETWORK_POLICY = <name>` — the bound network policy.
+    pub network_policy: Option<AstObjectRef>,
+    /// `UNSET NETWORK_POLICY` — the user's network policy is removed.
+    pub network_policy_unset: bool,
+    /// `SET PASSWORD POLICY <name>` — the attached password policy.
+    pub password_policy: Option<AstObjectRef>,
+    /// `SET SESSION POLICY <name>` — the attached session policy.
+    pub session_policy: Option<AstObjectRef>,
+}
+
+impl AstSnowflakeUserOptions {
+    /// Whether any option other than the attached password and session
+    /// policies is written.
+    pub fn has_property(&self) -> bool {
+        let Self {
+            default_role,
+            default_secondary_roles,
+            must_change_password,
+            disabled,
+            user_type,
+            mins_to_bypass_mfa,
+            days_to_expiry,
+            mins_to_unlock,
+            rsa_public_key_set,
+            rsa_public_key_2_set,
+            network_policy,
+            network_policy_unset,
+            password_policy: _,
+            session_policy: _,
+        } = self;
+        default_role.is_some()
+            || default_secondary_roles.is_some()
+            || must_change_password.is_some()
+            || disabled.is_some()
+            || user_type.is_some()
+            || mins_to_bypass_mfa.is_some()
+            || days_to_expiry.is_some()
+            || mins_to_unlock.is_some()
+            || *rsa_public_key_set
+            || *rsa_public_key_2_set
+            || network_policy.is_some()
+            || *network_policy_unset
+    }
 }
 
 /// T-SQL `CREATE/ALTER LOGIN` password-policy options. Pure recognition:
@@ -15841,6 +18812,9 @@ pub struct AstPgSet {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
     pub kind: PgSetKind,
+    /// Each schema `SET search_path TO …` names, as written, in order;
+    /// empty for `TO DEFAULT` and for every other form.
+    pub search_path: Vec<Span>,
 }
 
 /// Closed enum of `SET` / `RESET` statement variants, 1:1 with PG
@@ -16501,6 +19475,9 @@ pub struct AstPgCopy {
     pub options_span: Option<Span>,
     /// Optional WHERE clause span (COPY FROM only)
     pub where_span: Option<Span>,
+    /// The rows a `COPY … FROM STDIN` reads, written after its terminator,
+    /// through the line `\.` that ends them.
+    pub data_span: Option<Span>,
 }
 
 /// Direction for PG COPY.
@@ -16565,14 +19542,65 @@ pub struct AstPgRefreshMatview {
 
 /// Simple PostgreSQL utility statement — span-based passthrough.
 ///
-/// Used for administrative statements (LISTEN, NOTIFY, UNLISTEN, LOCK TABLE,
-/// CREATE RULE, CREATE AGGREGATE, CREATE OPERATOR, ALTER SYSTEM,
-/// DROP OWNED, REASSIGN OWNED, DISCARD, CLUSTER, PUBLICATION, SUBSCRIPTION)
-/// that are parsed structurally but formatted via span passthrough.
+/// Used for administrative statements (CREATE RULE, CREATE AGGREGATE,
+/// CREATE OPERATOR, ALTER SYSTEM, DROP OWNED, REASSIGN OWNED, DISCARD,
+/// PUBLICATION, SUBSCRIPTION) that are parsed structurally but formatted via
+/// span passthrough.
 #[derive(Debug, Clone)]
 pub struct AstPgSimpleUtility {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+}
+
+/// `CLUSTER [VERBOSE | (options)] [table [USING index]]`, or the older
+/// `CLUSTER [VERBOSE] index ON table`.
+#[derive(Debug, Clone)]
+pub struct AstPgCluster {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The table clustered; `None` for a bare `CLUSTER`.
+    pub table: Option<AstObjectRef>,
+    /// The index the table is clustered on.
+    pub index: Option<AstObjectRef>,
+}
+
+/// `LOCK [TABLE] [ONLY] name [*] [, …] [IN mode MODE] [NOWAIT]`, and MySQL's
+/// `LOCK TABLES name [AS alias] {READ | WRITE} [, …]`.
+#[derive(Debug, Clone)]
+pub struct AstPgLockTable {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The tables locked, in order.
+    pub tables: Vec<AstObjectRef>,
+}
+
+/// `LISTEN channel`.
+#[derive(Debug, Clone)]
+pub struct AstPgListen {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The channel's name.
+    pub channel: Span,
+}
+
+/// `NOTIFY channel [, 'payload']`.
+#[derive(Debug, Clone)]
+pub struct AstPgNotify {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The channel's name.
+    pub channel: Option<Span>,
+    /// The payload string after the comma.
+    pub payload: Option<Span>,
+}
+
+/// `UNLISTEN channel | *`.
+#[derive(Debug, Clone)]
+pub struct AstPgUnlisten {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The channel's name; `None` for `UNLISTEN *`.
+    pub channel: Option<Span>,
 }
 
 /// BigQuery EXPORT DATA statement with structured AST fields.
@@ -16641,9 +19669,15 @@ pub struct AstMysqlLoadData {
     pub local: bool,
     /// Span of the `INFILE '<path>'` file-path string literal.
     pub infile_path_span: Span,
+    /// Span of `REPLACE` before `INTO`: an input row that meets a row on a
+    /// unique key replaces it, the row held deleted first.
+    pub replace_span: Option<Span>,
     /// Span of the `INTO TABLE <name>` target (possibly qualified). `None` only
     /// when the clause is malformed / absent.
     pub target_table_span: Option<Span>,
+    /// The assignments of the `SET col = expr, …` clause, the statement's
+    /// last, from the first assigned column to the statement's end.
+    pub set_span: Option<Span>,
 }
 
 /// MySQL `RENAME TABLE a TO b [, c TO d, ...]` — renames one or more tables
@@ -16831,18 +19865,22 @@ pub struct AstAlterEvent {
     pub rename_present: bool,
     /// New enable state, when `ENABLE`/`DISABLE` is present.
     pub enable_state: Option<EventEnableState>,
-    /// The sub-parsed new `DO` body, when present (rebinds the scheduled SQL).
+    /// The `DO` keyword, when a new body is written.
+    pub do_span: Option<Span>,
+    /// The sub-parsed new `DO` body, when present and parsed (rebinds the
+    /// scheduled SQL); `None` with a `do_span` where the body did not parse.
     pub body_stmt: Option<Box<AstStmt>>,
 }
 
-/// BigQuery ASSERT statement with structured expression.
+/// An `ASSERT` statement, in every dialect: BigQuery's and PL/pgSQL's.
 ///
 /// ```sql
-/// ASSERT expression [AS description]
+/// ASSERT expression [, message] [AS description]
 /// ```
 ///
 /// The expression can be any boolean expression including subqueries.
-/// The description is an optional string literal.
+/// The message (PL/pgSQL) is an expression; the description (BigQuery) is
+/// an optional string literal.
 #[derive(Debug, Clone)]
 pub struct AstBqAssert {
     pub node_id: crate::ast::NodeId,
@@ -16851,6 +19889,8 @@ pub struct AstBqAssert {
     pub keyword_span: Span,
     /// The boolean expression to evaluate
     pub expression: Box<AstExpr>,
+    /// The message after a comma, raised when the expression is false.
+    pub message: Option<Box<AstExpr>>,
     /// Optional description string literal span (includes the AS keyword)
     pub description_span: Option<Span>,
 }
@@ -16872,6 +19912,12 @@ pub struct AstBqSimpleUtility {
 pub struct AstCreateFlow {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// The flow's name (absent for `APPLY CHANGES INTO`, which has none).
+    pub name: Option<AstObjectRef>,
+    /// The table `INTO` names.
+    pub target: Option<AstObjectRef>,
+    /// The relation `FROM` names; for `STREAM(t)`, the `t` inside.
+    pub source: Option<AstObjectRef>,
 }
 
 // ============================================================================
@@ -16887,6 +19933,9 @@ pub struct AstBqCreateSnapshotTable {
     pub keyword_span: Span,
     /// Span covering the snapshot table name (target)
     pub snapshot_name_span: Span,
+    /// The snapshot table's name. Where the tokens are not one name, a
+    /// reference with no parts whose span covers them all.
+    pub name: AstObjectRef,
     /// Span covering the source table name after CLONE
     pub source_table_span: Span,
     /// Optional trailing clauses (FOR SYSTEM_TIME AS OF, OPTIONS)
@@ -17184,6 +20233,9 @@ pub struct AstCreateForeignTable {
     pub create_span: Span,
     /// Span covering the foreign-table name.
     pub name_span: Span,
+    /// The foreign table's name. Where the tokens are not one name, a
+    /// reference with no parts whose span covers them all.
+    pub name: AstObjectRef,
     /// `IF NOT EXISTS` present.
     pub if_not_exists: bool,
     /// True for the `PARTITION OF parent` form (no own column list).
@@ -17317,8 +20369,9 @@ pub enum AstMssqlPrincipalSource {
     FromAsymmetricKey,
     /// `FROM WINDOWS [WITH ...]` — Windows-authenticated login.
     FromWindows,
-    /// `FOR LOGIN name` — `CREATE USER` mapped to a server login.
-    ForLogin,
+    /// `FOR | FROM LOGIN name` — `CREATE USER` mapped to a server login;
+    /// `login` is the name as written, `None` where none follows.
+    ForLogin { login: Option<Span> },
     /// `WITHOUT LOGIN` — contained user with no server login.
     WithoutLogin,
     /// No source clause present or unrecognized form.
@@ -17646,7 +20699,7 @@ pub enum AstMssqlRestoreSource {
 /// `FREEPROCCACHE`, `WRITEPAGE`, …). The only governance-bearing element is the
 /// command verb itself — which command is dangerous is the consumer's verdict
 /// — so recognition captures the command name and nothing else. Arguments are
-/// consumed but not surfaced (heterogeneous operands, no governance signal).
+/// consumed but not surfaced (heterogeneous operands, nothing a rule reads).
 #[derive(Debug, Clone)]
 pub struct AstMssqlDbcc {
     pub node_id: crate::ast::NodeId,
@@ -17669,19 +20722,19 @@ pub struct AstMssqlDbcc {
 ///
 /// This is a session-scoped key-context switch (distinct from the
 /// `{CREATE|ALTER|DROP}` key *object* DDL). The governance-bearing primitives
-/// are the verb (open/close), the key kind, and whether an inline password
+/// are the verb (open/close), the key kind, and each inline password that
 /// decrypts the key — which combination is dangerous is the consumer's
-/// verdict. The password VALUE is recorded as a redaction span at parse time, never
-/// surfaced.
+/// verdict. Each password's content is recorded as a redaction span at parse
+/// time.
 #[derive(Debug, Clone)]
 pub struct AstMssqlKeyManagement {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
     pub action: KeyMgmtAction,
     pub key_kind: KeyMgmtKind,
-    /// True when an inline `PASSWORD = '…'` decrypts/opens the key (a hardcoded
-    /// credential in source). The literal value is redacted, not stored.
-    pub password_present: bool,
+    /// Each `PASSWORD` string literal written, quotes and any `N` included;
+    /// one overlapping a placeholder is not recorded.
+    pub password_literal_spans: Vec<Span>,
 }
 
 /// The key-context verb.
@@ -17716,7 +20769,8 @@ pub enum KeyMgmtKind {
 /// primitives are the verb, the policy `STATE` (OFF — or unset on `CREATE`,
 /// which defaults to OFF — means the control enforces nothing), and whether
 /// filter / block predicates are present. Which combination is dangerous is
-/// the consumer's verdict. Predicate function / table operands are scanned past.
+/// the consumer's verdict. The policy name and each predicate's function and
+/// table are kept as object references.
 #[derive(Debug, Clone)]
 pub struct AstMssqlSecurityPolicy {
     pub node_id: crate::ast::NodeId,
@@ -17727,6 +20781,30 @@ pub struct AstMssqlSecurityPolicy {
     pub has_filter_predicate: bool,
     /// A `BLOCK PREDICATE` is bound (restricts which rows writes may touch).
     pub has_block_predicate: bool,
+    /// The policy's name; absent where none follows `POLICY`.
+    pub name: Option<AstObjectRef>,
+    /// Each `{ FILTER | BLOCK } PREDICATE` the policy states, in order.
+    pub predicates: Vec<AstSecurityPredicate>,
+}
+
+/// One `{ FILTER | BLOCK } PREDICATE [fn(args)] ON table [AFTER | BEFORE …]`
+/// of a security policy.
+#[derive(Debug, Clone)]
+pub struct AstSecurityPredicate {
+    pub kind: AstSecurityPredicateKind,
+    /// The predicate function; absent from `DROP … PREDICATE ON table`.
+    pub function: Option<AstObjectRef>,
+    /// The function's `( … )` argument list.
+    pub args_span: Option<Span>,
+    /// The table after `ON`; absent where none follows.
+    pub table: Option<AstObjectRef>,
+}
+
+/// Whether a security-policy predicate filters reads or blocks writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AstSecurityPredicateKind {
+    Filter,
+    Block,
 }
 
 /// The security-policy verb.
@@ -17769,9 +20847,9 @@ pub struct AstMssqlKeyBackup {
     pub span: Span,
     pub action: KeyBackupAction,
     pub key_object: BackupKeyObject,
-    /// An inline `{ENCRYPTION | DECRYPTION} BY PASSWORD = '…'` is present (a
-    /// hardcoded credential). The literal value is redacted, not stored.
-    pub password_present: bool,
+    /// Each `PASSWORD` string literal written, quotes and any `N` included;
+    /// one overlapping a placeholder is not recorded.
+    pub password_literal_spans: Vec<Span>,
 }
 
 /// The key-material verb.
@@ -17854,8 +20932,9 @@ pub enum AssemblyPermissionSet {
 /// or asymmetric key, regardless of caller. The governance-bearing primitives
 /// are whether it is a counter-signature, the signer kind, and whether an
 /// inline password unlocks the signer's private key. Which combination is
-/// dangerous is the consumer's verdict. The module name and precomputed-signature
-/// operand are scanned past; the password value is recorded as a redaction span.
+/// dangerous is the consumer's verdict. The module and each signer are kept as
+/// object references; the precomputed-signature operand is scanned past and the
+/// password value is recorded as a redaction span.
 #[derive(Debug, Clone)]
 pub struct AstMssqlAddSignature {
     pub node_id: crate::ast::NodeId,
@@ -17863,9 +20942,22 @@ pub struct AstMssqlAddSignature {
     /// `ADD COUNTER SIGNATURE` (signs an existing signature) vs `ADD SIGNATURE`.
     pub counter: bool,
     pub signer_kind: SignerKind,
-    /// An inline `WITH PASSWORD = '…'` unlocks the signer's private key (a
-    /// hardcoded credential). The literal value is redacted, not stored.
-    pub password_present: bool,
+    /// Each `PASSWORD` string literal written, quotes and any `N` included;
+    /// one overlapping a placeholder is not recorded.
+    pub password_literal_spans: Vec<Span>,
+    /// The signed module; absent where the statement is not the full form.
+    pub module: Option<AstObjectRef>,
+    /// The class word before `::` of `TO class::module`.
+    pub module_class: Option<Span>,
+    /// Each signer after `BY`, in order.
+    pub signers: Vec<AstSigner>,
+}
+
+/// One `CERTIFICATE name` or `ASYMMETRIC KEY name` after `BY`.
+#[derive(Debug, Clone)]
+pub struct AstSigner {
+    pub kind: SignerKind,
+    pub name: AstObjectRef,
 }
 
 /// What signs the module.
@@ -17919,9 +21011,9 @@ pub struct AstMssqlAlterServiceMasterKey {
     /// `FORCE REGENERATE` — re-keys even when some material can no longer be
     /// decrypted, discarding it irreversibly.
     pub force: bool,
-    /// An inline `{ OLD | NEW }_PASSWORD = '…'` is present (a hardcoded
-    /// service-account credential). The literal value is redacted, not stored.
-    pub password_present: bool,
+    /// Each `{ OLD | NEW }_PASSWORD` string literal written, quotes and any
+    /// `N` included; one overlapping a placeholder is not recorded.
+    pub password_literal_spans: Vec<Span>,
 }
 
 /// What an `ALTER SERVICE MASTER KEY` does.
@@ -18164,8 +21256,14 @@ pub struct AstCreateExternalTable {
     pub comment_span: Option<Span>,
     /// `[WITH] ROW ACCESS POLICY name ON (col)`
     pub row_access_policy_span: Option<Span>,
+    /// The policy that clause names.
+    pub row_access_policy: Option<AstObjectRef>,
+    /// The columns of that policy's `ON (…)`.
+    pub row_access_policy_columns: Vec<Span>,
     /// `[WITH] TAG (name = 'value', ...)`
     pub tag_span: Option<Span>,
+    /// The tags of the TAG clause, each name read as an object name.
+    pub tags: Vec<AstTagRef>,
 
     // ── Redshift Spectrum-specific ──
     /// `STORED AS <format>` (`PARQUET | TEXTFILE | ORC | RCFILE | SEQUENCEFILE |
@@ -18299,8 +21397,8 @@ pub struct AstCreateCatalog {
 /// The kind of ALTER CATALOG action.
 #[derive(Debug, Clone)]
 pub enum AlterCatalogActionKind {
-    /// `[SET] OWNER TO principal`
-    OwnerTo,
+    /// `[SET] OWNER TO principal`; `principal` is the principal's name as written.
+    OwnerTo { principal: Span },
     /// SET TAGS ('tag' = 'val', ...)
     SetTags,
     /// UNSET TAGS ('tag', ...)
@@ -18834,6 +21932,8 @@ pub struct AstMssqlAuditDdl {
     pub state: Option<AstMssqlAuditState>,
     /// Remaining body (TO FILE …, ADD (…), WHERE …), span-only.
     pub trailing_span: Option<Span>,
+    /// The audit a specification's `FOR SERVER AUDIT name` names.
+    pub server_audit: Option<AstObjectRef>,
 }
 
 /// Verb of an audit DDL statement.
@@ -18875,7 +21975,8 @@ pub struct AstMssqlSecurityObjectDdl {
     pub keyword_span: Span,
     pub action: AstMssqlAuditAction,
     pub object: AstMssqlSecurityObjectKind,
-    /// Object name. `None` for `MASTER KEY` (the database has one).
+    /// Object name. `None` for `MASTER KEY` and `DATABASE ENCRYPTION KEY` (the
+    /// database has one).
     pub name_span: Option<Span>,
     /// `DATABASE SCOPED CREDENTIAL` (vs server-level `CREDENTIAL`).
     pub database_scoped: bool,
@@ -18893,6 +21994,9 @@ pub struct AstMssqlSecurityObjectDdl {
 pub enum AstMssqlSecurityObjectKind {
     /// `MASTER KEY` — the database master key.
     MasterKey,
+    /// `DATABASE ENCRYPTION KEY` — the key of the database's transparent
+    /// data encryption. Carries no name.
+    DatabaseEncryptionKey,
     /// `SYMMETRIC KEY <name>`.
     SymmetricKey,
     /// `ASYMMETRIC KEY <name>`.
@@ -19012,6 +22116,9 @@ pub struct AstMssqlIf {
     pub if_span: Span,
     /// Span covering the condition expression
     pub condition_span: Span,
+    /// The condition. A trigger's `UPDATE(col)` predicate is an
+    /// [`AstExpr::Placeholder`] over its text.
+    pub condition: Box<AstExpr>,
     /// Body of the IF branch (single statement, possibly a BEGIN...END block)
     pub then_body: Vec<AstStmt>,
     /// Span covering the ELSE keyword (if present)
@@ -19033,10 +22140,14 @@ pub struct AstMssqlIf {
 pub struct AstMssqlWhile {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// Span of the label written before `WHILE` (`name:`), if any.
+    pub label_span: Option<Span>,
     /// Span covering the WHILE keyword
     pub while_span: Span,
     /// Span covering the condition expression
     pub condition_span: Span,
+    /// The condition.
+    pub condition: Box<AstExpr>,
     /// Body of the WHILE loop (single statement, possibly a BEGIN...END block)
     pub body: Vec<AstStmt>,
 }
@@ -19186,6 +22297,18 @@ pub enum AstMssqlSetOptionValue {
     Identifier,
     /// No / unrecognized value.
     Unparsed,
+}
+
+/// MySQL `UNLOCK {TABLES | TABLE}`, a session statement releasing the
+/// table locks the session holds.
+#[derive(Debug, Clone)]
+pub struct AstMysqlUnlockTables {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    /// The `UNLOCK` keyword.
+    pub unlock_span: Span,
+    /// `TABLES`, or its synonym `TABLE`.
+    pub tables_span: Span,
 }
 
 /// MySQL `SET` statement family. MySQL overloads `SET` across many
@@ -19399,18 +22522,40 @@ pub struct AstMssqlLabel {
 pub struct AstCreateMssqlTrigger {
     pub node_id: crate::ast::NodeId,
     pub span: Span,
+    /// Which statement defines the trigger: `CREATE`, `ALTER` or `CREATE
+    /// OR ALTER`.
+    pub verb: AstDefinitionVerb,
     /// Span of OR ALTER if present
     pub or_alter_span: Option<Span>,
     /// Span of the trigger name (possibly schema-qualified)
     pub name_span: Span,
     /// Span of the ON target (table/view/DATABASE/ALL SERVER)
     pub target_span: Span,
+    /// `WITH <option> [, …]` as written (ENCRYPTION, EXECUTE AS …,
+    /// SCHEMABINDING, NATIVE_COMPILATION), before the timing clause.
+    pub options_span: Option<Span>,
+    /// The mode the `EXECUTE AS` option names: the trigger runs as its owner
+    /// or as the caller; `None` with no such option, or `SELF` / a named
+    /// user, which name a principal no mode states.
+    pub execute_as_mode: Option<ExecuteAsMode>,
     /// Span of the timing clause (AFTER / INSTEAD OF / FOR)
     pub timing_span: Span,
     /// Span of the event list (INSERT, UPDATE, DELETE or DDL event names)
     pub events_span: Span,
+    /// The events listed, in order.
+    pub events: Vec<MssqlTriggerEvent>,
     /// Body statements (inside BEGIN...END)
     pub body: Vec<AstStmt>,
+}
+
+/// An event a T-SQL trigger fires on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MssqlTriggerEvent {
+    Insert,
+    Update,
+    Delete,
+    /// A DDL or logon event of a database or server trigger, by its name.
+    Named,
 }
 
 /// MSSQL DROP TRIGGER statement.
@@ -19431,6 +22576,49 @@ pub struct AstDropMssqlTrigger {
     pub trigger_names: Vec<Span>,
     /// ON DATABASE or ON ALL SERVER scope (None for DML triggers)
     pub scope_span: Option<Span>,
+}
+
+/// MSSQL ENABLE / DISABLE TRIGGER statement.
+///
+/// Syntax:
+/// ```sql
+/// { ENABLE | DISABLE } TRIGGER { [schema.]trigger_name [,...n] | ALL }
+///     ON { object_name | DATABASE | ALL SERVER } [;]
+/// ```
+#[derive(Debug, Clone)]
+pub struct AstMssqlTriggerState {
+    pub node_id: crate::ast::NodeId,
+    pub span: Span,
+    pub action: MssqlTriggerStateAction,
+    pub triggers: MssqlTriggerList,
+    pub scope: MssqlTriggerScope,
+}
+
+/// Whether `ENABLE` or `DISABLE TRIGGER` was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MssqlTriggerStateAction {
+    Enable,
+    Disable,
+}
+
+/// The triggers an `ENABLE` / `DISABLE TRIGGER` names.
+#[derive(Debug, Clone)]
+pub enum MssqlTriggerList {
+    /// `ALL`: every trigger defined at the scope.
+    All,
+    /// The triggers named, in the order written.
+    Named(Vec<AstObjectRef>),
+}
+
+/// Where the triggers an `ENABLE` / `DISABLE TRIGGER` names are defined.
+#[derive(Debug, Clone)]
+pub enum MssqlTriggerScope {
+    /// `ON object_name`: the table or view of a DML trigger.
+    Object(AstObjectRef),
+    /// `ON DATABASE`: a database-scoped DDL trigger.
+    Database,
+    /// `ON ALL SERVER`: a server-scoped DDL or logon trigger.
+    AllServer,
 }
 
 /// MSSQL BULK INSERT statement.

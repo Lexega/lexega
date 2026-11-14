@@ -13,7 +13,7 @@
 //! primitives are the verb, the permission set, and whether the assembly is
 //! loaded from a filesystem path. Which permission is dangerous is the
 //! consumer's verdict. The `AUTHORIZATION` owner and the binary / path operands carry no
-//! governance signal for this verdict and are scanned past.
+//! governance relevance for this verdict and are scanned past.
 //!
 //! `ASSEMBLY` / `PERMISSION_SET` / `EXTERNAL_ACCESS` / `UNSAFE` are Identifiers
 //! in our lexer; `FROM` is a Keyword.

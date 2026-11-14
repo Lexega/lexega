@@ -132,8 +132,9 @@ pub fn lower_drop_secret_to_secret_plan(s: &AstDrop, source: &str) -> SecretPlan
     SecretPlan {
         action: SecretAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: SecretOptions {
             or_replace: false,
             if_not_exists: false,
@@ -170,7 +171,7 @@ fn fold_properties(plan: &mut SecretPlan, properties: &[AstObjectProperty], sour
                 plan.api_authentication = prop
                     .value_span
                     .and_then(|sp| slice_span(source, sp))
-                    .map(|t| t.trim().trim_matches('\'').to_string());
+                    .map(crate::ir::span_extract::literal_value_or_text);
                 plan.set_property_names.push(name);
             }
             _ => {

@@ -167,6 +167,10 @@ pub struct SchemaOptions {
     pub or_replace: bool,
     pub if_not_exists: bool,
     pub if_exists: bool,
+    /// `DROP SCHEMA … CASCADE` was written.
+    pub cascade: bool,
+    /// `DROP SCHEMA … RESTRICT` was written.
+    pub restrict: bool,
 }
 
 /// Lower a typed [`AstCreateSchema`] into a [`SchemaPlan`].
@@ -182,6 +186,7 @@ pub fn lower_create_schema_to_schema_plan(s: &AstCreateSchema, source: &str) -> 
             or_replace: s.or_replace_span.is_some(),
             if_not_exists: s.if_not_exists_span.is_some(),
             if_exists: false,
+            ..SchemaOptions::default()
         },
         managed_access_enabled: s.with_managed_access_span.is_some(),
         managed_access_disabled: false,
@@ -207,7 +212,7 @@ pub fn lower_create_schema_to_schema_plan(s: &AstCreateSchema, source: &str) -> 
 pub fn lower_alter_schema_to_schema_plan(s: &AstAlterSchema, source: &str) -> SchemaPlan {
     let action = classify_alter_action(&s.action.kind);
 
-    // Pre-existing SNW-* signals continue to use per-condition booleans
+    // Pre-existing SNW-* findings continue to use per-condition booleans
     // because their existing rule_ids predicate against them. New
     // DBX-SCHEMA-* rules predicate against `actions` directly. The
     // booleans below are an additional projection of the typed action,
@@ -249,6 +254,7 @@ pub fn lower_alter_schema_to_schema_plan(s: &AstAlterSchema, source: &str) -> Sc
             or_replace: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
+            ..SchemaOptions::default()
         },
         managed_access_enabled,
         managed_access_disabled,
@@ -266,6 +272,12 @@ pub fn lower_alter_schema_to_schema_plan(s: &AstAlterSchema, source: &str) -> Sc
 
 /// Lower a typed [`AstDropSchema`] into a [`SchemaPlan`].
 pub fn lower_drop_schema_to_schema_plan(s: &AstDropSchema, source: &str) -> SchemaPlan {
+    // The span covers the one keyword written, `CASCADE` or `RESTRICT`.
+    let written = |keyword: &str| {
+        s.cascade_restrict_span
+            .and_then(|span| source.get(span.start as usize..span.end as usize))
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case(keyword))
+    };
     SchemaPlan {
         action: SchemaAction::Drop,
         target: Some(target_from_span(source, s.name_span)),
@@ -273,6 +285,8 @@ pub fn lower_drop_schema_to_schema_plan(s: &AstDropSchema, source: &str) -> Sche
             or_replace: false,
             if_not_exists: false,
             if_exists: s.if_exists_span.is_some(),
+            cascade: written("CASCADE"),
+            restrict: written("RESTRICT"),
         },
         managed_access_enabled: false,
         managed_access_disabled: false,

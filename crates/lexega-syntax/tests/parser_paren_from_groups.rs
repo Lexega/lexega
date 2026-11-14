@@ -137,3 +137,189 @@ fn paren_group_with_outer_join_after_paren() {
     assert_eq!(pg.inner_join_count, 1);
     assert_eq!(tbl.joins.len(), 2);
 }
+
+/// The table names of the one `SELECT`'s FROM items `sql` parses to under
+/// `dialect`, each with whether parentheses enclose it; `None` where the
+/// script is not one parsed `SELECT`.
+fn from_tables(sql: &str, dialect: &str) -> Option<Vec<(Vec<String>, bool)>> {
+    let dialect = lexega_syntax::dialect::dialect_from_name(dialect).expect("a dialect");
+    let script = lexega_syntax::parse_sql_with_dialect(sql, dialect.as_ref()).ok()?;
+    let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+        return None;
+    };
+    select
+        .from
+        .iter()
+        .map(|item| {
+            let table = item.as_table_ref()?;
+            let parts = table.name.parts.as_ref()?;
+            let names = parts
+                .iter()
+                .map(|p| {
+                    p.as_ref().map(|part| {
+                        sql[part.span().start as usize..part.span().end as usize].to_string()
+                    })
+                })
+                .collect::<Option<Vec<String>>>()?;
+            Some((names, table.paren_group.is_some()))
+        })
+        .collect()
+}
+
+#[test]
+fn a_parenthesised_table_is_the_table() {
+    let users = || Some(vec![(vec!["users".to_string()], true)]);
+    let mut wrong = Vec::new();
+    for dialect in [
+        "mysql",
+        "postgres",
+        "snowflake",
+        "mssql",
+        "bigquery",
+        "databricks",
+    ] {
+        let sql = "SELECT * FROM (users) WHERE email = NULL";
+        let read = from_tables(sql, dialect);
+        if read != users() {
+            wrong.push(format!("[{dialect}] {sql}: {read:?}"));
+        }
+    }
+    for (dialect, sql, expected) in [
+        (
+            "mysql",
+            "SELECT * FROM ((users)) WHERE email = NULL",
+            users(),
+        ),
+        (
+            "mysql",
+            "SELECT * FROM (analytics.users) WHERE email = NULL",
+            Some(vec![(
+                vec!["analytics".to_string(), "users".to_string()],
+                true,
+            )]),
+        ),
+        (
+            "mysql",
+            "SELECT u.id FROM (users u JOIN orders o ON o.user_id = u.id) WHERE u.email = NULL",
+            users(),
+        ),
+        (
+            "mysql",
+            "SELECT * FROM (users), (orders) WHERE users.id = orders.user_id",
+            Some(vec![
+                (vec!["users".to_string()], true),
+                (vec!["orders".to_string()], true),
+            ]),
+        ),
+        // A FROM naming no table, or a subquery that does not parse, is no table.
+        ("snowflake", "SELECT 1 FROM WHERE 1 = 1", None),
+        ("snowflake", "SELECT * FROM (SELECT FROM) t", None),
+        ("mysql", "SELECT * FROM (SELECT FROM) t", None),
+        ("mysql", "SELECT * FROM (users WHERE) t", None),
+        ("postgres", "SELECT id FROM users, WHERE id = 1", None),
+    ] {
+        let read = from_tables(sql, dialect);
+        if read != expected {
+            wrong.push(format!("[{dialect}] {sql}: {read:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A FROM item as [`first_from_item`] reads it: its table name parts,
+/// alias, alias columns, whether a sample clause is read, and how many
+/// joins it has.
+type FromItem = (Vec<String>, Option<String>, Vec<String>, bool, usize);
+
+/// The first FROM item of the one `SELECT` `sql` parses to under `dialect`;
+/// `None` where the script is not one parsed `SELECT`.
+fn first_from_item(sql: &str, dialect: &str) -> Option<FromItem> {
+    let dialect = lexega_syntax::dialect::dialect_from_name(dialect).expect("a dialect");
+    let script = lexega_syntax::parse_sql_with_dialect(sql, dialect.as_ref()).ok()?;
+    let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+        return None;
+    };
+    let table = select.from.first()?.as_table_ref()?;
+    let text =
+        |span: lexega_syntax::lexer::Span| sql[span.start as usize..span.end as usize].to_string();
+    let parts = table
+        .name
+        .parts
+        .as_ref()?
+        .iter()
+        .map(|p| p.as_ref().map(|part| text(part.span())))
+        .collect::<Option<Vec<String>>>()?;
+    Some((
+        parts,
+        table.alias.as_ref().map(|alias| text(alias.span)),
+        table
+            .alias_columns
+            .iter()
+            .flat_map(|columns| columns.iter().map(|c| text(c.span)))
+            .collect(),
+        table.sample.is_some(),
+        table.joins.len(),
+    ))
+}
+
+#[test]
+fn a_parenthesised_table_takes_the_alias_and_sample_written_after_it() {
+    let users = |alias: Option<&str>, columns: &[&str], sample: bool, joins: usize| {
+        Some((
+            vec!["users".to_string()],
+            alias.map(str::to_string),
+            columns.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            sample,
+            joins,
+        ))
+    };
+    let mut wrong = Vec::new();
+    for dialect in [
+        "databricks",
+        "mysql",
+        "postgres",
+        "snowflake",
+        "mssql",
+        "bigquery",
+    ] {
+        for (sql, expected) in [
+            (
+                "SELECT * FROM (users) u WHERE u.email = NULL",
+                users(Some("u"), &[], false, 0),
+            ),
+            (
+                "SELECT * FROM (users) AS u WHERE u.email = NULL",
+                users(Some("u"), &[], false, 0),
+            ),
+            (
+                "SELECT * FROM ((users)) u WHERE u.email = NULL",
+                users(Some("u"), &[], false, 0),
+            ),
+            (
+                "SELECT * FROM (users) AS u (a, b) WHERE u.a = NULL",
+                users(Some("u"), &["a", "b"], false, 0),
+            ),
+            (
+                "SELECT * FROM (users) u JOIN orders o ON o.user_id = u.id",
+                users(Some("u"), &[], false, 1),
+            ),
+            (
+                "SELECT * FROM (users) TABLESAMPLE (10 PERCENT) WHERE email = NULL",
+                users(None, &[], true, 0),
+            ),
+            (
+                "SELECT * FROM (users) TABLESAMPLE (10 PERCENT) u WHERE u.email = NULL",
+                users(Some("u"), &[], true, 0),
+            ),
+            // A FROM naming no table, or a subquery that does not parse, is no table.
+            ("SELECT * FROM (SELECT FROM) t", None),
+            ("SELECT * FROM (users WHERE) t", None),
+        ] {
+            let read = first_from_item(sql, dialect);
+            if read != expected {
+                wrong.push(format!("[{dialect}] {sql}: {read:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

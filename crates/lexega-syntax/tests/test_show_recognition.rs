@@ -219,6 +219,7 @@ fn formatter_roundtrip_safe() {
         "SHOW TERSE MATERIALIZED VIEWS;",
         "SHOW ROW ACCESS POLICIES;",
         "SHOW TABLES LIKE 'emp%' IN SCHEMA my_db.my_schema STARTS WITH 'E' LIMIT 5 FROM 'tok';",
+        "SHOW TABLES STARTS WITH 'E' LIMIT 5;",
         "SHOW COLUMNS IN TABLE my_db.my_schema.my_table;",
         "SHOW GRANTS;",
         "SHOW GRANTS ON TABLE t;",

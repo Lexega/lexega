@@ -162,6 +162,29 @@ fn test_group_by_expression() {
     assert!(result.is_some(), "Should parse GROUP BY with expression");
 }
 
+/// A GROUP BY key may be a constant or an ODBC escape: the statement is read
+/// whole, none of it skipped.
+#[test]
+fn test_group_by_literal_and_odbc_escape_keys() {
+    use lexega_syntax::{dialect, parse_sql_with_dialect, AstStmt};
+    for (dialect, sql) in [
+        (dialect::snowflake(), "SELECT 'x' AS v, COUNT(*) AS n FROM u GROUP BY 'x'"),
+        (dialect::snowflake(), "SELECT TRUE AS v, COUNT(*) AS n FROM u GROUP BY TRUE"),
+        (
+            dialect::mssql(),
+            "SELECT {fn CONVERT(email, SQL_VARCHAR)} AS k, COUNT(*) AS n FROM u GROUP BY {fn CONVERT(email, SQL_VARCHAR)}",
+        ),
+    ] {
+        let script = parse_sql_with_dialect(sql, &*dialect).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{sql}");
+        assert!(
+            !matches!(script.stmts[0], AstStmt::OpaqueContent { .. }),
+            "{sql}: {:?}",
+            script.stmts[0]
+        );
+    }
+}
+
 #[test]
 fn test_group_by_case_expression() {
     let sql = "SELECT CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END, COUNT(*) FROM users GROUP BY CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END";
@@ -169,5 +192,245 @@ fn test_group_by_case_expression() {
     assert!(
         result.is_some(),
         "Should parse GROUP BY with CASE expression"
+    );
+}
+
+/// The kinds of the statements `sql` parses into under `dialect`.
+fn statement_kinds(sql: &str, dialect: lexega_syntax::dialect::DialectRef) -> Vec<&'static str> {
+    use lexega_syntax::ast::AstStmt;
+    let script = lexega_syntax::parse_sql_with_dialect(sql, dialect.as_ref())
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    script
+        .stmts
+        .iter()
+        .map(|stmt| {
+            if matches!(stmt, AstStmt::Select(_)) {
+                "select"
+            } else if matches!(stmt, AstStmt::Update(_)) {
+                "update"
+            } else if matches!(stmt, AstStmt::Delete(_)) {
+                "delete"
+            } else if matches!(stmt, AstStmt::OpaqueContent { .. } | AstStmt::Error { .. }) {
+                "unparsed"
+            } else {
+                "other"
+            }
+        })
+        .collect()
+}
+
+// `GROUP BY ()`, the empty grouping set, groups every row into one group.
+#[test]
+fn the_empty_grouping_set_parses_and_formats_as_written() {
+    use lexega_syntax::dialect;
+    for sql in [
+        "SELECT COUNT(*) FROM t GROUP BY ()",
+        "SELECT COUNT(*) FROM t GROUP BY ();",
+        "SELECT a, COUNT(*) FROM t GROUP BY a, ()",
+        "SELECT a, COUNT(*) FROM t GROUP BY ROLLUP(a), ()",
+        "SELECT m FROM (SELECT MAX(c) AS m FROM s GROUP BY ( )) v",
+        "SELECT COUNT(*) FROM t GROUP BY () HAVING COUNT(*) > 1",
+    ] {
+        for dialect in [
+            dialect::mssql(),
+            dialect::postgres(),
+            dialect::redshift(),
+            dialect::snowflake(),
+            dialect::bigquery(),
+            dialect::databricks(),
+            dialect::mysql(),
+        ] {
+            assert_eq!(
+                statement_kinds(sql, dialect.clone()),
+                vec!["select"],
+                "{sql}"
+            );
+            let config = lexega_syntax::FormatterConfig {
+                dialect: dialect.clone(),
+                ..Default::default()
+            };
+            let formatted = lexega_syntax::format_sql_with_config(sql, &config)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, dialect.as_ref())
+                .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+            let again = lexega_syntax::format_sql_with_config(&formatted, &config)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(again, formatted, "{sql}");
+        }
+    }
+}
+
+// A grouping set written bare is printed bare, one in parentheses in them.
+#[test]
+fn grouping_sets_format_as_written() {
+    use lexega_syntax::dialect;
+    for sql in [
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS (a, ());",
+        "SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS (a, b);",
+        "SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), b, (a, b), ());",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), ());",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS ( /* c */ a , ( b ) );",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS ( /* c */ (a), ());",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS ((a) /* c */, ());",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS (( /* c */ a), ( /* d */ ));",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS (a /* c */, b);",
+        "SELECT a + 1, COUNT(*) FROM t GROUP BY GROUPING SETS (a + 1, (a + 1));",
+        "SELECT a, COUNT(*) FROM t GROUP BY a, GROUPING SETS (b, (c));",
+        "SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS (a, b) /* x */;",
+        "SELECT a, COUNT(*) FROM t GROUP BY CUBE (a) /* x */;",
+        "SELECT a, COUNT(*) FROM t GROUP BY ROLLUP (a) /* x */;",
+        "SELECT a, COUNT(*) FROM t GROUP BY ROLLUP (a) /* x */ HAVING COUNT(*) > 1;",
+        "SELECT a, COUNT(*) FROM t GROUP BY CUBE (a, b) /* x */ ORDER BY a;",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS /* y */ ((a), ()) /* x */ ORDER BY a;",
+        "SELECT a, COUNT(*) FROM t GROUP BY ROLLUP /* y */ (a, b), c;",
+        "SELECT a, COUNT(*) FROM t GROUP BY GROUPING SETS (ROLLUP (a) /* r */, CUBE (b) /* c */) /* x */;",
+        "SELECT a, COUNT(*) FROM t GROUP BY CUBE ( /* c */ a /* d */ );",
+    ] {
+        for dialect in [
+            dialect::mssql(),
+            dialect::postgres(),
+            dialect::redshift(),
+            dialect::snowflake(),
+            dialect::bigquery(),
+            dialect::databricks(),
+            dialect::mysql(),
+        ] {
+            assert_eq!(
+                statement_kinds(sql, dialect.clone()),
+                vec!["select"],
+                "{sql}"
+            );
+            let config = lexega_syntax::FormatterConfig {
+                dialect: dialect.clone(),
+                ..Default::default()
+            };
+            let formatted = lexega_syntax::format_sql_with_config(sql, &config)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, dialect.as_ref())
+                .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+            let again = lexega_syntax::format_sql_with_config(&formatted, &config)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(again, formatted, "{sql}");
+        }
+    }
+}
+
+// After an opening parenthesis never closed, what does not parse ends at a
+// `;` any statement follows, and at a T-SQL batch separator at any depth:
+// the statements after it are read.
+#[test]
+fn an_unparsed_statement_ends_where_a_statement_or_a_batch_starts() {
+    use lexega_syntax::dialect::{mssql, postgres, snowflake};
+    for (sql, dialect, kinds) in [
+        (
+            "SELECT COUNT(* FROM dbo.t;\nGRANT CONTROL ON SCHEMA::dbo TO public;\nDELETE FROM dbo.z;",
+            mssql(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t;\nEXEC dbo.p;\nDELETE FROM dbo.z;",
+            mssql(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t;\nEXECUTE dbo.p;\nDELETE FROM dbo.z;",
+            mssql(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t;\nWITH c AS (SELECT * FROM dbo.Orders) SELECT * FROM c;\nDELETE FROM dbo.z;",
+            mssql(),
+            vec!["unparsed", "select", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t;\nSET @x = 2;\nDELETE FROM dbo.z;",
+            mssql(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t;\nGO\nUPDATE dbo.mid SET a = 1;",
+            mssql(),
+            vec!["unparsed", "other", "update"],
+        ),
+        (
+            "SELECT a FROM dbo.t WHERE a IN (1, 2;\nGO\nUPDATE dbo.mid SET a = 1;\nGO",
+            mssql(),
+            vec!["unparsed", "other", "update", "other"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t\nGO\nUPDATE dbo.mid SET a = 1\nGO",
+            mssql(),
+            vec!["unparsed", "other", "update", "other"],
+        ),
+        (
+            "SELECT COUNT(* FROM dbo.t\nUPDATE dbo.s1 SET a = 1\nGO\nDELETE FROM dbo.s2",
+            mssql(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM t;\nWITH d AS (DELETE FROM q RETURNING *) SELECT * FROM d;\nDELETE FROM z;",
+            postgres(),
+            vec!["unparsed", "select", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM t;\nCALL p();\nDELETE FROM z;",
+            postgres(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM t;\nEXECUTE IMMEDIATE 'DELETE FROM q';\nDELETE FROM z;",
+            snowflake(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM t;\nCOPY INTO t FROM @s;\nDELETE FROM z;",
+            snowflake(),
+            vec!["unparsed", "other", "delete"],
+        ),
+        (
+            "SELECT COUNT(* FROM t;\nGRANT SELECT ON t TO ROLE r;\nDELETE FROM z;",
+            snowflake(),
+            vec!["unparsed", "other", "delete"],
+        ),
+    ] {
+        assert_eq!(statement_kinds(sql, dialect), kinds, "{sql}");
+    }
+    // Text after a `;` that starts no statement stays in the skip.
+    assert_eq!(
+        statement_kinds("SELECT COUNT(* FROM t; junk;\nDELETE FROM z;", snowflake()),
+        vec!["unparsed", "delete"]
+    );
+}
+
+// What does not parse ends at its statement's `;`: the statements after it
+// are read.
+#[test]
+fn an_unparsed_statement_ends_at_its_semicolon() {
+    let mssql = lexega_syntax::dialect::mssql;
+    assert_eq!(
+        statement_kinds(
+            "UPDATE e SET x = v.m FROM dbo.E e CROSS APPLY (SELECT MAX(s.c) AS m FROM dbo.S s WHERE s.Id = e.Id GROUP BY ()) v;\nUPDATE dbo.T SET a = 1;\nDELETE FROM dbo.T;",
+            mssql()
+        ),
+        vec!["update", "update", "delete"]
+    );
+    // A FROM list that does not parse leaves its UPDATE unparsed, to the `;`.
+    assert_eq!(
+        statement_kinds(
+            "UPDATE e SET x = 1 FROM dbo.E e CROSS APPLY (SELECT 1 AS one FROM dbo.S WHERE ) v;\nDELETE FROM dbo.T;",
+            mssql()
+        ),
+        vec!["unparsed", "delete"]
+    );
+    // A stray closing parenthesis opens no nesting.
+    assert_eq!(
+        statement_kinds("SELECT 1;\n) junk;\nDELETE FROM dbo.T;", mssql()),
+        vec!["select", "unparsed", "delete"]
+    );
+    // An opening parenthesis never closed ends at the `;` a statement
+    // follows.
+    assert_eq!(
+        statement_kinds("SELECT COUNT(* FROM t;\nDELETE FROM dbo.T;", mssql()),
+        vec!["unparsed", "delete"]
     );
 }

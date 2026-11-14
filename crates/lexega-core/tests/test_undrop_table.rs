@@ -7,8 +7,8 @@ use lexega_core::{
 
 use lexega_core::api::analyze_risk;
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.entries().any(|s| {
         let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;
         g.matched_rule == rule_id
     })
@@ -59,20 +59,19 @@ fn test_undrop_table_no_semicolon() {
 }
 
 // =============================================================================
-// RISK ANALYSIS SIGNALS
+// RISK ANALYSIS FINDINGS
 // =============================================================================
 
 #[test]
-fn test_undrop_table_signal() {
+fn test_undrop_table_finding() {
     let sql = "UNDROP TABLE deleted_audit_logs;";
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "INFO-TBL-UNDROP"),
-        "Should find INFO-TBL-UNDROP (Table Recovered). Signals: {:?}",
+        has_finding(&report, "INFO-TBL-UNDROP"),
+        "Should find INFO-TBL-UNDROP (Table Recovered). Findings: {:?}",
         report
-            .signals
-            .iter()
+            .entries()
             .map(|s| {
                 let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;
                 g.matched_rule.clone()
@@ -87,13 +86,13 @@ fn test_undrop_table_risk_level() {
     let report = analyze_risk(sql).expect("should analyze");
 
     // SNW-TBL-UNDROP Table Recovered should be Info level
-    let signal = report.signals.iter().find(|s| {
+    let finding = report.entries().find(|s| {
         let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;
         g.matched_rule == "INFO-TBL-UNDROP"
     });
 
-    assert!(signal.is_some(), "Should have INFO-TBL-UNDROP signal");
-    if let Some(lexega_core::analyzer::RuleMatch::Analysis(ref g)) = signal {
+    assert!(finding.is_some(), "Should have INFO-TBL-UNDROP finding");
+    if let Some(lexega_core::analyzer::RuleMatch::Analysis(ref g)) = finding {
         assert_eq!(
             g.risk_level,
             RiskLevel::Info,
@@ -103,12 +102,12 @@ fn test_undrop_table_risk_level() {
 }
 
 #[test]
-fn test_undrop_table_qualified_signal() {
+fn test_undrop_table_qualified_finding() {
     let sql = "UNDROP TABLE prod_db.analytics.deleted_metrics;";
     let report = analyze_risk(sql).expect("should analyze");
 
     assert!(
-        has_signal(&report, "INFO-TBL-UNDROP"),
+        has_finding(&report, "INFO-TBL-UNDROP"),
         "Should find INFO-TBL-UNDROP for qualified table name"
     );
 }
@@ -132,10 +131,9 @@ fn test_undrop_table_multi_statement() {
         "All 3 UNDROP TABLE statements should be parsed"
     );
 
-    // Count evidence for SNW-TBL-UNDROP (Table Recovered) rule across all signals
+    // Count evidence for SNW-TBL-UNDROP (Table Recovered) rule across all findings
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| {
             let lexega_core::analyzer::RuleMatch::Analysis(ref g) = s;
             g.matched_rule == "INFO-TBL-UNDROP"
@@ -169,11 +167,11 @@ fn test_undrop_table_mixed_with_other_statements() {
 
     // Should have both Table Dropped (TBL-DROP) and Table Recovered (C314)
     assert!(
-        has_signal(&report, "TBL-DROP"),
+        has_finding(&report, "TBL-DROP"),
         "Should find TBL-DROP (Table Dropped)"
     );
     assert!(
-        has_signal(&report, "INFO-TBL-UNDROP"),
+        has_finding(&report, "INFO-TBL-UNDROP"),
         "Should find INFO-TBL-UNDROP (Table Recovered)"
     );
 }

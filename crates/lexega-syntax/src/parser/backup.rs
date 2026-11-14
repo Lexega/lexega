@@ -46,6 +46,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn try_parse_mssql_backup_stmt(&mut self) -> ParseResult<AstStmt> {
         let _depth = self.track_depth("backup")?;
         let start_span = self.current_span();
+        let start_idx = self.idx;
 
         // 1. BACKUP keyword (Identifier in our lexer).
         let backup_tok = self
@@ -139,10 +140,12 @@ impl<'a> Parser<'a> {
 
         // 7. Consume the remainder of the statement (`= '<device>'`, additional
         //    comma destinations, MIRROR TO, WITH <options>) up to a depth-0
-        //    semicolon or EOF, recording whether WITH ENCRYPTION is present.
+        //    semicolon or EOF, or where the grammar ends if the dialect needs
+        //    no terminator, recording whether WITH ENCRYPTION is present.
+        let bound = self.clauses_bound(self.backup_clauses_end(self.idx));
         let mut encryption = false;
         let mut depth: u32 = 0;
-        while let Some(tok) = self.peek_non_trivia() {
+        while let Some(tok) = self.peek_non_trivia().filter(|_| self.idx < bound) {
             match tok.kind {
                 TokenKind::Punctuation(Punctuation::Semi) if depth == 0 => break,
                 TokenKind::Eof => break,
@@ -156,6 +159,8 @@ impl<'a> Parser<'a> {
                 .ok_or_eof(self.current_span(), vec![";".to_string()])?;
             end = t.span.end;
         }
+        // `WITH PASSWORD | MEDIAPASSWORD = '…'`.
+        self.record_secret_literals(start_idx, self.idx);
 
         let stmt_span = Span { start, end };
         let ast = AstMssqlBackup {
@@ -168,5 +173,43 @@ impl<'a> Parser<'a> {
             encryption,
         };
         Ok(AstStmt::MssqlBackup(Box::new(ast)))
+    }
+
+    /// The index past what follows the first device class at `i`:
+    /// `= value [, device]* [MIRROR TO device [, device]*]*
+    /// [WITH option [, option]*]`, a device being `{ DISK | TAPE | URL } =
+    /// value` or a logical device's name.
+    fn backup_clauses_end(&self, i: usize) -> usize {
+        let mut end = self.device_list_rest_end(i);
+        while let Some(to) = self.words_end(end, &["MIRROR", "TO"]) {
+            match self.comma_list_end(to, |j| self.backup_device_end(j)) {
+                Some(next) => end = next,
+                None => break,
+            }
+        }
+        self.with_list_end(end, |j| self.option_item_end(j))
+            .unwrap_or(end)
+    }
+
+    /// The index past a backup device at `i`: `{ DISK | TAPE | URL } =
+    /// value` or a logical device's name.
+    pub(crate) fn backup_device_end(&self, i: usize) -> Option<usize> {
+        self.any_words_end(i, &[&["DISK"], &["TAPE"], &["URL"]])
+            .and_then(|k| self.eq_value_end(k))
+            .or_else(|| self.option_value_end(i))
+    }
+
+    /// The index past a device list whose first device class was read
+    /// just before `i`: its `= value`, then `, device` for each further
+    /// device.
+    pub(crate) fn device_list_rest_end(&self, i: usize) -> usize {
+        self.comma_list_end(i, |j| {
+            if j == i {
+                self.eq_value_end(j)
+            } else {
+                self.backup_device_end(j)
+            }
+        })
+        .unwrap_or(i)
     }
 }

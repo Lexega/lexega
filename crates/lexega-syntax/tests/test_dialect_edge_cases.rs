@@ -408,6 +408,27 @@ fn test_mysql_double_dash_at_eof_is_comment() {
 }
 
 #[test]
+fn a_mysql_double_dash_before_a_line_end_is_a_comment() {
+    // mysqldump's header: `--` lines with nothing after the dashes.
+    let d = mysql();
+    for sql in [
+        "--\n-- Host: localhost\n--\nSELECT 1",
+        "--\r\nSELECT 1",
+        "SELECT 1 --\nFROM t",
+    ] {
+        let kinds = token_kinds(sql, &*d);
+        let minus = kinds
+            .iter()
+            .filter(|k| matches!(k, TokenKind::Operator(Operator::Minus)))
+            .count();
+        assert_eq!(minus, 0, "{sql:?}: {kinds:?}");
+    }
+    let script = lexega_syntax::parse_sql_with_dialect("--\n-- Host: x\n--\nSELECT 1;", &*d)
+        .expect("parses");
+    assert_eq!(script.stmts.len(), 1, "{:?}", script.stmts);
+}
+
+#[test]
 fn test_mysql_double_dash_number_not_comment() {
     // MySQL: '--1' is NOT a comment (common in expressions like x--1)
     let sql = "SELECT x--1";
@@ -835,8 +856,10 @@ fn test_cross_dialect_nested_comment_mssql_vs_mysql() {
 #[test]
 fn test_mssql_at_variable_format_roundtrip() {
     let sql = "SELECT @count AS cnt FROM t WHERE @count > 0";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = mssql();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("MSSQL @var format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -846,8 +869,10 @@ fn test_mssql_at_variable_format_roundtrip() {
 #[test]
 fn test_mssql_system_variable_format_roundtrip() {
     let sql = "SELECT @@ROWCOUNT, @@ERROR";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = mssql();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("MSSQL @@var format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -857,8 +882,10 @@ fn test_mssql_system_variable_format_roundtrip() {
 #[test]
 fn test_mssql_temp_table_format_roundtrip() {
     let sql = "SELECT * FROM #temp_table WHERE id > 10";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = mssql();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("MSSQL #temp format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -868,8 +895,10 @@ fn test_mssql_temp_table_format_roundtrip() {
 #[test]
 fn test_mssql_global_temp_table_format_roundtrip() {
     let sql = "SELECT * FROM ##global_temp WHERE status = 'active'";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = mssql();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("MSSQL ##temp format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -880,8 +909,10 @@ fn test_mssql_global_temp_table_format_roundtrip() {
 fn test_mssql_mixed_at_hash_format_roundtrip() {
     // Mix @vars and #temp in one statement
     let sql = "SELECT @page_size AS ps FROM #results WHERE @@ROWCOUNT > @min_rows";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = mssql();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("MSSQL mixed @/# format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -895,8 +926,10 @@ fn test_mssql_mixed_at_hash_format_roundtrip() {
 #[test]
 fn test_bigquery_backtick_format_roundtrip() {
     let sql = "SELECT `column_name` FROM `project.dataset.table`";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = bigquery();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("BQ backtick format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -920,8 +953,10 @@ fn test_bigquery_hash_line_comment() {
 #[test]
 fn test_bigquery_hash_comment_format_roundtrip() {
     let sql = "SELECT 1 # comment here\n, 2";
-    let mut config = lexega_syntax::FormatterConfig::default();
-    config.dialect = bigquery();
+    let config = lexega_syntax::FormatterConfig {
+        dialect: bigquery(),
+        ..Default::default()
+    };
     let formatted = lexega_syntax::format_sql_with_config(sql, &config)
         .expect("BQ hash comment format should succeed");
     lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
@@ -988,5 +1023,171 @@ fn test_bq_trait_no_version_comments() {
     assert!(
         !bigquery().supports_version_comments(),
         "BigQuery should NOT support MySQL version comments"
+    );
+}
+
+#[test]
+fn mysql_unlock_tables_is_its_own_statement() {
+    use lexega_syntax::ast::AstStmt;
+    let sql = "LOCK TABLES zz_t READ, zz_u LOW_PRIORITY WRITE;\nUNLOCK TABLES;\nunlock table";
+    let script = lexega_syntax::parse_sql_with_dialect(sql, mysql().as_ref()).expect("parses");
+    let text = |span: lexega_syntax::lexer::Span| &sql[span.start as usize..span.end as usize];
+    let [lock, first, second] = script.stmts.as_slice() else {
+        panic!("three statements: {:?}", script.stmts);
+    };
+    assert!(matches!(lock, AstStmt::PgLockTable(_)), "{lock:?}");
+    assert_eq!(
+        text(lock.span()),
+        "LOCK TABLES zz_t READ, zz_u LOW_PRIORITY WRITE"
+    );
+    for (stmt, words) in [(first, ("UNLOCK", "TABLES")), (second, ("unlock", "table"))] {
+        let AstStmt::MysqlUnlockTables(unlock) = stmt else {
+            panic!("not UNLOCK TABLES: {stmt:?}");
+        };
+        assert_eq!((text(unlock.unlock_span), text(unlock.tables_span)), words);
+        assert_eq!(text(unlock.span), format!("{} {}", words.0, words.1));
+    }
+}
+
+/// The aliases a dialect reads on the select items of `sql`'s only
+/// statement, as written; `None` where it is not one `SELECT`.
+fn select_aliases(sql: &str, dialect: &dyn Dialect) -> Option<Vec<Option<String>>> {
+    use lexega_syntax::ast::{AstProjectionKind, AstStmt, ProjectionItemKind};
+    let script = lexega_syntax::parse_sql_with_dialect(sql, dialect).ok()?;
+    let [AstStmt::Select(select)] = script.stmts.as_slice() else {
+        return None;
+    };
+    let AstProjectionKind::Columns(items) = &select.projection.kind else {
+        return None;
+    };
+    Some(
+        items
+            .iter()
+            .map(|item| match &item.kind {
+                ProjectionItemKind::SelectItem(item) => item.alias.as_ref().map(|alias| {
+                    let span = alias.ident.span;
+                    sql[span.start as usize..span.end as usize].to_string()
+                }),
+                ProjectionItemKind::JinjaBlock(_) => None,
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn a_string_alias_is_read_where_the_dialect_writes_one() {
+    use lexega_syntax::dialect::{databricks, redshift};
+    let alias = |text: &str| Some(text.to_string());
+    for dialect in [mssql(), mysql()] {
+        let name = dialect.name().to_string();
+        assert!(dialect.string_column_alias(), "{name}");
+        assert_eq!(
+            select_aliases(
+                "SELECT c AS 'Customer Name', d 'x', e AS 'it''s', 1 'n' FROM t WHERE id = 1",
+                dialect.as_ref()
+            ),
+            Some(vec![
+                alias("'Customer Name'"),
+                alias("'x'"),
+                alias("'it''s'"),
+                alias("'n'")
+            ]),
+            "{name}"
+        );
+        // A string after a string literal: MySQL joins the two, one item with
+        // no alias; T-SQL reads the second as the first's alias.
+        let joined = dialect.adjacent_string_literals_join();
+        assert_eq!(
+            select_aliases("SELECT 'a' 'b' FROM t", dialect.as_ref()),
+            Some(vec![if joined { None } else { alias("'b'") }]),
+            "{name}"
+        );
+        assert_eq!(
+            select_aliases("SELECT 'a' AS 'b' FROM t", dialect.as_ref()),
+            Some(vec![alias("'b'")]),
+            "{name}"
+        );
+    }
+    // A type name's string is its literal.
+    assert_eq!(
+        select_aliases("SELECT DATE '2024-01-01' FROM t", mysql().as_ref()),
+        Some(vec![None])
+    );
+    assert_eq!(
+        select_aliases("SELECT c \"x\" FROM t", mysql().as_ref()),
+        Some(vec![alias("\"x\"")])
+    );
+    for dialect in [
+        snowflake(),
+        postgres(),
+        bigquery(),
+        databricks(),
+        redshift(),
+    ] {
+        let name = dialect.name().to_string();
+        assert!(!dialect.string_column_alias(), "{name}");
+        assert_eq!(
+            select_aliases("SELECT c AS 'x' FROM t", dialect.as_ref()),
+            None,
+            "{name}"
+        );
+    }
+}
+
+// ============================================================================
+// MySQL client DELIMITER command
+// ============================================================================
+
+#[test]
+fn test_mysql_client_delimiter_sets_the_terminator() {
+    let d = mysql();
+    let sql = "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END //\nDELIMITER ;\nSELECT 2;";
+    assert!(all_trivia_kinds(sql, &*d).contains(&TriviaKind::ClientDelimiter));
+    let lexemes = token_lexemes(sql, &*d);
+    let kinds = token_kinds(sql, &*d);
+    let terminators: Vec<&str> = lexemes
+        .iter()
+        .zip(&kinds)
+        .filter(|(_, k)| matches!(k, TokenKind::Punctuation(lexega_syntax::Punctuation::Semi)))
+        .map(|(l, _)| *l)
+        .collect();
+    // The body's `;`, the `//` that ends the procedure, then `;` again.
+    assert_eq!(terminators, [";", "//", ";"]);
+    assert!(!lexemes.contains(&"DELIMITER"), "{lexemes:?}");
+
+    let script = lexega_syntax::parse_sql_with_dialect(sql, &*d).expect("parses");
+    assert_eq!(script.stmts.len(), 2, "{:?}", script.stmts);
+    let config = lexega_syntax::FormatterConfig {
+        dialect: mysql(),
+        ..Default::default()
+    };
+    for sql in [
+        sql,
+        "DELIMITER $$\nSELECT 1$$\nSELECT 2$$\nDELIMITER ;\nSELECT 3;",
+        "  delimiter ;;\nCREATE PROCEDURE p() BEGIN SELECT 1; END;;\n  delimiter ;",
+    ] {
+        let formatted = lexega_syntax::format_sql_with_config(sql, &config).expect("formats");
+        lexega_syntax::verify_formatting_safe_with_dialect(sql, &formatted, &*d)
+            .unwrap_or_else(|e| panic!("{e}\n{formatted}"));
+        assert!(
+            formatted
+                .lines()
+                .filter(|l| l.to_ascii_uppercase().contains("DELIMITER"))
+                .all(|l| l.to_ascii_uppercase().starts_with("DELIMITER")),
+            "{formatted}"
+        );
+    }
+}
+
+#[test]
+fn test_delimiter_is_a_word_elsewhere() {
+    // Not first on its line, or not followed by a space: a name.
+    let d = mysql();
+    assert!(token_lexemes("SELECT a,\ndelimiter\nFROM t", &*d).contains(&"delimiter"));
+    assert!(token_lexemes("SELECT delimiter $$ FROM t", &*d).contains(&"delimiter"));
+    // Other dialects have no such command.
+    let pg = postgres();
+    assert!(
+        !all_trivia_kinds("DELIMITER $$\nSELECT 1", &*pg).contains(&TriviaKind::ClientDelimiter)
     );
 }

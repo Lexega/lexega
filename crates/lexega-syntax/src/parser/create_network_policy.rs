@@ -322,16 +322,29 @@ impl<'a> Parser<'a> {
             }
 
             "ALLOWED_NETWORK_RULE_LIST" | "BLOCKED_NETWORK_RULE_LIST" => {
-                // Parse string list: ('rule1', 'rule2', ...)
-                let (list_span, lparen_token, rparen_token, rules) = self.parse_string_list()?;
+                // Parse string list: ('rule1', 'rule2', ...), or one rule
+                // written alone (`ADD ALLOWED_NETWORK_RULE_LIST = 'rule'`).
+                let alone = self
+                    .peek_non_trivia()
+                    .filter(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)));
+                let (list_span, lparen_token, rparen_token, rules) = match alone {
+                    Some(rule) => {
+                        self.advance();
+                        (rule.span, None, None, vec![rule.span])
+                    }
+                    None => {
+                        let (span, lparen, rparen, rules) = self.parse_string_list()?;
+                        (span, Some(lparen), Some(rparen), rules)
+                    }
+                };
 
                 let kind = if property_name == "ALLOWED_NETWORK_RULE_LIST" {
                     AstNetworkPolicyPropertyKind::AllowedNetworkRuleList {
                         property_name_span,
                         eq_span,
                         list_span,
-                        lparen_token: Some(lparen_token),
-                        rparen_token: Some(rparen_token),
+                        lparen_token,
+                        rparen_token,
                         rules,
                     }
                 } else {
@@ -339,8 +352,8 @@ impl<'a> Parser<'a> {
                         property_name_span,
                         eq_span,
                         list_span,
-                        lparen_token: Some(lparen_token),
-                        rparen_token: Some(rparen_token),
+                        lparen_token,
+                        rparen_token,
                         rules,
                     }
                 };

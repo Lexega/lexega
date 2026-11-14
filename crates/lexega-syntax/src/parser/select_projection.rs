@@ -15,12 +15,13 @@
 use crate::ast::{
     AstIdentifier, AstIdentifierWithAs, AstProjection, AstSelectItem, AstStarProjection,
 };
+use crate::dialect::LabelPosition;
 use crate::error::{ExpectInvariant, ParseError};
-use crate::lexer::{Keyword, Span, TokenKind};
+use crate::lexer::{Keyword, LiteralKind, Span, TokenKind};
 use crate::parser::core::Parser;
 use crate::parser::scripting::expr_span_end;
+use crate::parser::select::consume_adjacent_jinja_exprs;
 use crate::parser::select::InlineFragmentCollection;
-use crate::parser::select::{consume_adjacent_jinja_exprs, is_clause_keyword_lexeme};
 
 impl<'a> Parser<'a> {
     /// Peek-ahead recognition for variable-assignment projections:
@@ -31,6 +32,50 @@ impl<'a> Parser<'a> {
     /// it appears. Guards `=` against `=>` (named-arg operator).
     /// Consumes `@v` and the operator on match; otherwise leaves the
     /// parser cursor unchanged and returns `None`.
+    /// T-SQL `SELECT column_alias = expression`: where the dialect writes
+    /// an alias so and the item starts with a name and an `=` (not `=>`),
+    /// the alias and the `=`, consumed. T-SQL has no truth value in a
+    /// select list, so the `=` is no comparison.
+    fn try_parse_alias_first(&mut self) -> Option<(AstIdentifier, Span)> {
+        if !self.dialect.select_alias_first() {
+            return None;
+        }
+        let first = self.peek()?;
+        let named = if let TokenKind::Identifier { kind, .. } = first.kind {
+            !matches!(
+                kind,
+                crate::lexer::IdentifierKind::AtVariable
+                    | crate::lexer::IdentifierKind::TempTable
+                    | crate::lexer::IdentifierKind::DollarQuoteDelimiter
+            )
+        } else {
+            matches!(first.kind, TokenKind::Keyword(_)) && self.can_be_identifier_token(first)
+        };
+        let eq = self.peek_ahead(1)?;
+        if !named || !matches!(eq.kind, TokenKind::Operator(crate::lexer::Operator::Eq)) {
+            return None;
+        }
+        let fat_arrow = self.peek_ahead(2).is_some_and(|next| {
+            next.span.start == eq.span.end
+                && matches!(next.kind, TokenKind::Operator(crate::lexer::Operator::Gt))
+        });
+        if fat_arrow {
+            return None;
+        }
+        let (name_span, eq_span) = (first.span, eq.span);
+        self.advance();
+        self.advance();
+        Some((
+            AstIdentifier {
+                node_id: self.id_gen.next(),
+                span: name_span,
+                kind: crate::ast::AstIdentifierKind::Name,
+                templated: None,
+            },
+            eq_span,
+        ))
+    }
+
     fn try_parse_tsql_assignment_target_lifted(
         &mut self,
         allow_eq: bool,
@@ -41,7 +86,8 @@ impl<'a> Parser<'a> {
         let is_at_variable = matches!(
             first.kind,
             TokenKind::Identifier {
-                kind: crate::lexer::IdentifierKind::AtVariable
+                kind: crate::lexer::IdentifierKind::AtVariable,
+                ..
             }
         );
         if !is_at_variable {
@@ -86,6 +132,8 @@ impl<'a> Parser<'a> {
             target: crate::ast::AstIdentifier {
                 node_id: self.id_gen.next(),
                 span: first_span,
+                kind: crate::ast::AstIdentifierKind::Variable,
+                templated: None,
             },
             assign_op_span: eq_span,
         })
@@ -154,6 +202,7 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume '*'
 
                 let qualifier = AstObjectRef {
+                    name_kind: crate::ast::AstTableNameKind::Catalog,
                     node_id: self.id_gen.next(),
                     span: ident_span,
                     parts: None, // single-identifier projection qualifier; span IS the part
@@ -272,6 +321,8 @@ impl<'a> Parser<'a> {
                                                 TokenKind::Identifier { .. }
                                             ) {
                                                 qualifier = Some(AstObjectRef {
+                                                    name_kind:
+                                                        crate::ast::AstTableNameKind::Catalog,
                                                     node_id: self.id_gen.next(),
                                                     span: first_tok.span,
                                                     parts: None, // column qualifier; see AstObjectRef::parts
@@ -295,6 +346,8 @@ impl<'a> Parser<'a> {
                                     name: AstIdentifier {
                                         node_id: self.id_gen.next(),
                                         span: name_span,
+                                        kind: crate::ast::AstIdentifierKind::Name,
+                                        templated: None,
                                     },
                                 });
 
@@ -436,6 +489,8 @@ impl<'a> Parser<'a> {
                                         name: AstIdentifier {
                                             node_id: self.id_gen.next(),
                                             span: col_span,
+                                            kind: crate::ast::AstIdentifierKind::Name,
+                                            templated: None,
                                         },
                                     },
                                 });
@@ -570,12 +625,16 @@ impl<'a> Parser<'a> {
                                 name: AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: old_span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 },
                             },
                             as_span: Some(as_tok.span),
                             alias: AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: new_span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             },
                         });
 
@@ -897,14 +956,24 @@ impl<'a> Parser<'a> {
                 .try_parse_tsql_assignment_target_lifted(
                     self.dialect.supports_select_variable_assignment(),
                 );
+            let alias_first = match assign_target_lifted {
+                Some(_) => None,
+                None => self.try_parse_alias_first(),
+            };
 
             // Parse regular column expression with error recovery
             // This allows parsing to continue even if one projection item is invalid
             let expr = self.parse_expr_with_recovery()?;
+            if let Some(assigned) = &assign_target_lifted {
+                self.record_assigned_secret(assigned.target.span, &expr);
+            }
 
             // Calculate span using expr_span_start and expr_span_end helpers
             let mut span = Span {
-                start: crate::parser::scripting::expr_span_start(&expr),
+                start: alias_first.as_ref().map_or_else(
+                    || crate::parser::scripting::expr_span_start(&expr),
+                    |(alias, _)| alias.span.start,
+                ),
                 end: expr_span_end(&expr),
             };
 
@@ -925,9 +994,16 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Parse optional alias (AS or bare identifier)
-            let mut alias: Option<AstIdentifierWithAs> = None;
-            if let Some(next) = self.peek() {
+            // Parse optional alias (AS or bare identifier), where none is
+            // written first.
+            let alias_first_span = alias_first.as_ref().map(|(_, eq)| *eq);
+            let mut alias: Option<AstIdentifierWithAs> =
+                alias_first.map(|(ident, _)| AstIdentifierWithAs {
+                    node_id: self.id_gen.next(),
+                    as_span: None,
+                    ident,
+                });
+            if let Some(next) = self.peek().filter(|_| alias.is_none()) {
                 match next.kind {
                     TokenKind::Keyword(Keyword::As) => {
                         let as_tok = self
@@ -935,7 +1011,17 @@ impl<'a> Parser<'a> {
                             .expect_invariant("AS keyword confirmed by peek");
 
                         // Check if alias is a Jinja expression {{ ... }} or control block {% if %}...{% endif %}
-                        if let Some(alias_tok) = self.peek() {
+                        if let Some(aid) = self
+                            .parse_templated_identifier()
+                            .or_else(|| self.parse_string_alias())
+                        {
+                            span.end = aid.span.end;
+                            alias = Some(AstIdentifierWithAs {
+                                node_id: self.id_gen.next(),
+                                as_span: Some(as_tok.span),
+                                ident: aid,
+                            });
+                        } else if let Some(alias_tok) = self.peek() {
                             if matches!(alias_tok.kind, TokenKind::JinjaExprOpen) {
                                 // Consume the Jinja expression tokens directly without parsing
                                 let start_span = alias_tok.span.start;
@@ -960,6 +1046,8 @@ impl<'a> Parser<'a> {
                                 let aid = AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: alias_span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 };
                                 alias = Some(AstIdentifierWithAs {
                                     node_id: self.id_gen.next(),
@@ -1011,6 +1099,8 @@ impl<'a> Parser<'a> {
                                 let aid = AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: alias_span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 };
                                 alias = Some(AstIdentifierWithAs {
                                     node_id: self.id_gen.next(),
@@ -1018,10 +1108,14 @@ impl<'a> Parser<'a> {
                                     ident: aid,
                                 });
                                 span.end = alias_span.end;
-                            } else if let Some(alias_tok) = self.advance() {
-                                // Accept both identifiers and keywords as aliases (context-sensitive parsing)
-                                if self.can_be_identifier_token(alias_tok) {
-                                    // Check for adjacent Jinja expressions: total_{{ metric }}
+                            } else if let Some(alias_tok) = self.peek() {
+                                let named = self.can_be_label(
+                                    self.idx,
+                                    LabelPosition::ColumnLabel { after_as: true },
+                                );
+                                self.advance();
+                                if named {
+                                    // A template expression after the alias is taken into it.
                                     let alias_end =
                                         consume_adjacent_jinja_exprs(self, alias_tok.span.end);
                                     let alias_span = Span {
@@ -1031,6 +1125,8 @@ impl<'a> Parser<'a> {
                                     let aid = AstIdentifier {
                                         node_id: self.id_gen.next(),
                                         span: alias_span,
+                                        kind: crate::ast::AstIdentifierKind::Name,
+                                        templated: None,
                                     };
                                     alias = Some(AstIdentifierWithAs {
                                         node_id: self.id_gen.next(),
@@ -1049,70 +1145,62 @@ impl<'a> Parser<'a> {
                             }
                         }
                     }
-                    TokenKind::Identifier { .. } => {
-                        if !self.should_stop_scan_at_statement_start(next) {
-                            let alias_tok = self.advance().expect_invariant(
-                                "Identifier token confirmed by peek for bare alias",
-                            );
-                            // Check for adjacent Jinja expressions: total_{{ metric }}
-                            let alias_end = consume_adjacent_jinja_exprs(self, alias_tok.span.end);
-                            let alias_span = Span {
-                                start: alias_tok.span.start,
-                                end: alias_end,
-                            };
-                            let aid = AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_span,
-                            };
+                    TokenKind::JinjaExprOpen => {
+                        if let Some(aid) = self.parse_template_led_alias() {
+                            span.end = aid.span.end;
                             alias = Some(AstIdentifierWithAs {
                                 node_id: self.id_gen.next(),
                                 as_span: None,
                                 ident: aid,
                             });
-                            span.end = alias_span.end;
                         }
                     }
-                    TokenKind::Keyword(_) => {
-                        // Keywords can be used as bare column aliases (context-sensitive parsing)
-                        // Check if this is actually a clause keyword that should terminate the SELECT list
-                        let lexeme = next.lexeme(self.source);
-                        // A trailing `EXCLUDE (...)` is the projection-level
-                        // exclusion clause, not a bare alias — an alias is never
-                        // followed by `(`. Only dialects with the clause treat it
-                        // this way; leave it for the trailing-exclude hook.
-                        let is_trailing_exclude_clause = self.dialect.supports_projection_exclude()
-                            && matches!(next.kind, TokenKind::Keyword(Keyword::Exclude))
-                            && self.peek_ahead(1).is_some_and(|t| {
-                                matches!(
-                                    t.kind,
-                                    TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-                                )
-                            });
-                        if !is_clause_keyword_lexeme(lexeme)
-                            && !self.dialect.is_clause_boundary_keyword(lexeme)
-                            && !self.should_stop_scan_at_statement_start(next)
-                            && !is_trailing_exclude_clause
-                        {
-                            let alias_tok = self.advance().expect_invariant(
-                                "Keyword token confirmed by peek for context-sensitive alias",
-                            );
-                            // Check for adjacent Jinja expressions: total_{{ metric }}
-                            let alias_end = consume_adjacent_jinja_exprs(self, alias_tok.span.end);
-                            let alias_span = Span {
-                                start: alias_tok.span.start,
-                                end: alias_end,
-                            };
-                            let aid = AstIdentifier {
-                                node_id: self.id_gen.next(),
-                                span: alias_span,
-                            };
+                    TokenKind::Literal(LiteralKind::String) => {
+                        if let Some(aid) = self.parse_string_alias() {
+                            span.end = aid.span.end;
                             alias = Some(AstIdentifierWithAs {
                                 node_id: self.id_gen.next(),
                                 as_span: None,
                                 ident: aid,
                             });
-                            span.end = alias_span.end;
                         }
+                    }
+                    // A word is a bare column alias where the dialect takes it as
+                    // a bare column label; a clause keyword, a word the dialect
+                    // needs `AS` before, or the next statement's first word ends
+                    // the item.
+                    TokenKind::Identifier { .. } | TokenKind::Keyword(_)
+                        if self.can_be_label(
+                            self.idx,
+                            LabelPosition::ColumnLabel { after_as: false },
+                        ) =>
+                    {
+                        let aid = match self.parse_templated_identifier() {
+                            Some(aid) => aid,
+                            None => {
+                                let alias_tok = self
+                                    .advance()
+                                    .expect_invariant("word confirmed by peek for bare alias");
+                                // A template expression after the alias is taken into it.
+                                let alias_end =
+                                    consume_adjacent_jinja_exprs(self, alias_tok.span.end);
+                                AstIdentifier {
+                                    node_id: self.id_gen.next(),
+                                    span: Span {
+                                        start: alias_tok.span.start,
+                                        end: alias_end,
+                                    },
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
+                                }
+                            }
+                        };
+                        span.end = aid.span.end;
+                        alias = Some(AstIdentifierWithAs {
+                            node_id: self.id_gen.next(),
+                            as_span: None,
+                            ident: aid,
+                        });
                     }
                     _ => {}
                 }
@@ -1121,6 +1209,7 @@ impl<'a> Parser<'a> {
             let mut select_item =
                 crate::parser::sql_stmt::build_select_item(self.id_gen.next(), expr, alias, span);
             select_item.assign_target = assign_target_lifted;
+            select_item.alias_first = alias_first_span;
 
             // Collect inline Jinja statements/comments after this item (e.g., {% if not loop.last %},{% endif %})
             // These are distinct from block-level Jinja ({% for %}...{% endfor %}) which wrap multiple items
@@ -1320,17 +1409,33 @@ impl<'a> Parser<'a> {
             .try_parse_tsql_assignment_target_lifted(
                 self.dialect.supports_select_variable_assignment(),
             );
+        let alias_first = match assign_target_lifted {
+            Some(_) => None,
+            None => self.try_parse_alias_first(),
+        };
 
         // Parse regular column expression with error recovery
         let expr = self.parse_expr_with_recovery()?;
+        if let Some(assigned) = &assign_target_lifted {
+            self.record_assigned_secret(assigned.target.span, &expr);
+        }
         let mut span = Span {
-            start: crate::parser::scripting::expr_span_start(&expr),
+            start: alias_first.as_ref().map_or_else(
+                || crate::parser::scripting::expr_span_start(&expr),
+                |(alias, _)| alias.span.start,
+            ),
             end: expr_span_end(&expr),
         };
 
-        // Parse optional alias
-        let mut alias: Option<AstIdentifierWithAs> = None;
-        if let Some(next) = self.peek() {
+        // Parse optional alias, where none is written first.
+        let alias_first_span = alias_first.as_ref().map(|(_, eq)| *eq);
+        let mut alias: Option<AstIdentifierWithAs> =
+            alias_first.map(|(ident, _)| AstIdentifierWithAs {
+                node_id: self.id_gen.next(),
+                as_span: None,
+                ident,
+            });
+        if let Some(next) = self.peek().filter(|_| alias.is_none()) {
             match next.kind {
                 TokenKind::Keyword(Keyword::As) => {
                     let as_tok = match self.advance() {
@@ -1339,7 +1444,17 @@ impl<'a> Parser<'a> {
                     };
 
                     // Check if alias is a Jinja expression {{ ... }}
-                    if let Some(alias_tok) = self.peek() {
+                    if let Some(aid) = self
+                        .parse_templated_identifier()
+                        .or_else(|| self.parse_string_alias())
+                    {
+                        span.end = aid.span.end;
+                        alias = Some(AstIdentifierWithAs {
+                            node_id: self.id_gen.next(),
+                            as_span: Some(as_tok.span),
+                            ident: aid,
+                        });
+                    } else if let Some(alias_tok) = self.peek() {
                         if matches!(alias_tok.kind, TokenKind::JinjaExprOpen) {
                             // Parse the Jinja expression as the alias
                             let alias_expr = self.parse_expr_with_recovery()?;
@@ -1351,6 +1466,8 @@ impl<'a> Parser<'a> {
                             let aid = AstIdentifier {
                                 node_id: self.id_gen.next(),
                                 span: alias_span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
                             };
                             alias = Some(AstIdentifierWithAs {
                                 node_id: self.id_gen.next(),
@@ -1358,8 +1475,13 @@ impl<'a> Parser<'a> {
                                 ident: aid,
                             });
                             span.end = alias_span.end;
-                        } else if let Some(alias_tok) = self.advance() {
-                            if self.can_be_identifier_token(alias_tok) {
+                        } else if let Some(alias_tok) = self.peek() {
+                            let named = self.can_be_label(
+                                self.idx,
+                                LabelPosition::ColumnLabel { after_as: true },
+                            );
+                            self.advance();
+                            if named {
                                 let mut alias_span = alias_tok.span;
 
                                 // Check for immediately adjacent tokens
@@ -1377,6 +1499,8 @@ impl<'a> Parser<'a> {
                                 let aid = AstIdentifier {
                                     node_id: self.id_gen.next(),
                                     span: alias_span,
+                                    kind: crate::ast::AstIdentifierKind::Name,
+                                    templated: None,
                                 };
                                 alias = Some(AstIdentifierWithAs {
                                     node_id: self.id_gen.next(),
@@ -1396,33 +1520,49 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokenKind::Identifier { .. } => {
-                    let alias_tok = match self.advance() {
-                        Some(t) => t,
-                        None => return Ok(None),
-                    };
-                    let mut alias_span = alias_tok.span;
+                    let aid = match self.parse_templated_identifier() {
+                        Some(aid) => aid,
+                        None => {
+                            let alias_tok = match self.advance() {
+                                Some(t) => t,
+                                None => return Ok(None),
+                            };
+                            let mut alias_span = alias_tok.span;
 
-                    while let Some(next_tok) = self.peek() {
-                        if next_tok.span.start == alias_span.end
-                            && matches!(next_tok.kind, TokenKind::Identifier { .. })
-                        {
-                            self.advance();
-                            alias_span.end = next_tok.span.end;
-                        } else {
-                            break;
+                            while let Some(next_tok) = self.peek() {
+                                if next_tok.span.start == alias_span.end
+                                    && matches!(next_tok.kind, TokenKind::Identifier { .. })
+                                {
+                                    self.advance();
+                                    alias_span.end = next_tok.span.end;
+                                } else {
+                                    break;
+                                }
+                            }
+                            AstIdentifier {
+                                node_id: self.id_gen.next(),
+                                span: alias_span,
+                                kind: crate::ast::AstIdentifierKind::Name,
+                                templated: None,
+                            }
                         }
-                    }
-
-                    let aid = AstIdentifier {
-                        node_id: self.id_gen.next(),
-                        span: alias_span,
                     };
+                    span.end = aid.span.end;
                     alias = Some(AstIdentifierWithAs {
                         node_id: self.id_gen.next(),
                         as_span: None,
                         ident: aid,
                     });
-                    span.end = alias_span.end;
+                }
+                TokenKind::Literal(LiteralKind::String) => {
+                    if let Some(aid) = self.parse_string_alias() {
+                        span.end = aid.span.end;
+                        alias = Some(AstIdentifierWithAs {
+                            node_id: self.id_gen.next(),
+                            as_span: None,
+                            ident: aid,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1433,6 +1573,7 @@ impl<'a> Parser<'a> {
             expr,
             alias,
             assign_target: assign_target_lifted,
+            alias_first: alias_first_span,
             span,
         };
 
@@ -1515,14 +1656,11 @@ impl<'a> Parser<'a> {
         };
 
         // Check for identifier
-        let tok = self.peek()?;
-        if self.can_be_identifier_token(tok) {
-            // Make sure it's not a clause keyword
-            let lexeme = tok.lexeme(self.source);
-            if is_clause_keyword_lexeme(lexeme) || self.dialect.is_clause_boundary_keyword(lexeme) {
-                return None;
-            }
-
+        self.peek()?;
+        let position = LabelPosition::ColumnLabel {
+            after_as: as_span.is_some(),
+        };
+        if self.can_be_label(self.idx, position) {
             // If there's no AS keyword, check if this looks like the start of a new item
             // rather than an alias:
             // - identifier.something → qualified name, not an alias
@@ -1547,6 +1685,8 @@ impl<'a> Parser<'a> {
             let ident = AstIdentifier {
                 node_id: self.id_gen.next(),
                 span: alias_tok.span,
+                kind: crate::ast::AstIdentifierKind::Name,
+                templated: None,
             };
             return Some(AstIdentifierWithAs {
                 node_id: self.id_gen.next(),
@@ -1556,5 +1696,27 @@ impl<'a> Parser<'a> {
         }
 
         None
+    }
+
+    /// A select item's alias written as a string at the current token,
+    /// consumed, where the dialect writes one so
+    /// ([`crate::dialect::Dialect::string_column_alias`]); `None`,
+    /// consuming nothing, elsewhere. Strings a dialect joins
+    /// ([`crate::dialect::Dialect::adjacent_string_literals_join`]) were
+    /// read as one literal before an alias is looked for.
+    fn parse_string_alias(&mut self) -> Option<AstIdentifier> {
+        if !self.dialect.string_column_alias() {
+            return None;
+        }
+        let tok = self
+            .peek()
+            .filter(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)))?;
+        self.advance();
+        Some(AstIdentifier {
+            node_id: self.id_gen.next(),
+            span: tok.span,
+            kind: crate::ast::AstIdentifierKind::Name,
+            templated: None,
+        })
     }
 }

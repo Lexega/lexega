@@ -9,7 +9,7 @@ use super::extension::{Capability, Extension};
 pub fn print_top_usage(program: &str) {
     eprintln!("Usage: {} <COMMAND> [OPTIONS]", program);
     eprintln!();
-    eprintln!("Pre-execution SQL analysis for Snowflake, Databricks, BigQuery, PostgreSQL, MySQL and SQL Server");
+    eprintln!("Pre-execution SQL analysis for Snowflake, Databricks, BigQuery, PostgreSQL, MySQL, SQL Server and Redshift");
     eprintln!();
     eprintln!("Commands:");
     eprintln!(
@@ -47,15 +47,15 @@ pub fn print_top_usage(program: &str) {
         "  {} analyze models/ -r --format sarif > results.sarif",
         program
     );
-    eprintln!("  {} review main..HEAD --pr-comment", program);
+    eprintln!("  {} review main...HEAD --pr-comment", program);
     eprintln!("  {} fmt query.sql", program);
 }
 
 pub fn print_fmt_usage(program: &str, ext: &dyn Extension) {
     let renders = ext.offers(Capability::TemplateRendering);
-    eprintln!("Usage: {} fmt [OPTIONS] <FILE|DIRECTORY|GLOB>", program);
+    eprintln!("Usage: {} fmt [OPTIONS] <FILE|DIRECTORY|GLOB>...", program);
     eprintln!();
-    eprintln!("Format SQL files (Snowflake and PostgreSQL)");
+    eprintln!("Format SQL files");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --dialect <DIALECT>      SQL dialect: snowflake (default), postgresql, bigquery, mysql, mssql, databricks, redshift");
@@ -121,9 +121,9 @@ pub fn print_fmt_usage(program: &str, ext: &dyn Extension) {
         eprintln!(
             "  --render-jinja            Render/execute Jinja templates (converts to pure SQL)"
         );
-        eprintln!("  --dbt-project <path>      Path to dbt project directory");
+        eprintln!("  --dbt-project <path>      dbt project to render every file under (default: the one each file is in)");
         eprintln!("  --dbt-profile <name>      Use specific dbt profile");
-        eprintln!("  --load-macros             Load macros from dbt project (dbt_packages/)");
+        eprintln!("  --load-macros             Accepted: the project's macros and dbt_packages/ always load");
         eprintln!("  --fail-on-missing-packages  Fail if required dbt package macros are missing");
         eprintln!(
             "  --var KEY=VALUE           Set Jinja variable (repeatable, auto-enables rendering)"
@@ -282,14 +282,15 @@ pub fn print_ci_usage(program: &str, ext: &dyn Extension) {
 pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
     let gates = ext.offers(Capability::PolicyGate);
     let renders = ext.offers(Capability::TemplateRendering);
-    println!("Usage: {} analyze [OPTIONS] <FILE|DIRECTORY>", program);
+    println!("Usage: {} analyze [OPTIONS] <FILE|DIRECTORY>...", program);
     println!();
     println!("Analyze SQL for pre-execution risk assessment");
     println!();
     println!("Input:");
-    println!("  <FILE|DIRECTORY>         SQL file or directory to analyze");
+    println!("  <FILE|DIRECTORY>...      SQL files, directories or globs to analyze (several are one batch)");
     println!("  --stdin                  Read SQL from stdin (auto-detected when piped)");
     println!("  -r, --recursive          Analyze all *.sql files in directory");
+    println!("  --detail                 In a batch report, list more places of each finding");
     if ext.offers(Capability::CrossScript) {
         println!("  --cross-script           Analyze a non-dbt directory as a connected set (cross-script resolution + ordering hazards)");
     }
@@ -301,41 +302,51 @@ pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
     println!("  --dialect <DIALECT>      SQL dialect: snowflake (default), postgresql, bigquery, mysql, mssql, databricks, redshift");
     println!();
     println!("Strict Analysis (experimental):");
-    println!("  --strict [<MODE>]        Fail on unparsed/unsupported statements.");
+    println!("  --strict [<MODE>]        Fail on unparsed/unsupported statements, on a file");
+    println!("                           whose template did not render (alone or in a");
+    println!("                           batch), and in a batch on a file it could not read");
+    println!("                           or analyze and on a symbolic link the scan did not");
+    println!("                           follow.");
     println!("                           MODE: off (default) | strict | pedantic");
     println!("                           Bare --strict is equivalent to --strict strict.");
     println!("                           Also settable via LEXEGA_STRICT env var.");
     println!();
     println!("Output:");
-    println!("  --format <FORMAT>        Stdout format: text (default), json, yaml, sarif, markdown, both");
+    println!("  --format <FORMAT>        Stdout format: text (default), json, yaml, sarif, gl-sast, markdown, both");
     println!("  --color <WHEN>           Colorize text output: auto (default), always, never (--no-color = never)");
     println!("  --report-artifact-format <FMT>");
     println!(
-        "                           Report/summary artifact format: json (default), yaml, sarif"
+        "                           Report/summary artifact format: json, yaml, sarif; else the"
     );
+    println!("                           --report-out extension names it, else json (sarif under");
+    println!("                           --format sarif). It may not contradict the extension.");
     if gates {
         println!("  --decision-artifact-format <FMT>");
         println!("                           Decision artifact format: json (default), yaml");
         println!("                           (SARIF has no schema for policy decisions)");
     }
     println!("  --report-out <URI>       Write analysis report (local, s3://, gs://, az://)");
-    println!("  --trace                  Full trace mode (no truncation, includes all signals)");
+    println!("  --trace                  Add each statement's facts and rule evaluation to the JSON and YAML report");
     println!(
         "  --render-diagnostics <L> Placeholder verbosity: none (default), summary, impacted, all"
     );
     println!();
     println!("Output Filtering:");
-    println!("  --min-severity <LEVEL>   Filter signals by level (info|low|medium|high|critical) [default: high]");
+    println!("  --min-severity <LEVEL>   Lowest level shown and counted (info|low|medium|high|critical) [default: high]");
+    if gates {
+        println!("                           (a policy decides on every finding)");
+    }
     println!();
     if gates {
         println!("Policy Enforcement (the only way to block - set LEXEGA_CI=1 for strict mode):");
         println!("  --policy <URI>           Evaluate policy bundle (local, s3://, gs://, az://)");
         println!("  --env <NAME>             Environment context (required with --policy)");
-        println!("  --decision-out <URI>     Write decision artifact (local, s3://, gs://, az://)");
+        println!("  --decision-out <URI>     Write the policy's decision artifact (local, s3://, gs://, az://; requires --policy)");
         println!("                       Tip: use a unique per-run directory/prefix (e.g. .../$GITHUB_RUN_ID/) to avoid overwriting previous runs");
         println!(
             "  --exceptions <URI>       Optional exception grants file (local, s3://, gs://, az://)"
         );
+        println!("  --mode <MODE>            ci (default), or runtime: one file or stdin, the decision as JSON on stdout (requires --policy)");
         println!();
     }
     println!("Custom Rules:");
@@ -343,15 +354,18 @@ pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
         "  --custom-rules <URI>     Load rules from YAML/JSON/TOML (local, s3://, gs://, az://)"
     );
     println!("  --no-builtin             Disable built-in rules (custom rules only)");
-    println!("  --list-signals           Show catalog of available signal types");
-    println!("  --explain-signals        Show extracted signals by statement");
-    println!("  --verbose                Show per-statement rule-evaluation trace (matched + rejection reasons)");
+    println!("  --rule-syntax            Show the custom-rule syntax primer");
+    println!(
+        "  --explain-findings       Show findings by statement (one file; text, json or yaml)"
+    );
+    println!("  --explain-facts          Show the facts rules read, by statement (one file; text or json)");
+    println!("  --verbose                Show per-statement rule-evaluation trace (matched + rejection reasons; one file)");
     println!();
     if renders {
         println!("Jinja/dbt:");
-        println!("  --dbt-project <PATH>     Path to dbt project directory");
+        println!("  --dbt-project <PATH>     dbt project to render every file under (default: the one each file is in)");
         println!("  --dbt-profile <NAME>     Use specific dbt profile for rendering");
-        println!("  --load-macros            Load macros from dbt project (dbt_packages/)");
+        println!("  --load-macros            Accepted: the project's macros and dbt_packages/ always load");
         println!("  --fail-on-missing-packages  Fail if required dbt package macros are missing");
         println!("  --var KEY=VALUE          Set Jinja variable (repeatable)");
     } else {
@@ -371,6 +385,18 @@ pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
         "  --provider <NAME>        Catalog provider override ({})",
         lexega_core::builtin_catalog_provider_names().join("|")
     );
+    println!("  --default-schema <[DB.]SCHEMA>");
+    println!("                           Where a table named without a schema is looked for, until a USE or");
+    println!(
+        "                           SET search_path in the script (default: .lexega.toml [session]"
+    );
+    if renders {
+        println!("                           default_schema, else the dbt profile's, else the dialect's: dbo, public, default)");
+    } else {
+        println!(
+            "                           default_schema, else the dialect's: dbo, public, default)"
+        );
+    }
     println!();
     if gates {
         println!("Policy Metadata (optional):");
@@ -420,55 +446,59 @@ pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
     if gates {
         println!("  Policy:     https://lexega.com/schemas/v1/policy.schema.json");
     }
-    println!("  Rules:      https://lexega.com/schemas/v1/custom_rules.schema.json");
+    println!("  Rules:      https://lexega.com/schemas/v2/custom_rules.schema.json");
     if gates {
         println!("  Exceptions: https://lexega.com/schemas/v1/exceptions.schema.json");
-        println!("  Decision:   https://lexega.com/schemas/v1/decision.schema.json");
+        println!("  Decision:   https://lexega.com/schemas/v2/decision.schema.json");
     }
 }
 
-pub fn print_review_usage(program: &str) {
+pub fn print_review_usage(program: &str, ext: &dyn Extension) {
     println!("Usage: {} review <BASE..HEAD> [PATH...] [OPTIONS]", program);
     println!();
     println!("Analyze the SQL files a commit range changes, as of its head commit");
     println!();
     println!("Arguments:");
-    println!("  <BASE..HEAD>             Commit range (e.g. main..HEAD)");
+    println!("  <BASE..HEAD>             Commit range. BASE...HEAD (three dots) reviews only what HEAD changed since it left BASE: a pull request's own changes. BASE..HEAD compares the two trees, so changes BASE made since then are reviewed too");
     println!("  [PATH...]                Limit the review to these paths (default: .)");
     println!();
     println!("Options:");
     println!("  --pr-comment             Post the review as a pull/merge-request comment (CI)");
     println!("  --format <FORMAT>        Stdout format: markdown (default), text, json, yaml, sarif, gl-sast, both");
-    println!("  --min-severity <LEVEL>   Filter signals by level (info|low|medium|high|critical) [default: high]");
+    println!("  --min-severity <LEVEL>   Lowest level shown and counted (info|low|medium|high|critical) [default: high]");
+    if ext.offers(Capability::PolicyGate) {
+        println!("                           (a policy decides on every finding)");
+    }
     println!("  -h, --help               Show this help message");
     println!();
     println!(
-        "The options of `{} analyze` apply here too (see: {} analyze --help).",
+        "The options of `{} analyze` apply here too, except --stdin (see: {} analyze --help).",
         program, program
     );
+    println!("--scan-embedded also reads the Python and notebook files the range changes.");
     println!();
     println!("Examples:");
-    println!("  {} review main..HEAD", program);
+    println!("  {} review main...HEAD", program);
     println!(
-        "  {} review origin/main..HEAD models/ --pr-comment",
+        "  {} review origin/main...HEAD models/ --pr-comment",
         program
     );
 }
 
-/// Print the custom-rule authoring primer (`--list-signals`).
+/// Print the custom-rule authoring primer (`--rule-syntax`).
 ///
 /// Built-in rules are identified by `rule_id` (e.g. `DML-WRITE-UNBOUNDED`,
 /// `GRT-TO-PUBLIC`). Customers author rules in YAML whose `triggers:`
 /// predicate against extracted facts. This help text documents the
 /// predicate DSL and points at the full schemas / rule catalog.
-pub fn print_signal_catalog(program: &str, ext: &dyn Extension) {
+pub fn print_rule_syntax(program: &str, ext: &dyn Extension) {
     let gates = ext.offers(Capability::PolicyGate);
     println!("Custom Rule Syntax");
     println!("==================");
     println!();
-    println!("Lexega rules emit signals identified by `rule_id` (e.g.");
+    println!("Lexega rules raise findings identified by `rule_id` (e.g.");
     println!("DML-WRITE-UNBOUNDED, Q-NULL-NOTIN, GRT-TO-PUBLIC). Use");
-    println!("`--explain-signals` to see which rules fire on a given query.");
+    println!("`--explain-findings` to see which rules fire on a given query.");
     println!();
     println!("Authoring custom rules:");
     println!();
@@ -502,17 +532,44 @@ pub fn print_signal_catalog(program: &str, ext: &dyn Extension) {
     println!("  kind: grant                          # equality sugar");
     println!("  kind: {{ in: [grant, revoke] }}        # set membership");
     println!("  ddl.target.name.database.normalized: {{ matches: 'PROD_*' }}");
-    println!("                                       # glob (* and ?)");
+    println!("                                       # glob (* is the only wildcard)");
     println!("  query.implicit_cross_product_estimate: {{ gt: 1000000 }}");
     println!("                                       # gt / lt / gte / lte");
     println!("  ddl.target.name.database: {{ exists: true }}");
     println!("                                       # path resolves non-null");
+    println!("  mssql_exec.procedure_name: {{ not_in_list: my_procs }}");
+    println!("                                       # named list (see LISTS), ignoring");
+    println!("                                       # case; in_list is the converse");
+    println!();
+    println!("Both list operators read strings only: an absent or non-string value");
+    println!("makes both false.");
     println!();
     println!("Identifier matches: predicate against `name.normalized`, never");
     println!("`name.raw` — normalization is dialect-aware (Snowflake upper-folds,");
     println!("PostgreSQL lower-folds, etc.).");
     println!();
 
+    println!("LISTS");
+    println!("=====");
+    println!();
+    println!("A rule file may declare named lists of values and glob patterns beside");
+    println!("`rules:`, and a file may hold only `lists:`:");
+    println!();
+    println!("  lists:");
+    println!("    my_refs:");
+    println!("      values: [SET_BY_DEPLOY]");
+    println!("      patterns: [\"{{{{*secrets.*}}}}\"]");
+    println!("    credential_references:       # add to a built-in list");
+    println!("      extend:");
+    println!("        patterns: [\"vault://*\"]");
+    println!("    credential_dummies:          # or swap its contents");
+    println!("      replace:");
+    println!("        values: [\"\", CHANGEME]");
+    println!();
+    println!("Built-in lists: credential_dummies, credential_references.");
+    println!("Items must be strings (quote a number such as 1234); a pattern of only");
+    println!("`*` is rejected.");
+    println!();
     println!("QUANTIFIERS (over Vec paths)");
     println!("============================");
     println!();
@@ -533,14 +590,14 @@ pub fn print_signal_catalog(program: &str, ext: &dyn Extension) {
     println!("      name.normalized: PUBLIC");
     println!();
     println!("  query.scopes:");
-    println!("    each:                             # per-witness signal emission");
+    println!("    each:                             # one finding per item");
     println!("      has_distinct: true");
     println!();
 
     println!("DISCOVERY");
     println!("=========");
     println!();
-    println!("  1. {} analyze query.sql --explain-signals", program);
+    println!("  1. {} analyze query.sql --explain-findings", program);
     println!("     Lists matched rule_ids per statement.");
     println!();
     println!("  2. {} analyze query.sql --explain-facts", program);
@@ -554,7 +611,7 @@ pub fn print_signal_catalog(program: &str, ext: &dyn Extension) {
     println!();
     println!("  Rule catalog:   https://lexega.com/docs/rule-reference");
     println!("  Authoring:      https://lexega.com/docs/custom-rules");
-    println!("  Custom rules:   https://lexega.com/schemas/v1/custom_rules.schema.json");
+    println!("  Custom rules:   https://lexega.com/schemas/v2/custom_rules.schema.json");
     if gates {
         println!("  Policy schema:  https://lexega.com/schemas/v1/policy.schema.json");
         println!("  Exceptions:     https://lexega.com/schemas/v1/exceptions.schema.json");

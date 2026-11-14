@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! The `analyze` command: one source, or a batch of files, analyzed
-//! through the build's [`Session`](super::extension::Session) and written in
+//! through the build's [`Session`] and written in
 //! the requested format.
 //! `review` runs the same batch over the files a commit range touches.
 
@@ -16,20 +16,26 @@ use lexega_core::analyzer::{self, ToolRun};
 use lexega_core::template::RenderArtifacts;
 
 use super::artifacts::{
-    is_artifact_file_path, sanitize_artifact_key, write_optional_report_artifact,
-    write_report_artifact, DecisionArtifactFormat, ReportArtifactFormat,
+    is_artifact_file_path, resolve_report_format, write_optional_report_artifact,
+    write_report_artifact, ArtifactKeys, DecisionArtifactFormat, ReportArtifactFormat,
 };
 use super::extension::{
-    governance_capabilities, BatchCase, BatchPlan, Capability, Extension, FileFailure,
-    OrderingHazard, PolicyGate, PolicySetup, SessionOptions,
+    governance_capabilities, BatchCase, BatchFile, BatchPlan, Capability, ChangeRange, Extension,
+    FileFailure, OrderingHazard, PolicyGate, PolicyOutcome, PolicySetup, Session, SessionOptions,
+    SourceCase,
 };
+use super::git::FileAtCommitError;
 use super::io::load_custom_rules;
 use super::io::{
-    collect_embedded_files, collect_sql_files, resolve_dialect, strip_bom, FoundFiles, SkippedFile,
+    collect_embedded_files, collect_sql_files, resolve_dialect, strip_bom, FoundFiles, SkipReason,
+    SkippedFile,
 };
-use super::output::{print_analyze_markdown, print_fact_explanation, print_signal_explanation};
-use super::types::{BatchProcessingConfig, RenderDiagnosticsLevel};
-use super::usage::{print_review_usage, print_risk_usage, print_signal_catalog};
+use super::output::{
+    print_analyze_markdown, print_fact_explanation, print_finding_explanation, risk_icon,
+    write_text_entries,
+};
+use super::types::{BatchProcessingConfig, GivenOptions, RenderDiagnosticsLevel};
+use super::usage::{print_review_usage, print_risk_usage, print_rule_syntax};
 
 /// `println!` into a `String`.
 macro_rules! outln {
@@ -42,17 +48,89 @@ macro_rules! outln {
     }};
 }
 
+/// A file's entries in the batch report's per-file sections.
+struct FileSection {
+    path: String,
+    findings: Vec<analyzer::RuleMatch>,
+    context: Vec<analyzer::RuleMatch>,
+}
+
+/// The occurrences a finding stands for: a rule raised on several
+/// statements of a file is one finding, "(N occurrences)", counting each.
+fn occurrences(finding: &analyzer::AnalysisFinding) -> usize {
+    finding.findings_merged.unwrap_or(1)
+}
+
+/// A Markdown table of entries: level, message and up to `evidence_listed`
+/// evidence summaries. `column` names the entries' kind.
+fn write_markdown_entries(
+    md: &mut String,
+    column: &str,
+    entries: &[analyzer::RuleMatch],
+    evidence_listed: usize,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    outln!(md, "| Level | {} | Evidence |", column);
+    outln!(md, "|-------|--------|----------|");
+    for entry in entries {
+        let level = entry.risk_level();
+        let evidence = entry.evidence();
+        let mut parts: Vec<String> = evidence
+            .iter()
+            .take(evidence_listed)
+            .filter_map(|ev| {
+                let analyzer::RiskEvidence::RuleMatch { rule_id, .. } = ev else {
+                    return None;
+                };
+                let mut p = Vec::new();
+                if let Some(line) = super::output::source_line(ev) {
+                    p.push(format!("Line {}", line));
+                }
+                if !rule_id.is_empty() {
+                    p.push(format!("`{}`", rule_id));
+                }
+                (!p.is_empty()).then(|| p.join(": "))
+            })
+            .collect();
+        if evidence.len() > evidence_listed {
+            parts.push(format!("+{} more", evidence.len() - evidence_listed));
+        }
+        // Escape pipes in message for markdown table
+        let msg = entry.message().replace('|', "\\|");
+        outln!(
+            md,
+            "| {} {} | {} | {} |",
+            risk_icon(level),
+            level.as_str(),
+            msg,
+            parts.join("; ")
+        );
+    }
+    outln!(md);
+}
+
+/// The title of the per-file sections: context entries are not findings.
+fn sections_title(sections: &[FileSection]) -> &'static str {
+    if sections.iter().any(|section| !section.context.is_empty()) {
+        "Per-File Details"
+    } else {
+        "Per-File Finding Details"
+    }
+}
+
 /// What a run of the analyze driver measures.
 pub(crate) enum Scope {
     /// The sources named on the command line, as checked out.
     Snapshot,
     /// The SQL files a commit range touches, read at its head.
-    Change { base: String, head: String },
+    Change(super::git::CommitRange),
 }
 
 fn print_usage(program: &str, ext: &dyn Extension, change: bool) {
     if change {
-        print_review_usage(program);
+        print_review_usage(program, ext);
     } else {
         print_risk_usage(program, ext);
     }
@@ -69,7 +147,162 @@ fn tool_run<'a>(
         version: env!("CARGO_PKG_VERSION"),
         base_path,
         depth_note,
+        unrendered_files: &[],
+        skipped_files: &[],
+        macro_files: &[],
+        run_notes: &[],
     }
+}
+
+/// The highest risk level a batch's text summary states: none where it
+/// found nothing, and then not as all clear where `run_notes` say what it
+/// left undone.
+fn highest_risk(
+    findings: usize,
+    max_level: lexega_core::analyzer::RiskLevel,
+    run_notes: &[String],
+) -> String {
+    match (findings, run_notes.is_empty()) {
+        (0, true) => "NONE".to_string(),
+        (0, false) => "none found in what was checked (see the notes above)".to_string(),
+        _ => max_level.as_str().to_uppercase(),
+    }
+}
+
+/// What a run left undone that its findings do not show, a sentence each:
+/// `unrendered` template files analyzed as written, `render_failed` files
+/// that did not render and were not analyzed, and, for a `review`, a change
+/// `session` does not compare. Each says what the build adds where the
+/// session cannot do it.
+pub fn run_notes(
+    ext: &dyn Extension,
+    session: &dyn Session,
+    unrendered: usize,
+    render_failed: usize,
+    review: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if render_failed > 0 {
+        notes.push(if render_failed == 1 {
+            "1 template file did not render and was not analyzed: the skipped files say why."
+                .to_string()
+        } else {
+            format!(
+                "{} template files did not render and were not analyzed: the skipped files say why for each.",
+                render_failed
+            )
+        });
+    }
+    if unrendered > 0 {
+        let mut note = if unrendered == 1 {
+            "1 template file was analyzed as written, not rendered".to_string()
+        } else {
+            format!(
+                "{} template files were analyzed as written, not rendered",
+                unrendered
+            )
+        };
+        note.push_str(": findings that depend on the rendered SQL may be missing.");
+        if !session.renders_templates() {
+            note.push(' ');
+            note.push_str(&ext.rendering_offer());
+        }
+        notes.push(note);
+    }
+    if review && !session.compares_changes() {
+        notes.push(format!(
+            "The change was not compared with its base: no DIFF-* rule ran. {}",
+            ext.comparison_offer()
+        ));
+    }
+    notes
+}
+
+/// Each sqlcmd command line of `report` that runs what the analysis did not
+/// read, as a run's note lists it: its line (after `file`, in a batch),
+/// what it does, and the command as the report quotes it.
+pub fn unread_sqlcmd_lines(
+    file: Option<&str>,
+    report: &lexega_core::analyzer::AnalysisReport,
+) -> Vec<String> {
+    report
+        .unread_sqlcmd()
+        .map(|(skipped, runs)| {
+            let place = match file {
+                Some(file) => format!("{} line {}", file, skipped.line_number),
+                None => format!("line {}", skipped.line_number),
+            };
+            format!(
+                "{} {} (`{}`)",
+                place,
+                runs.describe(),
+                skipped.statement_prefix
+            )
+        })
+        .collect()
+}
+
+/// The run's note on its sqlcmd command lines that run what the analysis
+/// did not read ([`unread_sqlcmd_lines`]), naming the first ten; `None`
+/// where there is none.
+pub fn unread_sqlcmd_note(lines: &[String]) -> Option<String> {
+    const LISTED: usize = 10;
+    let (first, rest) = lines.split_at(lines.len().min(LISTED));
+    let mut note = match lines.len() {
+        0 => return None,
+        1 => "1 sqlcmd command runs what the analysis did not read, and --strict fails on it: "
+            .to_string(),
+        n => format!(
+            "{} sqlcmd commands run what the analysis did not read, and --strict fails on each: ",
+            n
+        ),
+    };
+    note.push_str(&first.join("; "));
+    if !rest.is_empty() {
+        note.push_str(&format!(
+            "; and {} more (the JSON report's skipped_details lists each)",
+            rest.len()
+        ));
+    }
+    note.push('.');
+    Some(note)
+}
+
+/// The options that take one value, so a second, different one is a
+/// mistake. `--var`, `--var-file`, `--snowsql-config`, `--var-env` and
+/// `--var-syntax` may repeat.
+const SINGLE_VALUED_OPTIONS: &[&str] = &[
+    "--format",
+    "--color",
+    "--report-artifact-format",
+    "--decision-artifact-format",
+    "--min-severity",
+    "--policy",
+    "--env",
+    "--exceptions",
+    "--decision-out",
+    "--report-out",
+    "--team",
+    "--job-type",
+    "--change-id",
+    "--repo",
+    "--commit",
+    "--run-id",
+    "--dbt-profile",
+    "--dbt-project",
+    "--custom-rules",
+    "--catalog",
+    "--provider",
+    "--default-schema",
+    "--render-diagnostics",
+    "--builtin-rules",
+    "--mode",
+    "--dialect",
+];
+
+/// Whether a path names a scan (a glob or a directory) rather than a file.
+fn scans(path: &str) -> bool {
+    path.contains('*') || path.contains('?') || Path::new(path).is_dir()
 }
 
 /// Handle the `analyze` subcommand.
@@ -81,15 +314,16 @@ pub fn handle_risk_command(args: &[String], ext: &dyn Extension) {
 /// commit range — and run the analysis.
 pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     let program = args[0].as_str();
-    let change = matches!(scope, Scope::Change { .. });
+    let change = matches!(scope, Scope::Change(_));
     // Parse risk-specific arguments
-    let mut input_file: Option<String> = None;
+    // The paths named: a change-scoped run's scope, or the files, directories
+    // and globs a snapshot reads.
     let mut paths: Vec<String> = Vec::new();
     let mut pr_comment = false;
     let mut use_stdin = false;
     // A change-scoped run reports for a pull request by default.
     let mut output_format = if change { "markdown" } else { "text" };
-    let mut report_artifact_format = ReportArtifactFormat::Json;
+    let mut report_artifact_format: Option<ReportArtifactFormat> = None;
     let mut decision_artifact_format = DecisionArtifactFormat::Json;
     // Quiet by default: only High and above, unless --min-severity lowers it.
     let mut min_severity: Option<lexega_core::analyzer::RiskLevel> =
@@ -115,11 +349,12 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     let mut fail_on_missing_packages = false;
     let mut custom_rules_path: Option<String> = None;
     let mut catalog_path: Option<String> = None;
+    let mut default_schema_flag: Option<String> = None;
     let mut catalog_provider: Option<String> = None;
     let mut trace_mode = false;
     let mut verbose_mode = false;
     let mut detail_mode = change;
-    let mut explain_signals = false;
+    let mut explain_findings = false;
     let mut explain_facts = false;
     let mut builtin_rules = true; // Default: run built-in rules
     let mut render_diagnostics = RenderDiagnosticsLevel::None; // none|summary|impacted|all
@@ -142,13 +377,30 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     // Embedded SQL extraction from Python/notebook files
     let mut scan_embedded = false;
 
-    // Strict-analysis mode. Default comes from
-    // LEXEGA_STRICT; `--strict[=<mode>]` overrides.
-    let mut strict_mode = lexega_core::strict_mode_from_env();
+    // Strict-analysis mode: `--strict[=<mode>]`, else LEXEGA_STRICT.
+    let mut strict_flag: Option<lexega_core::StrictMode> = None;
+
+    let mut given = GivenOptions::default();
 
     let mut i = if change { 3 } else { 2 }; // after the command, or after the commit range
     while i < args.len() {
-        match args[i].as_str() {
+        let option = args[i].as_str();
+        if SINGLE_VALUED_OPTIONS.contains(&option) {
+            if let Some(value) = args.get(i + 1) {
+                if let Err(e) = given.record(option, value) {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        match option {
+            "--stdin" if change => {
+                eprintln!(
+                    "Error: --stdin does not apply to review: it reads the files the range changes"
+                );
+                print_usage(program, ext, change);
+                process::exit(1);
+            }
             "--stdin" => {
                 use_stdin = true;
                 i += 1;
@@ -202,11 +454,12 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                     eprintln!("Error: --report-artifact-format requires a value (json|yaml|sarif)");
                     process::exit(1);
                 }
-                report_artifact_format = ReportArtifactFormat::from_cli_arg(&args[i + 1])
-                    .unwrap_or_else(|msg| {
+                report_artifact_format = Some(
+                    ReportArtifactFormat::from_cli_arg(&args[i + 1]).unwrap_or_else(|msg| {
                         eprintln!("Error: {}", msg);
                         process::exit(1);
-                    });
+                    }),
+                );
                 i += 2;
             }
             "--decision-artifact-format" => {
@@ -262,12 +515,22 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                     eprintln!("Error: --decision-out requires a file path or directory");
                     process::exit(1);
                 }
+                if let Err(e) =
+                    super::artifacts::check_output_target("--decision-out", &args[i + 1])
+                {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
                 decision_out = Some(args[i + 1].clone());
                 i += 2;
             }
             "--report-out" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --report-out requires a file path or directory");
+                    process::exit(1);
+                }
+                if let Err(e) = super::artifacts::check_report_target(&args[i + 1]) {
+                    eprintln!("Error: {}", e);
                     process::exit(1);
                 }
                 report_out = Some(args[i + 1].clone());
@@ -411,6 +674,14 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 catalog_path = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--default-schema" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --default-schema requires SCHEMA or DATABASE.SCHEMA");
+                    process::exit(1);
+                }
+                default_schema_flag = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--provider" => {
                 if i + 1 >= args.len() {
                     let valid = lexega_core::builtin_catalog_provider_names().join(", ");
@@ -436,20 +707,22 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 i += 1;
             }
             "--detail" => {
-                // Detail mode - show per-file signal details in batch text/markdown output
+                // Detail mode - show per-file finding details in batch text/markdown output
                 detail_mode = true;
                 i += 1;
             }
-            "--list-signals" => {
-                // Show available signal types and exit
-                print_signal_catalog(program, ext);
+            // `--list-signals` is accepted as well; help does not list it.
+            "--rule-syntax" | "--list-signals" => {
+                // Print the custom-rule syntax primer and exit
+                print_rule_syntax(program, ext);
                 process::exit(0);
             }
-            "--explain-signals" => {
-                // Signal preview mode — show per-statement matched rules
+            // `--explain-signals` is accepted as well; help does not list it.
+            "--explain-findings" | "--explain-signals" => {
+                // Findings preview mode — show per-statement matched rules
                 // (populated when trace_mode is on via
                 // `statement_explanations`).
-                explain_signals = true;
+                explain_findings = true;
                 trace_mode = true;
                 i += 1;
             }
@@ -515,7 +788,10 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
             }
             "--dialect" => {
                 if i + 1 >= args.len() {
-                    eprintln!("Error: --dialect requires a value (snowflake|postgresql|bigquery|databricks|redshift)");
+                    eprintln!(
+                        "Error: --dialect requires a value ({})",
+                        super::io::DIALECT_OPTIONS
+                    );
                     process::exit(1);
                 }
                 dialect_name = Some(args[i + 1].clone());
@@ -533,19 +809,35 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 // `--strict query.sql` runs strict on the file instead of
                 // misreading the path as the mode. `--strict=<mode>` also works via
                 // the global `--key=value` normalization.
-                match args
+                let (mode, consumed) = match args
                     .get(i + 1)
                     .and_then(|s| lexega_core::parse_strict_mode(s).ok())
                 {
-                    Some(m) => {
-                        strict_mode = m;
-                        i += 2;
-                    }
+                    Some(mode) => (mode, 2),
                     None => {
-                        strict_mode = lexega_core::StrictMode::Strict;
-                        i += 1;
+                        // A token after it that is neither a mode nor a path
+                        // a run reads is a mode misspelled.
+                        if let Some(next) = args.get(i + 1).filter(|next| {
+                            !change
+                                && !next.starts_with('-')
+                                && !next.contains(['*', '?'])
+                                && !Path::new(next.as_str()).exists()
+                        }) {
+                            eprintln!(
+                                "Error: '{}' after --strict is not a strict mode (off|strict|pedantic) and no such file exists",
+                                next
+                            );
+                            process::exit(1);
+                        }
+                        (lexega_core::StrictMode::Strict, 1)
                     }
+                };
+                if let Err(e) = given.record("--strict", mode.as_str()) {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
                 }
+                strict_flag = Some(mode);
+                i += consumed;
             }
             "--pr-comment" if change => {
                 pr_comment = true;
@@ -555,18 +847,18 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 print_usage(program, ext, change);
                 process::exit(0);
             }
+            "--" => {
+                paths.extend(args[i + 1..].iter().cloned());
+                break;
+            }
             arg if !arg.starts_with('-') => {
-                if change {
-                    paths.push(arg.to_string());
-                } else {
-                    input_file = Some(arg.to_string());
-                }
+                paths.push(arg.to_string());
                 i += 1;
             }
             arg => {
                 eprintln!(
                     "Error: Unknown {} argument '{}'",
-                    if change { "review" } else { "risk" },
+                    if change { "review" } else { "analyze" },
                     arg
                 );
                 print_usage(program, ext, change);
@@ -574,6 +866,41 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
             }
         }
     }
+
+    if use_stdin && !paths.is_empty() {
+        eprintln!(
+            "Error: --stdin reads standard input and takes no path (given: {})",
+            paths.join(", ")
+        );
+        process::exit(1);
+    }
+
+    let one_file_flags = [
+        ("--explain-findings", explain_findings),
+        ("--explain-facts", explain_facts),
+        ("--verbose", verbose_mode),
+    ];
+
+    let strict_mode = super::io::strict_mode_or_exit(strict_flag);
+
+    // The `--report-out` artifact's format: one rule for a file and a batch.
+    // A target that names no format is SARIF under `--format sarif`, JSON
+    // otherwise.
+    let default_report_format = if output_format == "sarif" {
+        ReportArtifactFormat::Sarif
+    } else {
+        ReportArtifactFormat::Json
+    };
+    let report_artifact_format = match report_out.as_deref() {
+        Some(target) => {
+            resolve_report_format(target, report_artifact_format, default_report_format)
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                })
+        }
+        None => report_artifact_format.unwrap_or(ReportArtifactFormat::Json),
+    };
 
     // Everything parsed so far is plain analysis unless an option reaches a
     // capability the build has to grant.
@@ -596,6 +923,18 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         needs.push(Capability::TemplateRendering);
     }
     ext.authorize(program, &needs);
+
+    // A decision record is a policy's decision.
+    if decision_out.is_some() && policy_path.is_none() {
+        eprintln!("Error: --decision-out requires --policy");
+        print_usage(program, ext, change);
+        process::exit(1);
+    }
+    // Runtime mode prints one decision and nothing else.
+    if runtime_mode && policy_path.is_none() {
+        eprintln!("Error: --mode runtime requires --policy");
+        process::exit(1);
+    }
 
     // CI strict mode: a missing policy is a hard error so the gate can't be
     // silently bypassed.
@@ -625,20 +964,24 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     // entries with the same `id` (last-write-wins), and customer
     // partial-override entries inherit `triggers`/`emission`/`per_statement`
     // from the matching built-in and replace only the fields they set.
+    // With neither, the corpus is empty and no rule runs.
+    if !builtin_rules && user_rules.is_none() && !quiet_mode {
+        eprintln!("Note: built-in rules are off and no --custom-rules is given: no rule runs.");
+    }
+    // The masking policy the custom rule file states, if any.
+    let masking = std::sync::Arc::new(
+        user_rules
+            .as_ref()
+            .map(|loaded| loaded.masking().clone())
+            .unwrap_or_default(),
+    );
     let custom_rules: Option<Vec<lexega_core::rules::Rule>> =
-        if builtin_rules || user_rules.is_some() {
-            match lexega_core::rules::build_v1_rule_corpus(
-                user_rules.unwrap_or_default(),
-                builtin_rules,
-            ) {
-                Ok(merged) => Some(merged),
-                Err(e) => {
-                    eprintln!("Error merging custom rules with built-in corpus: {}", e);
-                    process::exit(1);
-                }
+        match super::io::rule_corpus(custom_rules_path.as_deref().zip(user_rules), builtin_rules) {
+            Ok(merged) => Some(merged),
+            Err(e) => {
+                eprintln!("Error merging custom rules with built-in corpus: {}", e);
+                process::exit(1);
             }
-        } else {
-            None
         };
 
     // Resolve deployment-variable substitution once: .lexega.toml
@@ -651,6 +994,16 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 process::exit(1);
             }
         };
+
+    // Where a table named without a database or schema is looked for:
+    // --default-schema, else .lexega.toml [session] default_schema.
+    let default_schema = match super::io::resolve_default_schema(default_schema_flag.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+    };
 
     // Resolve artifact identity once. Stamped on reports/decisions so
     // dashboards can group by repository, run, and change.
@@ -669,6 +1022,23 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         repo: policy_repo.clone(),
         run_id: run_id.clone(),
     };
+
+    // Names each file of the run by the path it is reported by.
+    let names = super::io::ReportedPaths::new();
+    // The files named outright, which a batch must read, by the path the
+    // batch reports each file under.
+    let named_files: Vec<String> = if change {
+        Vec::new()
+    } else {
+        paths
+            .iter()
+            .filter(|path| !scans(path))
+            .map(|path| names.name(&super::io::absolute(Path::new(path))))
+            .collect()
+    };
+
+    // The run's one reading of the dbt projects it finds on disk.
+    let projects = lexega_core::template::ProjectsOnDisk::default();
 
     // Batch options, shared by the directory, embedded-file and
     // change-scoped paths below.
@@ -691,9 +1061,12 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         run_identity: snapshot_identity.clone(),
         catalog_path: catalog_path.as_deref(),
         catalog_provider: catalog_provider.as_deref(),
+        default_schema: default_schema.as_ref(),
         custom_rules,
+        masking,
         load_macros,
         dbt_project_path: dbt_project_path.as_deref(),
+        dbt_profile: dbt_profile.as_deref(),
         fail_on_missing_packages,
         jinja_vars: &jinja_vars,
         jinja_var_files: &jinja_var_files,
@@ -709,27 +1082,51 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         strict: strict_mode,
         cross_script,
         capture_markdown: false,
-        source_commit: None,
+        named_files: &named_files,
+        projects: &projects,
     };
 
     // Change scope: the SQL files the commit range touches, read at its head.
-    if let Scope::Change { base, head } = &scope {
+    if let Scope::Change(commits) = &scope {
+        let (base, head) = (&commits.base, &commits.head);
+        if runtime_mode {
+            refuse_runtime_batch();
+        }
+        refuse_diagnostics_in_batch(&one_file_flags);
+        require_batch_policy_outputs(
+            policy_path.as_deref(),
+            decision_out.as_deref(),
+            policy_env.as_deref(),
+        );
+        // A path that matches nothing at either commit is a mistake, as a
+        // file `analyze` cannot find is.
+        if let Err(e) = commits.check_paths(&paths) {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
         if paths.is_empty() {
             paths.push(".".to_string());
         }
-        let changed = match super::git::get_changed_sql_files(base, head, &paths, recursive) {
+        let changed = match super::git::get_changed_files(base, head, &paths) {
             Ok(changed) => changed,
             Err(e) => {
                 eprintln!("Error getting changed files: {}", e);
                 process::exit(1);
             }
         };
-        if changed.is_empty() {
-            if !quiet_mode {
-                eprintln!("No SQL files changed in {}..{}", base, head);
-            }
-            return;
-        }
+        // `--scan-embedded` reads the Python and notebook files the range
+        // changes, at its head.
+        let embedded_paths: Vec<BatchFile> = if scan_embedded {
+            changed.embedded.iter().map(BatchFile::in_change).collect()
+        } else {
+            Vec::new()
+        };
+        // A range that changes no SQL file under the paths is still handed
+        // to the session, whose analysis across the batch may add one; the
+        // batch says "No SQL files changed" where nothing is left.
+        let (embedded_fragments, unread_embedded) =
+            extract_sql_from_paths(&embedded_paths, Some(head.as_str()), quiet_mode);
+        let changed = changed.sql;
         let config = BatchProcessingConfig {
             run_identity: super::ci_env::RunIdentity {
                 scope: lexega_core::analyzer::RunScope::Change {
@@ -741,11 +1138,31 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 run_id: run_id.clone(),
             },
             capture_markdown: pr_comment,
-            source_commit: Some(head.as_str()),
             ..config
         };
-        let files = changed.files.into_iter().map(PathBuf::from).collect();
-        let outcome = handle_risk_batch(files, Vec::new(), changed.skipped, &config, ext);
+        let files = changed
+            .files
+            .into_iter()
+            .map(BatchFile::in_change)
+            .collect();
+        let range = ChangeRange {
+            base,
+            head,
+            renamed_from: &changed.renamed_from,
+            paths: &paths,
+        };
+        let outcome = handle_risk_batch(
+            files,
+            embedded_fragments,
+            changed.skipped,
+            unread_embedded,
+            &config,
+            Some(ReviewScope {
+                range,
+                paths: &paths,
+            }),
+            ext,
+        );
         if pr_comment {
             if let Some(markdown) = &outcome.markdown {
                 post_review_comment(markdown, output_format == "markdown");
@@ -755,40 +1172,61 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         return;
     }
 
-    // Handle batch mode (directory or multiple files)
-    if let Some(ref path) = input_file {
-        let path_obj = Path::new(path);
-        if path_obj.is_dir() || path.contains('*') || path.contains('?') {
-            // Policy gating in batch mode writes per-file artifacts.
-            // For batch with policy, require decision-out to be a directory.
-            // Note: --report-out can be a file (writes merged batch JSON) or directory.
-
-            if policy_path.is_some() {
-                let out = decision_out.as_deref().unwrap_or("");
-                if out.is_empty() {
-                    eprintln!("Error: --decision-out is required when using --policy");
-                    process::exit(1);
-                }
-                if is_artifact_file_path(out) {
-                    eprintln!("Error: In batch mode, --decision-out must be a directory (not a file path)");
-                    process::exit(1);
-                }
-                if policy_env.is_none() {
-                    eprintln!("Error: --env is required when using --policy");
+    // Batch mode: several paths, or a directory or glob. Every path named is
+    // read, and the run is one batch over all of them.
+    if paths.len() > 1 || paths.first().is_some_and(|path| scans(path)) {
+        if runtime_mode {
+            refuse_runtime_batch();
+        }
+        refuse_diagnostics_in_batch(&one_file_flags);
+        require_batch_policy_outputs(
+            policy_path.as_deref(),
+            decision_out.as_deref(),
+            policy_env.as_deref(),
+        );
+        let mut found = FoundFiles::default();
+        let mut embedded = FoundFiles::default();
+        // A file named that does not exist is unread like any other.
+        let mut missing: Vec<(String, String)> = Vec::new();
+        // Each path read, and whether SQL files are looked for under it.
+        let mut read: Vec<(&str, bool)> = Vec::new();
+        for path in &paths {
+            if !scans(path) && !Path::new(path).is_file() {
+                missing.push((names.name(Path::new(path)), "no such file".to_string()));
+                continue;
+            }
+            // A directory named outright that cannot be read is an error,
+            // as a named file is; one found under it is listed as skipped.
+            if Path::new(path).is_dir() {
+                if let Err(e) = fs::read_dir(path) {
+                    eprintln!("Error reading directory '{}': {}", path, e);
                     process::exit(1);
                 }
             }
-
-            let found = collect_sql_files(path, recursive);
-
-            // Also collect embedded files if --scan-embedded is set
-            let embedded = if scan_embedded {
+            // A file named outright is read as what its extension says.
+            let named_embedded = !scans(path) && super::io::has_embedded_extension(Path::new(path));
+            read.push((path, !(scan_embedded && named_embedded)));
+        }
+        // Every path is walked before a file of any is sorted as a macro.
+        let sql_paths: Vec<&str> = read
+            .iter()
+            .filter(|(_, sql)| *sql)
+            .map(|(path, _)| *path)
+            .collect();
+        let mut sql_found = collect_sql_files(&sql_paths, recursive, &projects).into_iter();
+        for (path, reads_sql) in read {
+            let sql = if reads_sql {
+                sql_found.next().unwrap_or_default()
+            } else {
+                FoundFiles::default()
+            };
+            let more = if scan_embedded {
                 collect_embedded_files(path, recursive)
             } else {
                 FoundFiles::default()
             };
-
-            if found.is_empty() && embedded.is_empty() {
+            // Each path must match something of its own.
+            if scans(path) && sql.is_empty() && more.is_empty() {
                 if scan_embedded {
                     eprintln!("No SQL or Python/notebook files found in '{}'", path);
                 } else {
@@ -796,56 +1234,134 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 }
                 process::exit(1);
             }
-
-            let embedded_fragments = extract_sql_from_paths(&embedded.files, quiet_mode);
+            found.files.extend(sql.files);
+            found.skipped.extend(sql.skipped);
+            embedded.files.extend(more.files);
+            embedded.skipped.extend(more.skipped);
+        }
+        // A file reached twice (named and under a directory) is read once.
+        // The batch then names each file by the path it reports it under.
+        found.files.sort();
+        found.files.dedup();
+        embedded.files.sort();
+        embedded.files.dedup();
+        let files = working_tree_files(&found.files, &names);
+        let embedded_files = working_tree_files(&embedded.files, &names);
+        {
+            let (embedded_fragments, mut unread_embedded) =
+                extract_sql_from_paths(&embedded_files, None, quiet_mode);
+            unread_embedded.extend(missing);
             let mut skipped = found.skipped;
             skipped.extend(embedded.skipped);
+            for unread in &mut skipped {
+                unread.path = PathBuf::from(names.name(&unread.path));
+            }
             finish(handle_risk_batch(
-                found.files,
+                files,
                 embedded_fragments,
                 skipped,
+                unread_embedded,
                 &config,
+                None,
                 ext,
             ));
             return;
         }
+    }
 
-        // Single embedded file: extract and analyze fragments
-        if scan_embedded {
-            let file_path = Path::new(path);
-            if lexega_core::extract::extractor_for_file(file_path).is_some() {
-                let source = fs::read_to_string(file_path).unwrap_or_else(|e| {
-                    eprintln!("Error reading file '{}': {}", path, e);
-                    process::exit(1);
-                });
+    // The one file, where it is read from, and the path its report names
+    // it by.
+    let input_path: Option<PathBuf> = if change {
+        None
+    } else {
+        paths.first().map(PathBuf::from)
+    };
+    let input_file: Option<String> = input_path.as_deref().map(|path| names.name(path));
+    // A Python or notebook file named outright, read for the SQL it embeds.
+    let embedded_input =
+        input_file
+            .as_deref()
+            .zip(input_path.as_deref())
+            .filter(|(_, read_from)| {
+                scan_embedded && lexega_core::extract::extractor_for_file(read_from).is_some()
+            });
+    if let Some((path, file_path)) = embedded_input {
+        // Each fragment is decided apart, as a batch's files are.
+        if runtime_mode {
+            refuse_runtime_batch();
+        }
+        refuse_diagnostics_in_batch(&one_file_flags);
+        if policy_path.is_some() && decision_out.as_deref().is_some_and(is_artifact_file_path) {
+            eprintln!(
+                "Error: --decision-out must be a directory for a Python or notebook file: each SQL fragment it holds gets a decision record of its own"
+            );
+            process::exit(1);
+        }
+        require_batch_policy_outputs(
+            policy_path.as_deref(),
+            decision_out.as_deref(),
+            policy_env.as_deref(),
+        );
+        let source = super::io::read_sql_file(file_path)
+            .unwrap_or_else(|e| {
+                eprintln!("Error reading file '{}': {}", path, e);
+                process::exit(1);
+            })
+            .text;
 
-                let patterns = lexega_core::extract::SqlCallPattern::spark_defaults();
-                let fragments = match lexega_core::extract::extract_sql_from_file(
-                    file_path, &source, &patterns,
-                ) {
-                    Some(f) if !f.is_empty() => f,
-                    _ => {
-                        eprintln!("No embedded SQL found in '{}'", path);
-                        process::exit(0);
-                    }
-                };
-
-                eprintln!(
-                    "Extracted {} SQL fragment(s) from {}",
-                    fragments.len(),
-                    path
-                );
-
-                // Process as batch with extracted fragments
-                finish(handle_risk_batch(
-                    Vec::new(),
-                    fragments,
-                    Vec::new(),
-                    &config,
-                    ext,
-                ));
-                return;
+        let patterns = lexega_core::extract::SqlCallPattern::spark_defaults();
+        let fragments = match lexega_core::extract::extract_sql_from_file(
+            Path::new(path),
+            &source,
+            &patterns,
+        ) {
+            Some(Ok(f)) if !f.is_empty() => f,
+            Some(Err(e)) => {
+                eprintln!("Error reading file '{}': {}", path, e);
+                process::exit(1);
             }
+            Some(Ok(_)) | None => {
+                eprintln!("No embedded SQL found in '{}'", path);
+                process::exit(0);
+            }
+        };
+
+        eprintln!(
+            "Extracted {} SQL fragment(s) from {}",
+            fragments.len(),
+            path
+        );
+
+        // Process as batch with extracted fragments
+        finish(handle_risk_batch(
+            Vec::new(),
+            fragments,
+            Vec::new(),
+            Vec::new(),
+            &config,
+            None,
+            ext,
+        ));
+        return;
+    }
+
+    // The explanations print the formats they have.
+    for (flag, given, formats) in [
+        (
+            "--explain-findings",
+            explain_findings,
+            &["text", "json", "yaml"][..],
+        ),
+        ("--explain-facts", explain_facts, &["text", "json"][..]),
+    ] {
+        if given && !formats.contains(&output_format) {
+            eprintln!(
+                "Error: {} prints {}: --format {} is none of them",
+                flag,
+                formats.join(", "),
+                output_format
+            );
+            process::exit(1);
         }
     }
 
@@ -853,15 +1369,18 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     // Auto-detect stdin: if no file provided and stdin is piped (not a TTY), read from stdin
     let use_stdin = use_stdin || (input_file.is_none() && !io::stdin().is_terminal());
 
-    let input = if use_stdin {
-        let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer).unwrap_or_else(|e| {
+    let source = if use_stdin {
+        let mut bytes = Vec::new();
+        io::stdin().read_to_end(&mut bytes).unwrap_or_else(|e| {
             eprintln!("Error reading from stdin: {}", e);
             process::exit(1);
         });
-        buffer
-    } else if let Some(ref file_path) = input_file {
-        fs::read_to_string(file_path).unwrap_or_else(|e| {
+        lexega_core::extract::decode_source(&bytes).unwrap_or_else(|e| {
+            eprintln!("Error reading from stdin: {}", e);
+            process::exit(1);
+        })
+    } else if let (Some(file_path), Some(read_from)) = (&input_file, input_path.as_deref()) {
+        super::io::read_sql_file(read_from).unwrap_or_else(|e| {
             eprintln!("Error reading file '{}': {}", file_path, e);
             process::exit(1);
         })
@@ -870,6 +1389,10 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         print_usage(program, ext, change);
         process::exit(1);
     };
+    // Text that is not the source's bytes as written (a mark removed, UTF-16
+    // decoded).
+    let rewritten = source.encoding != lexega_core::extract::SourceEncoding::Utf8;
+    let input = source.text;
 
     // Policy gate requires env + decision-out when enabled
     let policy_enabled = policy_path.is_some();
@@ -899,14 +1422,18 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
             dbt_project_path: dbt_project_path.as_deref(),
             load_macros,
             fail_on_missing_packages,
-            custom_rules: config.custom_rules,
+            custom_rules: config.custom_rules.clone(),
+            masking: config.masking.clone(),
             trace_mode,
             verbose_mode,
             catalog_path: catalog_path.as_deref(),
             catalog_provider: catalog_provider.as_deref(),
+            default_schema: default_schema.as_ref(),
             dialect_name: dialect_name.as_deref(),
             output_format,
             quiet: quiet_mode,
+            projects: &projects,
+            change: false,
         })
         .unwrap_or_else(|e| {
             eprintln!("{}", e);
@@ -929,8 +1456,48 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     }
 
     // Render the source if it is a template
-    let render = match session.render(input) {
-        Ok(artifacts) => artifacts,
+    let source_path = if use_stdin {
+        None
+    } else {
+        input_path.as_deref()
+    };
+    // A file is planned as a batch of one, so the session analyzes it with
+    // what it knows across files (the model graph of the dbt project it is
+    // in); text read from no file is rendered and analyzed on its own.
+    let planned = match (source_path, input_file.as_deref()) {
+        (Some(path), Some(name)) => {
+            let file = BatchFile {
+                path: path.to_path_buf(),
+                name: name.to_string(),
+            };
+            let plan = BatchPlan {
+                cross_script: false,
+                quiet: quiet_mode,
+                change: None,
+            };
+            let planned = session.plan_batch(std::slice::from_ref(&file), &plan);
+            Some(planned.map(|_| session.analyze_planned(0, &file, input, rewritten)))
+        }
+        (Some(_), None) | (None, Some(_)) | (None, None) => None,
+    };
+    let analyzed = match planned {
+        Some(Ok(Ok((render, report)))) => Ok((render, Ok(report))),
+        Some(Ok(Err(FileFailure::Render(e)))) => Err(e),
+        Some(Ok(Err(FileFailure::Analysis(e)))) => {
+            eprintln!("Error analyzing SQL: {}", e);
+            process::exit(1);
+        }
+        Some(Err(e)) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+        None => session.render_file(source_path, input).map(|render| {
+            let report = session.analyze(&render, input_file.as_deref());
+            (render, report)
+        }),
+    };
+    let (render, report) = match analyzed {
+        Ok(done) => done,
         Err(e) => {
             if fail_on_missing_packages {
                 eprintln!("Error: {}", e);
@@ -943,12 +1510,14 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
                 "Hint: Template uses runtime-only functions (run_query, adapter.*, exceptions.*)"
             );
             eprintln!("      Risk analysis will work on template structure, not rendered SQL");
-            RenderArtifacts::not_rendered(input.to_string(), e)
+            let render = RenderArtifacts::not_rendered(input.to_string(), e);
+            let report = session.analyze(&render, input_file.as_deref());
+            (render, report)
         }
     };
 
     // Run risk analysis
-    let mut report = match session.analyze(&render, input_file.as_deref()) {
+    let mut report = match report {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error analyzing SQL: {}", e);
@@ -968,173 +1537,50 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
     };
     identity.apply(&mut report);
 
-    // Strict-mode enforcement. Runs before the rest of the pipeline so
-    // CI failures stop early. Permissive is the default and this is a
-    // no-op in that case.
-    {
+    // Strict-mode enforcement. Permissive is the default and this is a
+    // no-op in that case. A violation, or a source whose template did not
+    // render (a file not analyzed, as a batch fails one), fails the run: its
+    // report stands and is decided, and the run exits 1 once it is out.
+    let strict_fails = {
         let label = input_file.as_deref().unwrap_or("<stdin>");
-        if report_strict_violations(strict_mode, &report, label) {
-            process::exit(1);
-        }
-    }
+        let unrendered_fails = render
+            .render_error
+            .as_deref()
+            .is_some_and(|reason| strict_not_analyzed(strict_mode, label, reason));
+        report_strict_violations(strict_mode, &report, label) || unrendered_fails
+    };
+    let strict_exit = if strict_fails { 1 } else { 0 };
 
     // Set source file path for the report (use absolute path for easy navigation)
-    if let Some(ref file_path) = input_file {
-        report.source_file_path = dunce::canonicalize(file_path)
+    if let (Some(file_path), Some(read_from)) = (&input_file, input_path.as_deref()) {
+        report.source_file_path = dunce::canonicalize(read_from)
             .map(|p| p.display().to_string())
             .ok()
             .or_else(|| Some(file_path.clone()));
     }
 
-    // Filter signals by --min-severity if specified
+    // The policy decides on every finding and context entry; --min-severity
+    // filters what the run shows and counts.
+    let evaluated = (policy_path.is_some() && min_severity.is_some()).then(|| report.clone());
     if let Some(threshold) = min_severity {
-        report.signals.retain(|s| s.risk_level() >= threshold);
-        report.summary.recalculate_from_signals(&report.signals);
+        report.retain_at_least(threshold);
     }
 
-    // How this run's depth is reported, when it ran at reduced depth.
-    let depth_note = report
-        .summary
-        .analysis_depth
-        .as_ref()
-        .map(|depth| ext.depth_note(depth));
+    // A SARIF --report-out holds what the run shows, as without a policy,
+    // and this driver writes it; the gate writes the risk report a decision
+    // names, a JSON or YAML --report-out or a file beside the decision.
+    let sarif_report_out =
+        report_out.is_some() && report_artifact_format == ReportArtifactFormat::Sarif;
 
-    // Handle --explain-facts mode: show structured facts extracted from policies
-    if explain_facts {
-        print_fact_explanation(&report, &render.sql, output_format);
-        process::exit(0);
-    }
-
-    // Handle --explain-signals mode: show only extracted signals by statement
-    if explain_signals {
-        print_signal_explanation(&report, &render.sql, output_format);
-        process::exit(0);
-    }
-
-    // Output report (stdout) - suppress in runtime mode
-    if !runtime_mode && (output_format == "json" || output_format == "both") {
-        match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => {
-                eprintln!("Error serializing report to JSON: {}", e);
-                process::exit(1);
-            }
-        }
-    }
-
-    if !runtime_mode && output_format == "yaml" {
-        match serde_yaml_ng::to_string(&report) {
-            Ok(yaml) => print!("{}", yaml),
-            Err(e) => {
-                eprintln!("Error serializing report to YAML: {}", e);
-                process::exit(1);
-            }
-        }
-    }
-
-    if !runtime_mode && output_format == "sarif" {
-        // Use git repo root for SARIF base path since file paths may be relative to repo root
-        let git_root = super::git::get_git_repo_root()
-            .and_then(|p| p.to_str().map(String::from))
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(String::from))
-            });
-        let sarif_report = analyzer::to_sarif(
-            &report,
-            &tool_run(ext, git_root.as_deref(), depth_note.as_deref()),
-        );
-        match serde_json::to_string_pretty(&sarif_report) {
-            Ok(json) => {
-                // If --report-out is provided, write to file instead of stdout
-                if let Some(ref risk_path) = report_out {
-                    let sarif_path = if is_artifact_file_path(risk_path) {
-                        risk_path.clone()
-                    } else {
-                        format!("{}/analysis_report.sarif", risk_path.trim_end_matches('/'))
-                    };
-
-                    // Ensure parent directory exists
-                    if let Some(parent) = std::path::Path::new(&sarif_path).parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-
-                    if let Err(e) = fs::write(&sarif_path, &json) {
-                        eprintln!("Error writing SARIF file: {}", e);
-                        process::exit(1);
-                    }
-                    eprintln!("Analysis SARIF report written to: {}", sarif_path);
-                } else {
-                    // No --report-out, print to stdout
-                    println!("{}", json);
-                }
-            }
-            Err(e) => {
-                eprintln!("Error serializing SARIF report: {}", e);
-                process::exit(1);
-            }
-        }
-    }
-
-    // GitLab SAST report always goes to stdout — redirect to
-    // gl-sast-report.json in CI and declare it as an artifacts.reports.sast
-    // path. (--report-out continues to write its own artifact formats.)
-    if !runtime_mode && output_format == "gl-sast" {
-        let gl_report = analyzer::to_gl_sast(&report, &tool_run(ext, None, depth_note.as_deref()));
-        match serde_json::to_string_pretty(&gl_report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => {
-                eprintln!("Error serializing GitLab SAST report: {}", e);
-                process::exit(1);
-            }
-        }
-    }
-
-    if output_format == "markdown" {
-        let display_path = if use_stdin {
-            "stdin".to_string()
-        } else {
-            input_file.clone().unwrap_or_else(|| "input".to_string())
-        };
-        print_analyze_markdown(
-            &report,
-            &display_path,
-            &render.placeholders,
-            depth_note.as_deref(),
-        );
-    }
-
-    // Write risk report to --report-out when policy is NOT enabled
-    // (When policy IS enabled, write_optional_report_artifact is called inside that block)
-    // Note: SARIF stdout-format already handles --report-out above, so skip it here
-    if !policy_enabled && report_out.is_some() && output_format != "sarif" {
-        let git_root = super::git::get_git_repo_root()
-            .and_then(|p| p.to_str().map(String::from))
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(String::from))
-            });
-        if let Some(path) = write_optional_report_artifact(
-            report_artifact_format,
-            &report,
-            &report,
-            report_out.as_deref(),
-            "risk_report",
-            &tool_run(ext, git_root.as_deref(), depth_note.as_deref()),
-        ) {
-            eprintln!("Risk report written to: {}", path);
-        }
-    }
-
-    // Optional policy evaluation + artifacts
+    // The policy decides before the run prints, so an explained run is
+    // decided too.
     let mut policy_blocked = false;
     if let Some(policy_file) = policy_path.as_deref() {
         let gate = ext
             .policy_gate(&PolicySetup {
                 policy_path: policy_file,
                 exceptions_path: exceptions_path.as_deref(),
+                rules: config.custom_rules.as_deref().unwrap_or_default(),
                 env: policy_env.as_deref(),
                 team: policy_team.as_deref(),
                 job_type: policy_job_type.as_deref(),
@@ -1159,7 +1605,157 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         } else {
             input_file.as_deref()
         };
-        policy_blocked = !gate.decide(&render.sql, &report, scope_path).allowed;
+        policy_blocked = !gate
+            .decide(&SourceCase {
+                sql: &render.sql,
+                report: evaluated.as_ref().unwrap_or(&report),
+                scope_path,
+            })
+            .allowed;
+    }
+
+    // How this run's depth is reported, when it ran at reduced depth.
+    let depth_note = report
+        .summary
+        .analysis_depth
+        .as_ref()
+        .map(|depth| ext.depth_note(depth));
+    // What the run left undone that its findings do not show.
+    let mut run_notes = run_notes(
+        ext,
+        session.as_ref(),
+        usize::from(
+            report.summary.render_completeness == analyzer::RenderCompleteness::NotRendered,
+        ),
+        0,
+        false,
+    );
+    let unread_sqlcmd = unread_sqlcmd_lines(None, &report);
+    run_notes.extend(unread_sqlcmd_note(&unread_sqlcmd));
+
+    // A blocked run exits 2, a strict failure 1.
+    let exit_code = if policy_blocked { 2 } else { strict_exit };
+
+    // Write --report-out here unless the policy gate wrote it as the report
+    // its decision names; an explained run writes it too.
+    if (!policy_enabled || sarif_report_out) && report_out.is_some() {
+        let git_root = super::git::get_git_repo_root()
+            .and_then(|p| p.to_str().map(String::from))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            });
+        let name =
+            if output_format == "sarif" && report_artifact_format == ReportArtifactFormat::Sarif {
+                "analysis_report"
+            } else {
+                "risk_report"
+            };
+        if let Some(path) = write_optional_report_artifact(
+            report_artifact_format,
+            &report,
+            &report,
+            report_out.as_deref(),
+            name,
+            &ToolRun {
+                run_notes: &run_notes,
+                ..tool_run(ext, git_root.as_deref(), depth_note.as_deref())
+            },
+        ) {
+            eprintln!("Risk report written to: {}", path);
+        }
+    }
+
+    // Handle --explain-facts mode: show structured facts extracted from policies
+    if explain_facts {
+        print_fact_explanation(&report, &render.sql, output_format);
+        process::exit(exit_code);
+    }
+
+    // Handle --explain-findings mode: show only extracted findings by statement
+    if explain_findings {
+        print_finding_explanation(&report, &render.sql, output_format);
+        process::exit(exit_code);
+    }
+
+    // Output report (stdout) - suppress in runtime mode
+    if !runtime_mode && (output_format == "json" || output_format == "both") {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing report to JSON: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if !runtime_mode && output_format == "yaml" {
+        match serde_yaml_ng::to_string(&report) {
+            Ok(yaml) => print!("{}", yaml),
+            Err(e) => {
+                eprintln!("Error serializing report to YAML: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // A SARIF report is on standard output unless `--report-out` delivers it.
+    if !runtime_mode && output_format == "sarif" && !sarif_report_out {
+        // Use git repo root for SARIF base path since file paths may be relative to repo root
+        let git_root = super::git::get_git_repo_root()
+            .and_then(|p| p.to_str().map(String::from))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            });
+        let run = ToolRun {
+            run_notes: &run_notes,
+            ..tool_run(ext, git_root.as_deref(), depth_note.as_deref())
+        };
+        match serde_json::to_string_pretty(&analyzer::to_sarif(&report, &run)) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing SARIF report: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    // GitLab SAST report always goes to stdout — redirect to
+    // gl-sast-report.json in CI and declare it as an artifacts.reports.sast
+    // path. (--report-out continues to write its own artifact formats.)
+    if !runtime_mode && output_format == "gl-sast" {
+        let gl_report = analyzer::to_gl_sast(
+            &report,
+            &ToolRun {
+                run_notes: &run_notes,
+                ..tool_run(ext, None, depth_note.as_deref())
+            },
+        );
+        match serde_json::to_string_pretty(&gl_report) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing GitLab SAST report: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if !runtime_mode && output_format == "markdown" {
+        let display_path = if use_stdin {
+            "stdin".to_string()
+        } else {
+            input_file.clone().unwrap_or_else(|| "input".to_string())
+        };
+        print_analyze_markdown(
+            &report,
+            &display_path,
+            &render.placeholders,
+            depth_note.as_deref(),
+            &run_notes,
+        );
     }
 
     if !runtime_mode && (output_format == "text" || output_format == "both") {
@@ -1170,10 +1766,18 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         let palette = super::color::Palette::resolve(color_choice);
 
         // Print text summary
-        println!("{}", palette.bold("Semantic Analysis Report"));
+        // A run at reduced depth is not titled for the analysis it lacks.
+        println!(
+            "{}",
+            palette.bold(if depth_note.is_some() {
+                "Analysis Report"
+            } else {
+                "Semantic Analysis Report"
+            })
+        );
         println!("========================");
 
-        // Confidence first - this is the most important signal for trust
+        // Confidence first - this is the most important indicator for trust
         let confidence_display = match (
             &report.summary.render_completeness,
             &report.summary.analysis_confidence,
@@ -1225,6 +1829,9 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         if let Some(note) = &depth_note {
             println!("Note: {}", note);
         }
+        for note in &run_notes {
+            println!("Note: {}", note);
+        }
         println!();
 
         // Severity-color non-zero counts; dim the zeros so the real
@@ -1238,7 +1845,10 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
             }
         };
         println!("{}", palette.bold("Summary:"));
-        println!("  Total signals: {}", report.summary.total_reported_signals);
+        println!(
+            "  Total findings: {}",
+            report.summary.total_reported_findings
+        );
         println!(
             "{}",
             count_line(
@@ -1265,11 +1875,12 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         );
         println!(
             "{}",
-            count_line(analyzer::RiskLevel::Info, "Info", report.summary.info_count)
+            count_line(
+                analyzer::RiskLevel::Info,
+                "Context",
+                report.summary.info_count
+            )
         );
-        if !report.positive_signals.is_empty() {
-            println!("  Positive signals: {}", report.positive_signals.len());
-        }
         println!();
         println!("{}", palette.bold("Coverage:"));
         println!(
@@ -1283,7 +1894,10 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
             );
         }
         if report.summary.jinja_blocks > 0 {
-            println!("  Jinja Blocks: {}", report.summary.jinja_blocks);
+            println!(
+                "  Template blocks, not SQL statements: {}",
+                report.summary.jinja_blocks
+            );
         }
         if render_diagnostics != RenderDiagnosticsLevel::None && render.placeholders.total > 0 {
             println!(
@@ -1314,11 +1928,22 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         }
         // Only show unrecognized if there are any — statements the parser
         // could not recognize (opaque / error / stray clause), so they were
-        // not analyzed. This is coverage loss, not a clean parse.
-        if report.summary.statements_skipped > 0 {
+        // not analyzed. This is coverage loss, not a clean parse. The sqlcmd
+        // commands that run what was not read are skipped too, and say so.
+        let unrecognized = report
+            .summary
+            .statements_skipped
+            .saturating_sub(unread_sqlcmd.len());
+        if unrecognized > 0 {
             println!(
                 "  Unrecognized: {} (could not parse, no analysis)",
-                report.summary.statements_skipped
+                unrecognized
+            );
+        }
+        if !unread_sqlcmd.is_empty() {
+            println!(
+                "  Not read: {} (sqlcmd commands that run SQL or commands the analysis did not read)",
+                unread_sqlcmd.len()
             );
         }
         println!();
@@ -1341,73 +1966,19 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         }
         println!();
 
-        if !report.signals.is_empty() {
-            println!("{}", palette.bold("signals:"));
-            for signal in &report.signals {
-                let level = signal.risk_level();
-                let tag = palette.severity(level, &format!("[{}]", level.as_str().to_uppercase()));
-                println!("  {} {}", tag, signal.message());
-
-                // Show evidence (line numbers & previews) directly from signal
-                let evidence = signal.evidence();
-
-                if !evidence.is_empty() {
-                    for ev in evidence.iter().take(3) {
-                        if let analyzer::RiskEvidence::RuleMatch {
-                            line_number,
-                            statement_preview,
-                            signal_value,
-                            location,
-                            ..
-                        } = ev
-                        {
-                            let mut parts = Vec::new();
-                            if let Some(line) = line_number {
-                                parts.push(palette.dim(&format!("Line {}", line)));
-                            }
-                            if !signal_value.is_empty() {
-                                parts.push(palette.rule_id(&format!("`{}`", signal_value)));
-                            }
-                            if let Some(preview) = statement_preview {
-                                if !preview.is_empty() {
-                                    // Collapse embedded newlines/indentation so each
-                                    // occurrence stays on one physical line and doesn't
-                                    // bury the signal headlines below it.
-                                    let one_line =
-                                        preview.split_whitespace().collect::<Vec<_>>().join(" ");
-                                    parts.push(palette.dim(&format!("\"{}\"", one_line)));
-                                }
-                            }
-                            // Add clickable location link
-                            if let Some(loc) = location {
-                                parts.push(palette.dim(loc));
-                            }
-                            if !parts.is_empty() {
-                                println!("    {} {}", palette.dim("↳"), parts.join(" • "));
-                            }
-                        }
-                    }
-                    if evidence.len() > 3 {
-                        println!(
-                            "    {}",
-                            palette.dim(&format!("↳ (+{} more occurrences)", evidence.len() - 3))
-                        );
-                    }
-                }
+        // Findings, then (with --min-severity info) context entries.
+        let print_entries = |heading: &str, entries: &[analyzer::RuleMatch]| {
+            if entries.is_empty() {
+                return;
             }
+            println!("{}", palette.bold(heading));
+            let mut lines = String::new();
+            write_text_entries(&mut lines, entries, 3, &palette);
+            print!("{}", lines);
             println!();
-        }
-
-        if !report.positive_signals.is_empty() {
-            println!("{}", palette.bold("Positive signals:"));
-            for signal in &report.positive_signals {
-                println!("  {} {}", palette.success("✓"), signal.message);
-                if let Some(details) = &signal.details {
-                    println!("    {}", palette.dim(details));
-                }
-            }
-            println!();
-        }
+        };
+        print_entries("findings:", &report.findings);
+        print_entries("Context:", &report.context);
 
         // --verbose: append the v1 rule-evaluation explanation surface
         // (`statement_explanations`). Only emitted in text/both
@@ -1419,51 +1990,62 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         }
     }
 
-    if policy_blocked {
-        process::exit(2);
+    if exit_code != 0 {
+        process::exit(exit_code);
     }
 }
 
-/// Extract SQL fragments from a list of Python/notebook files.
+/// Extract SQL fragments from a list of Python/notebook files, each read
+/// from the working tree or as of `commit`. The files that could not be
+/// read come back beside them, each with its reason; a file `commit` does
+/// not hold has no fragments.
 fn extract_sql_from_paths(
-    paths: &[PathBuf],
+    paths: &[BatchFile],
+    commit: Option<&str>,
     quiet_mode: bool,
-) -> Vec<lexega_core::extract::ExtractedSql> {
+) -> (
+    Vec<lexega_core::extract::ExtractedSql>,
+    Vec<(String, String)>,
+) {
     let patterns = lexega_core::extract::SqlCallPattern::spark_defaults();
     let mut fragments = Vec::new();
+    let mut unread = Vec::new();
 
-    for file_path in paths {
-        let source = match fs::read_to_string(file_path) {
-            Ok(content) => content,
-            Err(e) => {
-                if !quiet_mode {
-                    eprintln!("  ⚠ {} - skipped ({})", file_path.display(), e);
-                }
+    for file in paths {
+        let source = match read_source(&file.path, commit) {
+            Ok(content) => content.text,
+            Err(ReadFailure::Removed(_)) => continue,
+            Err(ReadFailure::Unreadable(reason)) => {
+                unread.push((file.name.clone(), reason));
                 continue;
             }
         };
 
-        if let Some(extracted) =
-            lexega_core::extract::extract_sql_from_file(file_path, &source, &patterns)
+        // Each fragment is named after the file's reported path.
+        match lexega_core::extract::extract_sql_from_file(Path::new(&file.name), &source, &patterns)
         {
-            if !extracted.is_empty() && !quiet_mode {
-                eprintln!(
-                    "  📋 {} - extracted {} SQL fragment(s)",
-                    file_path.display(),
-                    extracted.len()
-                );
+            Some(Ok(extracted)) => {
+                if !extracted.is_empty() && !quiet_mode {
+                    eprintln!(
+                        "  📋 {} - extracted {} SQL fragment(s)",
+                        file.name,
+                        extracted.len()
+                    );
+                }
+                fragments.extend(extracted);
             }
-            fragments.extend(extracted);
+            Some(Err(e)) => unread.push((file.name.clone(), e.to_string())),
+            None => {}
         }
     }
 
-    fragments
+    (fragments, unread)
 }
 
 /// Emit strict-mode violations for a single analysis report on stderr.
 ///
 /// Returns `true` if any violations were recorded. Callers decide what to
-/// do with that signal — the single-file path exits immediately, the
+/// do with that result — the single-file path exits immediately, the
 /// batch path accumulates and exits once at the end.
 fn report_strict_violations(
     strict: lexega_core::StrictMode,
@@ -1489,6 +2071,52 @@ fn report_strict_violations(
     !violations.is_empty()
 }
 
+/// Runtime mode gives one decision for one source; a run of several gives
+/// one per file. Exit, saying so, when runtime mode is asked of one.
+fn refuse_runtime_batch() -> ! {
+    eprintln!(
+        "Error: --mode runtime decides one source: name one SQL file or pipe the SQL on stdin"
+    );
+    process::exit(1);
+}
+
+/// The flags that explain the analysis of one source, each with whether it
+/// was given. Exit, saying so, when one is asked of a batch.
+fn refuse_diagnostics_in_batch(flags: &[(&str, bool)]) {
+    if let Some((flag, _)) = flags.iter().find(|(_, given)| *given) {
+        eprintln!(
+            "Error: {} applies to one file: name a single SQL file or pipe the SQL on stdin",
+            flag
+        );
+        process::exit(1);
+    }
+}
+
+/// A batch decides each file on its own, so a policy needs a directory for
+/// the decision records and an environment to decide in. Exit otherwise.
+fn require_batch_policy_outputs(
+    policy_path: Option<&str>,
+    decision_out: Option<&str>,
+    policy_env: Option<&str>,
+) {
+    if policy_path.is_none() {
+        return;
+    }
+    let out = decision_out.unwrap_or("");
+    if out.is_empty() {
+        eprintln!("Error: --decision-out is required when using --policy");
+        process::exit(1);
+    }
+    if is_artifact_file_path(out) {
+        eprintln!("Error: In batch mode, --decision-out must be a directory (not a file path)");
+        process::exit(1);
+    }
+    if policy_env.is_none() {
+        eprintln!("Error: --env is required when using --policy");
+        process::exit(1);
+    }
+}
+
 /// What a batch run produced beyond its output.
 pub(crate) struct BatchOutcome {
     /// The Markdown summary, when a surface asked for it.
@@ -1503,17 +2131,282 @@ fn finish(outcome: BatchOutcome) {
     }
 }
 
-/// One file's text: from the working tree, or as of `commit`.
-fn read_source(path: &Path, commit: Option<&str>) -> Result<String, String> {
+/// Why one file of a batch could not be read.
+enum ReadFailure {
+    /// The commit read does not hold the file: the change removes it.
+    Removed(String),
+    /// The file is there and could not be read.
+    Unreadable(String),
+}
+
+/// One file's text, read as its byte-order mark says: from the working
+/// tree, or as of `commit`.
+fn read_source(
+    path: &Path,
+    commit: Option<&str>,
+) -> Result<lexega_core::extract::SourceText, ReadFailure> {
     match commit {
-        Some(commit) => super::git::get_file_at_commit(commit, &path.display().to_string()),
-        None => fs::read_to_string(path).map_err(|e| format!("Error reading: {}", e)),
+        Some(commit) => super::git::read_source_at_commit(commit, &path.display().to_string())
+            .map_err(|e| match e {
+                FileAtCommitError::Absent(reason) => ReadFailure::Removed(reason),
+                FileAtCommitError::Unreadable(reason) => ReadFailure::Unreadable(reason),
+            }),
+        None => super::io::read_sql_file(&super::io::absolute(path))
+            .map_err(|e| ReadFailure::Unreadable(format!("Error reading: {}", e))),
     }
 }
 
+/// The less complete of two renders, in the order `RenderCompleteness`
+/// declares them: full, partial with low-impact placeholders only, partial,
+/// not rendered.
+fn less_complete(
+    a: analyzer::RenderCompleteness,
+    b: &analyzer::RenderCompleteness,
+) -> analyzer::RenderCompleteness {
+    fn rank(completeness: &analyzer::RenderCompleteness) -> u8 {
+        match completeness {
+            analyzer::RenderCompleteness::Full => 0,
+            analyzer::RenderCompleteness::PartialLowImpactOnly => 1,
+            analyzer::RenderCompleteness::Partial => 2,
+            analyzer::RenderCompleteness::NotRendered => 3,
+        }
+    }
+    if rank(b) > rank(&a) {
+        b.clone()
+    } else {
+        a
+    }
+}
+
+/// List `label` as a file of the batch that was not analyzed, for `reason`.
+fn skip(skipped: &mut Vec<(String, String)>, label: String, reason: String, quiet: bool) {
+    if !quiet {
+        eprintln!("  ✗ {} - {}", label, reason);
+    }
+    skipped.push((label, reason));
+}
+
+/// The files of `skipped` (path, reason) by reason, each reason once in the
+/// order first met: a dbt project's macro paths leave every file in them
+/// unread for one reason, which a report says once.
+fn skips_by_reason(skipped: &[(String, String)]) -> Vec<(&str, Vec<&str>)> {
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (path, reason) in skipped {
+        match grouped
+            .iter_mut()
+            .find(|(seen, _)| *seen == reason.as_str())
+        {
+            Some((_, paths)) => paths.push(path),
+            None => grouped.push((reason, vec![path])),
+        }
+    }
+    grouped
+}
+
+/// Under a strict mode, say on stderr that `label` was not analyzed, for
+/// `reason`. True when that fails the run.
+fn strict_not_analyzed(strict: lexega_core::StrictMode, label: &str, reason: &str) -> bool {
+    let fails = !matches!(strict, lexega_core::StrictMode::Permissive);
+    if fails {
+        eprintln!(
+            "{}: [E_STRICT_NOT_ANALYZED] not analyzed: {}",
+            label, reason
+        );
+    }
+    fails
+}
+
+/// List `label` as a file of the batch that could not be analyzed, for
+/// `reason`, among the `skipped` files and the `not_analyzed` ones. Under a
+/// strict mode that fails the run: it is said on stderr, and the return is
+/// true.
+fn fail_unanalyzed(
+    skipped: &mut Vec<(String, String)>,
+    not_analyzed: &mut Vec<(String, String)>,
+    strict: lexega_core::StrictMode,
+    label: String,
+    reason: String,
+    quiet: bool,
+) -> bool {
+    let fails = strict_not_analyzed(strict, &label, &reason);
+    not_analyzed.push((label.clone(), reason.clone()));
+    skip(skipped, label, reason, quiet);
+    fails
+}
+
+/// The name a batch gives an embedded fragment: its file, and the line and
+/// column (1-based) where its SQL begins, so two fragments on one line are
+/// two entries and two decision records.
+fn fragment_name(fragment: &lexega_core::extract::ExtractedSql) -> String {
+    format!(
+        "{}:{}:{}",
+        fragment.origin_file.display(),
+        fragment.origin.line,
+        fragment.origin.column
+    )
+}
+
+/// Place each evidence of `report`, analyzed from `fragment`'s SQL, at its
+/// place in the file the fragment came from
+/// ([`lexega_core::extract::ExtractedSql::place`]).
+fn place_in_origin(
+    report: &mut lexega_core::analyzer::AnalysisReport,
+    fragment: &lexega_core::extract::ExtractedSql,
+) {
+    let lines = analyzer::LineIndex::new(&fragment.sql);
+    for entry in report.findings.iter_mut().chain(report.context.iter_mut()) {
+        let lexega_core::analyzer::RuleMatch::Analysis(finding) = entry;
+        for evidence in &mut finding.evidence {
+            let lexega_core::analyzer::RiskEvidence::RuleMatch {
+                location,
+                position: Some(position),
+                ..
+            } = evidence
+            else {
+                continue;
+            };
+            let Some(offset) = lines.offset_at(&fragment.sql, position.line, position.column)
+            else {
+                continue;
+            };
+            *position = fragment.place(offset);
+            *location = Some(format!(
+                "{}:{}:{}",
+                fragment.origin_file.display(),
+                position.line,
+                position.column
+            ));
+        }
+    }
+}
+
+/// Whether the file reported as `name` was named on the command line.
+fn is_named(config: &BatchProcessingConfig, name: &str) -> bool {
+    config.named_files.iter().any(|file| file == name)
+}
+
+/// Say on stderr that the file reported as `name`, named on the command
+/// line, could not be read for `reason`: that fails the run.
+fn report_named_unread(name: &str, reason: &str) {
+    eprintln!(
+        "Error: '{}' was named on the command line and could not be read: {}",
+        name, reason
+    );
+}
+
+/// The files of a batch found in the working tree, each named by the path
+/// it is reported by.
+fn working_tree_files(files: &[PathBuf], names: &super::io::ReportedPaths) -> Vec<BatchFile> {
+    files
+        .iter()
+        .map(|path| BatchFile {
+            name: names.name(path),
+            path: path.clone(),
+        })
+        .collect()
+}
+
+/// Whether a file a scan found and left unread for `reason` is SQL the run
+/// leaves unanalyzed, which fails the strict gate. Macro definitions are not
+/// statements; a symbolic link the scan does not follow names a file it
+/// would otherwise analyze, and a directory it could not read may hold one.
+fn unread_is_unanalyzed_sql(reason: &SkipReason) -> bool {
+    match reason {
+        SkipReason::MacroDirectory(_) => false,
+        SkipReason::SymbolicLink | SkipReason::UnreadableDirectory => true,
+    }
+}
+
+/// Whether a file discovery left unread for `reason` holds dbt macros.
+pub fn unread_is_macro_file(reason: &SkipReason) -> bool {
+    match reason {
+        SkipReason::MacroDirectory(_) => true,
+        SkipReason::SymbolicLink | SkipReason::UnreadableDirectory => false,
+    }
+}
+
+/// What a report says of a macro file skipped for `reason`: in a change,
+/// with the `models` the change renders differently, which were reviewed
+/// in its place.
+pub fn macro_file_note(reason: &str, models: &[String]) -> String {
+    match models {
+        [] => reason.to_string(),
+        [model] => format!(
+            "{}; the change is reviewed through the model it renders differently: {}",
+            reason, model
+        ),
+        models => format!(
+            "{}; the change is reviewed through the {} models it renders differently: {}",
+            reason,
+            models.len(),
+            models.join(", ")
+        ),
+    }
+}
+
+/// The note of a run that analyzed no SQL file because each of its
+/// `macro_files` SQL files holds macros; `change` for a review.
+pub fn analyzed_nothing_note(macro_files: usize, change: bool) -> String {
+    let files = match macro_files {
+        1 => "1 file".to_string(),
+        n => format!("{} files", n),
+    };
+    let hold = if macro_files == 1 { "holds" } else { "hold" };
+    if change {
+        format!(
+            "No SQL file was analyzed: {} of the change {} dbt macro definitions, not statements, and no model the change renders differently was reviewed. --strict fails on a run that analyzes nothing.",
+            files, hold
+        )
+    } else {
+        format!(
+            "No SQL file was analyzed: {} found {} dbt macro definitions, not statements. --strict fails on a run that analyzes nothing.",
+            files, hold
+        )
+    }
+}
+
+/// How many template files a batch did not render: `unrendered` analyzed as
+/// written and `render_failed` not analyzed. None where it rendered every
+/// one.
+fn not_rendered_line(unrendered: usize, render_failed: usize) -> Option<String> {
+    match (unrendered, render_failed) {
+        (0, 0) => None,
+        (count, 0) => Some(count.to_string()),
+        (unrendered, failed) => Some(format!("{} ({} not analyzed)", unrendered + failed, failed)),
+    }
+}
+
+/// A file of the batch the session could not render: with
+/// `--fail-on-missing-packages` the run stops with exit code 1, and the file
+/// is listed as not analyzed otherwise, which leaves the batch's
+/// `completeness` not rendered. True when that fails the strict gate.
+fn render_failed(
+    config: &BatchProcessingConfig,
+    skipped: &mut Vec<(String, String)>,
+    not_analyzed: &mut Vec<(String, String)>,
+    completeness: &mut analyzer::RenderCompleteness,
+    name: &str,
+    reason: String,
+) -> bool {
+    if config.fail_on_missing_packages {
+        eprintln!("Error: {} (file: {})", reason, name);
+        process::exit(1);
+    }
+    *completeness = analyzer::RenderCompleteness::NotRendered;
+    fail_unanalyzed(
+        skipped,
+        not_analyzed,
+        config.strict,
+        name.to_string(),
+        reason,
+        config.quiet_mode,
+    )
+}
+
 /// Post the review as a pull-request comment. Without a detectable pull
-/// request the Markdown goes to standard output instead, unless it was
-/// already printed there.
+/// request the Markdown goes to standard error instead, unless it was
+/// already printed: standard output holds the report in the format asked
+/// for, and nothing else.
 fn post_review_comment(markdown: &str, already_printed: bool) {
     use super::pr_comment::{post_pr_comment, PRContext};
     match PRContext::from_env() {
@@ -1529,26 +2422,225 @@ fn post_review_comment(markdown: &str, already_printed: bool) {
         Err(e) => {
             eprintln!("⚠️  Cannot post PR comment: {}", e);
             if !already_printed {
-                eprintln!("   Falling back to stdout output.");
-                print!("{}", markdown);
+                eprintln!("   The comment follows.");
+                eprint!("{}", markdown);
             }
         }
     }
 }
 
+/// One file of a batch as the driver hands it to the session.
+enum BatchSource {
+    /// The file's text, to render and analyze.
+    Text(lexega_core::extract::SourceText),
+    /// A file the change removes: the session's report on it, and the text
+    /// at the range's base that report was made from (empty when the base
+    /// holds the file and it cannot be read).
+    Removed(Box<(RenderArtifacts, analyzer::AnalysisReport)>),
+}
+
+/// The session's report on `path`, which `range` removes, with the text it
+/// is read from at the range's base. `None` when the base does not hold the
+/// file either.
+fn removed(
+    session: &mut dyn Session,
+    path: &Path,
+    range: ChangeRange<'_>,
+) -> Result<Option<(RenderArtifacts, analyzer::AnalysisReport)>, String> {
+    let base = match super::git::read_file_at_commit(range.base, &path.display().to_string()) {
+        Ok(base) => Some(base),
+        Err(FileAtCommitError::Unreadable(_)) => None,
+        Err(FileAtCommitError::Absent(_)) => return Ok(None),
+    };
+    let base = base.as_deref().map(strip_bom);
+    Ok(session.analyze_removed(path, base)?.map(|report| {
+        (
+            RenderArtifacts::raw(base.unwrap_or_default().to_string()),
+            report,
+        )
+    }))
+}
+
+/// Which files of the planned batch `planned` are analyzed, by planned
+/// index: each of `files`, and, in a review, a file the session added
+/// where the review's head holds it under its paths. Outside a review,
+/// every planned file.
+fn planned_under_paths(
+    planned: &[BatchFile],
+    files: &[BatchFile],
+    review: Option<ReviewScope<'_>>,
+) -> Vec<bool> {
+    let given: std::collections::BTreeSet<&BatchFile> = files.iter().collect();
+    let Some(scope) = review else {
+        return vec![true; planned.len()];
+    };
+    if planned.iter().all(|file| given.contains(file)) {
+        return vec![true; planned.len()];
+    }
+    let under = super::git::sql_files_at_commit_under(scope.range.head, scope.paths)
+        .unwrap_or_else(|e| {
+            eprintln!("Error listing files at {}: {}", scope.range.head, e);
+            process::exit(1);
+        });
+    planned
+        .iter()
+        .map(|file| given.contains(file) || under.contains(&file.name))
+        .collect()
+}
+
+/// The range a `review` batch covers, and the path arguments it reviews.
+#[derive(Clone, Copy)]
+pub(crate) struct ReviewScope<'a> {
+    pub(crate) range: ChangeRange<'a>,
+    pub(crate) paths: &'a [String],
+}
+
 /// Analyze `files` and `embedded_fragments` as one batch. `found_unread` are
-/// the files discovery matched and left unread; they are reported with the
-/// files the batch itself fails to read or analyze.
+/// the files discovery matched and left unread, each by the path it is
+/// reported by; they are reported with the
+/// files the batch itself fails to read or analyze. `unreadable` are the
+/// files whose fragments could not be read, each with its reason; they fail
+/// the strict gate as a file the batch fails to read does. `review` is the
+/// range a `review` batch covers; each file is then read at its head, and
+/// a file the session adds is analyzed where the head holds it under the
+/// review's paths. A review left with nothing to analyze says so and
+/// reports nothing.
 pub(crate) fn handle_risk_batch(
-    files: Vec<PathBuf>,
+    files: Vec<BatchFile>,
     embedded_fragments: Vec<lexega_core::extract::ExtractedSql>,
     found_unread: Vec<SkippedFile>,
+    unreadable: Vec<(String, String)>,
     config: &BatchProcessingConfig,
+    review: Option<ReviewScope<'_>>,
     ext: &dyn Extension,
 ) -> BatchOutcome {
-    let to_analyze = files.len() + embedded_fragments.len();
-    let total = to_analyze + found_unread.len();
-    if !config.quiet_mode {
+    let change = review.map(|scope| scope.range);
+
+    // Open the session (same as single-file mode)
+    let mut session = ext
+        .open_session(SessionOptions {
+            jinja_vars: config.jinja_vars,
+            jinja_var_files: config.jinja_var_files,
+            snowsql_configs: config.snowsql_configs,
+            env_allowlist: config.env_allowlist,
+            substitution: config.substitution,
+            dbt_profile: config.dbt_profile,
+            dbt_project_path: config.dbt_project_path,
+            load_macros: config.load_macros,
+            fail_on_missing_packages: config.fail_on_missing_packages,
+            custom_rules: config.custom_rules.clone(),
+            masking: config.masking.clone(),
+            trace_mode: config.trace_mode,
+            verbose_mode: config.verbose_mode,
+            catalog_path: config.catalog_path,
+            catalog_provider: config.catalog_provider,
+            default_schema: config.default_schema,
+            dialect_name: config.dialect,
+            output_format: config.output_format,
+            quiet: config.quiet_mode,
+            projects: config.projects,
+            change: change.is_some(),
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            process::exit(1);
+        });
+
+    // Set dialect if specified (mirrors single-file path)
+    if let Some(name) = config.dialect {
+        match resolve_dialect(name) {
+            Some(d) => session.set_dialect(Some(d)),
+            None => {
+                eprintln!(
+                    "Error: Unknown dialect '{}'. Valid options: {}",
+                    name,
+                    super::io::DIALECT_OPTIONS
+                );
+                process::exit(1);
+            }
+        }
+    }
+
+    // A review with nothing to read under its paths, whose head holds no
+    // SQL file under them either, keeps no file the session could add: the
+    // batch is not planned. A head that cannot be listed may hold one, so
+    // its batch is planned; the files the session adds are listed again
+    // below, and only there does a listing error stop the run.
+    let nothing_to_plan = match review {
+        Some(scope)
+            if files.is_empty()
+                && embedded_fragments.is_empty()
+                && found_unread.is_empty()
+                && unreadable.is_empty() =>
+        {
+            super::git::sql_files_at_commit_under(scope.range.head, scope.paths)
+                .is_ok_and(|held| held.is_empty())
+        }
+        Some(_) | None => false,
+    };
+
+    // The session orders the batch, adds what its analysis across the
+    // files adds, and prepares that analysis.
+    let ordered_files = if nothing_to_plan {
+        Vec::new()
+    } else {
+        session
+            .plan_batch(
+                &files,
+                &BatchPlan {
+                    cross_script: config.cross_script,
+                    quiet: config.quiet_mode,
+                    change,
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("{}", e);
+                process::exit(1);
+            })
+    };
+    // Which planned files to analyze: each of `files`, and a file the
+    // session adds where the review's head holds it under its paths. A
+    // file left out keeps its index in the planned batch.
+    let analyzed_files = planned_under_paths(&ordered_files, &files, review);
+    let planned_count = analyzed_files.iter().filter(|kept| **kept).count();
+
+    // Each file and fragment the batch analyzes writes its decision under a
+    // key no other one of them has.
+    let fragment_names: Vec<String> = embedded_fragments.iter().map(fragment_name).collect();
+    let artifact_keys = ArtifactKeys::new(
+        ordered_files
+            .iter()
+            .zip(&analyzed_files)
+            .filter(|(_, analyzed)| **analyzed)
+            .map(|(file, _)| file.name.as_str())
+            .chain(fragment_names.iter().map(String::as_str)),
+    );
+
+    // A review left with nothing to analyze says so. The reports and
+    // decisions a program reads are still written, holding no file; the
+    // text and Markdown reports, and so the pull-request comment, are not.
+    let nothing_changed = change.is_some()
+        && planned_count == 0
+        && embedded_fragments.is_empty()
+        && found_unread.is_empty()
+        && unreadable.is_empty();
+    if nothing_changed {
+        if let Some(range) = change {
+            if !config.quiet_mode {
+                eprintln!("No SQL files changed in {}..{}", range.base, range.head);
+            }
+        }
+        if !config.writes_records() {
+            return BatchOutcome {
+                markdown: None,
+                exit_code: 0,
+            };
+        }
+    }
+
+    let to_analyze = planned_count + embedded_fragments.len();
+    let total = to_analyze + found_unread.len() + unreadable.len();
+    if !config.quiet_mode && !nothing_changed {
         eprintln!("Analyzing {} file(s)...", to_analyze);
     }
 
@@ -1559,6 +2651,7 @@ pub(crate) fn handle_risk_batch(
         ext.policy_gate(&PolicySetup {
             policy_path,
             exceptions_path: config.exceptions_path,
+            rules: config.custom_rules.as_deref().unwrap_or_default(),
             env: config.policy_env,
             team: config.policy_team,
             job_type: config.policy_job_type,
@@ -1585,25 +2678,33 @@ pub(crate) fn handle_risk_batch(
         process::exit(1);
     }
 
-    let mut total_signals = 0;
+    // A review that analyzes no file of the range, whatever it skipped, is
+    // decided once, for the range, on a report with nothing in it, as
+    // `diff` decides one; the batch report holds that decision.
+    let mut range_decision: Option<PolicyOutcome> = None;
+    if planned_count == 0 && embedded_fragments.is_empty() {
+        if let (Some(gate), Some(range)) = (&gate, change) {
+            let mut empty = analyzer::AnalysisReport::new();
+            config.run_identity.apply(&mut empty);
+            range_decision = Some(gate.decide(&SourceCase {
+                sql: &format!("review:{}..{}", range.base, range.head),
+                report: &empty,
+                scope_path: None,
+            }));
+        }
+    }
+    let range_blocked = range_decision
+        .as_ref()
+        .is_some_and(|outcome| !outcome.allowed);
+
+    let mut total_findings = 0;
     let mut max_level = lexega_core::analyzer::RiskLevel::Low;
-    let mut files_with_signals = 0;
+    let mut files_with_findings = 0;
     let mut files_blocked = 0;
-    // Effective --report-out artifact format, resolved once from config
-    // (file extension wins, then `--format sarif`, then
-    // --report-artifact-format). Drives both what the batch retains per
-    // file and the artifact written at the end — derived in one place so
+    // What the --report-out artifact, if any, is written as: it drives both
+    // what the batch retains per file and the artifact written at the end, so
     // retention can never disagree with the output.
-    let report_out_format: Option<ReportArtifactFormat> =
-        config.report_out.map(
-            |path| match super::artifacts::OutputFileFormat::from_path(path) {
-                Some(super::artifacts::OutputFileFormat::Sarif) => ReportArtifactFormat::Sarif,
-                Some(super::artifacts::OutputFileFormat::Yaml) => ReportArtifactFormat::Yaml,
-                Some(super::artifacts::OutputFileFormat::Json) => ReportArtifactFormat::Json,
-                None if config.output_format == "sarif" => ReportArtifactFormat::Sarif,
-                None => config.report_artifact_format,
-            },
-        );
+    let artifact_format = config.report_out.map(|_| config.report_artifact_format);
     // Per-file retention is matched to what the selected outputs actually
     // read. Retaining whole AnalysisReports made batch memory grow with
     // analysis internals (statement groupings, explanations, ledger) far
@@ -1612,21 +2713,26 @@ pub(crate) fn handle_risk_batch(
         || config.output_format == "both"
         || config.output_format == "yaml";
     let retain_per_file_json = matches!(
-        report_out_format,
+        artifact_format,
         Some(ReportArtifactFormat::Json | ReportArtifactFormat::Yaml)
     );
-    let retain_all_signals = config.output_format == "sarif"
+    let retain_all_findings = config.output_format == "sarif"
         || config.output_format == "gl-sast"
-        || matches!(report_out_format, Some(ReportArtifactFormat::Sarif));
+        || artifact_format == Some(ReportArtifactFormat::Sarif);
+    // The per-file sections only the text and Markdown reports read.
+    let retain_sections = config.output_format == "text"
+        || config.output_format == "both"
+        || config.output_format == "markdown"
+        || config.capture_markdown;
     // Pre-built per-file entries for the json/yaml stdout payloads.
     let mut files_json: Vec<serde_json::Value> = Vec::new();
     // Pre-built entries for the batch artifact's `per_file` payload
     // (json/yaml --report-out only; the SARIF artifact never reads it).
     let mut per_file_json: Vec<serde_json::Value> = Vec::new();
-    // (path, signals) for the --detail sections; only files with signals.
-    let mut detail_signals: Vec<(String, Vec<lexega_core::analyzer::RuleMatch>)> = Vec::new();
-    let mut all_signals: Vec<lexega_core::analyzer::RuleMatch> = Vec::new(); // Combined report (SARIF / gl-sast surfaces)
-                                                                             // (path, reason)
+    // Per-file sections; only files with a finding or a context entry.
+    let mut file_sections: Vec<FileSection> = Vec::new();
+    let mut all_findings: Vec<lexega_core::analyzer::RuleMatch> = Vec::new(); // Combined report (SARIF / gl-sast surfaces)
+                                                                              // (path, reason)
     let mut skipped_files: Vec<(String, String)> = found_unread
         .iter()
         .map(|skipped| {
@@ -1637,10 +2743,25 @@ pub(crate) fn handle_risk_batch(
         })
         .collect();
     if !config.quiet_mode {
-        for (path, reason) in &skipped_files {
-            eprintln!("  - {} - skipped ({})", path, reason);
+        for (reason, paths) in skips_by_reason(&skipped_files) {
+            match paths.as_slice() {
+                [path] => eprintln!("  - {} - skipped ({})", path, reason),
+                several => eprintln!("  - {} files skipped ({})", several.len(), reason),
+            }
         }
     }
+    // The dbt macro files discovery left unread, each with why.
+    let macro_files: Vec<(String, String)> = found_unread
+        .iter()
+        .filter(|found| unread_is_macro_file(&found.reason))
+        .map(|found| (found.path.display().to_string(), found.reason.to_string()))
+        .collect();
+    // The files and fragments analyzed, and of the files those the session
+    // added to the ones given.
+    let given: std::collections::BTreeSet<&str> =
+        files.iter().map(|file| file.name.as_str()).collect();
+    let mut files_analyzed: usize = 0;
+    let mut added_analyzed: Vec<String> = Vec::new();
 
     // Aggregate data for summary
     let mut critical_count = 0;
@@ -1657,6 +2778,8 @@ pub(crate) fn handle_risk_batch(
     // These three must always sum to ledger_entries_total
     let mut total_statements_analyzed: usize = 0;
     let mut total_statements_skipped: usize = 0;
+    // Of the skipped, the sqlcmd commands that run what was not read.
+    let mut unread_sqlcmd: Vec<String> = Vec::new();
     let mut total_jinja_blocks: usize = 0;
     let mut total_placeholders: usize = 0;
     let mut files_with_placeholders: usize = 0;
@@ -1670,108 +2793,172 @@ pub(crate) fn handle_risk_batch(
     let mut total_low_impact: usize = 0;
     let mut impacted_files: Vec<(String, usize, usize, usize)> = Vec::new(); // (path, total, high, low)
 
-    // Open the session (same as single-file mode)
-    let mut session = ext
-        .open_session(SessionOptions {
-            jinja_vars: config.jinja_vars,
-            jinja_var_files: config.jinja_var_files,
-            snowsql_configs: config.snowsql_configs,
-            env_allowlist: config.env_allowlist,
-            substitution: config.substitution,
-            dbt_profile: None, // No dbt profile in batch mode
-            dbt_project_path: config.dbt_project_path,
-            load_macros: config.load_macros,
-            fail_on_missing_packages: config.fail_on_missing_packages,
-            custom_rules: config.custom_rules.clone(),
-            trace_mode: config.trace_mode,
-            verbose_mode: config.verbose_mode,
-            catalog_path: config.catalog_path,
-            catalog_provider: config.catalog_provider,
-            dialect_name: config.dialect,
-            output_format: config.output_format,
-            quiet: config.quiet_mode,
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("{}", e);
-            process::exit(1);
-        });
+    // The least complete render of the files analyzed, the lowest confidence
+    // among them, and the files analyzed on their template text.
+    let mut render_completeness = analyzer::RenderCompleteness::Full;
+    let mut analysis_confidence = analyzer::ConfidenceLevel::High;
+    let mut unrendered_files: Vec<String> = Vec::new();
+    // The files of the batch that did not render and were not analyzed.
+    let mut render_failed_files: Vec<String> = Vec::new();
+    // The SQL files the batch left unanalyzed, with why.
+    let mut not_analyzed_files: Vec<(String, String)> = Vec::new();
 
     // Tracks whether any file in the batch emitted strict violations so
     // we can fail the process once at the end rather than per-file.
     let mut strict_violations_found = false;
+    // Whether a file named on the command line could not be read.
+    let mut named_files_unread = false;
 
     // The depth note of the first report that carries one; a run evaluates
     // one corpus at one depth.
     let mut analysis_depth: Option<analyzer::AnalysisDepth> = None;
 
-    // Set dialect if specified (mirrors single-file path)
-    if let Some(name) = config.dialect {
-        if let Some(d) = resolve_dialect(name) {
-            session.set_dialect(Some(d));
+    for found in found_unread
+        .iter()
+        .filter(|found| unread_is_unanalyzed_sql(&found.reason))
+    {
+        // A link the scan does not follow is named by its own path, not its
+        // target's.
+        let label = found.path.display().to_string();
+        let reason = found.reason.to_string();
+        if strict_not_analyzed(config.strict, &label, &reason) {
+            strict_violations_found = true;
+        }
+        not_analyzed_files.push((label, reason));
+    }
+    for (label, reason) in unreadable {
+        if is_named(config, &label) {
+            report_named_unread(&label, &reason);
+            named_files_unread = true;
+        }
+        if fail_unanalyzed(
+            &mut skipped_files,
+            &mut not_analyzed_files,
+            config.strict,
+            label,
+            reason,
+            config.quiet_mode,
+        ) {
+            strict_violations_found = true;
         }
     }
 
-    // The session orders the batch and prepares whatever analysis across
-    // files it performs.
-    let ordered_files = session.plan_batch(
-        &files,
-        &BatchPlan {
-            dbt_project_path: config.dbt_project_path,
-            cross_script: config.cross_script,
-            quiet: config.quiet_mode,
-        },
-    );
-
-    for (idx, file_path) in ordered_files.iter().enumerate() {
+    let planned = ordered_files
+        .iter()
+        .enumerate()
+        .zip(&analyzed_files)
+        .filter(|(_, analyzed)| **analyzed)
+        .map(|(planned, _)| planned);
+    for (position, (idx, file)) in planned.enumerate() {
         // Print progress in batch mode so long-running files are discoverable.
         // Use stderr so JSON/YAML stdout remains valid when requested.
         if !config.quiet_mode {
             eprintln!(
                 "  [{}/{}] analyzing {}",
-                idx + 1,
+                position + 1,
                 to_analyze,
-                file_path.display()
+                file.name
             );
         }
 
-        let input = match read_source(file_path, config.source_commit) {
-            Ok(content) => content,
-            Err(reason) => {
-                if !config.quiet_mode {
-                    eprintln!("  ✗ {} - {}", file_path.display(), reason);
+        let source = match read_source(&file.path, change.map(|range| range.head)) {
+            Ok(content) => BatchSource::Text(content),
+            // A file the change removes is reported from its text at the
+            // base, when the session reports on removals.
+            Err(ReadFailure::Removed(reason)) => {
+                match change.map(|range| removed(session.as_mut(), &file.path, range)) {
+                    Some(Ok(Some(removed))) => BatchSource::Removed(Box::new(removed)),
+                    // The head holds no text of it to analyze: listed, and
+                    // no strict failure.
+                    Some(Ok(None)) | None => {
+                        let label = file.name.clone();
+                        skip(&mut skipped_files, label, reason, config.quiet_mode);
+                        continue;
+                    }
+                    Some(Err(reason)) => {
+                        render_failed_files.push(file.name.clone());
+                        if render_failed(
+                            config,
+                            &mut skipped_files,
+                            &mut not_analyzed_files,
+                            &mut render_completeness,
+                            &file.name,
+                            reason,
+                        ) {
+                            strict_violations_found = true;
+                        }
+                        continue;
+                    }
                 }
-                skipped_files.push((file_path.display().to_string(), reason));
+            }
+            Err(ReadFailure::Unreadable(reason)) => {
+                if is_named(config, &file.name) {
+                    report_named_unread(&file.name, &reason);
+                    named_files_unread = true;
+                }
+                if fail_unanalyzed(
+                    &mut skipped_files,
+                    &mut not_analyzed_files,
+                    config.strict,
+                    file.name.clone(),
+                    reason,
+                    config.quiet_mode,
+                ) {
+                    strict_violations_found = true;
+                }
                 continue;
             }
         };
-        let had_bom = input.starts_with('\u{feff}');
-        let input = strip_bom(&input);
 
         // Render and analyze through the session, which applies the
         // analysis across files it planned for this batch.
-        let (render, mut report) = match session.analyze_planned(idx, file_path, input, had_bom) {
+        let analyzed = match source {
+            BatchSource::Text(input) => {
+                // Text that is not the file's bytes as written (a mark
+                // removed, UTF-16 decoded).
+                let had_bom = input.encoding != lexega_core::extract::SourceEncoding::Utf8;
+                session
+                    .analyze_planned(idx, file, &input.text, had_bom)
+                    .map(|done| (done, session.not_compared(idx)))
+            }
+            BatchSource::Removed(removed) => Ok((*removed, None)),
+        };
+        let ((render, mut report), not_compared) = match analyzed {
             Ok(done) => done,
             Err(FileFailure::Render(reason)) => {
-                if config.fail_on_missing_packages {
-                    eprintln!("Error: {} (file: {})", reason, file_path.display());
-                    process::exit(1);
+                render_failed_files.push(file.name.clone());
+                if render_failed(
+                    config,
+                    &mut skipped_files,
+                    &mut not_analyzed_files,
+                    &mut render_completeness,
+                    &file.name,
+                    reason,
+                ) {
+                    strict_violations_found = true;
                 }
-                if !config.quiet_mode {
-                    eprintln!("  ✗ {} - {}", file_path.display(), reason);
-                }
-                skipped_files.push((file_path.display().to_string(), reason));
                 continue;
             }
             Err(FileFailure::Analysis(reason)) => {
-                if !config.quiet_mode {
-                    eprintln!("  ✗ {} - {}", file_path.display(), reason);
+                if fail_unanalyzed(
+                    &mut skipped_files,
+                    &mut not_analyzed_files,
+                    config.strict,
+                    file.name.clone(),
+                    reason,
+                    config.quiet_mode,
+                ) {
+                    strict_violations_found = true;
                 }
-                skipped_files.push((file_path.display().to_string(), reason));
                 continue;
             }
         };
 
         config.run_identity.apply(&mut report);
+        files_analyzed += 1;
+        if !given.contains(file.name.as_str()) {
+            added_analyzed.push(file.name.clone());
+        }
         if analysis_depth.is_none() {
             analysis_depth = report.summary.analysis_depth.clone();
         }
@@ -1779,8 +2966,16 @@ pub(crate) fn handle_risk_batch(
         // Strict-mode enforcement. Accumulates across the batch so the
         // loop completes and the user sees every offending file before we
         // exit non-zero.
-        if report_strict_violations(config.strict, &report, &file_path.display().to_string()) {
+        if report_strict_violations(config.strict, &report, &file.name.clone()) {
             strict_violations_found = true;
+        }
+        // A file analyzed without the comparison of its change, or as its
+        // template text where the template did not render, fails the strict
+        // gate as a file not analyzed; its report stands.
+        if let Some(reason) = not_compared.or_else(|| render.render_error.clone()) {
+            if strict_not_analyzed(config.strict, &file.name.clone(), &reason) {
+                strict_violations_found = true;
+            }
         }
 
         // Stamp render completeness from this file's render artifacts. For the
@@ -1803,47 +2998,55 @@ pub(crate) fn handle_risk_batch(
                 top_kinds: render.placeholders.top_kinds(),
             });
         }
+        render_completeness =
+            less_complete(render_completeness, &report.summary.render_completeness);
 
         // Set source file path for the report (use absolute path for easy navigation)
-        report.source_file_path = dunce::canonicalize(file_path)
+        report.source_file_path = dunce::canonicalize(&file.path)
             .map(|p| p.display().to_string())
             .ok()
-            .or_else(|| Some(file_path.display().to_string()));
-
-        // Apply --min-severity filter (same as single-file mode)
-        if let Some(threshold) = config.min_severity {
-            report.signals.retain(|s| s.risk_level() >= threshold);
-            report.summary.recalculate_from_signals(&report.signals);
+            .or_else(|| Some(file.name.clone()));
+        analysis_confidence = analysis_confidence.min(report.summary.analysis_confidence.clone());
+        if report.summary.render_completeness == analyzer::RenderCompleteness::NotRendered {
+            unrendered_files.push(file.name.clone());
         }
 
-        // Collect signals for combined batch report (no per-file reports in batch mode)
-        let key = sanitize_artifact_key(&file_path.display().to_string());
+        let key = artifact_keys.key(&file.name);
 
-        // Optional per-file policy decision + artifacts
-        let mut decision_opt: Option<serde_json::Value> = None;
+        // The policy decides on every finding and context entry of the file;
+        // --min-severity then filters what the batch shows and counts. A
+        // decision is shown beside the report it decided on.
+        let mut decided: Option<(serde_json::Value, serde_json::Value)> = None;
         if let Some(gate) = &gate {
             let outcome = gate.decide_in_batch(&BatchCase {
                 sql: &render.sql,
                 report: &report,
-                file_path,
+                file_path: Path::new(&file.name),
                 artifact_key: &key,
                 want_record: retain_files_json,
             });
             if !outcome.allowed {
                 files_blocked += 1;
             }
-            decision_opt = outcome.record;
+            decided = outcome
+                .record
+                .map(|decision| (serde_json::json!(&report), decision));
+        }
+        if let Some(threshold) = config.min_severity {
+            report.retain_at_least(threshold);
         }
 
-        let signal_count = report.signals.len();
-        total_signals += signal_count;
-        if signal_count > 0 {
-            files_with_signals += 1;
+        let finding_count = report.findings.len();
+        total_findings += finding_count;
+        info_count += report.context.len();
+        if finding_count > 0 {
+            files_with_findings += 1;
         }
 
         // Aggregate statement counts (must sum to ledger_entries)
         total_statements_analyzed += report.summary.statements_analyzed;
         total_statements_skipped += report.summary.statements_skipped;
+        unread_sqlcmd.extend(unread_sqlcmd_lines(Some(&file.name), &report));
         total_jinja_blocks += report.summary.jinja_blocks;
 
         // Aggregate placeholder counts from render stats (has source/kind breakdown)
@@ -1855,7 +3058,7 @@ pub(crate) fn handle_risk_batch(
             total_low_impact += render.placeholders.low_impact;
 
             impacted_files.push((
-                file_path.display().to_string(),
+                file.name.clone(),
                 render.placeholders.total,
                 render.placeholders.high_impact,
                 render.placeholders.low_impact,
@@ -1877,48 +3080,55 @@ pub(crate) fn handle_risk_batch(
             max_level = file_max;
         }
 
-        // Aggregate signals by level and collect for combined report
-        for signal in &report.signals {
-            match signal.risk_level() {
+        // Aggregate findings by level and collect for combined report
+        for finding in &report.findings {
+            match finding.risk_level() {
                 lexega_core::analyzer::RiskLevel::Critical => critical_count += 1,
                 lexega_core::analyzer::RiskLevel::High => high_count += 1,
                 lexega_core::analyzer::RiskLevel::Medium => medium_count += 1,
                 lexega_core::analyzer::RiskLevel::Low => low_count += 1,
-                lexega_core::analyzer::RiskLevel::Info => info_count += 1,
+                // Context entries are not findings; `report.context` counts them.
+                lexega_core::analyzer::RiskLevel::Info => {}
             }
 
-            // Track violated rules (only for Policy signals)
-            let lexega_core::analyzer::RuleMatch::Analysis(policy_signal) = signal;
+            // Track violated rules (only for Policy findings)
+            let lexega_core::analyzer::RuleMatch::Analysis(policy_finding) = finding;
             let entry = rule_counts
-                .entry(policy_signal.matched_rule.clone())
-                .or_insert_with(|| (policy_signal.signal_type.clone(), 0));
-            entry.1 += 1;
+                .entry(policy_finding.matched_rule.clone())
+                .or_insert_with(|| (policy_finding.finding_type.clone(), 0));
+            entry.1 += occurrences(policy_finding);
 
-            // Collect signal for the combined report, but only when a
+            // Collect finding for the combined report, but only when a
             // combined surface (SARIF / gl-sast) will read it.
-            if retain_all_signals {
-                all_signals.push(signal.clone());
+            if retain_all_findings {
+                all_findings.push(finding.clone());
             }
         }
 
         // Track risky files
-        if signal_count > 0 {
-            risky_files.push((file_path.display().to_string(), signal_count, file_max));
+        if finding_count > 0 {
+            risky_files.push((file.name.clone(), finding_count, file_max));
         }
 
         // Retain only what the selected outputs read from this file's
-        // report — pre-built JSON fragments and detail signals — never the
-        // report itself.
-        if config.detail_mode && !report.signals.is_empty() {
-            detail_signals.push((file_path.display().to_string(), report.signals.clone()));
+        // report — pre-built JSON fragments and per-file sections — never
+        // the report itself.
+        if retain_sections && (!report.findings.is_empty() || !report.context.is_empty()) {
+            file_sections.push(FileSection {
+                path: file.name.clone(),
+                findings: report.findings.clone(),
+                context: report.context.clone(),
+            });
         }
         if retain_files_json {
-            let mut result = serde_json::json!({"report": report});
-            if let Some(dec) = &decision_opt {
-                result["decision"] = serde_json::json!(dec);
-            }
+            let result = match decided {
+                Some((decided_report, decision)) => {
+                    serde_json::json!({"report": decided_report, "decision": decision})
+                }
+                None => serde_json::json!({"report": report}),
+            };
             files_json.push(serde_json::json!({
-                "file": file_path.display().to_string(),
+                "file": file.name.clone(),
                 "result": result,
             }));
         }
@@ -1926,7 +3136,7 @@ pub(crate) fn handle_risk_batch(
             // Each `per_file` entry of the batch artifact has the shape of
             // a single-file `--report-out <file>` report.
             per_file_json.push(serde_json::json!({
-                "source_file": report.source_file_path.clone().unwrap_or_else(|| file_path.display().to_string()),
+                "source_file": file.name.clone(),
                 "report": report,
             }));
         }
@@ -1935,32 +3145,30 @@ pub(crate) fn handle_risk_batch(
         if !config.quiet_mode
             && !policy_enabled
             && (config.output_format == "text" || config.output_format == "both")
-            && signal_count > 0
+            && finding_count > 0
         {
             eprintln!(
-                "  {} - {} signal(s), max: {}",
-                file_path.display(),
-                signal_count,
+                "  {} - {} finding(s), max: {}",
+                file.name,
+                finding_count,
                 file_max.as_str().to_uppercase()
             );
         }
     }
 
-    // Process embedded SQL fragments (from --scan-embedded).
-    //
-    // Each fragment may carry a `dialect_hint` (e.g. spark.sql in a
-    // Databricks notebook). When present, the hint overrides the user's
-    // `--dialect` for this fragment only. We snapshot the user-chosen
-    // dialect here and restore it per-iteration so a fragment-level hint
-    // can't leak into the *next* fragment's analysis.
-    let user_dialect = session.dialect();
+    // Process embedded SQL fragments (from --scan-embedded), each in the
+    // run's dialect, whatever call or cell it came from.
     for (frag_idx, fragment) in embedded_fragments.iter().enumerate() {
-        let display_name = format!(
+        // The report's evidence places the fragment by file and line; the
+        // batch names it by file, line and column, so two fragments on one
+        // line are two entries and two decision records.
+        let source_name = format!(
             "{}:{}",
             fragment.origin_file.display(),
-            fragment.origin_line
+            fragment.origin.line
         );
-        let batch_idx = files.len() + frag_idx;
+        let display_name = fragment_name(fragment);
+        let batch_idx = planned_count + frag_idx;
 
         if !config.quiet_mode {
             eprintln!(
@@ -1972,31 +3180,28 @@ pub(crate) fn handle_risk_batch(
             );
         }
 
-        // Resolve per-fragment dialect deterministically: hint wins if
-        // present and resolvable, otherwise fall back to the user-chosen
-        // dialect captured before the loop.
-        session.set_dialect(
-            fragment
-                .dialect_hint
-                .as_deref()
-                .and_then(resolve_dialect)
-                .or_else(|| user_dialect.clone()),
-        );
-
         // Analyze the extracted SQL fragment as-is: fragments are never
         // rendered, and must not inherit the previous file's render state.
         let fragment_render = RenderArtifacts::raw(fragment.sql.clone());
-        let mut report = match session.analyze(&fragment_render, Some(&display_name)) {
+        let mut report = match session.analyze(&fragment_render, Some(&source_name)) {
             Ok(r) => r,
             Err(e) => {
-                if !config.quiet_mode {
-                    eprintln!("  ✗ {} - {}", display_name, e);
+                if fail_unanalyzed(
+                    &mut skipped_files,
+                    &mut not_analyzed_files,
+                    config.strict,
+                    display_name,
+                    e,
+                    config.quiet_mode,
+                ) {
+                    strict_violations_found = true;
                 }
-                skipped_files.push((display_name, e.to_string()));
                 continue;
             }
         };
         config.run_identity.apply(&mut report);
+        files_analyzed += 1;
+        place_in_origin(&mut report, fragment);
         if analysis_depth.is_none() {
             analysis_depth = report.summary.analysis_depth.clone();
         }
@@ -2006,20 +3211,37 @@ pub(crate) fn handle_risk_batch(
             strict_violations_found = true;
         }
 
-        // Apply --min-severity filter (same as single-file mode)
+        // Each fragment is decided on its own, as a file is.
+        let mut decided: Option<(serde_json::Value, serde_json::Value)> = None;
+        if let Some(gate) = &gate {
+            let outcome = gate.decide_in_batch(&BatchCase {
+                sql: &fragment.sql,
+                report: &report,
+                file_path: &fragment.origin_file,
+                artifact_key: &artifact_keys.key(&display_name),
+                want_record: retain_files_json,
+            });
+            if !outcome.allowed {
+                files_blocked += 1;
+            }
+            decided = outcome
+                .record
+                .map(|decision| (serde_json::json!(&report), decision));
+        }
         if let Some(threshold) = config.min_severity {
-            report.signals.retain(|s| s.risk_level() >= threshold);
-            report.summary.recalculate_from_signals(&report.signals);
+            report.retain_at_least(threshold);
         }
 
-        let signal_count = report.signals.len();
-        total_signals += signal_count;
+        let finding_count = report.findings.len();
+        total_findings += finding_count;
+        info_count += report.context.len();
         total_statements_analyzed += report.summary.statements_analyzed;
         total_statements_skipped += report.summary.statements_skipped;
+        unread_sqlcmd.extend(unread_sqlcmd_lines(Some(&display_name), &report));
         total_jinja_blocks += report.summary.jinja_blocks;
 
-        if signal_count > 0 {
-            files_with_signals += 1;
+        if finding_count > 0 {
+            files_with_findings += 1;
         }
 
         let file_max = report.max_risk_level();
@@ -2027,39 +3249,50 @@ pub(crate) fn handle_risk_batch(
             max_level = file_max;
         }
 
-        // Aggregate signals by level
-        for signal in &report.signals {
-            match signal.risk_level() {
+        // Aggregate findings by level
+        for finding in &report.findings {
+            match finding.risk_level() {
                 lexega_core::analyzer::RiskLevel::Critical => critical_count += 1,
                 lexega_core::analyzer::RiskLevel::High => high_count += 1,
                 lexega_core::analyzer::RiskLevel::Medium => medium_count += 1,
                 lexega_core::analyzer::RiskLevel::Low => low_count += 1,
-                lexega_core::analyzer::RiskLevel::Info => info_count += 1,
+                // Context entries are not findings; `report.context` counts them.
+                lexega_core::analyzer::RiskLevel::Info => {}
             }
 
-            let lexega_core::analyzer::RuleMatch::Analysis(policy_signal) = signal;
+            let lexega_core::analyzer::RuleMatch::Analysis(policy_finding) = finding;
             let entry = rule_counts
-                .entry(policy_signal.matched_rule.clone())
-                .or_insert_with(|| (policy_signal.signal_type.clone(), 0));
-            entry.1 += 1;
+                .entry(policy_finding.matched_rule.clone())
+                .or_insert_with(|| (policy_finding.finding_type.clone(), 0));
+            entry.1 += occurrences(policy_finding);
 
-            if retain_all_signals {
-                all_signals.push(signal.clone());
+            if retain_all_findings {
+                all_findings.push(finding.clone());
             }
         }
 
-        if signal_count > 0 {
-            risky_files.push((display_name.clone(), signal_count, file_max));
+        if finding_count > 0 {
+            risky_files.push((display_name.clone(), finding_count, file_max));
         }
 
         // Same retention as the file loop above; fragments are marked
         // `embedded` in the json/yaml payload.
-        if config.detail_mode && !report.signals.is_empty() {
-            detail_signals.push((display_name.clone(), report.signals.clone()));
+        if retain_sections && (!report.findings.is_empty() || !report.context.is_empty()) {
+            file_sections.push(FileSection {
+                path: display_name.clone(),
+                findings: report.findings.clone(),
+                context: report.context.clone(),
+            });
         }
         if retain_files_json {
-            let mut result = serde_json::json!({"report": report});
-            result["embedded"] = serde_json::json!(true);
+            let (fragment_report, decision) = match decided {
+                Some((decided_report, decision)) => (decided_report, Some(decision)),
+                None => (serde_json::json!(report), None),
+            };
+            let mut result = serde_json::json!({"report": fragment_report, "embedded": true});
+            if let Some(decision) = decision {
+                result["decision"] = decision;
+            }
             files_json.push(serde_json::json!({
                 "file": display_name.clone(),
                 "result": result,
@@ -2075,12 +3308,12 @@ pub(crate) fn handle_risk_batch(
         if !config.quiet_mode
             && !policy_enabled
             && (config.output_format == "text" || config.output_format == "both")
-            && signal_count > 0
+            && finding_count > 0
         {
             eprintln!(
-                "  {} - {} signal(s), max: {}",
+                "  {} - {} finding(s), max: {}",
                 display_name,
-                signal_count,
+                finding_count,
                 file_max.as_str().to_uppercase()
             );
         }
@@ -2088,6 +3321,49 @@ pub(crate) fn handle_risk_batch(
 
     // How this run's depth is reported, when it ran at reduced depth.
     let depth_note = analysis_depth.as_ref().map(|depth| ext.depth_note(depth));
+    // What the run left undone that its findings do not show, so no report
+    // reads it as all clear.
+    let mut run_notes = run_notes(
+        ext,
+        session.as_ref(),
+        unrendered_files.len(),
+        render_failed_files.len(),
+        change.is_some() && !nothing_changed,
+    );
+    run_notes.extend(unread_sqlcmd_note(&unread_sqlcmd));
+
+    // A run whose SQL files are all macro files analyzed nothing: no report
+    // reads it at high confidence, and a strict mode fails it.
+    if files_analyzed == 0 && !macro_files.is_empty() {
+        analysis_confidence = analyzer::ConfidenceLevel::Low;
+        run_notes.push(analyzed_nothing_note(macro_files.len(), change.is_some()));
+        for (path, reason) in &macro_files {
+            let reason = format!("{}; the run analyzed no file", reason);
+            if strict_not_analyzed(config.strict, path, &reason) {
+                strict_violations_found = true;
+            }
+        }
+    }
+    // Each macro file is named in every report with why it was skipped and,
+    // in a change, the models the session reviewed in its place.
+    let reviewed_through: &[String] = if change.is_some() {
+        &added_analyzed
+    } else {
+        &[]
+    };
+    let macro_notes: Vec<(String, String)> = macro_files
+        .iter()
+        .map(|(path, reason)| (path.clone(), macro_file_note(reason, reviewed_through)))
+        .collect();
+    let note_of: std::collections::BTreeMap<&str, &str> = macro_notes
+        .iter()
+        .map(|(path, note)| (path.as_str(), note.as_str()))
+        .collect();
+    for (path, reason) in skipped_files.iter_mut() {
+        if let Some(note) = note_of.get(path.as_str()) {
+            *reason = (*note).to_string();
+        }
+    }
 
     // Sort risky files by severity (descending), then by count (descending)
     // This must happen before format-specific output so all formats see the same order
@@ -2099,7 +3375,7 @@ pub(crate) fn handle_risk_batch(
     let connected = session.connected_set();
     let cs_paths = |idxs: &[usize]| -> Vec<String> {
         idxs.iter()
-            .filter_map(|&i| ordered_files.get(i).map(|p| p.display().to_string()))
+            .filter_map(|&i| ordered_files.get(i).map(|file| file.name.clone()))
             .collect()
     };
     let cross_script_json: serde_json::Value = match connected {
@@ -2127,35 +3403,69 @@ pub(crate) fn handle_risk_batch(
         None => serde_json::Value::Null,
     };
 
-    // Print text summary to stderr (skip for json/yaml/markdown - they have structured output)
-    if !config.quiet_mode && (config.output_format == "text" || config.output_format == "both") {
-        eprintln!();
-        eprintln!("Batch Semantic Analysis Summary");
-        eprintln!("==================");
-        eprintln!("Files processed: {}/{}", total - skipped_files.len(), total);
-        eprintln!("Files skipped: {}", skipped_files.len());
+    // The text report: written to stdout after any JSON report, whatever
+    // -q says (it quiets progress only).
+    let mut text = String::new();
+    // Where each finding's evidence is listed, how many places: --detail
+    // lists more.
+    let evidence_shown = if config.detail_mode { 3 } else { 1 };
+    if !nothing_changed && (config.output_format == "text" || config.output_format == "both") {
+        outln!(text);
+        // A run at reduced depth is not titled for the analysis it lacks.
+        outln!(
+            text,
+            "{}",
+            if depth_note.is_some() {
+                "Batch Analysis Summary"
+            } else {
+                "Batch Semantic Analysis Summary"
+            }
+        );
+        outln!(text, "==================");
+        outln!(
+            text,
+            "Files processed: {}/{}",
+            total - skipped_files.len(),
+            total
+        );
+        outln!(text, "Files skipped: {}", skipped_files.len());
         if !skipped_files.is_empty() {
-            eprintln!("\nSkipped files:");
-            for (path, reason) in &skipped_files {
-                eprintln!("  - {}: {}", path, reason);
+            outln!(text, "\nSkipped files:");
+            // A reason several files share is said once; --detail lists each.
+            for (reason, paths) in skips_by_reason(&skipped_files) {
+                match paths.as_slice() {
+                    [path] => outln!(text, "  - {}: {}", path, reason),
+                    several if config.detail_mode => {
+                        for path in several {
+                            outln!(text, "  - {}: {}", path, reason);
+                        }
+                    }
+                    several => outln!(text, "  - {} files: {}", several.len(), reason),
+                }
             }
         }
-        eprintln!();
+        outln!(text);
         if let Some(set) = connected {
-            eprintln!(
+            outln!(
+                text,
                 "Cross-script: {} scripts analyzed as a connected set (producer-first)",
                 set.order.len()
             );
             if set.hazards.is_empty() {
-                eprintln!("  no ordering hazards");
+                outln!(text, "  no ordering hazards");
             } else {
                 for h in &set.hazards {
                     match h {
                         OrderingHazard::CircularDependency { files } => {
-                            eprintln!("  ⚠ circular dependency: {}", cs_paths(files).join(", "))
+                            outln!(
+                                text,
+                                "  ⚠ circular dependency: {}",
+                                cs_paths(files).join(", ")
+                            )
                         }
                         OrderingHazard::MultipleWriters { object, files } => {
-                            eprintln!(
+                            outln!(
+                                text,
                                 "  ⚠ '{}' written by multiple files: {}",
                                 object,
                                 cs_paths(files).join(", ")
@@ -2164,30 +3474,52 @@ pub(crate) fn handle_risk_batch(
                     }
                 }
             }
-            eprintln!();
+            outln!(text);
         }
         // Simple, trust-building output
-        eprintln!("Analyzed: {} SQL statements", total_statements_analyzed);
+        outln!(
+            text,
+            "Analyzed: {} SQL statements",
+            total_statements_analyzed
+        );
         if total_jinja_blocks > 0 {
-            eprintln!("Jinja Blocks: {}", total_jinja_blocks);
+            outln!(
+                text,
+                "Template blocks, not SQL statements: {}",
+                total_jinja_blocks
+            );
+        }
+        if let Some(line) = not_rendered_line(unrendered_files.len(), render_failed_files.len()) {
+            outln!(text, "Templates not rendered: {}", line);
         }
         // Placeholder/taint tracking - show when templates had runtime-dependent values
         if config.render_diagnostics != RenderDiagnosticsLevel::None && total_placeholders > 0 {
-            eprintln!(
+            outln!(
+                text,
                 "Placeholders: {} ({} files) - runtime-dependent values",
-                total_placeholders, files_with_placeholders
+                total_placeholders,
+                files_with_placeholders
             );
-            eprintln!(
+            outln!(
+                text,
                 "  High-impact: {}, Low-impact: {}",
-                total_high_impact, total_low_impact
+                total_high_impact,
+                total_low_impact
             );
 
             if config.render_diagnostics >= RenderDiagnosticsLevel::Impacted {
                 let mut files_sorted = impacted_files.clone();
                 files_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                eprintln!("  Top impacted files:");
+                outln!(text, "  Top impacted files:");
                 for (path, total, high, low) in files_sorted.into_iter().take(10) {
-                    eprintln!("    - {}: {} (high {}, low {})", path, total, high, low);
+                    outln!(
+                        text,
+                        "    - {}: {} (high {}, low {})",
+                        path,
+                        total,
+                        high,
+                        low
+                    );
                 }
             }
 
@@ -2195,63 +3527,89 @@ pub(crate) fn handle_risk_batch(
                 let mut sources: Vec<_> = placeholder_source_counts.iter().collect();
                 sources.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
                 if !sources.is_empty() {
-                    eprintln!("  Top placeholder sources:");
+                    outln!(text, "  Top placeholder sources:");
                     for (source, count) in sources.into_iter().take(5) {
-                        eprintln!("    - {} ({})", source, count);
+                        outln!(text, "    - {} ({})", source, count);
                     }
                 }
 
                 let mut kinds: Vec<_> = placeholder_kind_counts.iter().collect();
                 kinds.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
                 if !kinds.is_empty() {
-                    eprintln!("  Top placeholder kinds:");
+                    outln!(text, "  Top placeholder kinds:");
                     for (kind, count) in kinds.into_iter().take(5) {
-                        eprintln!("    - {} ({})", kind, count);
+                        outln!(text, "    - {} ({})", kind, count);
                     }
                 }
             }
 
             if config.render_diagnostics >= RenderDiagnosticsLevel::Summary {
-                eprintln!("  Note: To reduce placeholders, provide --catalog, --dbt-project, or --var settings.");
+                outln!(text, "  Note: To reduce placeholders, provide --catalog, --dbt-project, or --var settings.");
             }
         }
         // Only show unrecognized if there are any — statements the parser
-        // could not recognize (opaque / error / stray clause), not analyzed.
-        if total_statements_skipped > 0 {
-            eprintln!(
+        // could not recognize (opaque / error / stray clause), not analyzed;
+        // the sqlcmd commands that run what was not read apart.
+        let unrecognized = total_statements_skipped.saturating_sub(unread_sqlcmd.len());
+        if unrecognized > 0 {
+            outln!(
+                text,
                 "Unrecognized: {} (could not parse, no analysis)",
-                total_statements_skipped
+                unrecognized
+            );
+        }
+        if !unread_sqlcmd.is_empty() {
+            outln!(
+                text,
+                "Not read: {} (sqlcmd commands that run SQL or commands the analysis did not read)",
+                unread_sqlcmd.len()
             );
         }
         if let Some(note) = &depth_note {
-            eprintln!("Note: {}", note);
+            outln!(text, "Note: {}", note);
         }
-        eprintln!("Files with signals: {}", files_with_signals);
-        eprintln!("Total signals: {}", total_signals);
-        if total_signals > 0 {
-            eprintln!(
+        for note in &run_notes {
+            outln!(text, "Note: {}", note);
+        }
+        outln!(text, "Files with findings: {}", files_with_findings);
+        outln!(text, "Total findings: {}", total_findings);
+        if info_count > 0 {
+            outln!(text, "Context: {}", info_count);
+        }
+        if total_findings > 0 {
+            outln!(
+                text,
                 "  By level: {} CRITICAL, {} HIGH, {} MEDIUM, {} LOW",
-                critical_count, high_count, medium_count, low_count
+                critical_count,
+                high_count,
+                medium_count,
+                low_count
             );
         }
-        if files_with_signals > 0 {
-            eprintln!(
-                "Average signals per file: {:.1}",
-                total_signals as f64 / files_with_signals as f64
+        if files_with_findings > 0 {
+            outln!(
+                text,
+                "Average findings per file: {:.1}",
+                total_findings as f64 / files_with_findings as f64
             );
         }
-        eprintln!("Highest risk level: {}", max_level.as_str().to_uppercase());
+        outln!(
+            text,
+            "Highest risk level: {}",
+            highest_risk(total_findings, max_level, &run_notes)
+        );
         if policy_enabled {
-            eprintln!("Files blocked by policy: {}", files_blocked);
+            outln!(text, "Files blocked by policy: {}", files_blocked);
         }
 
         // Top 5 risky files (already sorted above)
         if !risky_files.is_empty() {
-            eprintln!();
-            eprintln!("Top risky files:");
+            outln!(text);
+            outln!(text, "Top risky files:");
             for (path, count, level) in risky_files.iter().take(5) {
-                eprintln!(
-                    "  {} - {} signal(s), max {}",
+                outln!(
+                    text,
+                    "  {} - {} finding(s), max {}",
                     path,
                     count,
                     level.as_str().to_uppercase()
@@ -2263,66 +3621,42 @@ pub(crate) fn handle_risk_batch(
         if !rule_counts.is_empty() {
             let mut rules: Vec<_> = rule_counts.iter().collect();
             rules.sort_by(|a, b| (b.1).1.cmp(&(a.1).1).then_with(|| a.0.cmp(b.0)));
-            eprintln!();
-            eprintln!("Top Matched Rules:");
+            outln!(text);
+            outln!(text, "Top Matched Rules:");
             for (rule, (_, count)) in rules.iter().take(5) {
-                eprintln!("  {} - {} occurrence(s)", rule, count);
+                outln!(text, "  {} - {} occurrence(s)", rule, count);
             }
         }
 
-        // Per-file signal details (--detail flag). `detail_signals` holds
-        // only files with signals, so it is non-empty exactly when some
-        // file has one.
-        if config.detail_mode && !detail_signals.is_empty() {
-            eprintln!();
-            eprintln!("Per-File Signal Details");
-            eprintln!("══════════════════════════════════════════════════════════════");
-            for (path, signals) in &detail_signals {
-                eprintln!();
-                eprintln!(
-                    "── {} ({} signal{})",
-                    path,
-                    signals.len(),
-                    if signals.len() == 1 { "" } else { "s" }
+        // Each file's findings and context entries.
+        if !file_sections.is_empty() {
+            let plain = super::color::Palette::resolve(super::color::ColorChoice::Never);
+            outln!(text);
+            outln!(text, "{}", sections_title(&file_sections));
+            outln!(
+                text,
+                "══════════════════════════════════════════════════════════════"
+            );
+            for section in &file_sections {
+                outln!(text);
+                let findings = section.findings.len();
+                let context = if section.context.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} context", section.context.len())
+                };
+                outln!(
+                    text,
+                    "── {} ({} finding{}{})",
+                    section.path,
+                    findings,
+                    if findings == 1 { "" } else { "s" },
+                    context
                 );
-                for signal in signals {
-                    let level = signal.risk_level();
-                    eprintln!("  [{}] {}", level.as_str().to_uppercase(), signal.message());
-                    let evidence = signal.evidence();
-                    if !evidence.is_empty() {
-                        for ev in evidence.iter().take(3) {
-                            if let lexega_core::analyzer::RiskEvidence::RuleMatch {
-                                line_number,
-                                statement_preview,
-                                signal_value,
-                                location,
-                                ..
-                            } = ev
-                            {
-                                let mut parts = Vec::new();
-                                if let Some(line) = line_number {
-                                    parts.push(format!("Line {}", line));
-                                }
-                                if !signal_value.is_empty() {
-                                    parts.push(format!("`{}`", signal_value));
-                                }
-                                if let Some(preview) = statement_preview {
-                                    if !preview.is_empty() {
-                                        parts.push(format!("\"{}\"", preview));
-                                    }
-                                }
-                                if let Some(loc) = location {
-                                    parts.push(loc.clone());
-                                }
-                                if !parts.is_empty() {
-                                    eprintln!("    ↳ {}", parts.join(" • "));
-                                }
-                            }
-                        }
-                        if evidence.len() > 3 {
-                            eprintln!("    ↳ (+{} more occurrences)", evidence.len() - 3);
-                        }
-                    }
+                write_text_entries(&mut text, &section.findings, evidence_shown, &plain);
+                if !section.context.is_empty() {
+                    outln!(text, "  Context:");
+                    write_text_entries(&mut text, &section.context, evidence_shown, &plain);
                 }
             }
         }
@@ -2353,15 +3687,6 @@ pub(crate) fn handle_risk_batch(
             .take(5)
             .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))
             .collect()
-    };
-
-    // Determine render completeness
-    let render_completeness = if total_placeholders == 0 {
-        "full"
-    } else if total_high_impact == 0 {
-        "partial_low_impact_only"
-    } else {
-        "partial"
     };
 
     // Guidance message (only when placeholders present and verbosity wants it)
@@ -2421,7 +3746,7 @@ pub(crate) fn handle_risk_batch(
         .map(|(path, count, level)| {
             serde_json::json!({
                 "path": path,
-                "signal_count": count,
+                "finding_count": count,
                 "max_risk_level": level.as_str()
             })
         })
@@ -2431,7 +3756,7 @@ pub(crate) fn handle_risk_batch(
         "files_total": total,
         "files_processed": total - skipped_files.len(),
         "files_skipped": skipped_files.len(),
-        "files_with_signals": files_with_signals,
+        "files_with_findings": files_with_findings,
 
         // === STATEMENT LEDGER (accounting invariant: ledger = sql + jinja) ===
         "statements": {
@@ -2442,21 +3767,24 @@ pub(crate) fn handle_risk_batch(
             "jinja_blocks": total_jinja_blocks,
         },
 
-        // === signals ===
-        "signals": {
-            "total_reported": total_signals,
+        // === findings ===
+        "findings": {
+            "total_reported": total_findings,
             "by_level": {
                 "critical": critical_count,
                 "high": high_count,
                 "medium": medium_count,
                 "low": low_count
             },
-            "max_level": max_level.as_str(),
+            // None where nothing was found.
+            "max_level": (total_findings > 0).then(|| max_level.as_str()),
         },
 
         // === RENDERING (placeholder taint tracking) ===
         "rendering": {
             "completeness": render_completeness,
+            "files_not_rendered": unrendered_files.len() + render_failed_files.len(),
+            "files_render_failed": render_failed_files.len(),
             "placeholders_total": total_placeholders,
             "placeholders_high_impact": total_high_impact,
             "placeholders_low_impact": total_low_impact,
@@ -2473,9 +3801,16 @@ pub(crate) fn handle_risk_batch(
 
         // === CROSS-SCRIPT (null unless a non-dbt directory was analyzed as a set) ===
         "cross_script": cross_script_json.clone(),
+
+        // === WHAT THE RUN LEFT UNDONE (unrendered templates, a change not compared) ===
+        "notes": run_notes.clone(),
     });
     if let Some(depth) = &analysis_depth {
         batch_summary["analysis_depth"] = serde_json::json!(depth);
+    }
+    // The decision a review that analyzed no file made for its range.
+    if let Some(record) = range_decision.and_then(|outcome| outcome.record) {
+        batch_summary["range_decision"] = record;
     }
     // Write combined batch report if report_out is provided (like init/review commands)
     if config.report_out.is_some() {
@@ -2505,32 +3840,9 @@ pub(crate) fn handle_risk_batch(
             }
         };
 
-        // Determine if output is a file or directory, and derive format from extension
-        use super::artifacts::OutputFileFormat;
-        let file_format = OutputFileFormat::from_path(risk_out);
-        let is_file_output = file_format.is_some();
-
-        // For directory output, ensure it exists
-        if !is_file_output {
-            if let Err(e) = fs::create_dir_all(risk_out) {
-                eprintln!("Error creating risk output directory '{}': {}", risk_out, e);
-                process::exit(1);
-            }
-        } else {
-            // For file output, ensure parent directory exists
-            if let Some(parent) = Path::new(risk_out).parent() {
-                if !parent.as_os_str().is_empty() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        eprintln!("Error creating parent directory for '{}': {}", risk_out, e);
-                        process::exit(1);
-                    }
-                }
-            }
-        }
-
         // Build combined AnalysisReport for format conversion (like init command)
         let mut combined_report = lexega_core::analyzer::AnalysisReport::new();
-        combined_report.summary.total_reported_signals = total_signals;
+        combined_report.summary.total_reported_findings = total_findings;
         combined_report.summary.critical_count = critical_count;
         combined_report.summary.high_count = high_count;
         combined_report.summary.medium_count = medium_count;
@@ -2540,19 +3852,17 @@ pub(crate) fn handle_risk_batch(
         combined_report.summary.statements_skipped = total_statements_skipped;
         combined_report.summary.jinja_blocks = total_jinja_blocks;
         combined_report.summary.analysis_depth = analysis_depth.clone();
-        // Only the gl-sast stdout block can still read all_signals after
-        // this point (sarif-stdout is gated on report_out being unset), so
-        // move unless that surface is active.
-        combined_report.signals = if config.output_format == "gl-sast" {
-            all_signals.clone()
+        combined_report.summary.render_completeness = render_completeness.clone();
+        combined_report.summary.analysis_confidence = analysis_confidence.clone();
+        // Only the SARIF and gl-sast stdout blocks can still read
+        // all_findings after this point, so move unless one is active.
+        combined_report.findings = if matches!(config.output_format, "sarif" | "gl-sast") {
+            all_findings.clone()
         } else {
-            std::mem::take(&mut all_signals)
+            std::mem::take(&mut all_findings)
         };
 
-        // Effective report format resolved before the batch loop
-        // (`report_out_format`); Some by construction here since
-        // `config.report_out` is Some.
-        let effective_format = report_out_format.unwrap_or(config.report_artifact_format);
+        let effective_format = config.report_artifact_format;
         let git_root = super::git::get_git_repo_root()
             .and_then(|p| p.to_str().map(String::from))
             .or_else(|| {
@@ -2566,18 +3876,25 @@ pub(crate) fn handle_risk_batch(
             &summary_data,
             risk_out,
             "batch_summary",
-            &tool_run(ext, git_root.as_deref(), depth_note.as_deref()),
+            &ToolRun {
+                unrendered_files: &unrendered_files,
+                skipped_files: &not_analyzed_files,
+                macro_files: &macro_notes,
+                run_notes: &run_notes,
+                ..tool_run(ext, git_root.as_deref(), depth_note.as_deref())
+            },
         );
         eprintln!("\n✓ Batch summary written to {}", written);
     }
 
-    // Batch SARIF / GitLab SAST to stdout. Mirrors single-file behavior —
-    // without this, `-r --format sarif` with no --report-out printed nothing
-    // and exited 0, leaving a silently empty redirect target.
-    if config.output_format == "sarif" && config.report_out.is_none() {
+    // Batch SARIF / GitLab SAST to stdout, as a single file's: SARIF is on
+    // standard output unless `--report-out` delivers it.
+    if config.output_format == "sarif" && artifact_format != Some(ReportArtifactFormat::Sarif) {
         let mut combined_report = lexega_core::analyzer::AnalysisReport::new();
-        // Last reader of all_signals on this path — move, don't clone.
-        combined_report.signals = std::mem::take(&mut all_signals);
+        // Last reader of all_findings on this path — move, don't clone.
+        combined_report.findings = std::mem::take(&mut all_findings);
+        combined_report.summary.render_completeness = render_completeness.clone();
+        combined_report.summary.analysis_confidence = analysis_confidence.clone();
         let git_root = super::git::get_git_repo_root()
             .and_then(|p| p.to_str().map(String::from))
             .or_else(|| {
@@ -2587,7 +3904,13 @@ pub(crate) fn handle_risk_batch(
             });
         let sarif_report = lexega_core::analyzer::to_sarif(
             &combined_report,
-            &tool_run(ext, git_root.as_deref(), depth_note.as_deref()),
+            &ToolRun {
+                unrendered_files: &unrendered_files,
+                skipped_files: &not_analyzed_files,
+                macro_files: &macro_notes,
+                run_notes: &run_notes,
+                ..tool_run(ext, git_root.as_deref(), depth_note.as_deref())
+            },
         );
         match serde_json::to_string_pretty(&sarif_report) {
             Ok(json) => println!("{}", json),
@@ -2600,11 +3923,19 @@ pub(crate) fn handle_risk_batch(
 
     if config.output_format == "gl-sast" {
         let mut combined_report = lexega_core::analyzer::AnalysisReport::new();
-        // Last reader of all_signals on this path — move, don't clone.
-        combined_report.signals = std::mem::take(&mut all_signals);
+        // Last reader of all_findings on this path — move, don't clone.
+        combined_report.findings = std::mem::take(&mut all_findings);
+        combined_report.summary.render_completeness = render_completeness.clone();
+        combined_report.summary.analysis_confidence = analysis_confidence.clone();
         let gl_report = lexega_core::analyzer::to_gl_sast(
             &combined_report,
-            &tool_run(ext, None, depth_note.as_deref()),
+            &ToolRun {
+                unrendered_files: &unrendered_files,
+                skipped_files: &not_analyzed_files,
+                macro_files: &macro_notes,
+                run_notes: &run_notes,
+                ..tool_run(ext, None, depth_note.as_deref())
+            },
         );
         match serde_json::to_string_pretty(&gl_report) {
             Ok(json) => println!("{}", json),
@@ -2617,16 +3948,24 @@ pub(crate) fn handle_risk_batch(
 
     // Markdown batch summary, built for whichever surface reads it: the
     // `markdown` output format and the pull-request comment.
-    let markdown: Option<String> = if config.output_format == "markdown" || config.capture_markdown
+    let markdown: Option<String> = if !nothing_changed
+        && (config.output_format == "markdown" || config.capture_markdown)
     {
         let mut md = String::new();
-        // Markdown batch summary for PR comments
-        let risk_emoji = if critical_count > 0 {
+        // Markdown batch summary for PR comments. A run the policy blocked is
+        // headed as blocked, whatever the levels shown.
+        let policy_blocked = policy_enabled && (files_blocked > 0 || range_blocked);
+        let risk_emoji = if policy_blocked {
+            "⛔"
+        } else if critical_count > 0 {
             "🔴"
         } else if high_count > 0 {
             "🟠"
         } else if medium_count > 0 {
             "🟡"
+        } else if !run_notes.is_empty() {
+            // Not all clear: the notes say what was not checked.
+            "⚠️"
         } else {
             "🟢"
         };
@@ -2635,12 +3974,16 @@ pub(crate) fn handle_risk_batch(
         outln!(md);
         outln!(
             md,
-            "**{} files analyzed** | **{} with signals** | **{} total signals**",
+            "**{} files analyzed** | **{} with findings** | **{} total findings**",
             total - skipped_files.len(),
-            files_with_signals,
-            total_signals
+            files_with_findings,
+            total_findings
         );
         outln!(md);
+        if policy_enabled {
+            outln!(md, "**Files blocked by policy: {}**", files_blocked);
+            outln!(md);
+        }
         if !skipped_files.is_empty() {
             outln!(
                 md,
@@ -2653,9 +3996,13 @@ pub(crate) fn handle_risk_batch(
             outln!(md, "**Note**: {}", note);
             outln!(md);
         }
+        for note in &run_notes {
+            outln!(md, "**Note**: {}", note);
+            outln!(md);
+        }
 
-        // Signal summary
-        if total_signals > 0 {
+        // Finding summary
+        if total_findings > 0 || info_count > 0 {
             outln!(md, "| Level | Count |");
             outln!(md, "|-------|-------|");
             if critical_count > 0 {
@@ -2671,7 +4018,7 @@ pub(crate) fn handle_risk_batch(
                 outln!(md, "| 🟢 Low | {} |", low_count);
             }
             if info_count > 0 {
-                outln!(md, "| ℹ️ Info | {} |", info_count);
+                outln!(md, "| ℹ️ Context | {} |", info_count);
             }
             outln!(md);
         }
@@ -2680,24 +4027,14 @@ pub(crate) fn handle_risk_batch(
         if !risky_files.is_empty() {
             outln!(md, "### Top Risky Files");
             outln!(md);
-            outln!(md, "| File | Signals | Max Level |");
+            outln!(md, "| File | Findings | Max Level |");
             outln!(md, "|------|---------|-----------|");
             for (path, count, level) in risky_files.iter().take(10) {
-                let file_name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path);
-                let level_icon = match level {
-                    lexega_core::analyzer::RiskLevel::Critical => "🔴",
-                    lexega_core::analyzer::RiskLevel::High => "🟠",
-                    lexega_core::analyzer::RiskLevel::Medium => "🟡",
-                    lexega_core::analyzer::RiskLevel::Low => "🟢",
-                    lexega_core::analyzer::RiskLevel::Info => "ℹ️",
-                };
+                let level_icon = risk_icon(*level);
                 outln!(
                     md,
                     "| `{}` | {} | {} {} |",
-                    file_name,
+                    path,
                     count,
                     level_icon,
                     level.as_str()
@@ -2734,13 +4071,24 @@ pub(crate) fn handle_risk_batch(
         );
         outln!(md, "| SQL Statements | {} |", total_statements_analyzed);
         if total_jinja_blocks > 0 {
-            outln!(md, "| Jinja Blocks | {} |", total_jinja_blocks);
-        }
-        if total_statements_skipped > 0 {
             outln!(
                 md,
-                "| Unrecognized (opaque) | {} |",
-                total_statements_skipped
+                "| Template blocks, not SQL statements | {} |",
+                total_jinja_blocks
+            );
+        }
+        if let Some(line) = not_rendered_line(unrendered_files.len(), render_failed_files.len()) {
+            outln!(md, "| Templates not rendered | {} |", line);
+        }
+        let unrecognized = total_statements_skipped.saturating_sub(unread_sqlcmd.len());
+        if unrecognized > 0 {
+            outln!(md, "| Unrecognized (opaque) | {} |", unrecognized);
+        }
+        if !unread_sqlcmd.is_empty() {
+            outln!(
+                md,
+                "| Not read (sqlcmd commands) | {} |",
+                unread_sqlcmd.len()
             );
         }
         if total_placeholders > 0 {
@@ -2753,14 +4101,41 @@ pub(crate) fn handle_risk_batch(
         }
         outln!(md);
 
+        // --render-diagnostics, at the levels the text summary prints.
+        if config.render_diagnostics >= RenderDiagnosticsLevel::Impacted && total_placeholders > 0 {
+            let mut files_sorted = impacted_files.clone();
+            files_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            outln!(md, "**Top impacted files:**");
+            for (path, total, high, low) in files_sorted.into_iter().take(10) {
+                outln!(md, "- `{}`: {} (high {}, low {})", path, total, high, low);
+            }
+            outln!(md);
+        }
+        if config.render_diagnostics >= RenderDiagnosticsLevel::All && total_placeholders > 0 {
+            for (title, counts) in [
+                ("Top placeholder sources", &placeholder_source_counts),
+                ("Top placeholder kinds", &placeholder_kind_counts),
+            ] {
+                let mut sorted: Vec<_> = counts.iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+                if !sorted.is_empty() {
+                    outln!(md, "**{}:**", title);
+                    for (name, count) in sorted.into_iter().take(5) {
+                        outln!(md, "- {} ({})", name, count);
+                    }
+                    outln!(md);
+                }
+            }
+        }
+        if let Some(guidance) = placeholder_guidance {
+            outln!(md, "_{}_", guidance);
+            outln!(md);
+        }
+
         if !skipped_files.is_empty() {
             outln!(md, "**Skipped Files ({}):**", skipped_files.len());
             for (path, reason) in skipped_files.iter().take(5) {
-                let file_name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path);
-                outln!(md, "- `{}`: {}", file_name, reason);
+                outln!(md, "- `{}`: {}", path, reason);
             }
             if skipped_files.len() > 5 {
                 outln!(md, "- *...and {} more*", skipped_files.len() - 5);
@@ -2770,71 +4145,22 @@ pub(crate) fn handle_risk_batch(
 
         outln!(md, "</details>");
 
-        // Per-file signal details (--detail flag)
-        if config.detail_mode && !detail_signals.is_empty() {
+        // Each file's findings and context entries; --detail lists more of
+        // each one's evidence.
+        if !file_sections.is_empty() {
             outln!(md);
-            outln!(md, "### Per-File Signal Details");
+            outln!(md, "### {}", sections_title(&file_sections));
             outln!(md);
-            for (path, signals) in &detail_signals {
-                let file_name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path);
-                outln!(md, "#### `{}`", file_name);
+            let evidence_listed = if config.detail_mode { 2 } else { 1 };
+            for section in &file_sections {
+                outln!(md, "#### `{}`", section.path);
                 outln!(md);
-                outln!(md, "| Level | Signal | Evidence |");
-                outln!(md, "|-------|--------|----------|");
-                for signal in signals {
-                    let level = signal.risk_level();
-                    let level_icon = match level {
-                        lexega_core::analyzer::RiskLevel::Critical => "🔴",
-                        lexega_core::analyzer::RiskLevel::High => "🟠",
-                        lexega_core::analyzer::RiskLevel::Medium => "🟡",
-                        lexega_core::analyzer::RiskLevel::Low => "🟢",
-                        lexega_core::analyzer::RiskLevel::Info => "ℹ️",
-                    };
-                    // Build evidence summary
-                    let evidence = signal.evidence();
-                    let ev_summary = if !evidence.is_empty() {
-                        let mut parts = Vec::new();
-                        for ev in evidence.iter().take(2) {
-                            if let lexega_core::analyzer::RiskEvidence::RuleMatch {
-                                line_number,
-                                signal_value,
-                                ..
-                            } = ev
-                            {
-                                let mut p = Vec::new();
-                                if let Some(line) = line_number {
-                                    p.push(format!("Line {}", line));
-                                }
-                                if !signal_value.is_empty() {
-                                    p.push(format!("`{}`", signal_value));
-                                }
-                                if !p.is_empty() {
-                                    parts.push(p.join(": "));
-                                }
-                            }
-                        }
-                        if evidence.len() > 2 {
-                            parts.push(format!("+{} more", evidence.len() - 2));
-                        }
-                        parts.join("; ")
-                    } else {
-                        String::new()
-                    };
-                    // Escape pipes in message for markdown table
-                    let msg = signal.message().replace('|', "\\|");
-                    outln!(
-                        md,
-                        "| {} {} | {} | {} |",
-                        level_icon,
-                        level.as_str(),
-                        msg,
-                        ev_summary
-                    );
+                write_markdown_entries(&mut md, "Finding", &section.findings, evidence_listed);
+                if !section.context.is_empty() {
+                    outln!(md, "**ℹ️ Context ({})**", section.context.len());
+                    outln!(md);
+                    write_markdown_entries(&mut md, "Context", &section.context, evidence_listed);
                 }
-                outln!(md);
             }
         }
         Some(md)
@@ -2878,12 +4204,19 @@ pub(crate) fn handle_risk_batch(
             print!("{}", md);
         }
     }
+    if !text.is_empty() {
+        if config.output_format == "both" {
+            println!("\n---\n");
+        }
+        print!("{}", text);
+    }
 
-    let exit_code = if policy_enabled && files_blocked > 0 {
+    let exit_code = if policy_enabled && (files_blocked > 0 || range_blocked) {
         2
-    } else if strict_violations_found {
+    } else if strict_violations_found || named_files_unread {
         // Strict mode is independent of policy: any file that violated
-        // strict analysis fails the batch.
+        // strict analysis fails the batch, and so does a file named on the
+        // command line that could not be read.
         1
     } else {
         0

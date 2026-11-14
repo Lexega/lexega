@@ -62,6 +62,7 @@ use crate::cst::TokenId;
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterStreamAction, SyntaxAlterStreamStmt, SyntaxCreateStream, SyntaxDropStream,
 };
@@ -685,6 +686,7 @@ fn parse_stream_source_type(p: &mut Parser<'_>) -> ParseResult<(StreamSourceType
 
 /// Consume balanced parentheses, returning the end position (after closing paren)
 fn parse_balanced_parens(p: &mut Parser<'_>) -> ParseResult<u32> {
+    let from = p.idx;
     let mut depth = 1;
     let mut end = p.current_span().end;
 
@@ -714,6 +716,8 @@ fn parse_balanced_parens(p: &mut Parser<'_>) -> ParseResult<u32> {
         }
     }
 
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    p.record_unparsed_secrets(from, p.idx);
     Ok(end)
 }
 
@@ -996,31 +1000,11 @@ fn parse_alter_stream_action(p: &mut Parser<'_>) -> ParseResult<AstAlterStreamAc
                     .expect_invariant("TAG keyword consumed after peek in SET");
                 let tag_span = tag_tok.span;
 
-                // Parse tag assignments until end of statement
-                let assignments_start = p.current_span().start;
-                let mut assignments_end = assignments_start;
-
-                while let Some(peek) = p.peek_non_trivia() {
-                    if matches!(peek.kind, TokenKind::Punctuation(Punctuation::Semi))
-                        || matches!(peek.kind, TokenKind::Eof)
-                    {
-                        break;
-                    }
-                    // Consume token
-                    let t = p
-                        .advance()
-                        .expect_invariant("tag assignment token consumed after peek");
-                    assignments_end = t.span.end;
-                }
-
-                let assignments_span = Span {
-                    start: assignments_start,
-                    end: assignments_end,
-                };
+                let (assignments_span, tags) = p.parse_tag_list(TagListShape::Assignments)?;
 
                 let action_span = Span {
                     start: set_span.start,
-                    end: assignments_end,
+                    end: assignments_span.end,
                 };
 
                 return Ok(AstAlterStreamAction {
@@ -1029,6 +1013,7 @@ fn parse_alter_stream_action(p: &mut Parser<'_>) -> ParseResult<AstAlterStreamAc
                         set_span,
                         tag_span,
                         assignments_span,
+                        tags,
                     },
                 });
             }
@@ -1074,31 +1059,11 @@ fn parse_alter_stream_action(p: &mut Parser<'_>) -> ParseResult<AstAlterStreamAc
                     .expect_invariant("TAG keyword consumed after peek in UNSET");
                 let tag_span = tag_tok.span;
 
-                // Parse tag names until end of statement
-                let tags_start = p.current_span().start;
-                let mut tags_end = tags_start;
-
-                while let Some(peek) = p.peek_non_trivia() {
-                    if matches!(peek.kind, TokenKind::Punctuation(Punctuation::Semi))
-                        || matches!(peek.kind, TokenKind::Eof)
-                    {
-                        break;
-                    }
-                    // Consume token
-                    let t = p
-                        .advance()
-                        .expect_invariant("tag name token consumed after peek");
-                    tags_end = t.span.end;
-                }
-
-                let tags_span = Span {
-                    start: tags_start,
-                    end: tags_end,
-                };
+                let (tags_span, tags) = p.parse_tag_list(TagListShape::Names)?;
 
                 let action_span = Span {
                     start: unset_span.start,
-                    end: tags_end,
+                    end: tags_span.end,
                 };
 
                 return Ok(AstAlterStreamAction {
@@ -1107,6 +1072,7 @@ fn parse_alter_stream_action(p: &mut Parser<'_>) -> ParseResult<AstAlterStreamAc
                         unset_span,
                         tag_span,
                         tags_span,
+                        tags,
                     },
                 });
             }

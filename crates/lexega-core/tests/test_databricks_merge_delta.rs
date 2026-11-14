@@ -37,7 +37,7 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
 }
 
 fn has_analysis_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(
+    report.findings.iter().any(
         |s| matches!(s, lexega_core::analyzer::RuleMatch::Analysis(g) if g.matched_rule == rule_id),
     )
 }

@@ -27,9 +27,10 @@ use lexega_syntax::{format_sql_with_config, parse_sql_with_dialect, FormatterCon
 // ============================================================================
 
 fn mssql_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = mssql();
-    config
+    FormatterConfig {
+        dialect: mssql(),
+        ..Default::default()
+    }
 }
 
 fn format_and_verify(sql: &str) {
@@ -437,4 +438,50 @@ fn test_comparison_expression_while() {
     // Boolean-style condition
     let sql = "WHILE 1 = 1\n    SELECT 1;";
     format_and_verify(sql);
+}
+
+#[test]
+fn an_if_and_a_while_hold_their_condition_as_an_expression() {
+    use lexega_syntax::ast::AstExpr;
+    let text =
+        |sql: &str, e: &AstExpr| sql[e.span().start as usize..e.span().end as usize].to_string();
+    let sql =
+        "IF EXISTS (SELECT 1 FROM dbo.t WHERE id = dbo.f(N'x')) DELETE FROM dbo.a ELSE PRINT 'n';";
+    let stmts = parse_mssql(sql);
+    let AstStmt::MssqlIf(i) = &stmts[0] else {
+        panic!("an IF: {:?}", stmts[0]);
+    };
+    assert!(
+        matches!(*i.condition, AstExpr::ExistsSubquery { .. }),
+        "{:?}",
+        i.condition
+    );
+    assert_eq!(
+        text(sql, &i.condition),
+        "EXISTS (SELECT 1 FROM dbo.t WHERE id = dbo.f(N'x'))"
+    );
+    assert_eq!(i.condition.span(), i.condition_span);
+
+    let sql = "WHILE (SELECT COUNT(*) FROM dbo.q) > @n BEGIN SET @n = @n + 1; END;";
+    let stmts = parse_mssql(sql);
+    let AstStmt::MssqlWhile(w) = &stmts[0] else {
+        panic!("a WHILE: {:?}", stmts[0]);
+    };
+    assert_eq!(text(sql, &w.condition), "(SELECT COUNT(*) FROM dbo.q) > @n");
+    assert_eq!(w.condition.span(), w.condition_span);
+
+    let sql = "CREATE TRIGGER tr ON dbo.t AFTER UPDATE AS IF UPDATE(status) PRINT 'x';";
+    let stmts = parse_mssql(sql);
+    let AstStmt::CreateMssqlTrigger(t) = &stmts[0] else {
+        panic!("a trigger: {:?}", stmts[0]);
+    };
+    let AstStmt::MssqlIf(i) = &t.body[0] else {
+        panic!("an IF: {:?}", t.body);
+    };
+    assert!(
+        matches!(*i.condition, AstExpr::Placeholder { .. }),
+        "{:?}",
+        i.condition
+    );
+    assert_eq!(text(sql, &i.condition), "UPDATE(status)");
 }

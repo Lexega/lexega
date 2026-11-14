@@ -11,36 +11,38 @@ use lexega_core::api::analyze_risk_with_policy_config;
 use lexega_core::dialect::mssql;
 
 fn analyze(sql: &str) -> Vec<(String, RiskLevel)> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("analyze");
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some((g.matched_rule.clone(), g.risk_level)),
+        .map(|s| match s {
+            RuleMatch::Analysis(g) => (g.matched_rule.clone(), g.risk_level),
         })
         .collect()
 }
 
-fn fires(signals: &[(String, RiskLevel)], rule_id: &str) -> bool {
-    signals.iter().any(|(id, _)| id == rule_id)
+fn fires(findings: &[(String, RiskLevel)], rule_id: &str) -> bool {
+    findings.iter().any(|(id, _)| id == rule_id)
 }
 
-fn fires_with_level(signals: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
-    signals.iter().any(|(id, l)| id == rule_id && *l == level)
+fn fires_with_level(findings: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
+    findings.iter().any(|(id, l)| id == rule_id && *l == level)
 }
 
 // ── sp_addlinkedserver ──────────────────────────────────────────────────────
 
 #[test]
-fn add_linked_server_fires_high() {
+fn add_linked_server_fires_medium() {
     let sql = "EXEC sp_addlinkedserver @server=N'L', @provider=N'SQLNCLI', @datasrc=N'h';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LINKEDSRV-ADD", RiskLevel::High),
-        "MSSQL-LINKEDSRV-ADD should fire at High. Got: {:?}",
-        signals
+        fires_with_level(&findings, "MSSQL-LINKEDSRV-ADD", RiskLevel::Medium),
+        "MSSQL-LINKEDSRV-ADD should fire at Medium. Got: {:?}",
+        findings
     );
 }
 
@@ -49,20 +51,24 @@ fn add_linked_server_qualified_name_fires() {
     // Conventional invocation is fully qualified; base-name normalization
     // (mssql_exec.procedure_name) must let it match.
     let sql = "EXEC master.dbo.sp_addlinkedserver @server=N'L';";
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-LINKEDSRV-ADD"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(
+        fires(&findings, "MSSQL-LINKEDSRV-ADD"),
+        "Got: {:?}",
+        findings
+    );
 }
 
 // ── sp_addlinkedsrvlogin ────────────────────────────────────────────────────
 
 #[test]
-fn add_linked_srv_login_fires_high() {
+fn add_linked_srv_login_fires_medium() {
     let sql = "EXEC sp_addlinkedsrvlogin @rmtsrvname=N'L', @useself=N'True';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LINKEDSRV-LOGIN", RiskLevel::High),
-        "MSSQL-LINKEDSRV-LOGIN should fire at High. Got: {:?}",
-        signals
+        fires_with_level(&findings, "MSSQL-LINKEDSRV-LOGIN", RiskLevel::Medium),
+        "MSSQL-LINKEDSRV-LOGIN should fire at Medium. Got: {:?}",
+        findings
     );
 }
 
@@ -70,17 +76,17 @@ fn add_linked_srv_login_fires_high() {
 fn add_linked_srv_login_inline_password_fires_critical() {
     let sql = "EXEC master.dbo.sp_addlinkedsrvlogin @rmtsrvname=N'L', @useself=N'False', \
                @rmtuser=N'u', @rmtpassword=N'P@ss!';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LINKEDSRV-LOGIN-CRED", RiskLevel::Critical),
+        fires_with_level(&findings, "MSSQL-LINKEDSRV-LOGIN-CRED", RiskLevel::Critical),
         "MSSQL-LINKEDSRV-LOGIN-CRED should fire at Critical. Got: {:?}",
-        signals
+        findings
     );
     // The High base rule also fires alongside the Critical credential rule.
     assert!(
-        fires(&signals, "MSSQL-LINKEDSRV-LOGIN"),
+        fires(&findings, "MSSQL-LINKEDSRV-LOGIN"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -91,17 +97,17 @@ fn add_linked_srv_login_variable_password_no_cred() {
     // text glob over args could not. The credential rule must stay silent.
     let sql = "EXEC sp_addlinkedsrvlogin @rmtsrvname=N'L', @useself=N'False', \
                @rmtuser=N'u', @rmtpassword=@p;";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-LINKEDSRV-LOGIN-CRED"),
+        !fires(&findings, "MSSQL-LINKEDSRV-LOGIN-CRED"),
         "MSSQL-LINKEDSRV-LOGIN-CRED must not fire for a variable password. Got: {:?}",
-        signals
+        findings
     );
     // The base linked-server-login rule still fires.
     assert!(
-        fires(&signals, "MSSQL-LINKEDSRV-LOGIN"),
+        fires(&findings, "MSSQL-LINKEDSRV-LOGIN"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -110,11 +116,11 @@ fn add_linked_srv_login_integrated_security_no_cred() {
     // @useself = 'True', no @rmtpassword literal — the credential rule
     // must stay silent (regression guard against over-firing).
     let sql = "EXEC sp_addlinkedsrvlogin @rmtsrvname=N'L', @useself=N'True';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-LINKEDSRV-LOGIN-CRED"),
+        !fires(&findings, "MSSQL-LINKEDSRV-LOGIN-CRED"),
         "MSSQL-LINKEDSRV-LOGIN-CRED must not fire without an inline password. Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -124,11 +130,11 @@ fn add_linked_srv_login_integrated_security_no_cred() {
 fn agent_job_cmdexec_fires_critical() {
     let sql = "EXEC msdb.dbo.sp_add_jobstep @job_name=N'j', @step_name=N's', \
                @subsystem=N'CmdExec', @command=N'whoami';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-AGENTJOB-CMDEXEC", RiskLevel::Critical),
+        fires_with_level(&findings, "MSSQL-AGENTJOB-CMDEXEC", RiskLevel::Critical),
         "MSSQL-AGENTJOB-CMDEXEC should fire at Critical. Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -137,11 +143,11 @@ fn agent_job_tsql_subsystem_no_cmdexec() {
     // A non-CmdExec subsystem must not fire the OS-command rule.
     let sql = "EXEC msdb.dbo.sp_add_jobstep @job_name=N'j', @step_name=N's', \
                @subsystem=N'TSQL', @command=N'SELECT 1';";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-AGENTJOB-CMDEXEC"),
+        !fires(&findings, "MSSQL-AGENTJOB-CMDEXEC"),
         "MSSQL-AGENTJOB-CMDEXEC must not fire on a TSQL step. Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -150,7 +156,7 @@ fn agent_job_tsql_subsystem_no_cmdexec() {
 #[test]
 fn ordinary_proc_fires_no_linked_server_rules() {
     let sql = "EXEC dbo.my_business_proc @arg = 1;";
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     for id in [
         "MSSQL-LINKEDSRV-ADD",
         "MSSQL-LINKEDSRV-LOGIN",
@@ -158,9 +164,9 @@ fn ordinary_proc_fires_no_linked_server_rules() {
         "MSSQL-AGENTJOB-CMDEXEC",
     ] {
         assert!(
-            !fires(&signals, id),
+            !fires(&findings, id),
             "{id} should not fire. Got: {:?}",
-            signals
+            findings
         );
     }
 }

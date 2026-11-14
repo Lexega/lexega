@@ -17,8 +17,7 @@ use std::collections::HashSet;
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
         Ok(report) => report
-            .signals
-            .iter()
+            .entries()
             .map(|RuleMatch::Analysis(g)| g.matched_rule.clone())
             .collect(),
         Err(e) => {

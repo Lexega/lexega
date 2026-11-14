@@ -34,8 +34,8 @@ fn test_procedure_body_table_read() {
         "Procedure should be analyzed"
     );
 
-    // Check for procedure created signal
-    let has_procedure_created = report.signals.iter().any(|f| {
+    // Check for procedure created finding
+    let has_procedure_created = report.context.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
         p.matched_rule == "PROC-NEW"
     });
@@ -88,14 +88,15 @@ $$"#;
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Check for dynamic SQL signal (PROC-DYNSQL)
-    let has_dynamic_sql = report.signals.iter().any(|f| {
+    // A concatenation through `sql_text`: PROC-DYNSQL where the variable is
+    // not resolved, DYNSQL-CONCAT where analysis resolves the concatenation.
+    let has_dynamic_sql = report.findings.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
-        p.matched_rule == "PROC-DYNSQL"
+        p.matched_rule == "PROC-DYNSQL" || p.matched_rule == "DYNSQL-CONCAT"
     });
     assert!(
         has_dynamic_sql,
-        "Should detect dynamic SQL in procedure (PROC-DYNSQL)"
+        "Should detect dynamic SQL in procedure (PROC-DYNSQL or DYNSQL-CONCAT)"
     );
 }
 
@@ -121,8 +122,8 @@ fn test_function_body_table_read() {
         "Function should be analyzed"
     );
 
-    // Check for function created signal
-    let has_function_created = report.signals.iter().any(|f| {
+    // Check for function created finding
+    let has_function_created = report.context.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
         p.matched_rule == "UDF-NEW"
     });
@@ -147,15 +148,18 @@ $$"#;
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Check for dynamic SQL signal (UDF-DYNSQL)
-    let has_dynamic_sql = report.signals.iter().any(|f| {
-        let RuleMatch::Analysis(ref p) = f;
-        p.matched_rule == "UDF-DYNSQL"
-    });
-    assert!(
-        has_dynamic_sql,
-        "Should detect dynamic SQL in function (UDF-DYNSQL)"
-    );
+    // The function runs its parameter as SQL: DYNSQL-PARAM-TEXT, not the
+    // UDF-DYNSQL an unknown argument raises.
+    let rules: Vec<&str> = report
+        .findings
+        .iter()
+        .map(|f| {
+            let RuleMatch::Analysis(ref p) = f;
+            p.matched_rule.as_str()
+        })
+        .collect();
+    assert!(rules.contains(&"DYNSQL-PARAM-TEXT"), "{rules:?}");
+    assert!(!rules.contains(&"UDF-DYNSQL"), "{rules:?}");
 }
 
 /// Test multi-statement procedure with complex body
@@ -225,10 +229,10 @@ fn test_procedure_body_summary_fields() {
     );
 }
 
-/// Test Option C: body statements get proper parent_context in signals
+/// Test Option C: body statements get proper parent_context in findings
 #[test]
-fn test_procedure_body_signals_have_parent_context() {
-    // This procedure has an unbounded UPDATE which should trigger a signal
+fn test_procedure_body_findings_have_parent_context() {
+    // This procedure has an unbounded UPDATE which should trigger a finding
     let sql = r#"CREATE PROCEDURE dangerous_update()
 RETURNS VARCHAR
 AS
@@ -241,18 +245,18 @@ $$"#;
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Look for any signal that has parent_context set
-    let _has_parent_context = report.signals.iter().any(|f| match f {
+    // Look for any finding that has parent_context set
+    let _has_parent_context = report.findings.iter().any(|f| match f {
         RuleMatch::Analysis(ref g) => g.parent_context.is_some(),
     });
 
-    // Note: The procedure itself will have signals, body statements should also have them
-    // If there are signals from body statements, they should have parent_context
+    // Note: The procedure itself will have findings, body statements should also have them
+    // If there are findings from body statements, they should have parent_context
     if report.summary.statements_in_bodies > 0 {
-        // We expect at least the procedure created signal
+        // We expect at least the procedure created finding
         assert!(
-            report.signals.len() >= 1,
-            "Should have at least procedure created signal"
+            !report.findings.is_empty(),
+            "Should have at least procedure created finding"
         );
     }
 }
@@ -561,14 +565,20 @@ $$"#;
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Check for dynamic SQL signal (PROC-DYNSQL)
-    let has_dynamic_sql = report.signals.iter().any(|f| {
-        let RuleMatch::Analysis(ref p) = f;
-        p.matched_rule == "PROC-DYNSQL"
-    });
+    // An inline concatenation is DYNSQL-CONCAT's alone.
+    let fired = |rule: &str| {
+        report.findings.iter().any(|f| {
+            let RuleMatch::Analysis(ref p) = f;
+            p.matched_rule == rule
+        })
+    };
     assert!(
-        has_dynamic_sql,
-        "Should detect dynamic SQL inside WHILE loop (PROC-DYNSQL)"
+        fired("DYNSQL-CONCAT"),
+        "Should detect dynamic SQL inside WHILE loop (DYNSQL-CONCAT)"
+    );
+    assert!(
+        !fired("PROC-DYNSQL"),
+        "PROC-DYNSQL leaves a concatenation to DYNSQL-CONCAT"
     );
 }
 
@@ -601,8 +611,8 @@ fn test_function_with_while_loop() {
         "Function body should be counted in procedure_bodies_analyzed"
     );
 
-    // Check for function created signal
-    let has_function_created = report.signals.iter().any(|f| {
+    // Check for function created finding
+    let has_function_created = report.context.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
         p.matched_rule == "UDF-NEW"
     });
@@ -735,8 +745,8 @@ fn test_procedure_without_dollar_delimiters() {
         "Procedure body without $$ should be analyzed"
     );
 
-    // Check for procedure created signal
-    let has_procedure_created = report.signals.iter().any(|f| {
+    // Check for procedure created finding
+    let has_procedure_created = report.context.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
         p.matched_rule == "PROC-NEW"
     });
@@ -773,8 +783,8 @@ fn test_function_without_dollar_delimiters() {
         "Function body without $$ should be counted"
     );
 
-    // Check for function created signal
-    let has_function_created = report.signals.iter().any(|f| {
+    // Check for function created finding
+    let has_function_created = report.context.iter().any(|f| {
         let RuleMatch::Analysis(ref p) = f;
         p.matched_rule == "UDF-NEW"
     });
@@ -831,13 +841,303 @@ END"#;
 
     let report = analyze_risk(sql).expect("should analyze");
 
-    // Check for dynamic SQL signal (PROC-DYNSQL)
-    let has_dynamic_sql = report.signals.iter().any(|f| {
-        let RuleMatch::Analysis(ref p) = f;
-        p.matched_rule == "PROC-DYNSQL"
-    });
+    // An inline concatenation is DYNSQL-CONCAT's alone.
+    let fired = |rule: &str| {
+        report.findings.iter().any(|f| {
+            let RuleMatch::Analysis(ref p) = f;
+            p.matched_rule == rule
+        })
+    };
     assert!(
-        has_dynamic_sql,
-        "Should detect dynamic SQL in procedure without $$ delimiters (PROC-DYNSQL)"
+        fired("DYNSQL-CONCAT"),
+        "Should detect dynamic SQL in procedure without $$ delimiters (DYNSQL-CONCAT)"
     );
+    assert!(
+        !fired("PROC-DYNSQL"),
+        "PROC-DYNSQL leaves a concatenation to DYNSQL-CONCAT"
+    );
+}
+
+/// A function written without `RETURNS` ends at its own end: the statements
+/// after it are read and analysed.
+#[test]
+fn test_function_without_returns_leaves_the_next_statements_read() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    use lexega_core::{BigQueryDialect, DatabricksDialect, DialectRef, PostgresDialect};
+    use std::sync::Arc;
+
+    let later = "CREATE FUNCTION g(x INT64) RETURNS INT64 AS (x);";
+    let cases: [(DialectRef, &str); 4] = [
+        (
+            Arc::new(BigQueryDialect),
+            "CREATE TEMP FUNCTION f(x INT64) AS (x + 1);\nDELETE FROM ds.t WHERE TRUE;",
+        ),
+        (
+            Arc::new(PostgresDialect),
+            "CREATE FUNCTION f(x int, OUT a int, OUT b int) AS $$ SELECT 1, 2 $$ LANGUAGE sql;\n\
+             DELETE FROM t WHERE TRUE;",
+        ),
+        (
+            Arc::new(PostgresDialect),
+            "CREATE FUNCTION f(OUT a int) LANGUAGE sql AS $$ SELECT 1 $$;\nDELETE FROM t WHERE TRUE;",
+        ),
+        (
+            Arc::new(DatabricksDialect),
+            "CREATE FUNCTION f(x INT) RETURN x + 1;\nDELETE FROM t WHERE TRUE;",
+        ),
+    ];
+    for (dialect, head) in cases {
+        let sql = format!("{head}\n{later}");
+        let config = AnalysisConfig {
+            dialect: Some(dialect),
+            ..Default::default()
+        };
+        let report = analyze_risk_with_policy_config(&sql, &config).expect("should analyze");
+        // Statements raising one rule are merged into one finding.
+        let count = |entries: &[RuleMatch], rule: &str| -> usize {
+            entries
+                .iter()
+                .map(|f| {
+                    let RuleMatch::Analysis(ref p) = f;
+                    p
+                })
+                .filter(|p| p.matched_rule == rule)
+                .map(|p| p.findings_merged.unwrap_or(1))
+                .sum()
+        };
+        assert_eq!(count(&report.findings, "DML-WRITE-UNBOUNDED"), 1, "{sql}");
+        assert_eq!(count(&report.context, "UDF-NEW"), 2, "{sql}");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+    }
+}
+
+/// The dynamic-SQL findings `sql` raises under `dialect`, each rule with the
+/// number of findings it raises.
+fn dynamic_sql_findings(
+    dialect: lexega_core::DialectRef,
+    sql: &str,
+) -> std::collections::BTreeMap<String, usize> {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+
+    let config = AnalysisConfig {
+        dialect: Some(dialect),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config(sql, &config).expect("should analyze");
+    let mut out = std::collections::BTreeMap::new();
+    for entry in report.entries() {
+        let RuleMatch::Analysis(ref p) = entry;
+        let rule = p.matched_rule.as_str();
+        if rule.starts_with("DYNSQL") || rule == "PROC-DYNSQL" || rule == "UDF-DYNSQL" {
+            *out.entry(rule.to_string()).or_insert(0) += p.findings_merged.unwrap_or(1);
+        }
+    }
+    out
+}
+
+fn counts(pairs: &[(&str, usize)]) -> std::collections::BTreeMap<String, usize> {
+    pairs.iter().map(|(r, n)| (r.to_string(), *n)).collect()
+}
+
+/// A dynamic-SQL call in a procedure, function or T-SQL trigger body is
+/// reported once, by the rule of the routine at its CREATE; one in an
+/// event or an anonymous block, which no routine rule reports, by the
+/// call's rule at the call.
+#[test]
+fn a_dynamic_sql_call_in_a_body_is_reported_once() {
+    use lexega_core::dialect::{mssql, mysql, postgres, snowflake};
+
+    // A dialect, a script, and each rule with the number of times it fires.
+    type Case = (
+        lexega_core::DialectRef,
+        &'static str,
+        Vec<(&'static str, usize)>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            snowflake(),
+            "CREATE PROCEDURE p(t VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$\n\
+             BEGIN\n  EXECUTE IMMEDIATE 'SELECT * FROM ' || t;\n  RETURN 'ok';\nEND;\n$$;",
+            vec![("DYNSQL-CONCAT", 1)],
+        ),
+        (
+            snowflake(),
+            "CREATE PROCEDURE p(q VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$\n\
+             BEGIN\n  IF (q IS NOT NULL) THEN\n    EXECUTE IMMEDIATE UPPER(:q);\n  END IF;\n  \
+             RETURN 'ok';\nEND;\n$$;",
+            vec![("DYNSQL-PARAM-TEXT", 1)],
+        ),
+        (
+            snowflake(),
+            "CREATE PROCEDURE p(q VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$\n\
+             DECLARE v VARCHAR;\nBEGIN\n  SELECT c INTO :v FROM t;\n  IF (q IS NOT NULL) THEN\n    \
+             EXECUTE IMMEDIATE UPPER(:v);\n  END IF;\n  RETURN 'ok';\nEND;\n$$;",
+            vec![("PROC-DYNSQL", 1)],
+        ),
+        // A call in an exception handler is the procedure's too.
+        (
+            snowflake(),
+            "CREATE PROCEDURE p(q VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$\n\
+             BEGIN\n  RETURN 'ok';\nEXCEPTION\n  WHEN OTHER THEN\n    \
+             EXECUTE IMMEDIATE UPPER(:q);\n    RETURN 'err';\nEND;\n$$;",
+            vec![("DYNSQL-PARAM-TEXT", 1)],
+        ),
+        (
+            postgres(),
+            "CREATE FUNCTION f(t text) RETURNS void AS $$\n\
+             BEGIN\n  EXECUTE 'SELECT * FROM ' || t;\n  EXECUTE upper(t);\nEND;\n$$ LANGUAGE plpgsql;",
+            vec![("DYNSQL-CONCAT", 1), ("DYNSQL-PARAM-TEXT", 1)],
+        ),
+        (
+            postgres(),
+            "CREATE FUNCTION f(t text) RETURNS void AS $$\n\
+             DECLARE v text;\nBEGIN\n  SELECT c INTO v FROM app.t;\n  EXECUTE upper(v);\nEND;\n$$ \
+             LANGUAGE plpgsql;",
+            vec![("UDF-DYNSQL", 1)],
+        ),
+        (
+            mssql(),
+            "CREATE PROCEDURE dbo.p @t NVARCHAR(100) AS\n\
+             BEGIN\n  EXEC ('SELECT * FROM ' + @t);\nEND;",
+            vec![("DYNSQL-CONCAT", 1)],
+        ),
+        (
+            mssql(),
+            "CREATE TRIGGER trg ON dbo.t AFTER INSERT AS\n\
+             BEGIN\n  DECLARE @s NVARCHAR(MAX);\n  SELECT @s = cmd FROM inserted;\n  EXEC (@s);\nEND;",
+            vec![("DYNSQL", 1)],
+        ),
+        // No routine rule reports an event's or an anonymous block's call.
+        (
+            mysql(),
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO\n\
+             BEGIN\n  PREPARE s FROM @q;\n  EXECUTE s;\nEND;",
+            vec![("DYNSQL", 1)],
+        ),
+        (
+            snowflake(),
+            "BEGIN\n  EXECUTE IMMEDIATE UPPER(:q);\nEND;",
+            vec![("DYNSQL-NO-PARAM", 1)],
+        ),
+    ];
+    for (dialect, sql, expected) in cases {
+        assert_eq!(
+            dynamic_sql_findings(dialect, sql),
+            counts(&expected),
+            "{sql}"
+        );
+    }
+}
+
+/// A routine that runs one of its parameters, written alone, as SQL raises
+/// `DYNSQL-PARAM-TEXT` at its CREATE in every dialect, and no other
+/// dynamic-SQL rule for that call.
+#[test]
+fn a_routine_parameter_run_as_sql_raises_dynsql_param_text() {
+    use lexega_core::dialect::{bigquery, mssql, mysql, postgres, snowflake};
+
+    let cases: Vec<(lexega_core::DialectRef, &str)> = vec![
+        (
+            mssql(),
+            "CREATE PROCEDURE dbo.p @sql NVARCHAR(MAX) AS\nBEGIN\n  EXEC (@sql);\nEND;",
+        ),
+        (
+            mssql(),
+            "CREATE PROCEDURE dbo.p @sql NVARCHAR(MAX) AS\nBEGIN\n  EXEC sp_executesql @sql;\nEND;",
+        ),
+        (
+            snowflake(),
+            "CREATE PROCEDURE p(q VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$\n\
+             BEGIN\n  EXECUTE IMMEDIATE :q;\n  RETURN 'ok';\nEND;\n$$;",
+        ),
+        (
+            postgres(),
+            "CREATE FUNCTION f(q text) RETURNS void AS $$\nBEGIN\n  EXECUTE q;\nEND;\n$$ \
+             LANGUAGE plpgsql;",
+        ),
+        (
+            mysql(),
+            "CREATE PROCEDURE p(IN p_sql TEXT)\nBEGIN\n  PREPARE s FROM p_sql;\n  EXECUTE s;\nEND;",
+        ),
+        (
+            bigquery(),
+            "CREATE PROCEDURE ds.p(q STRING)\nBEGIN\n  EXECUTE IMMEDIATE q;\nEND;",
+        ),
+    ];
+    for (dialect, sql) in cases {
+        assert_eq!(
+            dynamic_sql_findings(dialect, sql),
+            counts(&[("DYNSQL-PARAM-TEXT", 1)]),
+            "{sql}"
+        );
+    }
+    // A variable the routine declares is no parameter.
+    assert_eq!(
+        dynamic_sql_findings(
+            mssql(),
+            "CREATE PROCEDURE dbo.p @n INT AS\nBEGIN\n  DECLARE @sql NVARCHAR(MAX);\n  \
+             SELECT @sql = cmd FROM dbo.jobs WHERE id = @n;\n  EXEC (@sql);\nEND;",
+        ),
+        counts(&[("PROC-DYNSQL", 1)])
+    );
+}
+
+/// `script_context.enclosing` lists the bodies that hold a statement,
+/// outermost first, and a call's `argument_parameter` names the parameter
+/// it runs.
+#[test]
+fn a_body_statement_carries_the_bodies_that_hold_it() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    use lexega_core::dialect::mssql;
+    use lexega_core::rules::{build_v1_rule_corpus, load_v1_rules};
+
+    let yaml = r#"
+rules:
+  - id: T-IN-IF-IN-PROC
+    risk_level: medium
+    message: "in an IF of a procedure"
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - script_context.enclosing.0.kind: procedure
+        - script_context.enclosing.0.name.raw: dbo.p
+        - script_context.enclosing.1.kind: block
+        - script_context.enclosing.2.kind: control_flow
+        - script_context.enclosing.2.flow_kind: if
+        - dynamic_sql_calls:
+            exists:
+              argument_parameter.raw: "@sql"
+  - id: T-TOP-LEVEL
+    risk_level: medium
+    message: "held by no body"
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - not:
+            script_context.enclosing:
+              exists: {}
+"#;
+    let rules =
+        build_v1_rule_corpus(load_v1_rules(yaml).expect("rules load"), false).expect("full rules");
+    let config = AnalysisConfig {
+        dialect: Some(mssql()),
+        custom_rules: Some(rules.into()),
+        ..Default::default()
+    };
+    let sql = "CREATE PROCEDURE dbo.p @sql NVARCHAR(MAX) AS\nBEGIN\n  IF @sql IS NOT NULL\n    \
+               EXEC (@sql);\nEND;\nGO\nEXEC (@x);";
+    let report = analyze_risk_with_policy_config(sql, &config).expect("should analyze");
+    let mut ids: Vec<String> = report
+        .entries()
+        .map(|entry| {
+            let RuleMatch::Analysis(ref p) = entry;
+            p.matched_rule.clone()
+        })
+        .filter(|rule| rule.starts_with("T-"))
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["T-IN-IF-IN-PROC", "T-TOP-LEVEL"]);
 }

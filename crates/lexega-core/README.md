@@ -25,8 +25,8 @@ and MySQL.
 
 ```rust
 let report = lexega_core::api::analyze_risk("GRANT ALL ON DATABASE prod TO ROLE PUBLIC;")?;
-for signal in &report.signals {
-    println!("{signal:?}");
+for finding in &report.findings {
+    println!("{finding:?}");
 }
 ```
 

@@ -14,7 +14,7 @@
 //! - AS → Keyword(As)
 //! - ALL → Keyword(All)
 //! - Parameter types (int, text, etc.) → Identifiers
-//! - $1, $2 → Literal(Position)
+//! - $1, $2 → Literal(Parameter)
 
 use crate::ast::types::{AstPgDeallocate, AstPgExecute, AstPgPrepare, AstStmt, PgDeallocateTarget};
 use crate::error::{ParseResult, ParseResultExt};

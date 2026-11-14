@@ -9,8 +9,9 @@ use crate::ast::{
     AstAlterMaskingPolicy, AstAlterMaskingPolicyAction, AstAlterMaskingPolicyActionKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
+use crate::lexer::{Keyword, Operator, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 
 impl<'a> Parser<'a> {
     pub(crate) fn try_parse_alter_masking_policy(&mut self) -> ParseResult<AstStmt> {
@@ -61,7 +62,7 @@ impl<'a> Parser<'a> {
         let (if_exists_span, if_keyword, exists_keyword) = self.parse_if_exists_clause_masking()?;
 
         // Policy name
-        let name_span = self.parse_policy_name_masking_alter()?;
+        let name_span = self.parse_object_name_span()?;
 
         // Parse action
         let action = self.parse_alter_masking_policy_action()?;
@@ -147,58 +148,6 @@ impl<'a> Parser<'a> {
         Ok((None, None, None))
     }
 
-    fn parse_policy_name_masking_alter(&mut self) -> ParseResult<Span> {
-        let first_tok = if let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Identifier { .. }) {
-                self.advance()
-                    .expect_invariant("identifier: checked in if-let above")
-            } else {
-                return Err(ParseError::new(
-                    tok.span,
-                    ParseErrorKind::UnexpectedToken {
-                        expected: vec!["identifier".to_string()],
-                        found: tok.lexeme(self.source).to_string(),
-                    },
-                ));
-            }
-        } else {
-            return Err(ParseError::new(
-                self.current_span(),
-                ParseErrorKind::InvalidStatement {
-                    message: "Expected policy name".to_string(),
-                },
-            ));
-        };
-
-        let start_pos = first_tok.span.start;
-        let mut end_pos = first_tok.span.end;
-
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance();
-                if let Some(id_tok) = self.peek_non_trivia() {
-                    if matches!(id_tok.kind, TokenKind::Identifier { .. }) {
-                        let t = self
-                            .advance()
-                            .expect_invariant("qualified name part: checked in if-let above");
-                        end_pos = t.span.end;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span {
-            start: start_pos,
-            end: end_pos,
-        })
-    }
-
     fn parse_alter_masking_policy_action(&mut self) -> ParseResult<AstAlterMaskingPolicyAction> {
         let next_tok = self.peek_non_trivia();
 
@@ -239,7 +188,7 @@ impl<'a> Parser<'a> {
         }
         let to_span = to_tok.span;
 
-        let new_name_span = self.parse_policy_name_masking_alter()?;
+        let new_name_span = self.parse_object_name_span()?;
 
         let action_span = Span {
             start: rename_span.start,
@@ -340,41 +289,7 @@ impl<'a> Parser<'a> {
             .expect_invariant("TAG keyword: verified by caller");
         let tag_span = tag_tok.span;
 
-        let assignments_start = self.current_span().start;
-
-        loop {
-            let _tag_name_span = self.parse_qualified_name_span()?;
-
-            let eq_tok = self
-                .advance()
-                .ok_or_eof(self.current_span(), vec!["=".to_string()])?;
-            if !matches!(eq_tok.kind, TokenKind::Operator(Operator::Eq)) {
-                return Err(ParseError::new(
-                    eq_tok.span,
-                    ParseErrorKind::InvalidStatement {
-                        message: "Expected = after tag name".to_string(),
-                    },
-                ));
-            }
-
-            let _value_tok = self
-                .advance()
-                .ok_or_eof(self.current_span(), vec!["tag value".to_string()])?;
-
-            if let Some(tok) = self.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                    self.advance();
-                    continue;
-                }
-            }
-            break;
-        }
-
-        let assignments_end = self.current_span().start;
-        let assignments_span = Span {
-            start: assignments_start,
-            end: assignments_end,
-        };
+        let (assignments_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
 
         let action_span = Span {
             start: set_span.start,
@@ -389,6 +304,7 @@ impl<'a> Parser<'a> {
                 set_span: Some(set_span),
                 tag_span: Some(tag_span),
                 assignments_span,
+                tags,
             },
         })
     }
@@ -470,25 +386,7 @@ impl<'a> Parser<'a> {
             .expect_invariant("TAG keyword: verified by caller");
         let tag_span = tag_tok.span;
 
-        let tags_start = self.current_span().start;
-
-        loop {
-            let _tag_name_span = self.parse_qualified_name_span()?;
-
-            if let Some(tok) = self.peek_non_trivia() {
-                if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Comma)) {
-                    self.advance();
-                    continue;
-                }
-            }
-            break;
-        }
-
-        let tags_end = self.current_span().start;
-        let tags_span = Span {
-            start: tags_start,
-            end: tags_end,
-        };
+        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
         let action_span = Span {
             start: unset_span.start,
@@ -503,6 +401,7 @@ impl<'a> Parser<'a> {
                 unset_span: Some(unset_span),
                 tag_span: Some(tag_span),
                 tags_span,
+                tags,
             },
         })
     }

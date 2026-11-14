@@ -15,18 +15,31 @@ use lexega_core::{
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     let report = analyze_risk(sql).expect("should analyze successfully");
-    extract_rule_ids(&report.signals)
+    extract_rule_ids(&report.findings)
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    extract_rule_ids(&report.context)
+}
+
+/// Rule ids across findings and context.
+fn analyze_and_get_entries(sql: &str) -> HashSet<String> {
+    let report = analyze_risk(sql).expect("should analyze successfully");
+    let mut ids = extract_rule_ids(&report.findings);
+    ids.extend(extract_rule_ids(&report.context));
+    ids
 }
 
 fn assert_formats_safe(sql: &str) {
@@ -58,7 +71,7 @@ fn test_secret_formatting_variants() {
 
 #[test]
 fn test_secret_create_and_drop() {
-    let rules = analyze_and_get_rules(
+    let rules = analyze_and_get_context(
         "CREATE SECRET basic_cred TYPE = PASSWORD USERNAME = 'u' PASSWORD = 'p';",
     );
     assert!(rules.contains("SNW-SECRET-NEW"), "got {rules:?}");
@@ -76,8 +89,10 @@ fn test_secret_rotation() {
     assert!(rules.contains("SNW-SECRET-ROTATED"), "got {rules:?}");
 
     // Non-credential property change is CHG, not ROTATED.
-    let rules = analyze_and_get_rules("ALTER SECRET s SET OAUTH_SCOPES = ('read');");
-    assert!(rules.contains("SNW-SECRET-CHG"), "got {rules:?}");
+    let sql = "ALTER SECRET s SET OAUTH_SCOPES = ('read');";
+    let context = analyze_and_get_context(sql);
+    assert!(context.contains("SNW-SECRET-CHG"), "got {context:?}");
+    let rules = analyze_and_get_entries(sql);
     assert!(!rules.contains("SNW-SECRET-ROTATED"), "got {rules:?}");
 }
 

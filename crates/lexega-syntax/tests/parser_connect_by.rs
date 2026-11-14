@@ -222,3 +222,75 @@ fn test_prior_expression_structure() {
         _ => panic!("Expected binary operator"),
     }
 }
+
+#[test]
+fn test_connect_by_nocycle_is_the_clause_keyword() {
+    for input in [
+        "SELECT id FROM emp START WITH id = 1 CONNECT BY NOCYCLE PRIOR id = mgr_id",
+        "SELECT id FROM emp CONNECT BY nocycle PRIOR id = mgr_id",
+        "SELECT id FROM emp CONNECT BY NOCYCLE mgr_id = PRIOR id",
+    ] {
+        let script = lexega_syntax::parse_sql(input).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{input}");
+        let sel = parse_select(input);
+        let cb = sel.connect_by.as_ref().expect("CONNECT BY");
+        let nocycle = cb.nocycle.expect("NOCYCLE");
+        assert!(input[nocycle.start as usize..nocycle.end as usize].eq_ignore_ascii_case("NOCYCLE"));
+        assert_eq!(cb.conditions.len(), 1);
+        assert!(
+            matches!(&cb.conditions[0], ast::AstExpr::BinaryOp { .. }),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn test_connect_by_column_named_nocycle_stays_a_column() {
+    for input in [
+        "SELECT id FROM emp CONNECT BY nocycle = PRIOR id",
+        "SELECT id FROM emp CONNECT BY nocycle IS NULL",
+        "SELECT id FROM emp CONNECT BY NOCYCLE.x = PRIOR id",
+    ] {
+        let sel = parse_select(input);
+        let cb = sel.connect_by.as_ref().expect("CONNECT BY");
+        assert!(cb.nocycle.is_none(), "{input}");
+    }
+}
+
+#[test]
+fn connect_by_root_is_an_operator_and_connect_by_may_precede_group_by() {
+    use lexega_syntax::{format_sql, verify_formatting_safe};
+    let sql =
+        "SELECT name, CONNECT_BY_ROOT email AS r FROM u START WITH id = 1 CONNECT BY PRIOR id = id";
+    let select = parse_select(sql);
+    let ast::AstProjectionKind::Columns(items) = &select.projection.kind else {
+        panic!("no select list");
+    };
+    let ast::ProjectionItemKind::SelectItem(item) = &items[1].kind else {
+        panic!("no item");
+    };
+    assert!(
+        matches!(item.expr, lexega_syntax::AstExpr::ConnectByRoot { .. }),
+        "{:?}",
+        item.expr
+    );
+    // A column of that name, read alone, is a column.
+    let select = parse_select("SELECT connect_by_root FROM t");
+    let ast::AstProjectionKind::Columns(items) = &select.projection.kind else {
+        panic!("no select list");
+    };
+    let ast::ProjectionItemKind::SelectItem(item) = &items[0].kind else {
+        panic!("no item");
+    };
+    assert!(matches!(item.expr, lexega_syntax::AstExpr::Ident { .. }));
+
+    let grouped =
+        "SELECT name, COUNT(email) FROM u START WITH id = 1 CONNECT BY PRIOR id = id GROUP BY name";
+    let select = parse_select(grouped);
+    assert!(select.connect_by.is_some() && select.group_by.is_some());
+    for sql in [sql, grouped] {
+        let formatted = format_sql(sql).expect("formats");
+        verify_formatting_safe(sql, &formatted)
+            .unwrap_or_else(|e| panic!("{sql}: {e}\n{formatted}"));
+    }
+}

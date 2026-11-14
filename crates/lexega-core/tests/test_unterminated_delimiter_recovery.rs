@@ -20,17 +20,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 fn analyze(sql: &str) -> AnalysisReport {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
 fn rule_ids(report: &AnalysisReport) -> HashSet<String> {
     report
-        .signals
+        .findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }

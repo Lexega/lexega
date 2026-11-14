@@ -154,7 +154,7 @@ impl<'a> Parser<'a> {
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["value".to_string()])?;
                 end = val.span.end;
-                props.ingest(key, val.lexeme(self.source));
+                props.ingest(key, val.lexeme(self.source), self.dialect);
             }
         }
 
@@ -267,7 +267,7 @@ impl<'a> Parser<'a> {
                 .advance()
                 .ok_or_eof(self.current_span(), vec!["value".to_string()])?;
             end = val.span.end;
-            props.ingest(key, val.lexeme(self.source));
+            props.ingest(key, val.lexeme(self.source), self.dialect);
         }
 
         let stmt_span = Span { start, end };
@@ -317,12 +317,13 @@ impl EdsProps {
         }
     }
 
-    /// Fold a recognized `<key> = <value>` pair into the accumulator.
-    fn ingest(&mut self, key: &'static str, val_lex: &str) {
+    /// Fold a recognized `<key> = <value>` pair, read as `dialect` reads
+    /// it, into the accumulator.
+    fn ingest(&mut self, key: &'static str, val_lex: &str, dialect: &dyn crate::dialect::Dialect) {
         match key {
             "LOCATION" => {
                 self.location_present = true;
-                self.location_scheme = scheme_of_literal(val_lex);
+                self.location_scheme = scheme_of_literal(val_lex, dialect);
             }
             "TYPE" => {
                 self.source_type = classify_source_type(val_lex);
@@ -346,12 +347,10 @@ impl EdsProps {
 
 /// Lowercased URI scheme of a quoted location literal — the chars before
 /// `://`. Returns `None` when the literal has no scheme separator.
-fn scheme_of_literal(lexeme: &str) -> Option<String> {
-    let inner = lexeme
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .unwrap_or(lexeme);
-    inner
+fn scheme_of_literal(lexeme: &str, dialect: &dyn crate::dialect::Dialect) -> Option<String> {
+    let value = crate::lexer::decode_string_literal(lexeme, dialect)
+        .map_or_else(|| lexeme.to_string(), |decoded| decoded.value);
+    value
         .split_once("://")
         .map(|(scheme, _)| scheme.to_ascii_lowercase())
         .filter(|s| !s.is_empty())

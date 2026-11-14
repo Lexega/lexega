@@ -12,25 +12,27 @@ use lexega_core::analyzer::{AnalysisConfig, RiskLevel, RuleMatch};
 use lexega_core::api::analyze_risk_with_policy_config;
 use lexega_core::{dialect::mssql, parse_sql_with_dialect, AstStmt, MsSqlDialect};
 
+/// Findings, then context entries.
 fn analyze(sql: &str) -> Vec<(String, RiskLevel)> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(mssql());
+    let config = AnalysisConfig {
+        dialect: Some(mssql()),
+        ..Default::default()
+    };
     let report = analyze_risk_with_policy_config(sql, &config).expect("analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|s| match s {
             RuleMatch::Analysis(g) => (g.matched_rule.clone(), g.risk_level),
         })
         .collect()
 }
 
-fn fires(signals: &[(String, RiskLevel)], rule_id: &str) -> bool {
-    signals.iter().any(|(id, _)| id == rule_id)
+fn fires(findings: &[(String, RiskLevel)], rule_id: &str) -> bool {
+    findings.iter().any(|(id, _)| id == rule_id)
 }
 
-fn fires_with_level(signals: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
-    signals.iter().any(|(id, l)| id == rule_id && *l == level)
+fn fires_with_level(findings: &[(String, RiskLevel)], rule_id: &str, level: RiskLevel) -> bool {
+    findings.iter().any(|(id, l)| id == rule_id && *l == level)
 }
 
 /// Statement must parse typed — an OpaqueContent fallback means the
@@ -51,16 +53,16 @@ fn assert_not_opaque(sql: &str) {
 fn alter_server_role_add_member_fires_high() {
     let sql = "ALTER SERVER ROLE diskadmin ADD MEMBER [corp\\bob];";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-SRVROLE-MEMBER-ADD", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-SRVROLE-MEMBER-ADD", RiskLevel::High),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        !fires(&signals, "MSSQL-SRVROLE-SYSADMIN"),
+        !fires(&findings, "MSSQL-SRVROLE-SYSADMIN"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -68,40 +70,40 @@ fn alter_server_role_add_member_fires_high() {
 fn alter_server_role_sysadmin_add_member_fires_critical() {
     let sql = "ALTER SERVER ROLE sysadmin ADD MEMBER svc_app;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-SRVROLE-SYSADMIN", RiskLevel::Critical),
+        fires_with_level(&findings, "MSSQL-SRVROLE-SYSADMIN", RiskLevel::Critical),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        fires(&signals, "MSSQL-SRVROLE-MEMBER-ADD"),
+        fires(&findings, "MSSQL-SRVROLE-MEMBER-ADD"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
 // ── ALTER ROLE ... ADD/DROP MEMBER ──────────────────────────────────────────
 
 #[test]
-fn alter_role_add_member_fires_medium() {
+fn alter_role_add_member_fires_info() {
     let sql = "ALTER ROLE db_datareader ADD MEMBER reporting_user;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-ROLE-MEMBER-ADD", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-ROLE-MEMBER-ADD", RiskLevel::Info),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        !fires(&signals, "MSSQL-DBROLE-ADMIN-ADD"),
+        !fires(&findings, "MSSQL-DBROLE-ADMIN-ADD"),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        !fires(&signals, "MSSQL-SRVROLE-MEMBER-ADD"),
+        !fires(&findings, "MSSQL-SRVROLE-MEMBER-ADD"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -109,33 +111,33 @@ fn alter_role_add_member_fires_medium() {
 fn alter_role_db_owner_add_member_fires_high() {
     let sql = "ALTER ROLE db_owner ADD MEMBER app_user;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-DBROLE-ADMIN-ADD", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-DBROLE-ADMIN-ADD", RiskLevel::High),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        fires(&signals, "MSSQL-ROLE-MEMBER-ADD"),
+        fires_with_level(&findings, "MSSQL-ROLE-MEMBER-ADD", RiskLevel::Info),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
 #[test]
-fn alter_role_drop_member_fires_medium() {
+fn alter_role_drop_member_fires_low() {
     let sql = "ALTER ROLE db_datawriter DROP MEMBER app_user;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-ROLE-MEMBER-DROP", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-ROLE-MEMBER-DROP", RiskLevel::Low),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        !fires(&signals, "MSSQL-ROLE-MEMBER-ADD"),
+        !fires(&findings, "MSSQL-ROLE-MEMBER-ADD"),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -143,7 +145,7 @@ fn alter_role_drop_member_fires_medium() {
 fn alter_role_without_membership_clause_silent() {
     // Snowflake-style ALTER ROLE with an options body — no membership
     // clause, so none of the membership rules fire.
-    let signals = analyze("ALTER ROLE analyst SET COMMENT = 'team role';");
+    let findings = analyze("ALTER ROLE analyst SET COMMENT = 'team role';");
     for id in [
         "MSSQL-ROLE-MEMBER-ADD",
         "MSSQL-ROLE-MEMBER-DROP",
@@ -151,9 +153,9 @@ fn alter_role_without_membership_clause_silent() {
         "MSSQL-SRVROLE-MEMBER-ADD",
     ] {
         assert!(
-            !fires(&signals, id),
+            !fires(&findings, id),
             "{id} should not fire. Got: {:?}",
-            signals
+            findings
         );
     }
 }
@@ -161,14 +163,14 @@ fn alter_role_without_membership_clause_silent() {
 // ── ALTER AUTHORIZATION ─────────────────────────────────────────────────────
 
 #[test]
-fn alter_authorization_on_object_fires_high() {
+fn alter_authorization_on_object_fires_medium() {
     let sql = "ALTER AUTHORIZATION ON OBJECT::dbo.payroll TO etl_admin;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-OWNER-XFER", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-OWNER-XFER", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -176,16 +178,16 @@ fn alter_authorization_on_object_fires_high() {
 fn alter_authorization_on_database_fires() {
     let sql = "ALTER AUTHORIZATION ON DATABASE::finance TO [corp\\dba];";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-OWNER-XFER"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(fires(&findings, "MSSQL-OWNER-XFER"), "Got: {:?}", findings);
 }
 
 #[test]
 fn alter_authorization_implicit_class_to_schema_owner_fires() {
     let sql = "ALTER AUTHORIZATION ON dbo.orders TO SCHEMA OWNER;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-OWNER-XFER"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(fires(&findings, "MSSQL-OWNER-XFER"), "Got: {:?}", findings);
 }
 
 // ── ALTER LOGIN / DROP LOGIN ────────────────────────────────────────────────
@@ -194,26 +196,34 @@ fn alter_authorization_implicit_class_to_schema_owner_fires() {
 fn alter_login_disable_fires() {
     let sql = "ALTER LOGIN sa DISABLE;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LOGIN-DISABLE", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-LOGIN-DISABLE", RiskLevel::Low),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "MSSQL-LOGIN-CHG"), "Got: {:?}", signals);
-    assert!(!fires(&signals, "MSSQL-LOGIN-ENABLE"), "Got: {:?}", signals);
+    assert!(fires(&findings, "MSSQL-LOGIN-CHG"), "Got: {:?}", findings);
+    assert!(
+        !fires(&findings, "MSSQL-LOGIN-ENABLE"),
+        "Got: {:?}",
+        findings
+    );
 }
 
 #[test]
 fn alter_login_enable_fires() {
     let sql = "ALTER LOGIN [legacy_svc] ENABLE;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-LOGIN-ENABLE"), "Got: {:?}", signals);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-LOGIN-DISABLE"),
+        fires(&findings, "MSSQL-LOGIN-ENABLE"),
         "Got: {:?}",
-        signals
+        findings
+    );
+    assert!(
+        !fires(&findings, "MSSQL-LOGIN-DISABLE"),
+        "Got: {:?}",
+        findings
     );
 }
 
@@ -221,16 +231,16 @@ fn alter_login_enable_fires() {
 fn alter_login_password_literal_fires_pwd_chg_and_cred_leak() {
     let sql = "ALTER LOGIN app_login WITH PASSWORD = 'Sup3rS3cret!';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LOGIN-PWD-CHG", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-LOGIN-PWD-CHG", RiskLevel::Low),
         "Got: {:?}",
-        signals
+        findings
     );
     assert!(
-        fires_with_level(&signals, "CRED-PWD-LEAK", RiskLevel::Critical),
+        fires_with_level(&findings, "CRED-PWD-LEAK", RiskLevel::Critical),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -238,17 +248,17 @@ fn alter_login_password_literal_fires_pwd_chg_and_cred_leak() {
 fn alter_login_default_db_fires_only_catchall() {
     let sql = "ALTER LOGIN app_login WITH DEFAULT_DATABASE = reporting;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(fires(&signals, "MSSQL-LOGIN-CHG"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(fires(&findings, "MSSQL-LOGIN-CHG"), "Got: {:?}", findings);
     for id in [
         "MSSQL-LOGIN-DISABLE",
         "MSSQL-LOGIN-ENABLE",
         "MSSQL-LOGIN-PWD-CHG",
     ] {
         assert!(
-            !fires(&signals, id),
+            !fires(&findings, id),
             "{id} should not fire. Got: {:?}",
-            signals
+            findings
         );
     }
 }
@@ -257,11 +267,11 @@ fn alter_login_default_db_fires_only_catchall() {
 fn drop_login_fires_medium() {
     let sql = "DROP LOGIN old_contractor;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-LOGIN-DROP", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-LOGIN-DROP", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
@@ -276,13 +286,13 @@ fn create_server_role_parses_typed() {
 fn create_application_role_fires_approle_and_cred_leak() {
     let sql = "CREATE APPLICATION ROLE weekly_receipts WITH PASSWORD = '987Gbv8$76sPYY5m23';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-APPROLE-NEW", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-APPROLE-NEW", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "CRED-PWD-LEAK"), "Got: {:?}", signals);
+    assert!(fires(&findings, "CRED-PWD-LEAK"), "Got: {:?}", findings);
 }
 
 #[test]
@@ -313,70 +323,78 @@ fn databricks_create_server_not_hijacked() {
 // ── EXECUTE AS / REVERT ─────────────────────────────────────────────────────
 
 #[test]
-fn execute_as_login_fires_high() {
+fn execute_as_login_fires_medium() {
     let sql = "EXECUTE AS LOGIN = 'corp\\admin';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-EXECAS-LOGIN", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-EXECAS-LOGIN", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(!fires(&signals, "MSSQL-EXECAS-USER"), "Got: {:?}", signals);
+    assert!(
+        !fires(&findings, "MSSQL-EXECAS-USER"),
+        "Got: {:?}",
+        findings
+    );
 }
 
 #[test]
 fn execute_as_user_fires_medium() {
     let sql = "EXEC AS USER = 'report_reader';";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-EXECAS-USER", RiskLevel::Medium),
+        fires_with_level(&findings, "MSSQL-EXECAS-USER", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
 }
 
 #[test]
-fn execute_as_with_no_revert_fires_high() {
+fn execute_as_with_no_revert_fires_medium() {
     let sql = "EXECUTE AS USER = 'app' WITH NO REVERT;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        fires_with_level(&signals, "MSSQL-EXECAS-NO-REVERT", RiskLevel::High),
+        fires_with_level(&findings, "MSSQL-EXECAS-NO-REVERT", RiskLevel::Medium),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "MSSQL-EXECAS-USER"), "Got: {:?}", signals);
+    assert!(fires(&findings, "MSSQL-EXECAS-USER"), "Got: {:?}", findings);
 }
 
 #[test]
 fn execute_as_with_cookie_no_norevert_rule() {
     let sql = "EXECUTE AS LOGIN = 'svc' WITH COOKIE INTO @c;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     assert!(
-        !fires(&signals, "MSSQL-EXECAS-NO-REVERT"),
+        !fires(&findings, "MSSQL-EXECAS-NO-REVERT"),
         "Got: {:?}",
-        signals
+        findings
     );
-    assert!(fires(&signals, "MSSQL-EXECAS-LOGIN"), "Got: {:?}", signals);
+    assert!(
+        fires(&findings, "MSSQL-EXECAS-LOGIN"),
+        "Got: {:?}",
+        findings
+    );
 }
 
 #[test]
 fn revert_parses_typed_and_fires_nothing() {
     let sql = "REVERT;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
+    let findings = analyze(sql);
     for id in [
         "MSSQL-EXECAS-LOGIN",
         "MSSQL-EXECAS-USER",
         "MSSQL-EXECAS-NO-REVERT",
     ] {
         assert!(
-            !fires(&signals, id),
+            !fires(&findings, id),
             "{id} should not fire. Got: {:?}",
-            signals
+            findings
         );
     }
 }
@@ -392,7 +410,15 @@ fn exec_proc_not_misparsed_as_execute_as() {
     // form (INFO-MSSQL-EXEC-PROC), not the impersonation statement.
     let sql = "EXEC dbo.refresh_cache;";
     assert_not_opaque(sql);
-    let signals = analyze(sql);
-    assert!(!fires(&signals, "MSSQL-EXECAS-USER"), "Got: {:?}", signals);
-    assert!(!fires(&signals, "MSSQL-EXECAS-LOGIN"), "Got: {:?}", signals);
+    let findings = analyze(sql);
+    assert!(
+        !fires(&findings, "MSSQL-EXECAS-USER"),
+        "Got: {:?}",
+        findings
+    );
+    assert!(
+        !fires(&findings, "MSSQL-EXECAS-LOGIN"),
+        "Got: {:?}",
+        findings
+    );
 }

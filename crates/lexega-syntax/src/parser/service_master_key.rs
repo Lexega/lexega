@@ -11,10 +11,9 @@
 //! decrypted — discarding it irreversibly. The `WITH … _ACCOUNT / _PASSWORD`
 //! form rotates the Windows service-account credentials that protect the SMK.
 //!
-//! Recognition captures the operation, whether it is forced, and whether an
-//! inline password is present. The account-name operands
-//! carry no governance signal and are scanned past; the password value is
-//! recorded as a redaction span.
+//! Recognition captures the operation, whether it is forced, and each inline
+//! password literal. The account-name operands carry nothing a rule reads and
+//! are scanned past; each password's content is recorded as a redaction span.
 //!
 //! `SERVICE` / `MASTER` / `REGENERATE` / `FORCE` / `OLD_PASSWORD` /
 //! `NEW_PASSWORD` are Identifiers in our lexer.
@@ -23,7 +22,6 @@ use crate::ast::types::{AstMssqlAlterServiceMasterKey, AstStmt, ServiceMasterKey
 use crate::error::{ParseResult, ParseResultExt};
 use crate::lexer::{Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::principal::peek_string_literal_after;
 
 impl<'a> Parser<'a> {
     /// `ALTER SERVICE MASTER KEY …` — dispatched on `ALTER SERVICE` + next ==
@@ -43,7 +41,7 @@ impl<'a> Parser<'a> {
         let mut regenerate = false;
         let mut force = false;
         let mut account_change = false;
-        let mut password_spans = Vec::new();
+        let mut password_literal_spans = Vec::new();
         let mut depth: u32 = 0;
         while self.idx < self.tokens.len() {
             let tok = &self.tokens[self.idx];
@@ -67,17 +65,10 @@ impl<'a> Parser<'a> {
                 || lx.eq_ignore_ascii_case("NEW_PASSWORD")
             {
                 account_change = true;
-                if let Some(sp) = peek_string_literal_after(self.tokens, self.idx, self.source) {
-                    password_spans.push(sp);
-                }
+                password_literal_spans.extend(self.password_literal_after(self.idx));
             }
             end = tok.span.end;
             self.idx += 1;
-        }
-
-        let password_present = !password_spans.is_empty();
-        for sp in password_spans {
-            self.redaction_spans.push(sp);
         }
 
         // REGENERATE (forced or not) is the rotation form; otherwise the
@@ -96,7 +87,7 @@ impl<'a> Parser<'a> {
             span: stmt_span,
             operation,
             force,
-            password_present,
+            password_literal_spans,
         };
         Ok(AstStmt::MssqlAlterServiceMasterKey(Box::new(ast)))
     }

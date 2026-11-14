@@ -27,18 +27,25 @@
 //! - WITH ( security_invoker / security_barrier / check_option [= value], ... )
 
 use crate::ast::{
-    AstCreateView, AstCreateViewColumn, AstObjectProperty, AstStmt, AstViewCheckOptionMode,
+    AstCreateView, AstCreateViewColumn, AstObjectProperty, AstObjectRef, AstStmt, AstTagRef,
+    AstViewCheckOptionMode,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResultExt};
 use crate::lexer::{Keyword, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::create_table::PolicyClause;
+use crate::parser::tag::TagListShape;
 
 /// Result of parsing view-level options (policies, tags, change tracking, etc.)
 struct CreateViewOptions {
     row_access_policy_span: Option<Span>,
+    row_access_policy: Option<PolicyClause>,
     aggregation_policy_span: Option<Span>,
+    aggregation_policy: Option<PolicyClause>,
     join_policy_span: Option<Span>,
+    join_policy: Option<PolicyClause>,
     tag_span: Option<Span>,
+    tags: Vec<AstTagRef>,
     with_contact_span: Option<Span>,
     change_tracking_span: Option<Span>,
     copy_grants_span: Option<Span>,
@@ -141,7 +148,7 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
     let mut recursive_span: Option<Span> = None;
     let mut materialized_span: Option<Span> = None;
     let mut if_not_exists_span: Option<Span> = None;
-    let mut name_span: Option<Span> = None;
+    let mut name: Option<crate::ast::AstObjectRef> = None;
     let mut columns_span: Option<Span> = None;
     let mut columns: Vec<AstCreateViewColumn> = Vec::new();
 
@@ -392,7 +399,12 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
 
     // Capture view name up to '(' or AS or clause keywords
     let name_start_idx = parser.idx;
-    while let Some(tok) = parser.peek() {
+    // `IDENTIFIER(<expression>)` names the view by its argument.
+    let identifier_call = parser.identifier_argument_at(name_start_idx);
+    if let Some((end, _)) = &identifier_call {
+        parser.idx = *end;
+    }
+    while let Some(tok) = parser.peek().filter(|_| identifier_call.is_none()) {
         if parser.should_stop_scan_at_statement_start(tok) {
             break;
         }
@@ -411,6 +423,19 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
             {
                 break
             }
+            // `OPTIONS (…)` / `TBLPROPERTIES (…)` written straight after the
+            // name; at a name part's place the word is the name.
+            _ if parser.idx > name_start_idx
+                && !matches!(
+                    parser.tokens[parser.idx - 1].kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::Dot)
+                )
+                && ["OPTIONS", "TBLPROPERTIES"]
+                    .iter()
+                    .any(|w| tok.lexeme(parser.source).eq_ignore_ascii_case(w)) =>
+            {
+                break
+            }
             _ => {
                 let _ = parser.advance();
             }
@@ -418,13 +443,11 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
     }
     let name_end_idx = parser.idx;
     if name_end_idx > name_start_idx {
-        let first = &parser.tokens[name_start_idx];
-        let last = &parser.tokens[name_end_idx - 1];
-        name_span = Some(Span {
-            start: first.span.start,
-            end: last.span.end,
-        });
-        span.end = last.span.end;
+        let node_id = parser.id_gen.next();
+        let mut read = parser.object_ref_of_range(name_start_idx, name_end_idx, node_id);
+        read.identifier_arg = identifier_call.map(|(_, argument)| Box::new(argument));
+        span.end = read.span.end;
+        name = Some(read);
     }
 
     // Optional column list starting with '('
@@ -449,6 +472,19 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
     // For materialized views, also stop at PARTITION BY, CLUSTER BY, and OPTIONS
     let options_start_idx = parser.idx;
     while let Some(tok) = parser.peek() {
+        // T-SQL's `WITH {ENCRYPTION | SCHEMABINDING | VIEW_METADATA} [, …]`.
+        let attributes = parser.words_end(parser.idx, &["WITH"]).and_then(|k| {
+            parser.comma_list_end(k, |j| {
+                parser.any_words_end(
+                    j,
+                    &[&["ENCRYPTION"], &["SCHEMABINDING"], &["VIEW_METADATA"]],
+                )
+            })
+        });
+        if let Some(end) = attributes {
+            parser.idx = end;
+            continue;
+        }
         if parser.should_stop_scan_at_statement_start(tok) {
             break;
         }
@@ -465,6 +501,13 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
                 break
             }
             _ => {
+                // `TBLPROPERTIES (…)`, BigQuery's `OPTIONS (…)`.
+                if ["OPTIONS", "TBLPROPERTIES"]
+                    .iter()
+                    .any(|w| tok.lexeme(parser.source).eq_ignore_ascii_case(w))
+                {
+                    parser.record_option_list_secrets(parser.idx + 1);
+                }
                 let _ = parser.advance();
             }
         }
@@ -488,7 +531,12 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
     let row_access_policy_span = options.row_access_policy_span;
     let aggregation_policy_span = options.aggregation_policy_span;
     let join_policy_span = options.join_policy_span;
+    let (row_access_policy, row_access_policy_columns) =
+        PolicyClause::parts(options.row_access_policy);
+    let (aggregation_policy, _) = PolicyClause::parts(options.aggregation_policy);
+    let (join_policy, _) = PolicyClause::parts(options.join_policy);
     let tag_span = options.tag_span;
+    let tags = options.tags;
     let with_contact_span = options.with_contact_span;
     let change_tracking_span = options.change_tracking_span;
     let copy_grants_span = options.copy_grants_span;
@@ -602,6 +650,7 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
             if tok.lexeme(parser.source).eq_ignore_ascii_case("OPTIONS") {
                 let options_tok = parser.advance().expect_invariant("OPTIONS after peek");
                 let options_start = options_tok.span.start;
+                parser.record_option_list_secrets(parser.idx);
                 // Consume parenthesized options list
                 let mut paren_depth: u32 = 0;
                 while let Some(t) = parser.peek() {
@@ -698,18 +747,8 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
                         parser.advance(); // consume OF
                     }
                 }
-                // Consume the source view name (qualified name: project.dataset.view)
-                while let Some(t) = parser.peek() {
-                    match t.kind {
-                        TokenKind::Eof
-                        | TokenKind::Punctuation(crate::lexer::Punctuation::Semi) => break,
-                        TokenKind::Identifier { .. }
-                        | TokenKind::Punctuation(crate::lexer::Punctuation::Dot) => {
-                            parser.advance();
-                        }
-                        _ => break,
-                    }
-                }
+                // The source view's name (project.dataset.view)
+                parser.take_name_span(crate::parser::core::NamePosition::Object);
                 let replica_end = parser.tokens[parser.idx.saturating_sub(1)].span.end;
                 replica_of_span = Some(Span {
                     start: replica_start,
@@ -725,42 +764,13 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
         // No query for REPLICA OF — use a dummy Err span
         Err(Span { start: 0, end: 0 })
     } else {
-        // Check for optional opening parenthesis before the query
-        let has_opening_paren = if let Some(tok) = parser.peek() {
-            matches!(
-                tok.kind,
-                TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
-            )
-        } else {
-            false
-        };
-
-        if has_opening_paren {
-            parser.advance(); // consume opening paren
-        }
-
-        // Parse the SELECT query
+        // The query, a parenthesised one with its parentheses
+        // (`AS (SELECT …) UNION (SELECT …)`).
         let query_start_idx = parser.idx;
         let query = parser.parse_statement();
         match query {
             Ok(stmt) => {
                 span.end = stmt.span().end;
-
-                // If there was an opening paren, expect and consume closing paren
-                if has_opening_paren {
-                    if let Some(closing_tok) = parser.peek() {
-                        if matches!(
-                            closing_tok.kind,
-                            TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                        ) {
-                            let closing = parser
-                                .advance()
-                                .expect_invariant("Closing paren should be available after peek");
-                            span.end = closing.span.end;
-                        }
-                    }
-                }
-
                 Ok(Box::new(stmt))
             }
             Err(_) => {
@@ -956,7 +966,7 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
     // Use row policy from view options (parsed before AS clause)
     let final_row_access_policy_span = row_access_policy_span;
 
-    let name_span = name_span.ok_or_else(|| {
+    let name = name.ok_or_else(|| {
         ParseError::new(
             parser.current_span(),
             ParseErrorKind::InvalidStatement {
@@ -979,14 +989,19 @@ pub(crate) fn try_parse_create_view_stmt_with_parser(
         recursive_span,
         view_keyword_span,
         if_not_exists_span,
-        name_span,
+        name,
         columns_span,
         column_list_id,
         columns,
         row_access_policy_span: final_row_access_policy_span,
+        row_access_policy,
+        row_access_policy_columns,
         aggregation_policy_span,
+        aggregation_policy,
         join_policy_span,
+        join_policy,
         tag_span,
+        tags,
         with_contact_span,
         change_tracking_span,
         copy_grants_span,
@@ -1140,9 +1155,13 @@ fn try_parse_single_view_column(
     let mut comment_id: Option<crate::syntax::SyntaxViewColumnCommentId> = None;
     let mut masking_policy_span: Option<Span> = None;
     let mut masking_policy_id: Option<crate::syntax::SyntaxViewColumnMaskingPolicyId> = None;
+    let mut masking_policy: Option<AstObjectRef> = None;
+    let mut masking_policy_using: Vec<Span> = Vec::new();
     let mut projection_policy_span: Option<Span> = None;
+    let mut projection_policy: Option<AstObjectRef> = None;
     let mut projection_policy_id: Option<crate::syntax::SyntaxViewColumnProjectionPolicyId> = None;
     let mut tag_span: Option<Span> = None;
+    let mut tags: Vec<AstTagRef> = Vec::new();
     let mut tag_id: Option<crate::syntax::SyntaxViewColumnTagId> = None;
 
     while let Some(tok) = parser.peek() {
@@ -1217,10 +1236,13 @@ fn try_parse_single_view_column(
                             parser.advance(); // POLICY
 
                             if let Some(name_tok) = parser.peek() {
-                                if parser.can_be_identifier_token(name_tok) {
+                                if parser.can_be_identifier_token(name_tok)
+                                    || parser.object_name_end(parser.idx).is_some()
+                                {
                                     let policy_name_id = parser.current_token_id();
-                                    let name_span = parser.parse_qualified_name_span().expect_invariant("WITH MASKING POLICY name: verified can_be_identifier above");
-                                    let mut attr_end = name_span.end;
+                                    let policy = parser.parse_object_ref()?;
+                                    let mut attr_end = policy.span.end;
+                                    masking_policy = Some(policy);
 
                                     // Optional USING clause
                                     let mut using_keyword = None;
@@ -1243,6 +1265,8 @@ fn try_parse_single_view_column(
                                                     )
                                                 ) {
                                                     using_l_paren = Some(parser.current_token_id());
+                                                    masking_policy_using =
+                                                        parser.column_spans_in_parens(parser.idx);
                                                     parser.advance();
 
                                                     // Skip to matching rparen
@@ -1321,14 +1345,13 @@ fn try_parse_single_view_column(
                             parser.advance(); // POLICY
 
                             if let Some(name_tok) = parser.peek() {
-                                if parser.can_be_identifier_token(name_tok) {
+                                if parser.can_be_identifier_token(name_tok)
+                                    || parser.object_name_end(parser.idx).is_some()
+                                {
                                     let policy_name_id = parser.current_token_id();
-                                    let name_span = parser
-                                        .parse_qualified_name_span()
-                                        .expect_invariant(
-                                        "projection policy name: verified can_be_identifier above",
-                                    );
-                                    column_end = name_span.end;
+                                    let policy = parser.parse_object_ref()?;
+                                    column_end = policy.span.end;
+                                    projection_policy = Some(policy);
 
                                     let span = Span {
                                         start: attr_start,
@@ -1372,6 +1395,11 @@ fn try_parse_single_view_column(
                             TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                         ) {
                             let l_paren_id = parser.current_token_id();
+                            if let Some((_, read)) = parser
+                                .parenthesised_tag_list_at(parser.idx, TagListShape::Assignments)
+                            {
+                                tags = read;
+                            }
                             parser.advance();
 
                             let mut depth = 1;
@@ -1444,12 +1472,13 @@ fn try_parse_single_view_column(
                     parser.advance();
 
                     if let Some(name_tok) = parser.peek() {
-                        if parser.can_be_identifier_token(name_tok) {
+                        if parser.can_be_identifier_token(name_tok)
+                            || parser.object_name_end(parser.idx).is_some()
+                        {
                             let policy_name_id = parser.current_token_id();
-                            let name_span = parser.parse_qualified_name_span().expect_invariant(
-                                "masking policy name: verified can_be_identifier above",
-                            );
-                            let mut attr_end = name_span.end;
+                            let policy = parser.parse_object_ref()?;
+                            let mut attr_end = policy.span.end;
+                            masking_policy = Some(policy);
 
                             // Optional USING clause
                             let mut using_keyword = None;
@@ -1472,6 +1501,8 @@ fn try_parse_single_view_column(
                                             )
                                         ) {
                                             using_l_paren = Some(parser.current_token_id());
+                                            masking_policy_using =
+                                                parser.column_spans_in_parens(parser.idx);
                                             parser.advance();
 
                                             let mut depth = 1;
@@ -1557,12 +1588,13 @@ fn try_parse_single_view_column(
                     parser.advance();
 
                     if let Some(name_tok) = parser.peek() {
-                        if parser.can_be_identifier_token(name_tok) {
+                        if parser.can_be_identifier_token(name_tok)
+                            || parser.object_name_end(parser.idx).is_some()
+                        {
                             let policy_name_id = parser.current_token_id();
-                            let name_span = parser.parse_qualified_name_span().expect_invariant(
-                                "projection policy name: verified can_be_identifier above",
-                            );
-                            column_end = name_span.end;
+                            let policy = parser.parse_object_ref()?;
+                            column_end = policy.span.end;
+                            projection_policy = Some(policy);
 
                             let span = Span {
                                 start: attr_start,
@@ -1603,6 +1635,11 @@ fn try_parse_single_view_column(
                     TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                 ) {
                     let l_paren_id = parser.current_token_id();
+                    if let Some((_, read)) =
+                        parser.parenthesised_tag_list_at(parser.idx, TagListShape::Assignments)
+                    {
+                        tags = read;
+                    }
                     parser.advance();
 
                     let mut depth = 1;
@@ -1682,8 +1719,12 @@ fn try_parse_single_view_column(
         name_span,
         comment_span,
         masking_policy_span,
+        masking_policy,
+        masking_policy_using,
         projection_policy_span,
+        projection_policy,
         tag_span,
+        tags,
         full_span: column_span,
     };
 
@@ -1697,9 +1738,13 @@ fn parse_create_view_options(
     end_idx: usize,
 ) -> CreateViewOptions {
     let mut row_access_policy_span = None;
+    let mut row_access_policy = None;
     let mut aggregation_policy_span = None;
+    let mut aggregation_policy = None;
     let mut join_policy_span = None;
+    let mut join_policy = None;
     let mut tag_span = None;
+    let mut tags = Vec::new();
     let mut with_contact_span = None;
     let mut change_tracking_span = None;
     let mut copy_grants_span = None;
@@ -1732,6 +1777,7 @@ fn parse_create_view_options(
             }
 
             if is_row_access {
+                row_access_policy = parser.row_access_policy_at(idx);
                 // Scan to end of policy clause (before next keyword)
                 while idx < end_idx {
                     let t = &parser.tokens[idx];
@@ -1825,6 +1871,7 @@ fn parse_create_view_options(
             .eq_ignore_ascii_case("AGGREGATION")
         {
             let start = tok.span.start;
+            aggregation_policy = parser.aggregation_policy_at(idx);
             while idx < end_idx {
                 let t = &parser.tokens[idx];
                 if is_view_options_boundary_agg(t.lexeme(parser.source)) {
@@ -1844,6 +1891,7 @@ fn parse_create_view_options(
             if temp_idx < end_idx {
                 let next = &parser.tokens[temp_idx];
                 if next.lexeme(parser.source).eq_ignore_ascii_case("POLICY") {
+                    join_policy = parser.join_policy_at(idx);
                     while idx < end_idx {
                         let t = &parser.tokens[idx];
                         if is_view_options_boundary_join(t.lexeme(parser.source)) {
@@ -1859,7 +1907,17 @@ fn parse_create_view_options(
         }
 
         if tok.lexeme(parser.source).eq_ignore_ascii_case("TAG") {
-            let start = tok.span.start;
+            // The clause starts at a `WITH` written before `TAG`.
+            let start = match idx.checked_sub(1).filter(|&prev| prev >= start_idx) {
+                Some(prev)
+                    if parser.tokens[prev]
+                        .lexeme(parser.source)
+                        .eq_ignore_ascii_case("WITH") =>
+                {
+                    parser.tokens[prev].span.start
+                }
+                Some(_) | None => tok.span.start,
+            };
             idx += 1;
             // Find opening paren, then use helper to find matching close
             while idx < end_idx {
@@ -1868,8 +1926,13 @@ fn parse_create_view_options(
                     t.kind,
                     TokenKind::Punctuation(crate::lexer::Punctuation::LParen)
                 ) {
-                    let close_idx = find_matching_paren(parser.tokens, idx + 1, end_idx);
-                    idx = close_idx + 1;
+                    idx = match parser.parenthesised_tag_list_at(idx, TagListShape::Assignments) {
+                        Some((next, read)) => {
+                            tags = read;
+                            next
+                        }
+                        None => find_matching_paren(parser.tokens, idx + 1, end_idx) + 1,
+                    };
                     break;
                 }
                 idx += 1;
@@ -1957,9 +2020,13 @@ fn parse_create_view_options(
 
     CreateViewOptions {
         row_access_policy_span,
+        row_access_policy,
         aggregation_policy_span,
+        aggregation_policy,
         join_policy_span,
+        join_policy,
         tag_span,
+        tags,
         with_contact_span,
         change_tracking_span,
         copy_grants_span,

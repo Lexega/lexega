@@ -185,13 +185,13 @@ fn test_all_keyword_case_variants() {
         fs::write(&config_path, format!("keyword_case = \"{}\"", variant)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected, &config.keyword_case) {
-            (KeywordCase::Upper, KeywordCase::Upper) => true,
-            (KeywordCase::Lower, KeywordCase::Lower) => true,
-            (KeywordCase::Title, KeywordCase::Title) => true,
-            (KeywordCase::Preserve, KeywordCase::Preserve) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected, &config.keyword_case),
+            (KeywordCase::Upper, KeywordCase::Upper)
+                | (KeywordCase::Lower, KeywordCase::Lower)
+                | (KeywordCase::Title, KeywordCase::Title)
+                | (KeywordCase::Preserve, KeywordCase::Preserve)
+        );
 
         assert!(matches, "Failed for variant: {}", variant);
     }
@@ -212,12 +212,12 @@ fn test_all_identifier_case_variants() {
         fs::write(&config_path, format!("identifier_case = \"{}\"", variant)).unwrap();
         let config = FormatterConfig::from_toml_file(&config_path).unwrap();
 
-        let matches = match (expected, &config.identifier_case) {
-            (IdentifierCase::Upper, IdentifierCase::Upper) => true,
-            (IdentifierCase::Lower, IdentifierCase::Lower) => true,
-            (IdentifierCase::Preserve, IdentifierCase::Preserve) => true,
-            _ => false,
-        };
+        let matches = matches!(
+            (expected, &config.identifier_case),
+            (IdentifierCase::Upper, IdentifierCase::Upper)
+                | (IdentifierCase::Lower, IdentifierCase::Lower)
+                | (IdentifierCase::Preserve, IdentifierCase::Preserve)
+        );
 
         assert!(matches, "Failed for variant: {}", variant);
     }
@@ -262,4 +262,97 @@ array_literal_threshold = 5
     assert_eq!(config.max_line_length, 120);
     assert_eq!(config.alias_align_max_width, 50);
     assert_eq!(config.array_literal_threshold, 5);
+}
+
+#[test]
+fn a_file_naming_no_option_loads_the_default_configuration() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join(".lexega.toml");
+    for content in ["", "[template.substitution]\nfoo = \"bar\"\n"] {
+        fs::write(&config_path, content).unwrap();
+        let config = FormatterConfig::from_toml_file(&config_path).unwrap();
+        assert_eq!(
+            format!("{config:?}"),
+            format!("{:?}", FormatterConfig::default()),
+            "{content:?}"
+        );
+    }
+}
+
+#[test]
+fn newline_style_is_auto_unless_a_file_sets_it() {
+    use lexega_syntax::NewlineStyle;
+    assert_eq!(FormatterConfig::default().newline_style, NewlineStyle::Auto);
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join(".lexega.toml");
+    for (content, style) in [
+        ("", NewlineStyle::Auto),
+        ("newline_style = \"auto\"\n", NewlineStyle::Auto),
+        ("newline_style = \"unix\"\n", NewlineStyle::Unix),
+        ("newline_style = \"windows\"\n", NewlineStyle::Windows),
+    ] {
+        fs::write(&config_path, content).unwrap();
+        let config = FormatterConfig::from_toml_file(&config_path).unwrap();
+        assert_eq!(config.newline_style, style, "{content:?}");
+    }
+}
+
+// `Auto` reads the first line break outside every token and every
+// dollar-quoted string, one nested in another included; an opener nothing
+// closes quotes nothing. `unix` and `windows` read nothing.
+#[test]
+fn newline_style_auto_reads_the_break_outside_nested_dollar_quotes() {
+    use lexega_syntax::dialect::{postgres, snowflake};
+    use lexega_syntax::lexer::tokenize_with_dialect;
+    use lexega_syntax::{LineBreak, NewlineStyle};
+
+    for (dialect, source, expected) in [
+        (
+            postgres(),
+            "select  $a$x $b$y\nz$b$ w$a$ as c\r\nfrom t;\r\n",
+            LineBreak::Crlf,
+        ),
+        (
+            postgres(),
+            "select  $a$x $b$y\r\nz$b$ w$a$ as c\nfrom t;\n",
+            LineBreak::Lf,
+        ),
+        (
+            postgres(),
+            "create function f() returns text language plpgsql as $f$\nbegin\n  return $q$a\nb$q$;\nend\n$f$;\r\nselect 1;\r\n",
+            LineBreak::Crlf,
+        ),
+        (
+            postgres(),
+            "create function f() returns text language plpgsql as $f$\r\nbegin\r\n  return $q$a\r\nb$q$;\r\nend\r\n$f$;\nselect 1;\n",
+            LineBreak::Lf,
+        ),
+        (snowflake(), "select $$abc\r\nfrom t;\r\n", LineBreak::Crlf),
+        (snowflake(), "select $$a\r\nb$$ as x\nfrom t;\n", LineBreak::Lf),
+        (snowflake(), "select $$a\nb$$ as x, $$c$$ as y\r\nfrom t;\r\n", LineBreak::Crlf),
+        (snowflake(), "select 1", LineBreak::Lf),
+    ] {
+        let tokens = tokenize_with_dialect(source, dialect.as_ref()).tokens;
+        assert_eq!(
+            NewlineStyle::Auto.resolve(source, &tokens),
+            expected,
+            "{source:?}"
+        );
+        assert_eq!(NewlineStyle::Unix.resolve(source, &tokens), LineBreak::Lf);
+        assert_eq!(
+            NewlineStyle::Windows.resolve(source, &tokens),
+            LineBreak::Crlf
+        );
+    }
+}
+
+#[test]
+fn a_dialect_that_does_not_exist_is_an_error() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join(".lexega.toml");
+    fs::write(&config_path, "dialect = \"oracle\"\n").unwrap();
+    let error = FormatterConfig::from_toml_file(&config_path).unwrap_err();
+    assert!(error.contains("unknown dialect 'oracle'"), "{error}");
+    fs::write(&config_path, "dialect = \"postgresql\"\n").unwrap();
+    assert!(FormatterConfig::from_toml_file(&config_path).is_ok());
 }

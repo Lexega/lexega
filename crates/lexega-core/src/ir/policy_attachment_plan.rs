@@ -155,6 +155,8 @@ fn lower_account_action(
             },
         )),
         // Generic property changes are not policy attachments.
-        AstAlterAccountActionKind::Set { .. } | AstAlterAccountActionKind::Unset { .. } => None,
+        AstAlterAccountActionKind::SetPolicy { .. }
+        | AstAlterAccountActionKind::Set { .. }
+        | AstAlterAccountActionKind::Unset { .. } => None,
     }
 }

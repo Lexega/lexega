@@ -17,7 +17,7 @@ use lexega_core::api::analyze_risk;
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn has_rule(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| match s {
+    report.findings.iter().any(|s| match s {
         RuleMatch::Analysis(ref p) => p.matched_rule == rule_id,
     })
 }
@@ -102,8 +102,8 @@ fn test_pg_create_policy_using_true_fires_rap_allow_all() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "PG CREATE POLICY USING (TRUE) should trigger RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "PG CREATE POLICY USING (TRUE) should trigger RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
     assert!(report.summary.critical_count >= 1);
 }
@@ -114,8 +114,8 @@ fn test_pg_create_policy_using_1eq1_fires_rap_allow_all() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "PG CREATE POLICY USING (1=1) should trigger RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "PG CREATE POLICY USING (1=1) should trigger RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -125,8 +125,8 @@ fn test_pg_alter_policy_using_true_fires_rap_allow_all() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "PG ALTER POLICY USING (TRUE) should trigger RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "PG ALTER POLICY USING (TRUE) should trigger RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -150,8 +150,8 @@ fn test_pg_create_policy_with_check_true_fires_pgc008() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "PG-RLS-WEAK-CHECK"),
-        "PG WITH CHECK (TRUE) should trigger PG-RLS-WEAK-CHECK. Signals: {:?}",
-        report.signals
+        "PG WITH CHECK (TRUE) should trigger PG-RLS-WEAK-CHECK. Findings: {:?}",
+        report.findings
     );
     assert!(report.summary.critical_count >= 1);
 }
@@ -162,8 +162,8 @@ fn test_pg_create_policy_with_check_1eq1_fires_pgc008() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "PG-RLS-WEAK-CHECK"),
-        "PG WITH CHECK (1=1) should trigger PG-RLS-WEAK-CHECK. Signals: {:?}",
-        report.signals
+        "PG WITH CHECK (1=1) should trigger PG-RLS-WEAK-CHECK. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -173,8 +173,8 @@ fn test_pg_alter_policy_with_check_true_fires_pgc008() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "PG-RLS-WEAK-CHECK"),
-        "PG ALTER POLICY WITH CHECK (TRUE) should trigger PG-RLS-WEAK-CHECK. Signals: {:?}",
-        report.signals
+        "PG ALTER POLICY WITH CHECK (TRUE) should trigger PG-RLS-WEAK-CHECK. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -198,13 +198,13 @@ fn test_pg_policy_both_using_and_check_tautology() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "USING (TRUE) should fire RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "USING (TRUE) should fire RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
     assert!(
         has_rule(&report, "PG-RLS-WEAK-CHECK"),
-        "WITH CHECK (TRUE) should fire PG-RLS-WEAK-CHECK. Signals: {:?}",
-        report.signals
+        "WITH CHECK (TRUE) should fire PG-RLS-WEAK-CHECK. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -218,8 +218,8 @@ fn test_sf_policy_case_all_true_fires_rap_allow_all() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "CASE with all-TRUE branches should trigger RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "CASE with all-TRUE branches should trigger RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -229,8 +229,8 @@ fn test_pg_policy_case_all_true_fires_rap_allow_all() {
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
         has_rule(&report, "RAP-ALLOW-ALL"),
-        "PG USING CASE all-TRUE should trigger RAP-ALLOW-ALL. Signals: {:?}",
-        report.signals
+        "PG USING CASE all-TRUE should trigger RAP-ALLOW-ALL. Findings: {:?}",
+        report.findings
     );
 }
 
@@ -339,4 +339,64 @@ fn test_in_list_constant_tautology_recognition() {
             "non-tautology IN must NOT fire RAP-ALLOW-ALL: {sql}"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Column references of a policy body's subquery
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// (table, column) of every column reference `sql` publishes.
+fn column_references(sql: &str) -> Vec<(Option<String>, String)> {
+    let config = lexega_core::analyzer::AnalysisConfig {
+        trace_mode: true,
+        ..Default::default()
+    };
+    let report = lexega_core::api::analyze_risk_with_policy_config(sql, &config)
+        .expect("analysis should succeed");
+    report
+        .statement_traces
+        .iter()
+        .filter_map(|statement| statement.facts.as_ref()?.query.as_ref())
+        .flat_map(|query| &query.references_column)
+        .map(|reference| {
+            (
+                reference
+                    .column
+                    .table
+                    .as_ref()
+                    .map(|table| table.canonical.to_ascii_uppercase()),
+                reference.column.name.normalized.to_ascii_uppercase(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_policy_bodys_subquery_column_names_its_table() {
+    let references = column_references(
+        "CREATE ROW ACCESS POLICY p AS (customer_id NUMBER) RETURNS BOOLEAN -> \
+         EXISTS (SELECT 1 FROM users u WHERE u.id = customer_id);",
+    );
+    assert!(
+        references.contains(&(Some("USERS".to_string()), "ID".to_string())),
+        "{references:?}"
+    );
+    // The policy's own argument is a column of no table.
+    assert!(
+        references.contains(&(None, "CUSTOMER_ID".to_string())),
+        "{references:?}"
+    );
+
+    // Read outside the subquery, the argument has no other reference.
+    let references = column_references(
+        "CREATE ROW ACCESS POLICY p AS (customer_id NUMBER) RETURNS BOOLEAN -> \
+         customer_id > 0 AND EXISTS (SELECT 1 FROM users u WHERE u.id = 1);",
+    );
+    assert_eq!(
+        references,
+        vec![
+            (None, "CUSTOMER_ID".to_string()),
+            (Some("USERS".to_string()), "ID".to_string()),
+        ]
+    );
 }

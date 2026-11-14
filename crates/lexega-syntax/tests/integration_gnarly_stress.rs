@@ -62,6 +62,7 @@ fn test_gnarly_all_statements_parse_independently() {
     ];
 
     for sql in statements {
-        let _result = parse_stmt_from_str(sql).expect(&format!("Failed to parse: {}", sql));
+        let _result =
+            parse_stmt_from_str(sql).unwrap_or_else(|| panic!("Failed to parse: {}", sql));
     }
 }

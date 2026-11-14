@@ -22,9 +22,8 @@
 use crate::ast::{AstStageCredentialOption, AstStmt};
 use crate::error::{ParseError, ParseResult, ParseResultExt};
 use crate::lexer::token::LiteralKind;
-use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
+use crate::lexer::{decode_string_literal, Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::create_stage::unquote_sql_string;
 
 impl<'a> Parser<'a> {
     /// Parse a Redshift `COPY table [ (cols) ] FROM 'source' [auth] [options]`.
@@ -72,11 +71,16 @@ impl<'a> Parser<'a> {
             self.current_span(),
             vec!["COPY data source string".to_string()],
         )?;
-        let location_url = if matches!(src_tok.kind, TokenKind::Literal(LiteralKind::String)) {
-            Some(unquote_sql_string(src_tok.lexeme(self.source)))
-        } else {
-            None
-        };
+        let (location_url, location_url_span) =
+            if matches!(src_tok.kind, TokenKind::Literal(LiteralKind::String)) {
+                (
+                    decode_string_literal(src_tok.lexeme(self.source), self.dialect)
+                        .map(|d| d.value),
+                    Some(src_tok.span),
+                )
+            } else {
+                (None, None)
+            };
         let from_span = Span {
             start: from_start,
             end: src_tok.span.end,
@@ -90,8 +94,10 @@ impl<'a> Parser<'a> {
             node_id: self.id_gen.next(),
             span: Span { start, end },
             table_span,
+            name_span,
             from_span,
             location_url,
+            location_url_span,
             credentials,
         })
     }

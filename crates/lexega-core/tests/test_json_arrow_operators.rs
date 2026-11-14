@@ -29,8 +29,10 @@ fn cfg(d: lexega_core::DialectRef) -> AnalysisConfig {
 /// is pretty-printed, so byte-exactness is not asserted — only that no token,
 /// the `->>` operator included, is lost).
 fn parses_token_safe(sql: &str, d: lexega_core::DialectRef) {
-    let mut config = FormatterConfig::default();
-    config.dialect = d.clone();
+    let config = FormatterConfig {
+        dialect: d.clone(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("formatter must preserve all tokens");

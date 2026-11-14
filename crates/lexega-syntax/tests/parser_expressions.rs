@@ -89,3 +89,68 @@ END;
         "failed to parse IS NULL in complex function"
     );
 }
+
+#[test]
+fn a_collation_named_by_a_name_or_a_string_is_read() {
+    use lexega_syntax::dialect::{databricks, mssql, mysql, postgres, snowflake};
+    use lexega_syntax::{
+        format_sql_with_config, parse_sql_with_dialect, verify_formatting_safe_with_dialect,
+        FormatterConfig,
+    };
+
+    for (dialect, sql) in [
+        (mssql(), "SELECT id FROM t WHERE c COLLATE Latin1_General_CS_AS = 'x'"),
+        (mssql(), "SELECT c COLLATE Latin1_General_CI_AS AS n FROM t"),
+        (
+            mssql(),
+            "SELECT a.id FROM a JOIN b ON a.c COLLATE DATABASE_DEFAULT = b.c COLLATE DATABASE_DEFAULT",
+        ),
+        (mysql(), "SELECT id FROM t WHERE c = 'x' COLLATE utf8mb4_bin"),
+        (mysql(), "SELECT id FROM t WHERE c = _utf8mb4'x' COLLATE utf8mb4_bin"),
+        (postgres(), "SELECT id FROM t ORDER BY c COLLATE \"C\""),
+        (databricks(), "SELECT id FROM t WHERE c COLLATE UTF8_LCASE = 'x'"),
+        (snowflake(), "SELECT id FROM t WHERE c COLLATE 'en-ci' = 'x'"),
+    ] {
+        let script = parse_sql_with_dialect(sql, dialect.as_ref()).expect("parses");
+        assert_eq!(script.stmts.len(), 1, "{sql}: {:?}", script.stmts);
+        let tree = format!("{:?}", script.stmts[0]);
+        assert!(tree.contains("Collate {"), "{sql}: {tree}");
+        assert!(!tree.contains("Error {"), "{sql}: {tree}");
+        let config = FormatterConfig { dialect, ..Default::default() };
+        let formatted = format_sql_with_config(sql, &config).expect("formats");
+        verify_formatting_safe_with_dialect(sql, &formatted, config.dialect.as_ref())
+            .unwrap_or_else(|e| panic!("{sql} -> {formatted}: {e}"));
+    }
+}
+
+/// The elements `row_elements` reads of the one item `SELECT <expr>` projects.
+fn row_element_count(expr: &str) -> Option<usize> {
+    use lexega_syntax::ast::{AstProjectionKind, AstStmt, ProjectionItemKind};
+    let sql = format!("SELECT {expr}");
+    let script = parse_sql(&sql).expect("parses");
+    let Some(AstStmt::Select(select)) = script.stmts.first() else {
+        panic!("{sql}: not a SELECT");
+    };
+    let AstProjectionKind::Columns(items) = &select.projection.kind else {
+        panic!("{sql}: no column list");
+    };
+    let ProjectionItemKind::SelectItem(item) = &items[0].kind else {
+        panic!("{sql}: no select item");
+    };
+    item.expr.row_elements(&sql).map(|elements| elements.len())
+}
+
+#[test]
+fn a_row_is_a_parenthesised_list_or_a_row_call_without_modifiers() {
+    for (expr, expected) in [
+        ("(a, b)", Some(2)),
+        ("ROW(a, b, 'c')", Some(3)),
+        ("row(a, b)", Some(2)),
+        ("ROW(DISTINCT a, b)", None),
+        ("ROW(a => 1, b)", None),
+        ("COALESCE(a, b)", None),
+        ("a", None),
+    ] {
+        assert_eq!(row_element_count(expr), expected, "{expr}");
+    }
+}

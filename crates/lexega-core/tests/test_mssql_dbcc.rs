@@ -30,7 +30,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
         .expect("merge against built-ins succeeds");
     AnalysisConfig {
         dialect: Some(dialect::mssql()),
-        custom_rules: Some(merged),
+        custom_rules: Some(merged.into()),
         ..Default::default()
     }
 }
@@ -38,8 +38,7 @@ fn mssql_cfg_with_overlay(custom_yaml: &str) -> AnalysisConfig {
 fn rule_ids_with(sql: &str, cfg: &AnalysisConfig) -> Vec<String> {
     let report = analyze_risk_with_policy_config(sql, cfg).expect("should analyze");
     report
-        .signals
-        .iter()
+        .entries()
         .map(|RuleMatch::Analysis(a)| a.matched_rule.clone())
         .collect()
 }
@@ -52,8 +51,10 @@ fn rule_ids(sql: &str) -> Vec<String> {
 /// the formatter applies its own inter-statement blank-line policy (tokens
 /// preserved, bytes not necessarily identical).
 fn roundtrip_not_skipped(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     verify_formatting_safe_with_dialect(sql, &out, config.dialect.as_ref())
         .expect("should preserve tokens");
@@ -68,8 +69,10 @@ fn roundtrip_not_skipped(sql: &str) {
 /// Single-statement byte-exact round-trip — the Pattern-A span-only formatter
 /// must reproduce the source verbatim.
 fn roundtrip_byte_exact(sql: &str) {
-    let mut config = FormatterConfig::default();
-    config.dialect = dialect::mssql();
+    let config = FormatterConfig {
+        dialect: dialect::mssql(),
+        ..Default::default()
+    };
     let out = format_sql_with_config(sql, &config).expect("should format");
     assert_eq!(
         out, sql,

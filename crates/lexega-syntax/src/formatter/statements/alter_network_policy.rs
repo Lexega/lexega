@@ -112,6 +112,7 @@ pub fn format_alter_network_policy(
             set_span,
             tag_span,
             assignments_span,
+            ..
         } => {
             printer.push_span(*set_span);
             printer.space();
@@ -123,6 +124,7 @@ pub fn format_alter_network_policy(
             unset_span,
             tag_span,
             names_span,
+            ..
         } => {
             printer.push_span(*unset_span);
             printer.space();

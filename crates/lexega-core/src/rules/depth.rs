@@ -23,7 +23,13 @@ fn reads(p: &Predicate, enclosing: &str) -> bool {
             parts.iter().any(|c| reads(c, enclosing))
         }
         Predicate::Not(inner) => reads(inner, enclosing),
-        Predicate::Scalar(s) => path_reads(&s.path, enclosing).0,
+        // The field an operator compares with is read beside its path.
+        Predicate::Scalar(s) => {
+            path_reads(&s.path, enclosing).0
+                || s.op
+                    .compared_field()
+                    .is_some_and(|field| path_reads(field, enclosing).0)
+        }
         Predicate::Relational(r) => {
             let (hit, element_key) = path_reads(&r.path, enclosing);
             hit || match &r.quantifier {
@@ -100,6 +106,16 @@ mod tests {
         )));
         assert!(reads_reasoning(&p(
             "privilege.role_grant_impact.affected_users: { gte: 20 }"
+        )));
+    }
+
+    #[test]
+    fn a_field_compared_against_is_read() {
+        assert!(reads_reasoning(&p(
+            "query.written_columns:\n  each:\n    column_taint_labels:\n      all_in_field: value_taint_labels"
+        )));
+        assert!(!reads_reasoning(&p(
+            "query.written_columns:\n  each:\n    column_taint_labels:\n      all_in_field: column_taint_labels"
         )));
     }
 }

@@ -4,7 +4,7 @@
 // SNW-AUTHPOL-ON / SNW-AUTHPOL-OFF.
 //
 // Pipeline: parse → IR PolicyAttachmentPlan → derive_facts → evaluate_rules
-//   → Signal { rule_id }
+//   → Finding { rule_id }
 //
 // The rules track the principal-binding lifecycle: enable == ALTER
 // USER/ACCOUNT SET AUTHENTICATION POLICY = …; disable == ALTER
@@ -16,8 +16,8 @@
 use lexega_core::api::analyze_policy_attachment_facts;
 
 fn fact_rule_ids(sql: &str) -> Vec<String> {
-    let signals = analyze_policy_attachment_facts(sql).expect("fact pipeline succeeds");
-    signals.into_iter().map(|s| s.rule_id).collect()
+    let findings = analyze_policy_attachment_facts(sql).expect("fact pipeline succeeds");
+    findings.into_iter().map(|s| s.rule_id).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -146,8 +146,8 @@ fn snw_authpol_off_silent_on_alter_user_unrelated() {
 
 #[test]
 fn pipeline_skips_non_attachment_statements() {
-    let signals = analyze_policy_attachment_facts("SELECT 1;").expect("parses");
-    assert!(signals.is_empty(), "got {:?}", signals);
+    let findings = analyze_policy_attachment_facts("SELECT 1;").expect("parses");
+    assert!(findings.is_empty(), "got {:?}", findings);
 }
 
 #[test]
@@ -180,11 +180,11 @@ fn multi_statement_collects_per_attachment() {
 }
 
 #[test]
-fn signal_carries_source_span_for_attachment() {
-    let signals =
+fn finding_carries_source_span_for_attachment() {
+    let findings =
         analyze_policy_attachment_facts("ALTER USER alice SET AUTHENTICATION POLICY = my_pol;")
             .expect("parses");
-    let on = signals
+    let on = findings
         .iter()
         .find(|s| s.rule_id == "SNW-AUTHPOL-ON")
         .expect("SNW-AUTHPOL-ON emitted");

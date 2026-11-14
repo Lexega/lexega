@@ -36,8 +36,10 @@ fn format_with_config(sql: &str, config: FormatterConfig) -> String {
 fn test_create_stage_clause_style_stacked() {
     let sql = "CREATE STAGE my_stage URL='s3://bucket' FILE_FORMAT=(TYPE='CSV')";
 
-    let mut config = FormatterConfig::default();
-    config.create_stage_clause_style = CreateStageClauseStyle::Stacked;
+    let config = FormatterConfig {
+        create_stage_clause_style: CreateStageClauseStyle::Stacked,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -50,8 +52,10 @@ fn test_create_stage_clause_style_stacked() {
 fn test_create_stage_clause_style_inline() {
     let sql = "CREATE STAGE my_stage URL='s3://bucket' FILE_FORMAT=(TYPE='CSV')";
 
-    let mut config = FormatterConfig::default();
-    config.create_stage_clause_style = CreateStageClauseStyle::Inline;
+    let config = FormatterConfig {
+        create_stage_clause_style: CreateStageClauseStyle::Inline,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -64,8 +68,10 @@ fn test_create_stage_clause_style_inline() {
 fn test_multi_insert_into_indent_true() {
     let sql = "INSERT ALL INTO t1 VALUES(1) INTO t2 VALUES(2) SELECT 1";
 
-    let mut config = FormatterConfig::default();
-    config.multi_insert_into_indent = true;
+    let config = FormatterConfig {
+        multi_insert_into_indent: true,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -78,8 +84,10 @@ fn test_multi_insert_into_indent_true() {
 fn test_multi_insert_into_indent_false() {
     let sql = "INSERT ALL INTO t1 VALUES(1) INTO t2 VALUES(2) SELECT 1";
 
-    let mut config = FormatterConfig::default();
-    config.multi_insert_into_indent = false;
+    let config = FormatterConfig {
+        multi_insert_into_indent: false,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -92,8 +100,10 @@ fn test_multi_insert_into_indent_false() {
 fn test_multi_insert_values_on_newline_true() {
     let sql = "INSERT ALL INTO t1 (col1) VALUES(1) SELECT 1";
 
-    let mut config = FormatterConfig::default();
-    config.multi_insert_values_on_newline = true;
+    let config = FormatterConfig {
+        multi_insert_values_on_newline: true,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -106,8 +116,10 @@ fn test_multi_insert_values_on_newline_true() {
 fn test_multi_insert_values_on_newline_false() {
     let sql = "INSERT ALL INTO t1 (col1) VALUES(1) SELECT 1";
 
-    let mut config = FormatterConfig::default();
-    config.multi_insert_values_on_newline = false;
+    let config = FormatterConfig {
+        multi_insert_values_on_newline: false,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -120,8 +132,10 @@ fn test_multi_insert_values_on_newline_false() {
 fn test_copy_into_from_on_newline_true() {
     let sql = "COPY INTO table1 FROM @stage";
 
-    let mut config = FormatterConfig::default();
-    config.copy_into_from_on_newline = true;
+    let config = FormatterConfig {
+        copy_into_from_on_newline: true,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -134,8 +148,10 @@ fn test_copy_into_from_on_newline_true() {
 fn test_copy_into_from_on_newline_false() {
     let sql = "COPY INTO table1 FROM @stage";
 
-    let mut config = FormatterConfig::default();
-    config.copy_into_from_on_newline = false;
+    let config = FormatterConfig {
+        copy_into_from_on_newline: false,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -148,8 +164,10 @@ fn test_copy_into_from_on_newline_false() {
 fn test_copy_into_options_style_inline() {
     let sql = "COPY INTO t FROM @s FILE_FORMAT=(TYPE='CSV')";
 
-    let mut config = FormatterConfig::default();
-    config.copy_into_options_style = CopyIntoOptionsStyle::Inline;
+    let config = FormatterConfig {
+        copy_into_options_style: CopyIntoOptionsStyle::Inline,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -161,8 +179,10 @@ fn test_copy_into_options_style_inline() {
 fn test_copy_into_options_style_stacked() {
     let sql = "COPY INTO t FROM @s FILE_FORMAT=(TYPE='CSV')";
 
-    let mut config = FormatterConfig::default();
-    config.copy_into_options_style = CopyIntoOptionsStyle::Stacked;
+    let config = FormatterConfig {
+        copy_into_options_style: CopyIntoOptionsStyle::Stacked,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -174,8 +194,10 @@ fn test_copy_into_options_style_stacked() {
 fn test_create_proc_func_returns_on_newline_true() {
     let sql = "CREATE PROCEDURE p() RETURNS INT AS $$ SELECT 1; $$";
 
-    let mut config = FormatterConfig::default();
-    config.create_proc_func_returns_on_newline = true;
+    let config = FormatterConfig {
+        create_proc_func_returns_on_newline: true,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -188,8 +210,10 @@ fn test_create_proc_func_returns_on_newline_true() {
 fn test_create_proc_func_returns_on_newline_false() {
     let sql = "CREATE PROCEDURE p() RETURNS INT AS $$ SELECT 1; $$";
 
-    let mut config = FormatterConfig::default();
-    config.create_proc_func_returns_on_newline = false;
+    let config = FormatterConfig {
+        create_proc_func_returns_on_newline: false,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -202,8 +226,10 @@ fn test_create_proc_func_returns_on_newline_false() {
 fn test_create_proc_func_body_indent_true() {
     let sql = "CREATE PROCEDURE p() RETURNS INT AS $$ SELECT 1; $$";
 
-    let mut config = FormatterConfig::default();
-    config.create_proc_func_body_indent = true;
+    let config = FormatterConfig {
+        create_proc_func_body_indent: true,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -215,8 +241,10 @@ fn test_create_proc_func_body_indent_true() {
 fn test_create_proc_func_body_indent_false() {
     let sql = "CREATE PROCEDURE p() RETURNS INT AS $$ SELECT 1; $$";
 
-    let mut config = FormatterConfig::default();
-    config.create_proc_func_body_indent = false;
+    let config = FormatterConfig {
+        create_proc_func_body_indent: false,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -228,8 +256,10 @@ fn test_create_proc_func_body_indent_false() {
 fn test_pipe_chain_style_preserve() {
     let sql = "SELECT * FROM t1  ->>  SELECT * FROM t2";
 
-    let mut config = FormatterConfig::default();
-    config.pipe_chain_style = PipeChainStyle::Preserve;
+    let config = FormatterConfig {
+        pipe_chain_style: PipeChainStyle::Preserve,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -241,8 +271,10 @@ fn test_pipe_chain_style_preserve() {
 fn test_pipe_chain_style_inline() {
     let sql = "SELECT * FROM t1\n->> SELECT * FROM t2";
 
-    let mut config = FormatterConfig::default();
-    config.pipe_chain_style = PipeChainStyle::Inline;
+    let config = FormatterConfig {
+        pipe_chain_style: PipeChainStyle::Inline,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -254,8 +286,10 @@ fn test_pipe_chain_style_inline() {
 fn test_pipe_chain_style_stacked() {
     let sql = "SELECT * FROM t1 ->> SELECT * FROM t2 ->> SELECT * FROM t3";
 
-    let mut config = FormatterConfig::default();
-    config.pipe_chain_style = PipeChainStyle::Stacked;
+    let config = FormatterConfig {
+        pipe_chain_style: PipeChainStyle::Stacked,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -267,8 +301,10 @@ fn test_pipe_chain_style_stacked() {
 fn test_param_list_style_inline() {
     let sql = "CREATE PROCEDURE p(a INT, b VARCHAR) RETURNS INT AS $$ SELECT 1; $$";
 
-    let mut config = FormatterConfig::default();
-    config.create_proc_func_params_style = ParamListStyle::Inline;
+    let config = FormatterConfig {
+        create_proc_func_params_style: ParamListStyle::Inline,
+        ..Default::default()
+    };
 
     let result = format_with_config(sql, config);
 
@@ -286,19 +322,19 @@ fn test_config_defaults() {
         config.create_stage_clause_style,
         CreateStageClauseStyle::Stacked
     );
-    assert_eq!(config.create_stage_credentials_expanded, false);
-    assert_eq!(config.create_stage_file_format_expanded, false);
-    assert_eq!(config.multi_insert_into_indent, true);
-    assert_eq!(config.multi_insert_when_indent, true);
-    assert_eq!(config.multi_insert_values_on_newline, true);
+    assert!(!config.create_stage_credentials_expanded);
+    assert!(!config.create_stage_file_format_expanded);
+    assert!(config.multi_insert_into_indent);
+    assert!(config.multi_insert_when_indent);
+    assert!(config.multi_insert_values_on_newline);
     assert!(matches!(
         config.create_proc_func_params_style,
         ParamListStyle::Threshold(3)
     ));
-    assert_eq!(config.create_proc_func_returns_on_newline, true);
-    assert_eq!(config.create_proc_func_format_body, false);
-    assert_eq!(config.create_proc_func_body_indent, true);
-    assert_eq!(config.copy_into_from_on_newline, true);
+    assert!(config.create_proc_func_returns_on_newline);
+    assert!(!config.create_proc_func_format_body);
+    assert!(config.create_proc_func_body_indent);
+    assert!(config.copy_into_from_on_newline);
     assert_eq!(config.pipe_chain_style, PipeChainStyle::Stacked);
 }
 
@@ -311,10 +347,10 @@ fn test_compact_preset_overrides() {
         config.create_stage_clause_style,
         CreateStageClauseStyle::Inline
     );
-    assert_eq!(config.multi_insert_into_indent, false);
-    assert_eq!(config.multi_insert_when_indent, false);
-    assert_eq!(config.create_proc_func_returns_on_newline, false);
-    assert_eq!(config.copy_into_from_on_newline, false);
+    assert!(!config.multi_insert_into_indent);
+    assert!(!config.multi_insert_when_indent);
+    assert!(!config.create_proc_func_returns_on_newline);
+    assert!(!config.copy_into_from_on_newline);
     assert_eq!(config.pipe_chain_style, PipeChainStyle::Inline);
 }
 
@@ -327,10 +363,10 @@ fn test_ultra_readable_preset_overrides() {
         config.create_stage_clause_style,
         CreateStageClauseStyle::Stacked
     );
-    assert_eq!(config.multi_insert_into_indent, true);
-    assert_eq!(config.multi_insert_when_indent, true);
-    assert_eq!(config.multi_insert_values_on_newline, true);
-    assert_eq!(config.create_proc_func_returns_on_newline, true);
-    assert_eq!(config.copy_into_from_on_newline, true);
+    assert!(config.multi_insert_into_indent);
+    assert!(config.multi_insert_when_indent);
+    assert!(config.multi_insert_values_on_newline);
+    assert!(config.create_proc_func_returns_on_newline);
+    assert!(config.copy_into_from_on_newline);
     assert_eq!(config.pipe_chain_style, PipeChainStyle::Stacked);
 }

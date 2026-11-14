@@ -32,16 +32,16 @@ use crate::ast::types::{
     AstCreateImageRepository, AstCreateListing, AstCreateManagedAccount, AstCreateNetworkRule,
     AstCreateNotebook, AstCreateReplicationFailoverGroup, AstCreateResourceMonitor,
     AstCreateSecret, AstCreateSecurityIntegration, AstCreateSemanticView, AstCreateService,
-    AstCreateShare, AstCreateStreamlit, AstDatashareObjectKind, AstGitRepositoryAction,
-    AstImageRepositoryAction, AstListingAction, AstNotebookAction,
+    AstCreateShare, AstCreateStreamlit, AstDatashareObjectKind, AstExpr, AstGitRepositoryAction,
+    AstImageRepositoryAction, AstListingAction, AstNotebookAction, AstObjectRef,
     AstReplicationFailoverGroupAction, AstReplicationFailoverGroupActionKind,
     AstResourceMonitorTrigger, AstSemanticViewAction, AstSemanticViewTable, AstServiceAction,
-    AstStageFileCommand, AstStageFileCommandKind, AstStmt, AstStreamlitAction, AstUnknownClause,
-    UnknownKind,
+    AstShareObjectKind, AstStageFileCommand, AstStageFileCommandKind, AstStmt, AstStreamlitAction,
+    AstUnknownClause, UnknownKind,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, LiteralKind, Punctuation, Span, Token, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{NamePosition, Parser};
 
 impl<'a> Parser<'a> {
     /// Parse `CREATE [OR REPLACE] SHARE [IF NOT EXISTS] <name> [COMMENT = '<text>']`.
@@ -1358,8 +1358,7 @@ impl<'a> Parser<'a> {
             end = spec_kw.span.end;
             let body_is_dollar = self
                 .peek_non_trivia()
-                .map(|t| crate::parser::core::is_dollar_quote_tag(t.lexeme(self.source)))
-                .unwrap_or(false);
+                .is_some_and(|t| self.delimits_dollar_quote(t));
             let body_is_string = self
                 .peek_non_trivia()
                 .map(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)))
@@ -1582,8 +1581,8 @@ impl<'a> Parser<'a> {
     ///
     /// The TABLES block is decomposed into the base-table access surface; the
     /// other model blocks are captured as opaque balanced-paren spans (presence
-    /// is the recognition signal). Trailing properties (COMMENT, WITH
-    /// EXTENSION, …) carry no governance signal and are absorbed to the
+    /// is what is recognized). Trailing properties (COMMENT, WITH
+    /// EXTENSION, …) carry nothing a rule reads and are absorbed to the
     /// statement terminator.
     pub(crate) fn try_parse_create_semantic_view(&mut self) -> ParseResult<AstStmt> {
         let _depth = self.track_depth("create_semantic_view")?;
@@ -1654,7 +1653,7 @@ impl<'a> Parser<'a> {
         }
 
         // Trailing properties (COMMENT = '…', [WITH] EXTENSION (…)) carry no
-        // governance signal — absorb opaquely to the statement terminator.
+        // governance relevance — absorb opaquely to the statement terminator.
         let tail_end = skip_to_statement_terminator(self);
         if tail_end > end {
             end = tail_end;
@@ -2336,8 +2335,7 @@ impl<'a> Parser<'a> {
         self.advance().expect_invariant("AS consumed after peek");
         let body_is_dollar = self
             .peek_non_trivia()
-            .map(|t| crate::parser::core::is_dollar_quote_tag(t.lexeme(self.source)))
-            .unwrap_or(false);
+            .is_some_and(|t| self.delimits_dollar_quote(t));
         let body_is_string = self
             .peek_non_trivia()
             .map(|t| matches!(t.kind, TokenKind::Literal(LiteralKind::String)))
@@ -2467,6 +2465,7 @@ impl<'a> Parser<'a> {
         // Consume the rest of the statement, capturing the `@<stage>` reference
         // (the first run of tokens beginning with `@`, extended while adjacent).
         let mut stage_ref_span: Option<Span> = None;
+        let mut stage_at: Option<usize> = None;
         loop {
             let (is_terminator, tok_start, tok_end, starts_with_at) = match self.peek_non_trivia() {
                 None => break,
@@ -2474,7 +2473,7 @@ impl<'a> Parser<'a> {
                     matches!(
                         tok.kind,
                         TokenKind::Punctuation(Punctuation::Semi) | TokenKind::Eof
-                    ),
+                    ) || self.should_stop_scan_at_statement_start(tok),
                     tok.span.start,
                     tok.span.end,
                     tok.lexeme(self.source).starts_with('@'),
@@ -2485,6 +2484,7 @@ impl<'a> Parser<'a> {
             }
             match stage_ref_span {
                 None if starts_with_at => {
+                    stage_at = Some(self.idx);
                     stage_ref_span = Some(Span {
                         start: tok_start,
                         end: tok_end,
@@ -2509,6 +2509,7 @@ impl<'a> Parser<'a> {
             span: Span { start, end },
             kind,
             stage_ref_span,
+            stage: stage_at.and_then(|at| self.stage_ref_at(at)),
         };
         Ok(AstStmt::StageFileCommand(Box::new(ast)))
     }
@@ -2610,6 +2611,7 @@ impl<'a> Parser<'a> {
         // IF ( EXISTS ( <query> ) )
         let mut if_span: Option<Span> = None;
         let mut condition_span: Option<Span> = None;
+        let mut condition: Option<Box<AstExpr>> = None;
         if matches!(
             self.peek_non_trivia(),
             Some(t) if matches!(t.kind, TokenKind::Keyword(Keyword::If))
@@ -2621,7 +2623,16 @@ impl<'a> Parser<'a> {
                 self.peek_non_trivia(),
                 Some(t) if matches!(t.kind, TokenKind::Punctuation(Punctuation::LParen))
             ) {
-                let cspan = self.consume_balanced_parens()?;
+                let from = self.idx;
+                let cspan = match self.parse_parenthesized_expr() {
+                    Some((cspan, expr)) => {
+                        // Secrets in the condition are masked as in text kept as written.
+                        self.record_unparsed_secrets(from, self.idx);
+                        condition = Some(Box::new(expr));
+                        cspan
+                    }
+                    None => self.consume_balanced_parens()?,
+                };
                 condition_span = Some(cspan);
                 end = cspan.end;
             }
@@ -2671,6 +2682,7 @@ impl<'a> Parser<'a> {
             comment_span,
             if_span,
             condition_span,
+            condition,
             then_span,
             action,
         };
@@ -2769,13 +2781,36 @@ impl<'a> Parser<'a> {
                     .peek_non_trivia()
                     .map(|t| t.span.start)
                     .unwrap_or(modify_span.end);
-                let cend = skip_to_statement_terminator(self);
+                let from = self.idx;
+                // The condition is the expression up to the statement's end;
+                // else the text there is kept as written.
+                let parsed = self.try_read(|p| {
+                    let expr = p.parse_expr_without_recovery()?;
+                    p.peek_non_trivia()
+                        .is_none_or(|t| {
+                            matches!(
+                                t.kind,
+                                TokenKind::Eof | TokenKind::Punctuation(Punctuation::Semi)
+                            )
+                        })
+                        .then_some(expr)
+                });
+                let (cend, condition) = match parsed {
+                    Some(expr) => {
+                        // Secrets in the condition are masked as in text kept as written.
+                        self.record_unparsed_secrets(from, self.idx);
+                        let end = self.last_consumed_span().map_or(cstart, |last| last.end);
+                        (end, Some(Box::new(expr)))
+                    }
+                    None => (skip_to_statement_terminator(self), None),
+                };
                 AstAlterAlertActionKind::ModifyCondition {
                     modify_span,
                     condition_span: Span {
                         start: cstart,
                         end: cend,
                     },
+                    condition,
                 }
             } else if sub.lexeme(self.source).eq_ignore_ascii_case("ACTION") {
                 self.advance()
@@ -3451,6 +3486,32 @@ enum AddRemoveSet {
     Remove,
 }
 
+/// `TABLE | SCHEMA | VIEW | VOLUME | MODEL name` at the current token,
+/// consumed; nothing is consumed where the object word or the name is
+/// missing.
+fn share_object(parser: &mut Parser<'_>) -> Option<(AstShareObjectKind, Span, AstObjectRef)> {
+    let word = parser.peek_non_trivia()?;
+    let kind_span = word.span;
+    let kind = match word.lexeme(parser.source).to_ascii_uppercase().as_str() {
+        "TABLE" => AstShareObjectKind::Table,
+        "SCHEMA" => AstShareObjectKind::Schema,
+        "VIEW" => AstShareObjectKind::View,
+        "VOLUME" => AstShareObjectKind::Volume,
+        "MODEL" => AstShareObjectKind::Model,
+        _ => return None,
+    };
+    let saved = parser.idx;
+    parser.advance();
+    parser.skip_trivia();
+    match parser.parse_object_ref_with_argument(NamePosition::Object) {
+        Some(object) => Some((kind, kind_span, object)),
+        None => {
+            parser.idx = saved;
+            None
+        }
+    }
+}
+
 fn parse_share_add_or_remove_set_accounts(
     parser: &mut Parser<'_>,
     op: AddRemoveSet,
@@ -3501,6 +3562,33 @@ fn parse_share_add_or_remove_set_accounts(
                 start: action_start,
                 end: list_end,
             },
+            kind,
+        });
+    }
+
+    if let Some((kind, kind_span, object)) = share_object(parser) {
+        let end = consume_until_semi_or_eof(parser, object.span.end);
+        let span = Span {
+            start: action_start,
+            end,
+        };
+        let kind = match op {
+            AddRemoveSet::Add => AstAlterShareActionKind::AddObject {
+                add_span: op_span,
+                kind,
+                kind_span,
+                object,
+            },
+            AddRemoveSet::Remove => AstAlterShareActionKind::RemoveObject {
+                remove_span: op_span,
+                kind,
+                kind_span,
+                object,
+            },
+        };
+        return Ok(AstAlterShareAction {
+            node_id: parser.id_gen.next(),
+            span,
             kind,
         });
     }
@@ -4067,8 +4155,8 @@ fn git_repository_slots(
 
 /// Pull the `EXTERNAL_ACCESS_INTEGRATIONS` value span out of a property bag —
 /// the network-egress recognition surface shared by STREAMLIT and SERVICE.
-/// Returns the value span when the clause is present; its presence is the
-/// signal, not its contents.
+/// Returns the value span when the clause is present; its presence is
+/// what matters, not its contents.
 fn external_access_integrations_slot(
     parser: &Parser<'_>,
     properties: &[crate::ast::AstObjectProperty],
@@ -4153,6 +4241,7 @@ fn alert_property_slots(
 /// returning the end position of the last consumed token. Used to capture
 /// an unparseable alert action body or a MODIFY CONDITION span.
 fn skip_to_statement_terminator(parser: &mut Parser<'_>) -> u32 {
+    let from = parser.idx;
     let mut end = parser.current_span().end;
     while let Some(tok) = parser.peek_non_trivia() {
         if matches!(
@@ -4166,6 +4255,8 @@ fn skip_to_statement_terminator(parser: &mut Parser<'_>) -> u32 {
             .expect_invariant("token consumed in skip_to_statement_terminator");
         end = t.span.end;
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    parser.record_unparsed_secrets(from, parser.idx);
     end
 }
 
@@ -4277,6 +4368,7 @@ fn is_likely_property_name(tok: &crate::lexer::Token, source: &str, upper_lex: &
 /// generic SET/UNSET/MOVE/Unknown bodies that don't enumerate every
 /// Snowflake property in the AST.
 fn consume_until_semi_or_eof(parser: &mut Parser<'_>, start: u32) -> u32 {
+    let from = parser.idx;
     let mut end = start;
     while let Some(tok) = parser.peek_non_trivia() {
         if matches!(
@@ -4288,5 +4380,7 @@ fn consume_until_semi_or_eof(parser: &mut Parser<'_>, start: u32) -> u32 {
         end = tok.span.end;
         parser.advance();
     }
+    // The text is not read: its secrets are recorded as unparsed text's are.
+    parser.record_unparsed_secrets(from, parser.idx);
     end
 }

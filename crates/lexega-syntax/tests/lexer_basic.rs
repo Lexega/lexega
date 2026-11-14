@@ -23,7 +23,8 @@ fn lex_match_condition_identifier() {
     assert!(matches!(
         tokens.tokens[0].kind,
         TokenKind::Identifier {
-            kind: IdentifierKind::Unquoted
+            kind: IdentifierKind::Unquoted,
+            ..
         }
     ));
     assert_eq!(tokens.tokens[0].lexeme(src), "MATCH_CONDITION");
@@ -252,7 +253,8 @@ fn lex_quoted_ident_and_cast_and_comparisons() {
     assert!(ks.iter().any(|k| matches!(
         k,
         TokenKind::Identifier {
-            kind: lexega_syntax::IdentifierKind::Quoted
+            kind: lexega_syntax::IdentifierKind::Quoted,
+            ..
         }
     )));
     assert!(ks
@@ -562,4 +564,59 @@ fn lex_array_brackets_as_punctuation() {
         kinds[kinds.len() - 2],
         TokenKind::Punctuation(Punctuation::RBracket)
     ));
+}
+
+#[test]
+fn a_jinja_comment_inside_a_string_is_a_token_of_the_string() {
+    // Inside a string, each template is a token between string fragments.
+    let src = "SELECT 'a{# c #}b{{ x }}c''{# d #}e'";
+    let tokens = tokenize(src).tokens;
+    let read: Vec<(&str, bool)> = tokens
+        .iter()
+        .filter(|t| !matches!(t.kind, TokenKind::Eof))
+        .map(|t| {
+            (
+                t.lexeme(src),
+                matches!(t.kind, TokenKind::Literal(LiteralKind::StringFragment)),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("SELECT", false),
+            ("'a", true),
+            ("{# c #}", false),
+            ("b", true),
+            ("{{", false),
+            ("x", false),
+            ("}}", false),
+            ("c''", true),
+            ("{# d #}", false),
+            ("e'", true),
+        ]
+    );
+    let comments: Vec<&str> = tokens
+        .iter()
+        .filter(|t| matches!(t.kind, TokenKind::JinjaComment))
+        .map(|t| t.lexeme(src))
+        .collect();
+    assert_eq!(comments, ["{# c #}", "{# d #}"]);
+    // Outside a string, a comment is trivia of the next token, as before.
+    let src = "SELECT {# c #} 1";
+    let tokens = tokenize(src).tokens;
+    assert!(!tokens
+        .iter()
+        .any(|t| matches!(t.kind, TokenKind::JinjaComment)));
+    let one = tokens
+        .iter()
+        .find(|t| t.lexeme(src) == "1")
+        .expect("the number");
+    assert!(
+        one.leading_trivia
+            .iter()
+            .any(|t| &src[t.span.start as usize..t.span.end as usize] == "{# c #}"),
+        "{:?}",
+        one.leading_trivia
+    );
 }

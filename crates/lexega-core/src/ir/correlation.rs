@@ -9,14 +9,14 @@
 //! The lowerer emits [`ScalarExpr::ScalarSubquery`],
 //! [`ScalarExpr::Exists`], and
 //! [`super::scalar::QuantifiedRhs::Subquery`] with
-//! `correlates_with: vec![]` as a stub (see `lower.rs`). Name
-//! resolution inside a subquery body that hits an enclosing FROM scope
-//! returns a [`ScalarExpr::Column`] carrying the outer scope's
-//! [`ColumnId`] — *not* a [`ScalarExpr::OuterRef`]. Correlation is
-//! therefore not encoded in the expression's tag but is a derived
-//! property of the subquery body: a referenced [`ColumnId`] that no
-//! node within the subquery's subtree introduces must have come from
-//! an enclosing scope.
+//! `correlates_with: vec![]` as a stub (see `lower.rs`). Correlation is
+//! a derived property of the subquery body: a referenced [`ColumnId`]
+//! that no node within the subquery's subtree introduces must have come
+//! from an enclosing scope. A column of no source
+//! ([`super::column::ColumnOrigin::Unattributed`]) is introduced by no
+//! node, so the body states where it comes from: it is an enclosing
+//! scope's where the body reads it through a [`ScalarExpr::OuterRef`]
+//! whose scope reaches past the body.
 //!
 //! This pass computes that derived property once after lowering and
 //! materializes it on each subquery node so downstream consumers
@@ -42,6 +42,11 @@
 //! "produced" by the outer subquery — they cancel against the nested
 //! subquery's own internal references, leaving only truly external
 //! references (those bound in an enclosing scope) in the difference.
+//! A column of no source stays in it only where an outer reference to
+//! it has a scope greater than the number of nested blocks between the
+//! body's root and the reference: the blocks lowering counts, which are
+//! subqueries, derived tables, CTE bodies, an `INSERT`'s query and a
+//! pivot's `IN` subquery.
 //!
 //! ## Closed-enum discipline
 //!
@@ -56,8 +61,8 @@ use super::column::ColumnId;
 use super::plan::RelPlan;
 use super::scalar::ScalarExpr;
 use super::visitor::{
-    walk_rel_plan, walk_rel_plan_mut, walk_scalar_expr_standalone, RelPlanMutator, RelPlanVisitor,
-    ScalarExprVisitor,
+    walk_rel_plan, walk_rel_plan_mut, walk_scalar_expr, walk_scalar_expr_standalone,
+    RelPlanMutator, RelPlanVisitor, ScalarExprVisitor,
 };
 
 /// Public entry point. Walks `plan` and fills `correlates_with` on
@@ -66,79 +71,93 @@ pub(crate) fn populate_subquery_correlates(
     plan: &mut RelPlan,
     bindings: &super::column::BindingTable,
 ) {
-    // Pre-collect, for every CTE binding, the closure of source-node
-    // NodeIds (`Scan`, `CteRef`, `DerivedTable`, `ModelRef`,
-    // `TableFunction`, `Values`) reachable through that CTE's body.
-    // This is needed because the lowerer redirects column
-    // allocations on unresolved-star CTE references to the CTE
-    // body's leaf-scan NodeId (see `lower.rs::register_from_source`
-    // / `cte_passthrough_renames`). Without walking through the CTE
-    // body, a subquery that references a CTE whose body contains
-    // `FROM raw.t` would mis-classify columns rooted at `raw.t` as
-    // correlated — they're "local" in the sense that the subquery's
-    // own FROM-clause reaches them.
+    // Pre-collect, for every CTE binding, the source-node NodeIds
+    // (`Scan`, `CteRef`, `DerivedTable`, `ModelRef`, `TableFunction`,
+    // `Values`) its body reaches, and the bindings it refers to: a
+    // table column of a source inside a CTE body the subquery's own
+    // FROM clause reaches is local to the subquery, not correlated.
     //
-    // Precomputed as `Vec<NodeId>` (owned data) rather than `&RelPlan`
-    // borrows so the mutable walk below can take `&mut plan` without
-    // borrow-checker conflicts.
-    let cte_source_closure = precompute_cte_source_closure(plan);
+    // Owned data rather than `&RelPlan` borrows so the mutable walk
+    // below can take `&mut plan`.
+    let cte_sources = precompute_cte_sources(plan);
     let mut m = CorrelationPopulator {
         bindings,
-        cte_source_closure: &cte_source_closure,
+        cte_sources: &cte_sources,
     };
     m.visit_rel_plan_mut(plan);
 }
 
-/// Build, for every CTE binding's `ScopeId`, the transitive closure
-/// of source-node NodeIds reachable from the CTE body (including
-/// through nested CteRef references inside the body). Owned data so
-/// the caller can mutate the plan afterward.
-fn precompute_cte_source_closure(
-    plan: &RelPlan,
-) -> std::collections::BTreeMap<super::scalar::ScopeId, HashSet<crate::ast::NodeId>> {
-    // Phase 1: scope → CTE body reference.
+/// What one CTE body reaches without following its references.
+#[derive(Default)]
+struct BodySources {
+    /// The source nodes of its own FROM clauses.
+    nodes: Vec<crate::ast::NodeId>,
+    /// The bindings its `CteRef`s name.
+    refers_to: Vec<super::scalar::ScopeId>,
+}
+
+type CteSources = std::collections::BTreeMap<super::scalar::ScopeId, BodySources>;
+
+/// Build, for every CTE binding's `ScopeId`, the source nodes its body
+/// reaches and the bindings it refers to: each body is walked once,
+/// and what a reference reaches is followed when a subquery asks.
+fn precompute_cte_sources(plan: &RelPlan) -> CteSources {
     let mut bodies: std::collections::BTreeMap<super::scalar::ScopeId, &RelPlan> =
         std::collections::BTreeMap::new();
     walk_for_cte_bodies(plan, &mut bodies);
-
-    // Phase 2: for each CTE body, compute the source-node closure
-    // (following CteRef into other CTEs' bodies recursively).
-    let mut out: std::collections::BTreeMap<super::scalar::ScopeId, HashSet<crate::ast::NodeId>> =
-        std::collections::BTreeMap::new();
-    for (scope, body) in bodies.iter() {
-        let mut nodes: HashSet<crate::ast::NodeId> = HashSet::new();
-        let mut visited: HashSet<super::scalar::ScopeId> = HashSet::new();
-        visited.insert(*scope);
-        walk_source_nodes(body, &bodies, &mut nodes, &mut visited);
-        out.insert(*scope, nodes);
-    }
-    out
+    bodies
+        .into_iter()
+        .map(|(scope, body)| {
+            let mut sources = BodySources::default();
+            walk_source_nodes(body, &mut sources);
+            (scope, sources)
+        })
+        .collect()
 }
 
-fn walk_source_nodes<'a>(
-    plan: &'a RelPlan,
-    bodies: &std::collections::BTreeMap<super::scalar::ScopeId, &'a RelPlan>,
+/// Adds to `out` the source nodes the body of `scope` reaches, and
+/// those of every body it refers to, transitively. `followed` holds the
+/// bindings already followed; none is followed twice.
+fn reach_cte_sources(
+    scope: super::scalar::ScopeId,
+    cte_sources: &CteSources,
+    followed: &mut HashSet<super::scalar::ScopeId>,
     out: &mut HashSet<crate::ast::NodeId>,
-    visited: &mut HashSet<super::scalar::ScopeId>,
 ) {
+    if !cte_sources.contains_key(&scope) || !followed.insert(scope) {
+        return;
+    }
+    let mut pending = vec![scope];
+    while let Some(next) = pending.pop() {
+        let Some(sources) = cte_sources.get(&next) else {
+            continue;
+        };
+        out.extend(sources.nodes.iter().copied());
+        pending.extend(
+            sources
+                .refers_to
+                .iter()
+                .copied()
+                .filter(|refers_to| followed.insert(*refers_to)),
+        );
+    }
+}
+
+fn walk_source_nodes(plan: &RelPlan, out: &mut BodySources) {
     match plan {
         RelPlan::Scan { node_id, .. }
         | RelPlan::ModelRef { node_id, .. }
         | RelPlan::TableFunction { node_id, .. }
         | RelPlan::Values { node_id, .. } => {
-            out.insert(*node_id);
+            out.nodes.push(*node_id);
         }
         RelPlan::CteRef { node_id, scope, .. } => {
-            out.insert(*node_id);
-            if visited.insert(*scope) {
-                if let Some(b) = bodies.get(scope) {
-                    walk_source_nodes(b, bodies, out, visited);
-                }
-            }
+            out.nodes.push(*node_id);
+            out.refers_to.push(*scope);
         }
         RelPlan::DerivedTable { node_id, input, .. } => {
-            out.insert(*node_id);
-            walk_source_nodes(input, bodies, out, visited);
+            out.nodes.push(*node_id);
+            walk_source_nodes(input, out);
         }
         RelPlan::Project { input, .. }
         | RelPlan::Filter { input, .. }
@@ -152,15 +171,15 @@ fn walk_source_nodes<'a>(
         | RelPlan::MatchRecognize { input, .. }
         | RelPlan::ConnectBy { input, .. }
         | RelPlan::TableSample { input, .. } => {
-            walk_source_nodes(input, bodies, out, visited);
+            walk_source_nodes(input, out);
         }
         RelPlan::Join { left, right, .. } => {
-            walk_source_nodes(left, bodies, out, visited);
-            walk_source_nodes(right, bodies, out, visited);
+            walk_source_nodes(left, out);
+            walk_source_nodes(right, out);
         }
         RelPlan::SetOp { inputs, .. } => {
             for inp in inputs {
-                walk_source_nodes(inp, bodies, out, visited);
+                walk_source_nodes(inp, out);
             }
         }
         RelPlan::WithScope { ctes, body, .. } => {
@@ -169,32 +188,32 @@ fn walk_source_nodes<'a>(
                     super::plan::CteBody::NonRecursive(b) => b,
                     super::plan::CteBody::Recursive { anchor, .. } => anchor,
                 };
-                walk_source_nodes(body_plan, bodies, out, visited);
+                walk_source_nodes(body_plan, out);
             }
-            walk_source_nodes(body, bodies, out, visited);
+            walk_source_nodes(body, out);
         }
         RelPlan::Insert { source, .. } => match source {
             super::plan::InsertSource::Values(p) | super::plan::InsertSource::Query(p) => {
-                walk_source_nodes(p, bodies, out, visited)
+                walk_source_nodes(p, out)
             }
             super::plan::InsertSource::DefaultValues => {}
         },
         RelPlan::Update { from, .. } => {
             if let Some(f) = from {
-                walk_source_nodes(f, bodies, out, visited);
+                walk_source_nodes(f, out);
             }
         }
         RelPlan::Delete { using, .. } => {
             if let Some(u) = using {
-                walk_source_nodes(u, bodies, out, visited);
+                walk_source_nodes(u, out);
             }
         }
-        RelPlan::Merge { source, .. } => walk_source_nodes(source, bodies, out, visited),
-        RelPlan::MultiInsert { source, .. } => walk_source_nodes(source, bodies, out, visited),
-        RelPlan::Explain { body, .. } => walk_source_nodes(body, bodies, out, visited),
+        RelPlan::Merge { source, .. } => walk_source_nodes(source, out),
+        RelPlan::MultiInsert { source, .. } => walk_source_nodes(source, out),
+        RelPlan::Explain { body, .. } => walk_source_nodes(body, out),
         RelPlan::CreateAsQuery { body, .. } => {
             if let Some(b) = body {
-                walk_source_nodes(b, bodies, out, visited);
+                walk_source_nodes(b, out);
             }
         }
         RelPlan::InvalidInput { .. }
@@ -280,8 +299,7 @@ fn walk_for_cte_bodies<'a>(
 
 struct CorrelationPopulator<'a> {
     bindings: &'a super::column::BindingTable,
-    cte_source_closure:
-        &'a std::collections::BTreeMap<super::scalar::ScopeId, HashSet<crate::ast::NodeId>>,
+    cte_sources: &'a CteSources,
 }
 
 impl<'a> RelPlanMutator for CorrelationPopulator<'a> {
@@ -291,49 +309,41 @@ impl<'a> RelPlanMutator for CorrelationPopulator<'a> {
         // nested `correlates_with` values, so the order is only a
         // matter of debugging clarity, not correctness.)
         walk_rel_plan_mut(self, plan);
-        *correlates_with = compute_correlation(plan, self.bindings, self.cte_source_closure);
+        *correlates_with = compute_correlation(plan, self.bindings, self.cte_sources);
     }
 }
 
 fn compute_correlation(
     body: &RelPlan,
     bindings: &super::column::BindingTable,
-    cte_source_closure: &std::collections::BTreeMap<
-        super::scalar::ScopeId,
-        HashSet<crate::ast::NodeId>,
-    >,
+    cte_sources: &CteSources,
 ) -> Vec<ColumnId> {
-    let mut produced: HashSet<ColumnId> = HashSet::new();
-    let mut produced_collector = ProducedColumns { out: &mut produced };
-    produced_collector.visit_rel_plan(body);
+    let produced = produced_columns(body);
 
     // Also collect the NodeIds of every source node (`Scan`,
     // `CteRef`, `DerivedTable`, `ModelRef`, `TableFunction`, `Values`)
-    // inside the body. A `ColumnOrigin::Table { table_node }` whose
-    // `table_node` is in this set is locally produced — even when
-    // the source's `columns` Vec doesn't enumerate it (which happens
-    // for catalog-unresolved `SELECT *` CteRef bodies, where
-    // `CteRef.columns` stays empty but the lowerer still allocates
-    // fresh Table-origin ColumnIds against the CteRef's NodeId for
-    // each column reference).
-    //
-    // Crucially, this collection follows `CteRef.scope` into the CTE
-    // bodies the subquery references — the lowerer's `leaf_scan_node`
-    // redirect (see `lower.rs::register_from_source` for
-    // unresolved-star CTE refs) routes column allocations to the CTE
-    // body's underlying scan node, not the CteRef's own NodeId.
-    // Without walking through, those `Table { table_node: <leaf_scan> }`
-    // columns appear non-local, producing a category-wide FP on
-    // `Q-SUBQ-CORR-SEL` / `Q-SUBQ-CORR-WHERE` for uncorrelated
-    // scalar subqueries over CTE-resolved tables.
+    // inside the body, following `CteRef.scope` into the CTE bodies
+    // the subquery references. A `ColumnOrigin::Table { table_node }`
+    // whose `table_node` is in this set is locally produced even when
+    // no node of the subquery lists it. A column read through a
+    // `CteRef` is the reference's own and is listed in its output
+    // schema, so `produced` already holds it.
     let mut local_source_nodes: HashSet<crate::ast::NodeId> = HashSet::new();
-    collect_local_source_nodes(body, cte_source_closure, &mut local_source_nodes);
+    collect_local_source_nodes(
+        body,
+        cte_sources,
+        &mut HashSet::new(),
+        &mut local_source_nodes,
+    );
 
     let mut referenced: HashSet<ColumnId> = HashSet::new();
     let mut ref_collector = ReferencedColumns {
         out: &mut referenced,
     };
     ref_collector.visit_rel_plan(body);
+
+    let mut stated = StatedOuterReferences::default();
+    stated.visit_rel_plan(body);
 
     let mut diff: Vec<ColumnId> = referenced
         .iter()
@@ -342,35 +352,89 @@ fn compute_correlation(
             if produced.contains(c) {
                 return false;
             }
-            // Table-origin column allocated against a local source
-            // node — locally produced even if not in the source's
-            // `columns` Vec.
-            if let Some(binding) = bindings.get(*c) {
-                if let super::column::ColumnOrigin::Table { table_node, .. } = &binding.origin {
-                    if local_source_nodes.contains(table_node) {
-                        return false;
-                    }
+            match bindings.get(*c).map(|binding| &binding.origin) {
+                // Table-origin column allocated against a local source
+                // node — locally produced even if not in the source's
+                // `columns` Vec.
+                Some(super::column::ColumnOrigin::Table { table_node, .. }) => {
+                    !local_source_nodes.contains(table_node)
                 }
+                // A column of no source is produced by no node: it is
+                // outer where an outer reference to it leaves the body.
+                Some(super::column::ColumnOrigin::Unattributed { .. }) => stated.outer.contains(c),
+                Some(
+                    super::column::ColumnOrigin::Computed { .. }
+                    | super::column::ColumnOrigin::Merged { .. }
+                    | super::column::ColumnOrigin::SetOp { .. }
+                    | super::column::ColumnOrigin::OuterRef { .. }
+                    | super::column::ColumnOrigin::RecursiveRef { .. },
+                )
+                | None => true,
             }
-            true
         })
         .collect();
     diff.sort_by_key(|c| c.as_u32());
     diff
 }
 
+/// Every column a node of `plan` introduces, its nested subqueries'
+/// included.
+pub(crate) fn produced_columns(plan: &RelPlan) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    ProducedColumns {
+        out: &mut out,
+        skipped: None,
+    }
+    .visit_rel_plan(plan);
+    out
+}
+
+/// As [`produced_columns`], the nodes of `skipped`, a subtree of `plan`,
+/// aside.
+pub(crate) fn produced_columns_except(plan: &RelPlan, skipped: &RelPlan) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    ProducedColumns {
+        out: &mut out,
+        skipped: Some(skipped),
+    }
+    .visit_rel_plan(plan);
+    out
+}
+
+/// Every column `plan` reads, in its expressions and its nested
+/// subqueries'.
+pub(crate) fn plan_referenced_columns(plan: &RelPlan) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    ReferencedColumns { out: &mut out }.visit_rel_plan(plan);
+    out
+}
+
+/// Every column `expr` reads, in its nested subqueries too.
+pub(crate) fn expr_referenced_columns(expr: &ScalarExpr) -> HashSet<ColumnId> {
+    let mut out = HashSet::new();
+    ScalarRefBridge { out: &mut out }.visit_scalar_expr(expr);
+    out
+}
+
+/// The NodeIds of every source-position node of `plan` (not of its
+/// nested subqueries, nor inside the CTE bodies its `CteRef`s name).
+pub(crate) fn source_nodes(plan: &RelPlan) -> HashSet<crate::ast::NodeId> {
+    let mut out = HashSet::new();
+    collect_local_source_nodes(plan, &CteSources::new(), &mut HashSet::new(), &mut out);
+    out
+}
+
 /// Recursively collect the NodeIds of every source-position node
 /// (`Scan`, `CteRef`, `DerivedTable`, `ModelRef`, `TableFunction`,
 /// `Values`) reachable from `plan` through clause-level wrappers,
 /// joins, set-ops, DML sources, AND through `CteRef.scope` lookups
-/// into CTE bodies in `cte_bodies`. Nested subqueries are NOT
-/// traversed — they're their own scope.
+/// into the CTE bodies `cte_sources` describes, each followed once
+/// (`followed`). Nested subqueries are NOT traversed — they're their
+/// own scope.
 fn collect_local_source_nodes(
     plan: &RelPlan,
-    cte_source_closure: &std::collections::BTreeMap<
-        super::scalar::ScopeId,
-        HashSet<crate::ast::NodeId>,
-    >,
+    cte_sources: &CteSources,
+    followed: &mut HashSet<super::scalar::ScopeId>,
     out: &mut HashSet<crate::ast::NodeId>,
 ) {
     match plan {
@@ -382,18 +446,13 @@ fn collect_local_source_nodes(
         }
         RelPlan::CteRef { node_id, scope, .. } => {
             out.insert(*node_id);
-            // Union the CTE body's precomputed source-node closure
-            // so columns the lowerer redirected to the body's leaf
-            // scan node are recognized as local.
-            if let Some(extra) = cte_source_closure.get(scope) {
-                for n in extra {
-                    out.insert(*n);
-                }
-            }
+            // Table columns of the sources the CTE body reaches count
+            // as local.
+            reach_cte_sources(*scope, cte_sources, followed, out);
         }
         RelPlan::DerivedTable { node_id, input, .. } => {
             out.insert(*node_id);
-            collect_local_source_nodes(input, cte_source_closure, out);
+            collect_local_source_nodes(input, cte_sources, followed, out);
         }
         RelPlan::Project { input, .. }
         | RelPlan::Filter { input, .. }
@@ -407,15 +466,15 @@ fn collect_local_source_nodes(
         | RelPlan::MatchRecognize { input, .. }
         | RelPlan::ConnectBy { input, .. }
         | RelPlan::TableSample { input, .. } => {
-            collect_local_source_nodes(input, cte_source_closure, out);
+            collect_local_source_nodes(input, cte_sources, followed, out);
         }
         RelPlan::Join { left, right, .. } => {
-            collect_local_source_nodes(left, cte_source_closure, out);
-            collect_local_source_nodes(right, cte_source_closure, out);
+            collect_local_source_nodes(left, cte_sources, followed, out);
+            collect_local_source_nodes(right, cte_sources, followed, out);
         }
         RelPlan::SetOp { inputs, .. } => {
             for inp in inputs {
-                collect_local_source_nodes(inp, cte_source_closure, out);
+                collect_local_source_nodes(inp, cte_sources, followed, out);
             }
         }
         RelPlan::WithScope { ctes, body, .. } => {
@@ -424,36 +483,38 @@ fn collect_local_source_nodes(
                     super::plan::CteBody::NonRecursive(b) => b,
                     super::plan::CteBody::Recursive { anchor, .. } => anchor,
                 };
-                collect_local_source_nodes(body_plan, cte_source_closure, out);
+                collect_local_source_nodes(body_plan, cte_sources, followed, out);
             }
-            collect_local_source_nodes(body, cte_source_closure, out);
+            collect_local_source_nodes(body, cte_sources, followed, out);
         }
         RelPlan::Insert { source, .. } => match source {
             super::plan::InsertSource::Values(p) | super::plan::InsertSource::Query(p) => {
-                collect_local_source_nodes(p, cte_source_closure, out)
+                collect_local_source_nodes(p, cte_sources, followed, out)
             }
             super::plan::InsertSource::DefaultValues => {}
         },
         RelPlan::Update { from, .. } => {
             if let Some(f) = from {
-                collect_local_source_nodes(f, cte_source_closure, out);
+                collect_local_source_nodes(f, cte_sources, followed, out);
             }
         }
         RelPlan::Delete { using, .. } => {
             if let Some(u) = using {
-                collect_local_source_nodes(u, cte_source_closure, out);
+                collect_local_source_nodes(u, cte_sources, followed, out);
             }
         }
         RelPlan::Merge { source, .. } => {
-            collect_local_source_nodes(source, cte_source_closure, out)
+            collect_local_source_nodes(source, cte_sources, followed, out)
         }
         RelPlan::MultiInsert { source, .. } => {
-            collect_local_source_nodes(source, cte_source_closure, out)
+            collect_local_source_nodes(source, cte_sources, followed, out)
         }
-        RelPlan::Explain { body, .. } => collect_local_source_nodes(body, cte_source_closure, out),
+        RelPlan::Explain { body, .. } => {
+            collect_local_source_nodes(body, cte_sources, followed, out)
+        }
         RelPlan::CreateAsQuery { body, .. } => {
             if let Some(b) = body {
-                collect_local_source_nodes(b, cte_source_closure, out);
+                collect_local_source_nodes(b, cte_sources, followed, out);
             }
         }
         RelPlan::InvalidInput { .. }
@@ -467,14 +528,26 @@ fn collect_local_source_nodes(
 /// taking the union of every node's [`RelPlan::output_schema`]. Walks
 /// into nested subqueries so their internally-bound scan columns are
 /// included.
-struct ProducedColumns<'a> {
+struct ProducedColumns<'a, 's> {
     out: &'a mut HashSet<ColumnId>,
+    /// A subtree whose nodes are left out.
+    skipped: Option<&'s RelPlan>,
 }
 
-impl<'a, 'p> RelPlanVisitor<'p> for ProducedColumns<'a> {
+impl<'a, 's, 'p> RelPlanVisitor<'p> for ProducedColumns<'a, 's> {
     fn visit_rel_plan(&mut self, plan: &'p RelPlan) {
-        for c in plan.output_schema() {
-            self.out.insert(c);
+        if self
+            .skipped
+            .is_some_and(|skipped| std::ptr::eq(skipped, plan))
+        {
+            return;
+        }
+        // A join's list is its sides' and the columns `USING` merges: its
+        // sides' are theirs to add, so a chain of joins is read once.
+        if let RelPlan::Join { using, .. } = plan {
+            self.out.extend(using.iter().map(|column| column.merged));
+        } else {
+            self.out.extend(plan.output_schema());
         }
         walk_rel_plan(self, plan);
     }
@@ -543,6 +616,105 @@ impl<'a, 'p> ScalarExprVisitor<'p> for ScalarRefBridge<'a> {
     }
 }
 
+/// The columns a body reads through an outer reference that leaves it:
+/// one whose scope, the number of blocks out its column is, exceeds the
+/// number of nested blocks between the body's root and the reference.
+#[derive(Default)]
+struct StatedOuterReferences<'p> {
+    outer: HashSet<ColumnId>,
+    /// The plans being walked, innermost last.
+    open: Vec<&'p RelPlan>,
+    /// Nested blocks entered below the body's root.
+    depth: u32,
+    /// Set while a subquery's root is entered.
+    entering_subquery: bool,
+}
+
+impl<'p> RelPlanVisitor<'p> for StatedOuterReferences<'p> {
+    fn visit_rel_plan(&mut self, plan: &'p RelPlan) {
+        let nested = std::mem::take(&mut self.entering_subquery)
+            || self
+                .open
+                .last()
+                .is_some_and(|parent| opens_block(parent, plan));
+        if nested {
+            self.depth += 1;
+        }
+        self.open.push(plan);
+        walk_rel_plan(self, plan);
+        self.open.pop();
+        if nested {
+            self.depth -= 1;
+        }
+    }
+
+    fn visit_scalar_expr(&mut self, expr: &'p ScalarExpr) {
+        if let ScalarExpr::OuterRef { scope, column, .. } = expr {
+            if scope.0 > self.depth {
+                self.outer.insert(*column);
+            }
+        }
+        walk_scalar_expr(self, expr);
+    }
+
+    fn visit_subquery(&mut self, plan: &'p RelPlan, _correlates_with: &'p [ColumnId]) {
+        self.entering_subquery = true;
+        self.visit_rel_plan(plan);
+    }
+}
+
+/// Whether `child`, a plan `parent` holds, is a block nested in the
+/// block `parent` is part of: a derived table's input, a CTE's body, the
+/// query an `INSERT` reads, a pivot's `IN` subquery. A subquery of an
+/// expression is one too, entered through `visit_subquery`; a branch of a
+/// set operation is none.
+fn opens_block(parent: &RelPlan, child: &RelPlan) -> bool {
+    match parent {
+        RelPlan::DerivedTable { input, .. } => std::ptr::eq(input.as_ref(), child),
+        RelPlan::WithScope { body, .. } => !std::ptr::eq(body.as_ref(), child),
+        RelPlan::Insert { source, .. } => match source {
+            super::plan::InsertSource::Query(query) => std::ptr::eq(query.as_ref(), child),
+            super::plan::InsertSource::Values(_) | super::plan::InsertSource::DefaultValues => {
+                false
+            }
+        },
+        RelPlan::MultiInsert { source, .. } => std::ptr::eq(source.as_ref(), child),
+        RelPlan::Pivot { pivot_values, .. } => match pivot_values {
+            super::plan::PivotValues::Subquery(query) => std::ptr::eq(query.as_ref(), child),
+            super::plan::PivotValues::ValueList(_)
+            | super::plan::PivotValues::Any { .. }
+            | super::plan::PivotValues::Opaque { .. } => false,
+        },
+        RelPlan::Scan { .. }
+        | RelPlan::Values { .. }
+        | RelPlan::CteRef { .. }
+        | RelPlan::ModelRef { .. }
+        | RelPlan::Project { .. }
+        | RelPlan::Filter { .. }
+        | RelPlan::Aggregate { .. }
+        | RelPlan::Window { .. }
+        | RelPlan::Join { .. }
+        | RelPlan::Sort { .. }
+        | RelPlan::Limit { .. }
+        | RelPlan::SetOp { .. }
+        | RelPlan::Update { .. }
+        | RelPlan::Delete { .. }
+        | RelPlan::Merge { .. }
+        | RelPlan::Explain { .. }
+        | RelPlan::CreateAsQuery { .. }
+        | RelPlan::CreateTableForm { .. }
+        | RelPlan::TableFunction { .. }
+        | RelPlan::Unnest { .. }
+        | RelPlan::Unpivot { .. }
+        | RelPlan::MatchRecognize { .. }
+        | RelPlan::ConnectBy { .. }
+        | RelPlan::TableSample { .. }
+        | RelPlan::InvalidInput { .. }
+        | RelPlan::ParseRecovery { .. }
+        | RelPlan::Opaque { .. } => false,
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────
@@ -594,6 +766,7 @@ mod tests {
         // Subquery body: SELECT 1 FROM u WHERE u.x = t.a
         let sub_body = RelPlan::Project {
             input: Box::new(RelPlan::Filter {
+                computed: Vec::new(),
                 input: Box::new(scan("u", vec![u_x])),
                 predicate: ScalarExpr::BinOp {
                     op: crate::ir::scalar::BinOpKind::Cmp(crate::ir::scalar::ComparisonOp::Eq),
@@ -632,6 +805,7 @@ mod tests {
         let outer_out = alloc.fresh_test();
         let mut outer = RelPlan::Project {
             input: Box::new(RelPlan::Filter {
+                computed: Vec::new(),
                 input: Box::new(scan("t", vec![t_a])),
                 predicate: ScalarExpr::ScalarSubquery {
                     subquery: Box::new(sub_body),
@@ -692,6 +866,7 @@ mod tests {
         };
 
         let mut outer = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(scan("t", vec![alloc.fresh_test()])),
             predicate: ScalarExpr::ScalarSubquery {
                 subquery: Box::new(sub_body),
@@ -728,6 +903,7 @@ mod tests {
         // SELECT MAX(login_time) FROM sessions WHERE sess.user_id = s.user_id
         let sub_body = RelPlan::Aggregate {
             input: Box::new(RelPlan::Filter {
+                computed: Vec::new(),
                 input: Box::new(scan("sessions", vec![sess_user_id, login_time])),
                 predicate: ScalarExpr::BinOp {
                     op: crate::ir::scalar::BinOpKind::Cmp(crate::ir::scalar::ComparisonOp::Eq),
@@ -765,12 +941,14 @@ mod tests {
             }],
             having: None,
             output_columns: vec![max_login],
+            computed: Vec::new(),
             hints: Vec::new(),
             node_id: nid(),
             span: sp(),
         };
 
         let mut outer = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(scan("users", vec![s_user_id])),
             predicate: ScalarExpr::ScalarSubquery {
                 subquery: Box::new(sub_body),
@@ -787,6 +965,54 @@ mod tests {
 
         let correlation = find_first_scalar_subquery_correlates(&outer);
         assert_eq!(correlation, vec![s_user_id]);
+    }
+
+    /// `WITH c0 AS (SELECT a FROM t), c1 AS (SELECT a + 1 AS a FROM c0),
+    /// … SELECT a FROM c<last>`, lowered with its bindings.
+    fn chain_of_bindings(bindings: usize) -> RelPlan {
+        use crate::ir::{
+            lower_query_full_with_bindings, CatalogDialect, FunctionCatalog, SessionContext,
+            StrictMode,
+        };
+        use crate::lexer::tokenize;
+        use crate::parser::parse_script;
+
+        let mut sql = String::from("WITH c0 AS (SELECT a FROM t)");
+        for n in 1..bindings {
+            sql.push_str(&format!(", c{n} AS (SELECT a + 1 AS a FROM c{})", n - 1));
+        }
+        sql.push_str(&format!(" SELECT a FROM c{}", bindings - 1));
+        let tokens = tokenize(&sql);
+        let script = parse_script(&sql, &tokens.tokens).expect("parse");
+        let catalog = FunctionCatalog::for_dialect(CatalogDialect::Default);
+        let (plan, _catalog_ctx, _bindings, _facts) = lower_query_full_with_bindings(
+            &script.stmts[0],
+            &sql,
+            StrictMode::Permissive,
+            &catalog,
+            &SessionContext::default(),
+            None,
+        )
+        .expect("lowers");
+        plan
+    }
+
+    #[test]
+    fn a_chain_of_bindings_is_lowered_holding_each_body_s_sources_once() {
+        const BINDINGS: usize = 4_000;
+        let _folding = crate::ir::normalize::default_folding();
+        let plan = chain_of_bindings(BINDINGS);
+        let RelPlan::WithScope { ctes, .. } = &plan else {
+            panic!("expected a scope");
+        };
+        assert_eq!(ctes.len(), BINDINGS);
+        // The first body's scan; each later body's reference to the one
+        // before, and that binding.
+        let held: usize = precompute_cte_sources(&plan)
+            .values()
+            .map(|sources| sources.nodes.len() + sources.refers_to.len())
+            .sum();
+        assert_eq!(held, 2 * BINDINGS - 1);
     }
 
     /// Helper: dig the first encountered ScalarSubquery's

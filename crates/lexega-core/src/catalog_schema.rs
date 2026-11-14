@@ -28,8 +28,9 @@ pub struct CatalogSnapshotSchema {
     /// The data platform that produced this snapshot.
     ///
     /// Determines identifier normalization rules.
-    /// Supported values: "snowflake", "postgresql", "bigquery", "databricks".
-    /// When absent, defaults to "snowflake".
+    /// Supported values: "snowflake", "postgresql", "bigquery", "databricks",
+    /// "mysql", "mssql", "redshift". When absent, defaults to "snowflake";
+    /// `--provider` overrides it.
     #[serde(default)]
     pub provider: Option<String>,
 
@@ -188,6 +189,7 @@ pub enum CatalogTableKindSchema {
     View,
     MaterializedView,
     ExternalTable,
+    Temporary,
     #[default]
     Unknown,
 }
@@ -198,6 +200,8 @@ pub enum CatalogTableKindSchema {
 pub struct CatalogTableSchema {
     pub name: CatalogIdentSchema,
 
+    /// What the relation is, written exactly as listed, in this case
+    /// (`Table`, not `table`). Absent, `Unknown`.
     #[serde(default)]
     pub kind: CatalogTableKindSchema,
 
@@ -293,7 +297,9 @@ pub struct CatalogColumnSchema {
     #[serde(default)]
     pub nullable: Option<bool>,
 
-    /// Tags attached to this column from ACCOUNT_USAGE.TAG_REFERENCES.
+    /// Tags attached to this column (Snowflake: ACCOUNT_USAGE.TAG_REFERENCES).
+    /// Any tag marks the column classified: a value read from it is
+    /// followed into what the SQL writes and exports.
     #[serde(default)]
     pub tags: Vec<CatalogTagSchema>,
 }

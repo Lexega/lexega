@@ -10,9 +10,9 @@
 //!
 //! Signing a module delegates the signer's privileges to it. Three recognition
 //! primitives are surfaced: whether it is a counter-signature, the signer kind,
-//! and whether an inline password unlocks the signer's private key. Which
-//! combination is dangerous is a YAML verdict. The password value is redacted
-//! at parse time and never appears here.
+//! and each inline password that unlocks the signer's private key. Which
+//! combination is dangerous is a YAML verdict. Each password's value is in
+//! the facts and is masked in every report.
 //!
 //! Predicate example:
 //! ```yaml
@@ -23,6 +23,8 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+
+use super::PasswordLiteral;
 
 #[cfg(feature = "schema")]
 use schemars::JsonSchema;
@@ -47,6 +49,13 @@ pub struct MssqlAddSignatureFacts {
     /// Whether the module is signed by a certificate or an asymmetric key.
     pub signer_kind: SignerKind,
     /// `true` when an inline `WITH PASSWORD = '…'` unlocks the signer's private
-    /// key — a hardcoded credential. The value is redacted.
+    /// key — a hardcoded credential.
     pub password_present: bool,
+    /// Each password literal written, decoded: doubled quotes undone and any
+    /// `N` prefix dropped. A value the engine rendered from a template or
+    /// substituted for a deploy variable is not listed. The value is masked
+    /// in every report; a custom rule message that interpolates it shows it
+    /// unmasked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub password_literals: Vec<PasswordLiteral>,
 }

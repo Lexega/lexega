@@ -6,9 +6,10 @@ use lexega_syntax::{format_sql_with_config, verify_formatting_safe, FormatterCon
 use std::sync::Arc;
 
 fn postgres_config() -> FormatterConfig {
-    let mut config = FormatterConfig::default();
-    config.dialect = Arc::new(PostgresDialect);
-    config
+    FormatterConfig {
+        dialect: Arc::new(PostgresDialect),
+        ..Default::default()
+    }
 }
 
 #[test]

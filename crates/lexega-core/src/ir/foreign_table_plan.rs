@@ -43,8 +43,18 @@ pub fn lower_create_foreign_table_to_plan(
             .trim()
             .to_string()
     };
+    // The name's parts as written, joined: no text between them.
+    let name = crate::ir::utils::written_name_parts(source, &s.name)
+        .map(|(db, schema, name)| {
+            [db, schema, Some(name)]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .unwrap_or_else(|| text(s.name_span));
     ForeignTablePlan {
-        name: text(s.name_span),
+        name,
         name_span: s.name_span,
         server: text(s.server_span),
         if_not_exists: s.if_not_exists,

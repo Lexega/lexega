@@ -4,11 +4,24 @@
 //! Formatter configuration
 
 use crate::dialect::{DialectRef, SnowflakeDialect};
+use crate::lexer::{IdentifierKind, Token, TokenKind, Trivia, TriviaKind};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Formatter configuration options
-#[derive(Debug, Clone)]
+/// The dialect a configuration file names.
+fn deserialize_dialect<'de, D>(deserializer: D) -> Result<DialectRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    crate::dialect::dialect_from_name(&name)
+        .ok_or_else(|| serde::de::Error::custom(format!("unknown dialect '{name}'")))
+}
+
+/// Formatter configuration options. A key a configuration file leaves out
+/// keeps its default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct FormatterConfig {
     /// Keyword case style
     pub keyword_case: KeywordCase,
@@ -25,8 +38,9 @@ pub struct FormatterConfig {
     /// Maximum line length (0 = no limit)
     pub max_line_length: usize,
 
-    /// SQL dialect to use (default: Snowflake)
-    /// Note: This field is skipped during serialization/deserialization
+    /// SQL dialect to use (default: Snowflake). A configuration file names it
+    /// as a string; a name that is not a dialect is an error.
+    #[serde(deserialize_with = "deserialize_dialect")]
     pub dialect: DialectRef,
 
     /// Whether to align keywords in SELECT clauses
@@ -259,10 +273,14 @@ pub struct FormatterConfig {
     /// Put RETURNS clause on new line
     pub create_proc_func_returns_on_newline: bool,
 
-    /// Parse and format SQL body (for SQL language procedures/functions)
+    /// No effect: a SQL procedure body the parser reads as a block is laid
+    /// out, and every other body is copied as written. A configuration that
+    /// sets it still loads.
     pub create_proc_func_format_body: bool,
 
-    /// Indent procedure/function body
+    /// No effect: a SQL procedure body the parser reads as a block is laid
+    /// out at the block's indentation, and every other body is copied as
+    /// written. A configuration that sets it still loads.
     pub create_proc_func_body_indent: bool,
 
     // COPY INTO options
@@ -296,7 +314,7 @@ impl Default for FormatterConfig {
             keyword_case: KeywordCase::Upper,
             identifier_case: IdentifierCase::Preserve,
             indent_style: IndentStyle::Spaces(4),
-            newline_style: NewlineStyle::Unix,
+            newline_style: NewlineStyle::Auto,
             max_line_length: 0,
             dialect: Arc::new(SnowflakeDialect),
             align_keywords: false,
@@ -397,16 +415,40 @@ impl FormatterConfig {
             .map_err(|e| format!("Failed to parse config file '{}': {}", path.display(), e))
     }
 
+    /// `path` with the part up to its last `..` resolved as the file system
+    /// resolves it (links included), and the rest as written.
+    fn resolve_parent_dirs(path: &std::path::Path) -> std::path::PathBuf {
+        let parts: Vec<_> = path.components().collect();
+        let Some(last) = parts
+            .iter()
+            .rposition(|part| matches!(part, std::path::Component::ParentDir))
+        else {
+            return path.to_path_buf();
+        };
+        match std::fs::canonicalize(parts[..=last].iter().collect::<std::path::PathBuf>()) {
+            Ok(mut resolved) => {
+                resolved.extend(&parts[last + 1..]);
+                resolved
+            }
+            Err(_) => path.to_path_buf(),
+        }
+    }
+
     /// Discover .lexega.toml file by walking up from the given path
     ///
     /// Starts at the given path (or its parent if it's a file) and walks up
     /// the directory tree until it finds a .lexega.toml file or reaches the root.
     pub fn discover(start_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        // The walk follows the path as the file system resolves it up to its
+        // last `..` and as written after it, so a link on the final part is not followed.
+        let start_path = Self::resolve_parent_dirs(
+            &std::path::absolute(start_path).unwrap_or_else(|_| start_path.to_path_buf()),
+        );
         // Start from the parent directory if start_path is a file
         let mut current = if start_path.is_file() {
             start_path.parent()?
         } else {
-            start_path
+            start_path.as_path()
         };
 
         loop {
@@ -544,10 +586,121 @@ pub enum IndentStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NewlineStyle {
+    /// The input's own: the ending of its first line break outside a token,
+    /// Unix where it has none
+    Auto,
     /// Unix-style \n
     Unix,
     /// Windows-style \r\n
     Windows,
+}
+
+/// A line break the formatter writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineBreak {
+    /// `\n`
+    Lf,
+    /// `\r\n`
+    Crlf,
+}
+
+impl LineBreak {
+    /// The break's text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineBreak::Lf => "\n",
+            LineBreak::Crlf => "\r\n",
+        }
+    }
+}
+
+impl NewlineStyle {
+    /// The break this style writes. `Auto` is the ending of the first line
+    /// break of `source` that lies outside every token and every
+    /// dollar-quoted string, nested ones included, as `tokens` lexed from it
+    /// show (a break inside a literal, a body or a comment says nothing about
+    /// the file); Unix where there is none.
+    pub fn resolve(self, source: &str, tokens: &[Token]) -> LineBreak {
+        match self {
+            NewlineStyle::Unix => LineBreak::Lf,
+            NewlineStyle::Windows => LineBreak::Crlf,
+            NewlineStyle::Auto => {
+                let is_line_break = |trivia: &&Trivia| matches!(trivia.kind, TriviaKind::Newline);
+                let mut quoted = dollar_quoted_token_ranges(source, tokens)
+                    .into_iter()
+                    .peekable();
+                for (index, token) in tokens.iter().enumerate() {
+                    while quoted.next_if(|&(_, closer)| closer < index).is_some() {}
+                    // Leading trivia lies before the token: inside a string
+                    // from after its opener through its closer. Trailing
+                    // trivia lies after it: inside from the opener through
+                    // the token before its closer.
+                    let (before_quoted, after_quoted) =
+                        quoted.peek().map_or((false, false), |&(opener, closer)| {
+                            (
+                                opener < index && index <= closer,
+                                opener <= index && index < closer,
+                            )
+                        });
+                    let before = (!before_quoted)
+                        .then(|| token.leading_trivia.iter().find(is_line_break))
+                        .flatten();
+                    let after = (!after_quoted)
+                        .then(|| token.trailing_trivia.iter().find(is_line_break))
+                        .flatten();
+                    if let Some(trivia) = before.or(after) {
+                        let text = &source[trivia.span.start as usize..trivia.span.end as usize];
+                        return if text.ends_with("\r\n") {
+                            LineBreak::Crlf
+                        } else {
+                            LineBreak::Lf
+                        };
+                    }
+                }
+                LineBreak::Lf
+            }
+        }
+    }
+}
+
+/// The token index ranges `(opener, closer)` of the outermost dollar-quoted
+/// strings of `tokens`, in order. An opener is a `DollarQuoteDelimiter`
+/// token; its closer is the next one of the same text once every string
+/// opened after it has closed. An opener nothing closes quotes nothing.
+pub(crate) fn dollar_quoted_token_ranges(source: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut open: Vec<(usize, &str)> = Vec::new();
+    let mut closed = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let is_delimiter = matches!(
+            token.kind,
+            TokenKind::Identifier {
+                kind: IdentifierKind::DollarQuoteDelimiter,
+                ..
+            }
+        );
+        if !is_delimiter {
+            continue;
+        }
+        let tag = token.lexeme(source);
+        let closes = open.last().is_some_and(|&(_, innermost)| innermost == tag);
+        if closes {
+            if let Some((opener, _)) = open.pop() {
+                closed.push((opener, index));
+            }
+        } else {
+            open.push((index, tag));
+        }
+    }
+    // A string inside another counts with it; one inside an opener nothing
+    // closes counts alone.
+    closed.sort_unstable();
+    let mut outermost: Vec<(usize, usize)> = Vec::new();
+    for range in closed {
+        if outermost.last().is_none_or(|&(_, closer)| range.0 > closer) {
+            outermost.push(range);
+        }
+    }
+    outermost
 }
 
 /// Comma placement style
@@ -894,374 +1047,6 @@ impl Serialize for FormatterConfig {
     }
 }
 
-impl<'de> Deserialize<'de> for FormatterConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        // Deserialize into a helper struct, then construct FormatterConfig with dialect
-        #[derive(Deserialize)]
-        struct FormatterConfigHelper {
-            #[serde(default = "default_keyword_case")]
-            keyword_case: KeywordCase,
-            #[serde(default = "default_identifier_case")]
-            identifier_case: IdentifierCase,
-            #[serde(default = "default_indent_style")]
-            indent_style: IndentStyle,
-            #[serde(default = "default_newline_style")]
-            newline_style: NewlineStyle,
-            #[serde(default)]
-            max_line_length: usize,
-            #[serde(default)]
-            dialect: Option<String>,
-            #[serde(default)]
-            align_keywords: bool,
-            #[serde(default)]
-            trailing_commas: bool,
-            #[serde(default = "default_comma_style")]
-            comma_style: CommaStyle,
-            #[serde(default = "default_true")]
-            clauses_on_newlines: bool,
-            #[serde(default = "default_true")]
-            select_items_on_newlines: bool,
-            #[serde(default)]
-            where_conditions_on_newlines: bool,
-            #[serde(default = "default_true")]
-            joins_on_newlines: bool,
-            #[serde(default)]
-            group_by_items_on_newlines: bool,
-            #[serde(default)]
-            order_by_items_on_newlines: bool,
-            #[serde(default)]
-            from_tables_on_newlines: bool,
-            #[serde(default = "default_true")]
-            spaces_around_operators: bool,
-            #[serde(default)]
-            space_after_comma: bool,
-            #[serde(default)]
-            align_select_aliases: bool,
-            #[serde(default = "default_alias_align_max_width")]
-            alias_align_max_width: usize,
-            #[serde(default)]
-            align_joins: bool,
-            #[serde(default)]
-            align_join_conditions: bool,
-            #[serde(default)]
-            join_on_clause_on_newline: bool,
-            #[serde(default = "default_true")]
-            indent_join_on_clause: bool,
-            #[serde(default = "default_boolean_operator_position")]
-            boolean_operator_position: BooleanOperatorPosition,
-            #[serde(default)]
-            align_column_definitions: bool,
-            #[serde(default)]
-            align_update_set: bool,
-            #[serde(default = "default_true")]
-            insert_values_on_newlines: bool,
-            #[serde(default)]
-            delete_using_on_newlines: bool,
-            #[serde(default)]
-            align_merge_actions: bool,
-            #[serde(default)]
-            indent_select_items: bool,
-            #[serde(default)]
-            indent_from_tables: bool,
-            #[serde(default = "default_true")]
-            indent_group_by_items: bool,
-            #[serde(default = "default_true")]
-            indent_order_by_items: bool,
-            #[serde(default = "default_true")]
-            indent_subqueries: bool,
-            #[serde(default = "default_true")]
-            uppercase_boolean_operators: bool,
-            #[serde(default)]
-            semicolon_on_newline: bool,
-            #[serde(default = "default_true")]
-            indent_case_then: bool,
-            #[serde(default = "default_parenthesized_expr_style")]
-            parenthesized_expr_style: ParenthesizedExprStyle,
-            #[serde(default)]
-            normalize_join_keywords: bool,
-            #[serde(default = "default_true")]
-            scripting_statement_spacing: bool,
-            #[serde(default = "default_true")]
-            declare_on_newlines: bool,
-            #[serde(default = "default_true")]
-            indent_declare_section: bool,
-            #[serde(default = "default_true")]
-            blank_line_after_declare: bool,
-            #[serde(default = "default_true")]
-            cursor_query_on_newline: bool,
-            #[serde(default = "default_true")]
-            indent_cursor_query: bool,
-            #[serde(default = "default_true")]
-            loop_body_on_newlines: bool,
-            #[serde(default = "default_true")]
-            indent_loop_body: bool,
-            #[serde(default = "default_true")]
-            if_branches_on_newlines: bool,
-            #[serde(default = "default_true")]
-            indent_if_body: bool,
-            #[serde(default)]
-            compact_simple_select: bool,
-            #[serde(default)]
-            case_when_aligned: bool,
-            #[serde(default)]
-            case_style_compact: bool,
-            #[serde(default = "default_true")]
-            case_expression_on_newline: bool,
-            #[serde(default = "default_in_list_threshold")]
-            in_list_threshold: usize,
-            #[serde(default)]
-            in_list_items_per_line: usize,
-            #[serde(default)]
-            window_function_on_newline: bool,
-            #[serde(default = "default_true")]
-            indent_window_function_clauses: bool,
-            #[serde(default = "default_true")]
-            partition_by_on_newline: bool,
-            #[serde(default = "default_true")]
-            order_by_in_window_on_newline: bool,
-            #[serde(default = "default_window_frame_style")]
-            window_frame_style: WindowFrameStyle,
-            #[serde(default = "default_true")]
-            cte_name_on_newline: bool,
-            #[serde(default = "default_cte_indent_style")]
-            cte_indent_style: CteIndentStyle,
-            #[serde(default = "default_subquery_paren_style")]
-            subquery_paren_style: SubqueryParenStyle,
-            #[serde(default = "default_flatten_style")]
-            flatten_style: FlattenStyle,
-            #[serde(default = "default_copy_into_options_style")]
-            copy_into_options_style: CopyIntoOptionsStyle,
-            #[serde(default = "default_match_recognize_format")]
-            match_recognize_format: MatchRecognizeFormat,
-            #[serde(default = "default_true")]
-            match_recognize_on_newline: bool,
-            #[serde(default = "default_match_recognize_measures_style")]
-            match_recognize_measures_style: MatchRecognizeMeasuresStyle,
-            #[serde(default = "default_match_recognize_define_style")]
-            match_recognize_define_style: MatchRecognizeDefineStyle,
-            #[serde(default = "default_array_literal_style")]
-            array_literal_style: ArrayLiteralStyle,
-            #[serde(default = "default_array_literal_threshold")]
-            array_literal_threshold: usize,
-            #[serde(default = "default_object_literal_style")]
-            object_literal_style: ObjectLiteralStyle,
-            #[serde(default = "default_create_stage_clause_style")]
-            create_stage_clause_style: CreateStageClauseStyle,
-            #[serde(default)]
-            create_stage_credentials_expanded: bool,
-            #[serde(default)]
-            create_stage_file_format_expanded: bool,
-            #[serde(default = "default_true")]
-            multi_insert_into_indent: bool,
-            #[serde(default = "default_true")]
-            multi_insert_when_indent: bool,
-            #[serde(default)]
-            multi_insert_values_on_newline: bool,
-            #[serde(default = "default_create_proc_func_params_style")]
-            create_proc_func_params_style: ParamListStyle,
-            #[serde(default = "default_true")]
-            create_proc_func_returns_on_newline: bool,
-            #[serde(default)]
-            create_proc_func_format_body: bool,
-            #[serde(default = "default_true")]
-            create_proc_func_body_indent: bool,
-            #[serde(default = "default_true")]
-            copy_into_from_on_newline: bool,
-            #[serde(default = "default_pipe_chain_style")]
-            pipe_chain_style: PipeChainStyle,
-            #[serde(default = "default_true")]
-            jinja_format_sql_content: bool,
-            #[serde(default = "default_true")]
-            jinja_indent_delimiters: bool,
-            #[serde(default = "default_jinja_content_indent_level")]
-            jinja_content_indent_level: usize,
-            #[serde(default)]
-            jinja_preserve_original: bool,
-            #[serde(default)]
-            skip_verification: bool,
-        }
-
-        // Default value functions for serde
-        fn default_true() -> bool {
-            true
-        }
-        fn default_keyword_case() -> KeywordCase {
-            KeywordCase::Upper
-        }
-        fn default_identifier_case() -> IdentifierCase {
-            IdentifierCase::Preserve
-        }
-        fn default_indent_style() -> IndentStyle {
-            IndentStyle::Spaces(4)
-        }
-        fn default_newline_style() -> NewlineStyle {
-            NewlineStyle::Unix
-        }
-        fn default_comma_style() -> CommaStyle {
-            CommaStyle::Trailing
-        }
-        fn default_boolean_operator_position() -> BooleanOperatorPosition {
-            BooleanOperatorPosition::End
-        }
-        fn default_parenthesized_expr_style() -> ParenthesizedExprStyle {
-            ParenthesizedExprStyle::Compact
-        }
-        fn default_window_frame_style() -> WindowFrameStyle {
-            WindowFrameStyle::Compact
-        }
-        fn default_cte_indent_style() -> CteIndentStyle {
-            CteIndentStyle::Standard
-        }
-        fn default_subquery_paren_style() -> SubqueryParenStyle {
-            SubqueryParenStyle::SameLine
-        }
-        fn default_flatten_style() -> FlattenStyle {
-            FlattenStyle::Inline
-        }
-        fn default_copy_into_options_style() -> CopyIntoOptionsStyle {
-            CopyIntoOptionsStyle::Stacked
-        }
-        fn default_match_recognize_format() -> MatchRecognizeFormat {
-            MatchRecognizeFormat::Compact
-        }
-        fn default_match_recognize_measures_style() -> MatchRecognizeMeasuresStyle {
-            MatchRecognizeMeasuresStyle::Threshold(3)
-        }
-        fn default_match_recognize_define_style() -> MatchRecognizeDefineStyle {
-            MatchRecognizeDefineStyle::Threshold(2)
-        }
-        fn default_array_literal_style() -> ArrayLiteralStyle {
-            ArrayLiteralStyle::Inline
-        }
-        fn default_object_literal_style() -> ObjectLiteralStyle {
-            ObjectLiteralStyle::Inline
-        }
-        fn default_create_stage_clause_style() -> CreateStageClauseStyle {
-            CreateStageClauseStyle::Stacked
-        }
-        fn default_create_proc_func_params_style() -> ParamListStyle {
-            ParamListStyle::Inline
-        }
-        fn default_pipe_chain_style() -> PipeChainStyle {
-            PipeChainStyle::Preserve
-        }
-        fn default_alias_align_max_width() -> usize {
-            60
-        }
-        fn default_in_list_threshold() -> usize {
-            5
-        }
-        fn default_array_literal_threshold() -> usize {
-            5
-        }
-        fn default_jinja_content_indent_level() -> usize {
-            1
-        }
-
-        let helper = FormatterConfigHelper::deserialize(deserializer)?;
-
-        Ok(FormatterConfig {
-            keyword_case: helper.keyword_case,
-            identifier_case: helper.identifier_case,
-            indent_style: helper.indent_style,
-            newline_style: helper.newline_style,
-            max_line_length: helper.max_line_length,
-            dialect: helper
-                .dialect
-                .as_deref()
-                .and_then(crate::dialect::dialect_from_name)
-                .unwrap_or_else(|| Arc::new(SnowflakeDialect)),
-            align_keywords: helper.align_keywords,
-            trailing_commas: helper.trailing_commas,
-            comma_style: helper.comma_style,
-            clauses_on_newlines: helper.clauses_on_newlines,
-            select_items_on_newlines: helper.select_items_on_newlines,
-            where_conditions_on_newlines: helper.where_conditions_on_newlines,
-            joins_on_newlines: helper.joins_on_newlines,
-            group_by_items_on_newlines: helper.group_by_items_on_newlines,
-            order_by_items_on_newlines: helper.order_by_items_on_newlines,
-            from_tables_on_newlines: helper.from_tables_on_newlines,
-            spaces_around_operators: helper.spaces_around_operators,
-            space_after_comma: helper.space_after_comma,
-            align_select_aliases: helper.align_select_aliases,
-            alias_align_max_width: helper.alias_align_max_width,
-            align_joins: helper.align_joins,
-            align_join_conditions: helper.align_join_conditions,
-            join_on_clause_on_newline: helper.join_on_clause_on_newline,
-            indent_join_on_clause: helper.indent_join_on_clause,
-            boolean_operator_position: helper.boolean_operator_position,
-            align_column_definitions: helper.align_column_definitions,
-            align_update_set: helper.align_update_set,
-            insert_values_on_newlines: helper.insert_values_on_newlines,
-            delete_using_on_newlines: helper.delete_using_on_newlines,
-            align_merge_actions: helper.align_merge_actions,
-            indent_select_items: helper.indent_select_items,
-            indent_from_tables: helper.indent_from_tables,
-            indent_group_by_items: helper.indent_group_by_items,
-            indent_order_by_items: helper.indent_order_by_items,
-            indent_subqueries: helper.indent_subqueries,
-            uppercase_boolean_operators: helper.uppercase_boolean_operators,
-            semicolon_on_newline: helper.semicolon_on_newline,
-            indent_case_then: helper.indent_case_then,
-            parenthesized_expr_style: helper.parenthesized_expr_style,
-            normalize_join_keywords: helper.normalize_join_keywords,
-            scripting_statement_spacing: helper.scripting_statement_spacing,
-            declare_on_newlines: helper.declare_on_newlines,
-            indent_declare_section: helper.indent_declare_section,
-            blank_line_after_declare: helper.blank_line_after_declare,
-            cursor_query_on_newline: helper.cursor_query_on_newline,
-            indent_cursor_query: helper.indent_cursor_query,
-            loop_body_on_newlines: helper.loop_body_on_newlines,
-            indent_loop_body: helper.indent_loop_body,
-            if_branches_on_newlines: helper.if_branches_on_newlines,
-            indent_if_body: helper.indent_if_body,
-            compact_simple_select: helper.compact_simple_select,
-            case_when_aligned: helper.case_when_aligned,
-            case_style_compact: helper.case_style_compact,
-            case_expression_on_newline: helper.case_expression_on_newline,
-            in_list_threshold: helper.in_list_threshold,
-            in_list_items_per_line: helper.in_list_items_per_line,
-            window_function_on_newline: helper.window_function_on_newline,
-            indent_window_function_clauses: helper.indent_window_function_clauses,
-            partition_by_on_newline: helper.partition_by_on_newline,
-            order_by_in_window_on_newline: helper.order_by_in_window_on_newline,
-            window_frame_style: helper.window_frame_style,
-            cte_name_on_newline: helper.cte_name_on_newline,
-            cte_indent_style: helper.cte_indent_style,
-            subquery_paren_style: helper.subquery_paren_style,
-            flatten_style: helper.flatten_style,
-            copy_into_options_style: helper.copy_into_options_style,
-            match_recognize_format: helper.match_recognize_format,
-            match_recognize_on_newline: helper.match_recognize_on_newline,
-            match_recognize_measures_style: helper.match_recognize_measures_style,
-            match_recognize_define_style: helper.match_recognize_define_style,
-            array_literal_style: helper.array_literal_style,
-            array_literal_threshold: helper.array_literal_threshold,
-            object_literal_style: helper.object_literal_style,
-            create_stage_clause_style: helper.create_stage_clause_style,
-            create_stage_credentials_expanded: helper.create_stage_credentials_expanded,
-            create_stage_file_format_expanded: helper.create_stage_file_format_expanded,
-            multi_insert_into_indent: helper.multi_insert_into_indent,
-            multi_insert_when_indent: helper.multi_insert_when_indent,
-            multi_insert_values_on_newline: helper.multi_insert_values_on_newline,
-            create_proc_func_params_style: helper.create_proc_func_params_style,
-            create_proc_func_returns_on_newline: helper.create_proc_func_returns_on_newline,
-            create_proc_func_format_body: helper.create_proc_func_format_body,
-            create_proc_func_body_indent: helper.create_proc_func_body_indent,
-            copy_into_from_on_newline: helper.copy_into_from_on_newline,
-            pipe_chain_style: helper.pipe_chain_style,
-            jinja_format_sql_content: helper.jinja_format_sql_content,
-            jinja_indent_delimiters: helper.jinja_indent_delimiters,
-            jinja_content_indent_level: helper.jinja_content_indent_level,
-            jinja_preserve_original: helper.jinja_preserve_original,
-            skip_verification: helper.skip_verification,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1272,7 +1057,7 @@ mod tests {
         assert_eq!(config.keyword_case, KeywordCase::Upper);
         assert_eq!(config.identifier_case, IdentifierCase::Preserve);
         assert_eq!(config.indent_style, IndentStyle::Spaces(4));
-        assert_eq!(config.newline_style, NewlineStyle::Unix);
+        assert_eq!(config.newline_style, NewlineStyle::Auto);
         assert_eq!(config.max_line_length, 0);
         assert!(!config.align_keywords);
         assert!(!config.trailing_commas);

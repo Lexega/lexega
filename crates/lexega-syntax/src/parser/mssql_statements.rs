@@ -14,7 +14,7 @@ use crate::ast::types::{
 use crate::ast::AstStmt;
 use crate::error::{ParseError, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
-use crate::parser::core::Parser;
+use crate::parser::core::{NamePosition, Parser};
 
 /// Peek the lexemes of up to two non-trivia tokens starting at the
 /// parser's current cursor without consuming. Returns `(first, second)`
@@ -43,6 +43,23 @@ fn peek_two_lexemes<'a>(p: &mut Parser<'a>) -> (Option<&'a str>, Option<&'a str>
 }
 
 impl<'a> Parser<'a> {
+    /// The login named by `FOR | FROM LOGIN name` at the cursor, without
+    /// consuming. Empty, at the end of `LOGIN`, where no name follows.
+    fn mssql_login_name_span(&self) -> Option<Span> {
+        let significant_after = |from: usize| {
+            (from + 1..self.tokens.len()).find(|&i| {
+                !matches!(
+                    self.tokens[i].kind,
+                    TokenKind::Eof | TokenKind::LineComment | TokenKind::BlockComment
+                )
+            })
+        };
+        significant_after(self.idx)
+            .and_then(significant_after)
+            .and_then(|i| self.name_span_at(i, NamePosition::Object))
+            .map(|(_, span)| span)
+    }
+
     /// Classify the source clause that follows the principal name in
     /// `CREATE LOGIN <name>` / `CREATE USER <name>`. Peeks the next one
     /// or two non-trivia tokens without consuming.
@@ -57,9 +74,12 @@ impl<'a> Parser<'a> {
                 AstMssqlPrincipalSource::WithoutLogin
             }
             (Some(x), Some(y))
-                if x.eq_ignore_ascii_case("FOR") && y.eq_ignore_ascii_case("LOGIN") =>
+                if (x.eq_ignore_ascii_case("FOR") || x.eq_ignore_ascii_case("FROM"))
+                    && y.eq_ignore_ascii_case("LOGIN") =>
             {
-                AstMssqlPrincipalSource::ForLogin
+                AstMssqlPrincipalSource::ForLogin {
+                    login: self.mssql_login_name_span(),
+                }
             }
             (Some(x), Some(y))
                 if x.eq_ignore_ascii_case("FROM") && y.eq_ignore_ascii_case("EXTERNAL") =>
@@ -389,26 +409,7 @@ impl<'a> Parser<'a> {
         }
 
         // Table name (possibly qualified: schema.table)
-        let first_tok = self
-            .advance()
-            .ok_or_eof(self.current_span(), vec!["table_name".to_string()])?;
-        let table_start = first_tok.span.start;
-        let mut table_end = first_tok.span.end;
-        // Consume dot-separated parts
-        while let Some(dot_tok) = self.peek_non_trivia() {
-            if !matches!(dot_tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                break;
-            }
-            self.advance(); // dot
-            let part_tok = self
-                .advance()
-                .ok_or_eof(self.current_span(), vec!["identifier".to_string()])?;
-            table_end = part_tok.span.end;
-        }
-        let table_span = Span {
-            start: table_start,
-            end: table_end,
-        };
+        let table_span = self.parse_object_name_span()?;
 
         // Column list in parentheses
         let columns_span = self.mssql_parse_paren_content()?;

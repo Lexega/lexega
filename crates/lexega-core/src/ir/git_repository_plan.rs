@@ -16,6 +16,7 @@
 use crate::ast::{
     types::AstGitRepositoryAction, AstAlterGitRepository, AstCreateGitRepository, AstDrop, NodeId,
 };
+use crate::ir::span_extract::literal_value_or_text;
 use crate::ir::utils::slice_span;
 use crate::lexer::token::Span;
 
@@ -119,8 +120,9 @@ pub fn lower_drop_git_repository_to_git_repository_plan(
     GitRepositoryPlan {
         action: GitRepositoryAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: GitRepositoryOptions {
             or_replace: false,
             if_not_exists: false,
@@ -145,13 +147,13 @@ fn classify_alter_action(action: AstGitRepositoryAction) -> GitRepositoryAlterAc
 
 fn upper_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|sp| slice_span(source, sp))
-        .map(|t| t.trim().trim_matches('\'').trim().to_ascii_uppercase())
+        .map(|t| literal_value_or_text(t).to_ascii_uppercase())
         .filter(|s| !s.is_empty())
 }
 
 fn dequote_text(source: &str, span: Option<Span>) -> Option<String> {
     span.and_then(|sp| slice_span(source, sp))
-        .map(|t| t.trim().trim_matches('\'').trim().to_string())
+        .map(literal_value_or_text)
         .filter(|s| !s.is_empty())
 }
 

@@ -508,6 +508,7 @@ mod tests {
 
     #[test]
     fn single_symbol() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, syms) = parse("UP").unwrap();
         assert!(matches!(e, PatternExpr::Symbol(SymbolId(0))));
         assert_eq!(syms.len(), 1);
@@ -516,6 +517,7 @@ mod tests {
 
     #[test]
     fn concatenation_three_symbols() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, syms) = parse("A B C").unwrap();
         match e {
             PatternExpr::Concat(items) => assert_eq!(items.len(), 3),
@@ -526,6 +528,7 @@ mod tests {
 
     #[test]
     fn alternation_two_arms() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("UP | DOWN").unwrap();
         match e {
             PatternExpr::Alternation(arms) => {
@@ -539,6 +542,7 @@ mod tests {
 
     #[test]
     fn anchors() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("^ A $").unwrap();
         match e {
             PatternExpr::Concat(items) => {
@@ -555,6 +559,7 @@ mod tests {
 
     #[test]
     fn quantifier_star() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A*").unwrap();
         let q = match e {
             PatternExpr::Quantified { kind, greedy, .. } => (kind, greedy),
@@ -566,6 +571,7 @@ mod tests {
 
     #[test]
     fn quantifier_reluctant() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A+?").unwrap();
         let q = match e {
             PatternExpr::Quantified { kind, greedy, .. } => (kind, greedy),
@@ -577,6 +583,7 @@ mod tests {
 
     #[test]
     fn quantifier_brace_exact() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A{3}").unwrap();
         match e {
             PatternExpr::Quantified { kind, .. } => {
@@ -588,6 +595,7 @@ mod tests {
 
     #[test]
     fn quantifier_brace_range() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A{2,5}").unwrap();
         match e {
             PatternExpr::Quantified { kind, .. } => {
@@ -599,6 +607,7 @@ mod tests {
 
     #[test]
     fn quantifier_brace_at_least() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A{2,}").unwrap();
         match e {
             PatternExpr::Quantified { kind, .. } => {
@@ -610,6 +619,7 @@ mod tests {
 
     #[test]
     fn quantifier_brace_at_most() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A{,5}").unwrap();
         match e {
             PatternExpr::Quantified { kind, .. } => {
@@ -621,6 +631,7 @@ mod tests {
 
     #[test]
     fn brace_range_inverted_rejected() {
+        let _folding = crate::ir::normalize::default_folding();
         match parse("A{5,2}") {
             Err(PatternParseError::BoundOutOfRange { .. }) => {}
             other => panic!("expected BoundOutOfRange, got {:?}", other),
@@ -629,6 +640,7 @@ mod tests {
 
     #[test]
     fn grouped_alternation_with_quantifier() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("(UP | DOWN)+").unwrap();
         match e {
             PatternExpr::Quantified { inner, kind, .. } => {
@@ -641,6 +653,7 @@ mod tests {
 
     #[test]
     fn unclosed_group_rejected() {
+        let _folding = crate::ir::normalize::default_folding();
         match parse("(A | B") {
             Err(PatternParseError::UnclosedGroup { .. }) => {}
             other => panic!("expected UnclosedGroup, got {:?}", other),
@@ -649,6 +662,7 @@ mod tests {
 
     #[test]
     fn permute() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("PERMUTE(A, B, C)").unwrap();
         match e {
             PatternExpr::Permute(arms) => assert_eq!(arms.len(), 3),
@@ -658,6 +672,7 @@ mod tests {
 
     #[test]
     fn permute_as_identifier_when_no_parens() {
+        let _folding = crate::ir::normalize::default_folding();
         // Bare `PERMUTE` (no following `(`) should parse as a symbol.
         let (e, syms) = parse("PERMUTE").unwrap();
         assert!(matches!(e, PatternExpr::Symbol(SymbolId(0))));
@@ -666,6 +681,7 @@ mod tests {
 
     #[test]
     fn exclude_block() {
+        let _folding = crate::ir::normalize::default_folding();
         let (e, _) = parse("A {- B -} C").unwrap();
         match e {
             PatternExpr::Concat(items) => {
@@ -678,6 +694,7 @@ mod tests {
 
     #[test]
     fn symbol_interning_case_insensitive() {
+        let _folding = crate::ir::normalize::default_folding();
         let (_, syms) = parse("UP up Up").unwrap();
         // IdentKey::new is case-insensitive for unquoted identifiers
         // — all three references intern to the same SymbolId.
@@ -686,6 +703,7 @@ mod tests {
 
     #[test]
     fn unexpected_trailing_char() {
+        let _folding = crate::ir::normalize::default_folding();
         match parse("A )") {
             Err(PatternParseError::UnexpectedChar { ch, .. }) => assert_eq!(ch, ')'),
             other => panic!("expected UnexpectedChar, got {:?}", other),
@@ -694,6 +712,7 @@ mod tests {
 
     #[test]
     fn complex_pattern_round_trip() {
+        let _folding = crate::ir::normalize::default_folding();
         // "STRT (UP+ DOWN+)+ END" — typical Snowflake example.
         let (e, syms) = parse("STRT (UP+ DOWN+)+ END").unwrap();
         // Four distinct symbols: STRT, UP, DOWN, END.

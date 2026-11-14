@@ -35,10 +35,10 @@ use super::column::ColumnId;
 // via `use super::*;`; it is unused in the lib-only build path.
 #[cfg_attr(not(test), allow(unused_imports))]
 use super::plan::{
-    AggregateCall, ChangesClause, CteBinding, CteBody, FilterKind, FrameBound, GroupKey,
-    GroupingSpec, Hint, MergeAction, MergeBranch, ProjectItem, ProjectStar, RelPlan, SampleSize,
-    ScanModifier, SortKey, StarQualifier, StarReplace, TableSample, TimeTravel, WindowCall,
-    WindowFrame,
+    AggregateCall, AssignedValue, Assignment, ChangesClause, CteBinding, CteBody, FilterKind,
+    FrameBound, GroupKey, GroupingSpec, Hint, MergeAction, MergeBranch, ProjectItem, ProjectStar,
+    RelPlan, SampleSize, ScanModifier, SortKey, StarQualifier, StarReplace, TableSample,
+    TimeTravel, WindowCall, WindowFrame,
 };
 use super::scalar::{FieldStep, QuantifiedRhs, ScalarExpr};
 
@@ -63,8 +63,9 @@ pub trait RelPlanVisitor<'a>: Sized {
     }
 
     /// Called when entering a subquery plan reached from a scalar
-    /// (`Exists` / `ScalarSubquery` / `QuantifiedCmp::Subquery`). Default
-    /// delegates to [`visit_rel_plan`](Self::visit_rel_plan); override to distinguish.
+    /// (`Exists` / `ScalarSubquery` / `QuantifiedCmp::Subquery`) or from
+    /// an assignment ([`AssignedValue::Query`]). Default delegates to
+    /// [`visit_rel_plan`](Self::visit_rel_plan); override to distinguish.
     fn visit_subquery(&mut self, plan: &'a RelPlan, correlates_with: &'a [ColumnId]) {
         let _ = correlates_with;
         self.visit_rel_plan(plan);
@@ -171,9 +172,15 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
         }
 
         RelPlan::Filter {
-            input, predicate, ..
+            input,
+            computed,
+            predicate,
+            ..
         } => {
             v.visit_rel_plan(input);
+            for item in computed {
+                v.visit_scalar_expr(&item.expr);
+            }
             v.visit_scalar_expr(predicate);
         }
 
@@ -182,10 +189,14 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             grouping,
             aggregates,
             having,
+            computed,
             ..
         } => {
             v.visit_rel_plan(input);
             walk_grouping(v, grouping);
+            for item in computed {
+                v.visit_scalar_expr(&item.expr);
+            }
             for agg in aggregates {
                 walk_aggregate_call(v, agg);
             }
@@ -194,8 +205,16 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             }
         }
 
-        RelPlan::Window { input, windows, .. } => {
+        RelPlan::Window {
+            input,
+            windows,
+            computed,
+            ..
+        } => {
             v.visit_rel_plan(input);
+            for item in computed {
+                v.visit_scalar_expr(&item.expr);
+            }
             for w in windows {
                 walk_window_call(v, w);
             }
@@ -285,9 +304,7 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             if let Some(f) = from {
                 v.visit_rel_plan(f);
             }
-            for (_, expr) in assignments {
-                v.visit_scalar_expr(expr);
-            }
+            walk_assignments(v, assignments);
             if let Some(p) = predicate {
                 v.visit_scalar_expr(p);
             }
@@ -332,6 +349,7 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             on,
             branches,
             output,
+            returning,
             ..
         } => {
             v.visit_rel_plan(source);
@@ -341,6 +359,9 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             }
             if let Some(o) = output {
                 walk_dml_output(v, o);
+            }
+            if let Some(r) = returning {
+                walk_returning(v, r);
             }
         }
 
@@ -352,20 +373,20 @@ pub fn walk_rel_plan<'a, V: RelPlanVisitor<'a>>(v: &mut V, plan: &'a RelPlan) {
             ..
         } => {
             for c in unconditional_clauses {
-                for val in &c.values {
+                for val in c.values.iter().flatten() {
                     v.visit_scalar_expr(val);
                 }
             }
             for w in when_clauses {
                 v.visit_scalar_expr(&w.condition);
                 for c in &w.targets {
-                    for val in &c.values {
+                    for val in c.values.iter().flatten() {
                         v.visit_scalar_expr(val);
                     }
                 }
             }
             for c in else_clauses {
-                for val in &c.values {
+                for val in c.values.iter().flatten() {
                     v.visit_scalar_expr(val);
                 }
             }
@@ -483,7 +504,7 @@ pub fn walk_scalar_expr<'a, V: RelPlanVisitor<'a>>(v: &mut V, expr: &'a ScalarEx
             v.visit_scalar_expr(right);
         }
 
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 v.visit_scalar_expr(operand);
             }
@@ -576,6 +597,18 @@ pub fn walk_scalar_expr<'a, V: RelPlanVisitor<'a>>(v: &mut V, expr: &'a ScalarEx
             }
         }
 
+        ScalarExpr::RowCmp {
+            left,
+            subquery,
+            correlates_with,
+            ..
+        } => {
+            for e in left {
+                v.visit_scalar_expr(e);
+            }
+            v.visit_subquery(subquery, correlates_with);
+        }
+
         ScalarExpr::WindowFn { call, .. } => walk_window_call(v, call),
 
         ScalarExpr::FieldAccess { base, path, .. } => {
@@ -608,7 +641,7 @@ pub fn walk_scalar_expr_standalone<'a, V: ScalarExprVisitor<'a>>(v: &mut V, expr
             v.visit_scalar_expr(right);
         }
 
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 v.visit_scalar_expr(operand);
             }
@@ -701,6 +734,18 @@ pub fn walk_scalar_expr_standalone<'a, V: ScalarExprVisitor<'a>>(v: &mut V, expr
             }
         }
 
+        ScalarExpr::RowCmp {
+            left,
+            subquery,
+            correlates_with,
+            ..
+        } => {
+            for e in left {
+                v.visit_scalar_expr(e);
+            }
+            v.visit_scalar_subquery(subquery, correlates_with);
+        }
+
         ScalarExpr::WindowFn { call, .. } => walk_window_call_standalone(v, call),
 
         ScalarExpr::FieldAccess { base, path, .. } => {
@@ -729,6 +774,10 @@ fn walk_project_star<'a, V: RelPlanVisitor<'a>>(v: &mut V, s: &'a ProjectStar) {
         rename: _,
         ilike: _,
         top_level_pure: _,
+        enumerated: _,
+        itemized: _,
+        complete: _,
+        unplaced: _,
         span: _,
     } = s;
     match qualifier {
@@ -803,16 +852,14 @@ fn walk_grouping<'a, V: RelPlanVisitor<'a>>(v: &mut V, g: &'a GroupingSpec) {
         GroupingSpec::Standard(keys)
         | GroupingSpec::Cube(keys)
         | GroupingSpec::Rollup(keys)
-        | GroupingSpec::All(keys) => {
+        | GroupingSpec::All { keys, .. } => {
             for k in keys {
                 walk_group_key(v, k);
             }
         }
         GroupingSpec::GroupingSets(sets) => {
-            for set in sets {
-                for k in set {
-                    walk_group_key(v, k);
-                }
+            for k in &sets.keys {
+                walk_group_key(v, k);
             }
         }
     }
@@ -921,17 +968,32 @@ fn walk_merge_branch<'a, V: RelPlanVisitor<'a>>(v: &mut V, b: &'a MergeBranch) {
                 v.visit_scalar_expr(val);
             }
         }
-        MergeAction::Update { assignments } => {
-            for (_, expr) in assignments {
-                v.visit_scalar_expr(expr);
-            }
-        }
-        MergeAction::InsertStar
-        | MergeAction::InsertAllByName
-        | MergeAction::UpdateSetStar
-        | MergeAction::UpdateAllByName
+        MergeAction::Update { assignments } => walk_assignments(v, assignments),
+        MergeAction::InsertStar { .. }
+        | MergeAction::InsertAllByName { .. }
+        | MergeAction::UpdateSetStar { .. }
+        | MergeAction::UpdateAllByName { .. }
         | MergeAction::Delete
         | MergeAction::DoNothing => {}
+    }
+}
+
+/// Each assignment's value: a row's expressions, or a query, which is
+/// handed over as a subquery.
+fn walk_assignments<'a, V: RelPlanVisitor<'a>>(v: &mut V, assignments: &'a [Assignment]) {
+    for assignment in assignments {
+        match &assignment.value {
+            AssignedValue::Row(exprs) => {
+                for expr in exprs {
+                    v.visit_scalar_expr(expr);
+                }
+            }
+            AssignedValue::Query {
+                subquery,
+                correlates_with,
+                ..
+            } => v.visit_subquery(subquery, correlates_with),
+        }
     }
 }
 
@@ -967,17 +1029,13 @@ fn walk_on_conflict<'a, V: RelPlanVisitor<'a>>(v: &mut V, oc: &'a crate::ir::pla
             assignments,
             where_clause,
         } => {
-            for (_, e) in assignments {
-                v.visit_scalar_expr(e);
-            }
+            walk_assignments(v, assignments);
             if let Some(w) = where_clause {
                 v.visit_scalar_expr(w);
             }
         }
         ConflictAction::MySqlDuplicateKeyUpdate { assignments } => {
-            for (_, e) in assignments {
-                v.visit_scalar_expr(e);
-            }
+            walk_assignments(v, assignments);
         }
     }
 }
@@ -986,7 +1044,7 @@ fn walk_returning<'a, V: RelPlanVisitor<'a>>(v: &mut V, r: &'a crate::ir::plan::
     use crate::ir::plan::ReturningItem;
     for it in &r.items {
         match it {
-            ReturningItem::Star => {}
+            ReturningItem::Star(_) => {}
             ReturningItem::Expr { expr, .. } => v.visit_scalar_expr(expr),
         }
     }
@@ -996,7 +1054,7 @@ fn walk_dml_output<'a, V: RelPlanVisitor<'a>>(v: &mut V, o: &'a crate::ir::plan:
     use crate::ir::plan::ReturningItem;
     for it in &o.items {
         match it {
-            ReturningItem::Star => {}
+            ReturningItem::Star(_) => {}
             ReturningItem::Expr { expr, .. } => v.visit_scalar_expr(expr),
         }
     }
@@ -1050,9 +1108,15 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
         }
 
         RelPlan::Filter {
-            input, predicate, ..
+            input,
+            computed,
+            predicate,
+            ..
         } => {
             m.visit_rel_plan_mut(input);
+            for item in computed {
+                m.visit_scalar_expr_mut(&mut item.expr);
+            }
             m.visit_scalar_expr_mut(predicate);
         }
 
@@ -1061,10 +1125,14 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             grouping,
             aggregates,
             having,
+            computed,
             ..
         } => {
             m.visit_rel_plan_mut(input);
             walk_grouping_mut(m, grouping);
+            for item in computed {
+                m.visit_scalar_expr_mut(&mut item.expr);
+            }
             for agg in aggregates {
                 walk_aggregate_call_mut(m, agg);
             }
@@ -1073,8 +1141,16 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             }
         }
 
-        RelPlan::Window { input, windows, .. } => {
+        RelPlan::Window {
+            input,
+            windows,
+            computed,
+            ..
+        } => {
             m.visit_rel_plan_mut(input);
+            for item in computed {
+                m.visit_scalar_expr_mut(&mut item.expr);
+            }
             for w in windows {
                 walk_window_call_mut(m, w);
             }
@@ -1160,9 +1236,7 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             if let Some(f) = from {
                 m.visit_rel_plan_mut(f);
             }
-            for (_, expr) in assignments {
-                m.visit_scalar_expr_mut(expr);
-            }
+            walk_assignments_mut(m, assignments);
             if let Some(p) = predicate {
                 m.visit_scalar_expr_mut(p);
             }
@@ -1207,6 +1281,7 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             on,
             branches,
             output,
+            returning,
             ..
         } => {
             m.visit_rel_plan_mut(source);
@@ -1216,6 +1291,9 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             }
             if let Some(o) = output {
                 walk_dml_output_mut(m, o);
+            }
+            if let Some(r) = returning {
+                walk_returning_mut(m, r);
             }
         }
 
@@ -1227,20 +1305,20 @@ pub fn walk_rel_plan_mut<M: RelPlanMutator>(m: &mut M, plan: &mut RelPlan) {
             ..
         } => {
             for c in unconditional_clauses {
-                for val in &mut c.values {
+                for val in c.values.iter_mut().flatten() {
                     m.visit_scalar_expr_mut(val);
                 }
             }
             for w in when_clauses {
                 m.visit_scalar_expr_mut(&mut w.condition);
                 for c in &mut w.targets {
-                    for val in &mut c.values {
+                    for val in c.values.iter_mut().flatten() {
                         m.visit_scalar_expr_mut(val);
                     }
                 }
             }
             for c in else_clauses {
-                for val in &mut c.values {
+                for val in c.values.iter_mut().flatten() {
                     m.visit_scalar_expr_mut(val);
                 }
             }
@@ -1344,7 +1422,7 @@ pub fn walk_scalar_expr_mut<M: RelPlanMutator>(m: &mut M, expr: &mut ScalarExpr)
             m.visit_scalar_expr_mut(right);
         }
 
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 m.visit_scalar_expr_mut(operand);
             }
@@ -1437,6 +1515,18 @@ pub fn walk_scalar_expr_mut<M: RelPlanMutator>(m: &mut M, expr: &mut ScalarExpr)
             }
         }
 
+        ScalarExpr::RowCmp {
+            left,
+            subquery,
+            correlates_with,
+            ..
+        } => {
+            for e in left {
+                m.visit_scalar_expr_mut(e);
+            }
+            m.visit_subquery_mut(subquery, correlates_with);
+        }
+
         ScalarExpr::WindowFn { call, .. } => walk_window_call_mut(m, call),
 
         ScalarExpr::FieldAccess { base, path, .. } => {
@@ -1467,7 +1557,7 @@ pub fn walk_scalar_expr_standalone_mut<M: ScalarExprMutator>(m: &mut M, expr: &m
             m.visit_scalar_expr_mut(right);
         }
 
-        ScalarExpr::LogicalChain { operands, .. } => {
+        ScalarExpr::LogicalChain { operands, .. } | ScalarExpr::OperatorChain { operands, .. } => {
             for operand in operands {
                 m.visit_scalar_expr_mut(operand);
             }
@@ -1560,6 +1650,18 @@ pub fn walk_scalar_expr_standalone_mut<M: ScalarExprMutator>(m: &mut M, expr: &m
             }
         }
 
+        ScalarExpr::RowCmp {
+            left,
+            subquery,
+            correlates_with,
+            ..
+        } => {
+            for e in left {
+                m.visit_scalar_expr_mut(e);
+            }
+            m.visit_scalar_subquery_mut(subquery, correlates_with);
+        }
+
         ScalarExpr::WindowFn { call, .. } => walk_window_call_standalone_mut(m, call),
 
         ScalarExpr::FieldAccess { base, path, .. } => {
@@ -1588,6 +1690,10 @@ fn walk_project_star_mut<M: RelPlanMutator>(m: &mut M, s: &mut ProjectStar) {
         rename: _,
         ilike: _,
         top_level_pure: _,
+        enumerated: _,
+        itemized: _,
+        complete: _,
+        unplaced: _,
         span: _,
     } = s;
     match qualifier {
@@ -1698,16 +1804,14 @@ fn walk_grouping_mut<M: RelPlanMutator>(m: &mut M, g: &mut GroupingSpec) {
         GroupingSpec::Standard(keys)
         | GroupingSpec::Cube(keys)
         | GroupingSpec::Rollup(keys)
-        | GroupingSpec::All(keys) => {
+        | GroupingSpec::All { keys, .. } => {
             for k in keys {
                 m.visit_scalar_expr_mut(&mut k.expr);
             }
         }
         GroupingSpec::GroupingSets(sets) => {
-            for set in sets {
-                for k in set {
-                    m.visit_scalar_expr_mut(&mut k.expr);
-                }
+            for k in &mut sets.keys {
+                m.visit_scalar_expr_mut(&mut k.expr);
             }
         }
     }
@@ -1810,17 +1914,31 @@ fn walk_merge_branch_mut<M: RelPlanMutator>(m: &mut M, b: &mut MergeBranch) {
                 m.visit_scalar_expr_mut(val);
             }
         }
-        MergeAction::Update { assignments } => {
-            for (_, expr) in assignments {
-                m.visit_scalar_expr_mut(expr);
-            }
-        }
-        MergeAction::InsertStar
-        | MergeAction::InsertAllByName
-        | MergeAction::UpdateSetStar
-        | MergeAction::UpdateAllByName
+        MergeAction::Update { assignments } => walk_assignments_mut(m, assignments),
+        MergeAction::InsertStar { .. }
+        | MergeAction::InsertAllByName { .. }
+        | MergeAction::UpdateSetStar { .. }
+        | MergeAction::UpdateAllByName { .. }
         | MergeAction::Delete
         | MergeAction::DoNothing => {}
+    }
+}
+
+/// [`walk_assignments`], mutating.
+fn walk_assignments_mut<M: RelPlanMutator>(m: &mut M, assignments: &mut [Assignment]) {
+    for assignment in assignments {
+        match &mut assignment.value {
+            AssignedValue::Row(exprs) => {
+                for expr in exprs {
+                    m.visit_scalar_expr_mut(expr);
+                }
+            }
+            AssignedValue::Query {
+                subquery,
+                correlates_with,
+                ..
+            } => m.visit_subquery_mut(subquery, correlates_with),
+        }
     }
 }
 
@@ -1853,17 +1971,13 @@ fn walk_on_conflict_mut<M: RelPlanMutator>(m: &mut M, oc: &mut crate::ir::plan::
             assignments,
             where_clause,
         } => {
-            for (_, e) in assignments {
-                m.visit_scalar_expr_mut(e);
-            }
+            walk_assignments_mut(m, assignments);
             if let Some(w) = where_clause {
                 m.visit_scalar_expr_mut(w);
             }
         }
         ConflictAction::MySqlDuplicateKeyUpdate { assignments } => {
-            for (_, e) in assignments {
-                m.visit_scalar_expr_mut(e);
-            }
+            walk_assignments_mut(m, assignments);
         }
     }
 }
@@ -1872,7 +1986,7 @@ fn walk_returning_mut<M: RelPlanMutator>(m: &mut M, r: &mut crate::ir::plan::Ret
     use crate::ir::plan::ReturningItem;
     for it in &mut r.items {
         match it {
-            ReturningItem::Star => {}
+            ReturningItem::Star(_) => {}
             ReturningItem::Expr { expr, .. } => m.visit_scalar_expr_mut(expr),
         }
     }
@@ -1882,7 +1996,7 @@ fn walk_dml_output_mut<M: RelPlanMutator>(m: &mut M, o: &mut crate::ir::plan::Dm
     use crate::ir::plan::ReturningItem;
     for it in &mut o.items {
         match it {
-            ReturningItem::Star => {}
+            ReturningItem::Star(_) => {}
             ReturningItem::Expr { expr, .. } => m.visit_scalar_expr_mut(expr),
         }
     }
@@ -1956,6 +2070,7 @@ mod tests {
             hints: Vec::new(),
         };
         let filter = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(scan),
             predicate: ScalarExpr::BinOp {
                 op: crate::ir::scalar::BinOpKind::Cmp(crate::ir::scalar::ComparisonOp::Eq),
@@ -2041,6 +2156,7 @@ mod tests {
             hints: Vec::new(),
         };
         let outer = RelPlan::Filter {
+            computed: Vec::new(),
             input: Box::new(RelPlan::Scan {
                 table: tref("outer"),
                 columns: vec![alloc.fresh_test()],
@@ -2216,6 +2332,7 @@ mod tests {
             }],
             having: None,
             output_columns: vec![agg_out],
+            computed: Vec::new(),
             node_id: nid(),
             span: sp(),
             hints: Vec::new(),

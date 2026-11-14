@@ -166,6 +166,7 @@ impl<'a> Parser<'a> {
                 .ok_or_eof(self.current_span(), vec!["parameter value".to_string()])?;
             let value_kind = session_value_kind(&value_tok.kind);
             let value_span = value_tok.span;
+            self.record_setting_expression(Some(name_span), value_span);
 
             params.push(AstSessionSetParam {
                 name_span,
@@ -225,7 +226,10 @@ fn session_value_kind(kind: &TokenKind) -> AstSessionValueKind {
             LiteralKind::String | LiteralKind::StringFragment => AstSessionValueKind::String,
             LiteralKind::Number => AstSessionValueKind::Number,
             LiteralKind::Boolean => AstSessionValueKind::Boolean,
-            LiteralKind::Position | LiteralKind::Null => AstSessionValueKind::Other,
+            LiteralKind::Position
+            | LiteralKind::Parameter
+            | LiteralKind::Money
+            | LiteralKind::Null => AstSessionValueKind::Other,
         },
         _ => AstSessionValueKind::Other,
     }

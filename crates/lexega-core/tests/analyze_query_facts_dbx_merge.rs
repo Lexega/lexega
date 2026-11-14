@@ -20,7 +20,7 @@ fn fact_rule_ids(sql: &str) -> Vec<String> {
 fn risk_rule_ids(sql: &str) -> Vec<String> {
     let report = analyze_risk(sql).expect("analyze_risk succeeds");
     report
-        .signals
+        .findings
         .iter()
         .filter_map(|s| s.rule_id().map(String::from))
         .collect()

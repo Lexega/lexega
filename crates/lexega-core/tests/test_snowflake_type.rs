@@ -21,8 +21,8 @@ fn format_and_verify(sql: &str) -> String {
     formatted
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
-    report.signals.iter().any(|s| {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+    report.entries().any(|s| {
         let RuleMatch::Analysis(ref p) = s;
         p.matched_rule == rule_id
     })
@@ -299,46 +299,46 @@ fn test_drop_type_if_exists() {
 }
 
 // ============================================================================
-// Risk Analysis — signal emission
+// Risk Analysis — finding emission
 // ============================================================================
 
 #[test]
-fn test_create_type_signal() {
+fn test_create_type_finding() {
     let sql = "CREATE TYPE age AS NUMBER(3,0);";
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
-        has_signal(&report, "INFO-PG-TYPE-NEW"),
-        "Should emit INFO-PG-TYPE-NEW signal for CREATE TYPE"
+        has_finding(&report, "INFO-PG-TYPE-NEW"),
+        "Should emit INFO-PG-TYPE-NEW finding for CREATE TYPE"
     );
 }
 
 #[test]
-fn test_alter_type_signal() {
+fn test_alter_type_finding() {
     let sql = "ALTER TYPE age SET COMMENT = 'test';";
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
-        has_signal(&report, "INFO-PG-TYPE-CHG"),
-        "Should emit INFO-PG-TYPE-CHG signal for ALTER TYPE"
+        has_finding(&report, "INFO-PG-TYPE-CHG"),
+        "Should emit INFO-PG-TYPE-CHG finding for ALTER TYPE"
     );
 }
 
 #[test]
-fn test_undrop_type_signal() {
+fn test_undrop_type_finding() {
     let sql = "UNDROP TYPE age;";
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
-        has_signal(&report, "INFO-TYPE-UNDROP"),
-        "Should emit INFO-TYPE-UNDROP signal for UNDROP TYPE"
+        has_finding(&report, "INFO-TYPE-UNDROP"),
+        "Should emit INFO-TYPE-UNDROP finding for UNDROP TYPE"
     );
 }
 
 #[test]
-fn test_drop_type_signal() {
+fn test_drop_type_finding() {
     let sql = "DROP TYPE age;";
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
-        has_signal(&report, "PG-TYPE-DROP"),
-        "Should emit PG-TYPE-DROP signal for DROP TYPE"
+        has_finding(&report, "PG-TYPE-DROP"),
+        "Should emit PG-TYPE-DROP finding for DROP TYPE"
     );
 }
 
@@ -356,8 +356,7 @@ fn test_multi_create_type_evidence() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     let evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(ref p) if p.matched_rule == "INFO-PG-TYPE-NEW"))
         .map(|s| {
             let RuleMatch::Analysis(ref p) = s;
@@ -381,20 +380,20 @@ fn test_multi_statement_all_type_ops() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     assert!(
-        has_signal(&report, "INFO-PG-TYPE-NEW"),
-        "Should have CREATE signal"
+        has_finding(&report, "INFO-PG-TYPE-NEW"),
+        "Should have CREATE finding"
     );
     assert!(
-        has_signal(&report, "INFO-PG-TYPE-CHG"),
-        "Should have ALTER signal"
+        has_finding(&report, "INFO-PG-TYPE-CHG"),
+        "Should have ALTER finding"
     );
     assert!(
-        has_signal(&report, "PG-TYPE-DROP"),
-        "Should have DROP signal"
+        has_finding(&report, "PG-TYPE-DROP"),
+        "Should have DROP finding"
     );
     assert!(
-        has_signal(&report, "INFO-TYPE-UNDROP"),
-        "Should have UNDROP signal"
+        has_finding(&report, "INFO-TYPE-UNDROP"),
+        "Should have UNDROP finding"
     );
 }
 

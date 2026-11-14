@@ -25,11 +25,13 @@ fn attrs(sql: &str) -> Vec<(AstRoleAttributeKind, bool)> {
 }
 
 fn pg_rules(sql: &str) -> HashSet<String> {
-    let mut config = AnalysisConfig::default();
-    config.dialect = Some(Arc::new(PostgresDialect));
+    let config = AnalysisConfig {
+        dialect: Some(Arc::new(PostgresDialect)),
+        ..Default::default()
+    };
     match analyze_risk_with_policy_config(sql, &config) {
         Ok(report) => report
-            .signals
+            .findings
             .iter()
             .map(|f| match f {
                 RuleMatch::Analysis(g) => g.matched_rule.clone(),

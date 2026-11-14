@@ -106,8 +106,9 @@ pub fn lower_drop_service_to_service_plan(s: &AstDrop, source: &str) -> ServiceP
     ServicePlan {
         action: ServiceAction::Drop,
         target: s
-            .target_name_span
-            .map(|span| target_from_span(source, span)),
+            .target_name
+            .as_ref()
+            .map(|name| target_from_span(source, name.span)),
         options: ServiceOptions {
             or_replace: false,
             if_not_exists: false,

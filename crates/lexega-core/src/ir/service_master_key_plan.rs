@@ -9,18 +9,20 @@
 //! `StatementFacts.mssql_service_master_key` carrier.
 //!
 //! The lowering carries the governance-bearing primitives: the operation,
-//! whether the regenerate is forced, and whether an inline password is present.
+//! whether the regenerate is forced, and each inline password.
 //! Which combination is dangerous is a YAML verdict.
 
 use crate::ast::types::{AstMssqlAlterServiceMasterKey, ServiceMasterKeyOperation};
 use crate::ast::NodeId;
+use crate::ir::span_extract::string_literal_values;
 use crate::lexer::token::Span;
 
 #[derive(Debug, Clone)]
 pub struct MssqlServiceMasterKeyPlan {
     pub operation: ServiceMasterKeyOperation,
     pub force: bool,
-    pub password_present: bool,
+    /// Each inline `{ OLD | NEW }_PASSWORD = '…'`, decoded.
+    pub password_literals: Vec<String>,
     pub node_id: NodeId,
     pub span: Span,
 }
@@ -29,11 +31,12 @@ pub struct MssqlServiceMasterKeyPlan {
 /// [`MssqlServiceMasterKeyPlan`].
 pub fn lower_service_master_key_to_plan(
     s: &AstMssqlAlterServiceMasterKey,
+    source: &str,
 ) -> MssqlServiceMasterKeyPlan {
     MssqlServiceMasterKeyPlan {
         operation: s.operation,
         force: s.force,
-        password_present: s.password_present,
+        password_literals: string_literal_values(&s.password_literal_spans, source),
         node_id: s.node_id,
         span: s.span,
     }

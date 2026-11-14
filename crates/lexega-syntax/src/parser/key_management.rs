@@ -12,18 +12,17 @@
 //! dialect branch.
 //!
 //! Recognition captures three governance-bearing primitives: the verb
-//! (open/close), the key kind, and whether an inline `PASSWORD = '…'` decrypts
-//! the key. Which combination is dangerous is the consumer's verdict. The password
-//! literal VALUE is recorded as a redaction span at parse time so it is masked
-//! from every output surface; operands (certificate / asymmetric-key names)
-//! carry no governance signal and are scanned past.
+//! (open/close), the key kind, and each inline `PASSWORD = '…'` literal that
+//! decrypts the key. Which combination is dangerous is the consumer's verdict.
+//! Each password's content is recorded as a redaction span at parse time so it
+//! is masked from every output surface; operands (certificate / asymmetric-key
+//! names) carry nothing a rule reads and are scanned past.
 
 use crate::ast::types::{AstMssqlKeyManagement, AstStmt, KeyMgmtAction, KeyMgmtKind};
 use crate::error::{ParseResult, ParseResultExt};
 use crate::lexer::token::Token;
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::principal::peek_string_literal_after;
 
 /// Index of the next significant (non-comment) token at or after `from`.
 fn next_sig_idx(tokens: &[Token], mut from: usize) -> Option<usize> {
@@ -80,8 +79,8 @@ impl<'a> Parser<'a> {
         let start = verb_tok.span.start;
 
         // 2. Key kind — the guard guarantees the next token is ALL / MASTER /
-        //    SYMMETRIC. The trailing `KEY` / name / `KEYS` carry no governance
-        //    signal beyond the kind and are scanned past below.
+        //    SYMMETRIC. The trailing `KEY` / name / `KEYS` carry nothing a
+        //    rule reads beyond the kind and are scanned past below.
         let kind_tok = self
             .advance()
             .ok_or_eof(self.current_span(), vec!["MASTER".to_string()])?;
@@ -95,14 +94,23 @@ impl<'a> Parser<'a> {
         };
         let mut end = kind_tok.span.end;
 
-        // 3. Scan the remainder to the depth-0 terminator, recording the single
-        //    governance-bearing operand: an inline `PASSWORD = '…'` literal
-        //    (DECRYPTION BY PASSWORD / WITH PASSWORD). The literal value is
-        //    redacted, never surfaced.
-        let mut password_present = false;
-        let mut password_span = None;
+        // 3. Scan the remainder to the depth-0 terminator, recording EVERY
+        //    inline `PASSWORD = '…'` literal (DECRYPTION BY PASSWORD / WITH
+        //    PASSWORD). Each content is redacted; one a placeholder overlaps
+        //    is no literal the author wrote and is not recorded.
+        // `KEY`, `KEY name` or `SYMMETRIC KEYS`, then `DECRYPTION BY …`.
+        let head_end = match key_kind {
+            KeyMgmtKind::Master => self.words_end(self.idx, &["KEY"]),
+            KeyMgmtKind::Symmetric => self
+                .words_end(self.idx, &["KEY"])
+                .and_then(|k| self.option_value_end(k)),
+            KeyMgmtKind::AllSymmetric => self.words_end(self.idx, &["SYMMETRIC", "KEYS"]),
+        }
+        .unwrap_or(self.idx);
+        let bound = self.clauses_bound(self.key_clauses_end(head_end));
+        let mut password_literal_spans = Vec::new();
         let mut depth: u32 = 0;
-        while self.idx < self.tokens.len() {
+        while self.idx < self.tokens.len() && self.idx < bound {
             let tok = &self.tokens[self.idx];
             match tok.kind {
                 TokenKind::Eof => break,
@@ -111,17 +119,11 @@ impl<'a> Parser<'a> {
                 TokenKind::Punctuation(Punctuation::RParen) => depth = depth.saturating_sub(1),
                 _ => {}
             }
-            if !password_present && tok.lexeme(self.source).eq_ignore_ascii_case("PASSWORD") {
-                if let Some(sp) = peek_string_literal_after(self.tokens, self.idx, self.source) {
-                    password_present = true;
-                    password_span = Some(sp);
-                }
+            if tok.lexeme(self.source).eq_ignore_ascii_case("PASSWORD") {
+                password_literal_spans.extend(self.password_literal_after(self.idx));
             }
             end = tok.span.end;
             self.idx += 1;
-        }
-        if let Some(sp) = password_span {
-            self.redaction_spans.push(sp);
         }
 
         let stmt_span = Span { start, end };
@@ -130,7 +132,7 @@ impl<'a> Parser<'a> {
             span: stmt_span,
             action,
             key_kind,
-            password_present,
+            password_literal_spans,
         };
         Ok(AstStmt::MssqlKeyManagement(Box::new(ast)))
     }

@@ -57,6 +57,7 @@ pub mod query;
 pub mod reasoning;
 pub mod restore;
 pub mod script_context;
+pub(crate) mod secrets;
 pub mod security_policy;
 pub mod service_master_key;
 pub mod statement;
@@ -99,14 +100,15 @@ pub use diff::{
     ClauseKind, ConstraintFactArm, ConstraintFactSet, CteFact, DiffContext, DiffEvent, DiffFacts,
     DiffStatementSnapshot, DistinctChange, ExpressionContainment, ExpressionDelta,
     ExpressionDeltaKind, ExpressionPathStep, ExpressionVariant, FieldAccessStep, LimitDirection,
-    OpaqueDiffReason, OutputColumnFact, ScriptShape, SelectScope, SubqueryShape, UnaryOperator,
-    WriteBoundedness,
+    OpaqueDiffReason, OutputColumnFact, QueryBlock, QueryBlockKind, ScriptShape, SelectScope,
+    SubqueryShape, UnaryOperator, WriteBoundedness,
 };
 pub use expr::{
     BinaryOp, BinaryOpExpr, CaseBranch, CaseExpr, CastExpr, CastKind, CollectionExpr,
-    CollectionKind, Expr, FieldAccessExpr, FuncCallExpr, InListExpr, IndexAccessExpr, OpaqueExpr,
-    OpaqueExprReason, OuterColumnRef, ParameterKind, ParameterRef, StarExpr, StarRename,
-    SubqueryExpr, SubqueryKind, UnaryOp, UnaryOpExpr, WindowExpr, WindowFunctionName,
+    CollectionKind, Expr, FieldAccessExpr, FuncCallExpr, InListExpr, IndexAccessExpr,
+    NamedArgument, OpaqueExpr, OpaqueExprReason, OuterColumnRef, ParameterKind, ParameterRef,
+    StarExpr, StarRename, SubqueryExpr, SubqueryKind, UnaryOp, UnaryOpExpr, WindowExpr,
+    WindowFunctionName,
 };
 pub use extract::CatalogCtx;
 pub use identity::{
@@ -120,7 +122,9 @@ pub use key_backup::{
     BackupKeyObject as KeyBackupObjectFacts, KeyBackupAction as KeyBackupActionFacts,
     MssqlKeyBackupFacts,
 };
-pub use key_management::{KeyManagementAction, KeyManagementKind, MssqlKeyManagementFacts};
+pub use key_management::{
+    KeyManagementAction, KeyManagementKind, MssqlKeyManagementFacts, PasswordLiteral,
+};
 pub use literal::{DataType, DataTypeField, DataTypeKind, IntervalValue, LiteralValue};
 pub use pg_copy::{PgCopyDirection, PgCopyFacts, PgCopyTargetKind};
 pub use pg_default_privileges::{
@@ -141,13 +145,14 @@ pub use policy_attachment::{
 pub use privilege::{Privilege, PrivilegeChangeKind, PrivilegeFacts};
 pub use query::{
     AggregateEvent, AggregateFunction, ColumnConstraintAnomaly, ColumnConstraintEvent,
-    DroppedObjectKind, FkRelationshipStatus, JoinColumnPair, JoinEvent, JoinKind,
-    JoinPredicateEvent, LateralEvent, LimitEvent, NullsOrdering, OrTautologyEvent, OrderByEvent,
-    OrderDirection, PredicateEvent, ProjectionEvent, ProjectionKind, QueryFacts, RangeBoundFact,
-    ScopeFacts, ScopeKind, SetOpEvent, SetOpKind, StaleColumnReference, StaleTableReference,
-    StaleTableState, StarProjectionEvent, SubqueryPosition, SubqueryRef, TableAccessKind,
-    TableEvent, TypeCompatibility, WindowEvent, WindowFrame, WindowFrameBound,
-    WindowFrameExclusion, WindowFrameKind,
+    ConnectionStringEntry, DroppedObjectKind, FkRelationshipStatus, FunctionOrigin, JoinColumnPair,
+    JoinEvent, JoinKind, JoinPredicateEvent, JoinSource, LimitEvent, NullsOrdering,
+    OrTautologyEvent, OrderByEvent, OrderDirection, PredicateEvent, ProjectionEvent,
+    ProjectionKind, QueryFacts, RangeBoundFact, ScopeFacts, ScopeKind, SetOpEvent, SetOpKind,
+    StaleColumnReference, StaleTableReference, StaleTableState, StarProjectionEvent,
+    SubqueryPosition, SubqueryRef, TableAccessKind, TableEvent, TableFunctionEvent,
+    TypeCompatibility, WindowEvent, WindowFrame, WindowFrameBound, WindowFrameExclusion,
+    WindowFrameKind,
 };
 pub use restore::{MssqlRestoreFacts, RestoreSource, RestoreTarget};
 pub use script_context::{

@@ -366,13 +366,12 @@ fn test_drop_snapshot_table_fires_bq_c001() {
     let sql = "DROP SNAPSHOT TABLE IF EXISTS my_dataset.my_snapshot;";
     let report = analyze_risk(sql).expect("should analyze DROP SNAPSHOT TABLE");
     assert!(
-        has_signal(&report, "BQ-SNAP-TBL-DROP"),
-        "DROP SNAPSHOT TABLE should trigger BQ-SNAP-TBL-DROP. Signals: {:?}",
+        has_finding(&report, "BQ-SNAP-TBL-DROP"),
+        "DROP SNAPSHOT TABLE should trigger BQ-SNAP-TBL-DROP. Findings: {:?}",
         report
-            .signals
-            .iter()
-            .filter_map(|s| match s {
-                RuleMatch::Analysis(g) => Some(&g.matched_rule),
+            .entries()
+            .map(|s| match s {
+                RuleMatch::Analysis(g) => &g.matched_rule,
             })
             .collect::<Vec<_>>()
     );
@@ -387,8 +386,7 @@ fn test_drop_snapshot_table_multi_statement_evidence() {
     let report = analyze_risk(sql).expect("should analyze");
 
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-SNAP-TBL-DROP"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -470,13 +468,12 @@ fn test_alter_vector_index_fires_info_bq021() {
     let sql = "ALTER VECTOR INDEX my_index REBUILD;";
     let report = analyze_risk(sql).expect("should analyze ALTER VECTOR INDEX");
     assert!(
-        has_signal(&report, "BQ-VECIDX-CHG"),
-        "ALTER VECTOR INDEX should trigger BQ-VECIDX-CHG. Signals: {:?}",
+        has_finding(&report, "BQ-VECIDX-CHG"),
+        "ALTER VECTOR INDEX should trigger BQ-VECIDX-CHG. Findings: {:?}",
         report
-            .signals
-            .iter()
-            .filter_map(|s| match s {
-                RuleMatch::Analysis(g) => Some(&g.matched_rule),
+            .entries()
+            .map(|s| match s {
+                RuleMatch::Analysis(g) => &g.matched_rule,
             })
             .collect::<Vec<_>>()
     );
@@ -522,16 +519,25 @@ fn test_multi_bq_semantic_all_classified() {
     );
 }
 
+/// `sql` analysed as BigQuery: an `ASSERT` is BigQuery's own statement there.
+fn analyze_bigquery(sql: &str) -> lexega_core::analyzer::AnalysisReport {
+    let cfg = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(lexega_core::dialect::bigquery()),
+        ..Default::default()
+    };
+    lexega_core::api::analyze_risk_with_policy_config(sql, &cfg).expect("should analyze ASSERT")
+}
+
 #[test]
 fn test_assert_with_description_fires_bq_assert_cfg_not_bq_assert_nodesc() {
     let sql = "ASSERT 1 = 1 AS 'sanity check';";
-    let report = analyze_risk(sql).expect("should analyze ASSERT");
+    let report = analyze_bigquery(sql);
     assert!(
-        has_signal(&report, "BQ-ASSERT-CFG"),
+        has_finding(&report, "BQ-ASSERT-CFG"),
         "ASSERT should trigger BQ-ASSERT-CFG"
     );
     assert!(
-        !has_signal(&report, "BQ-ASSERT-NODESC"),
+        !has_finding(&report, "BQ-ASSERT-NODESC"),
         "ASSERT with description should NOT trigger BQ-ASSERT-NODESC"
     );
 }
@@ -539,26 +545,110 @@ fn test_assert_with_description_fires_bq_assert_cfg_not_bq_assert_nodesc() {
 #[test]
 fn test_assert_without_description_fires_bq_assert_nodesc() {
     let sql = "ASSERT 1 = 1;";
-    let report = analyze_risk(sql).expect("should analyze ASSERT");
+    let report = analyze_bigquery(sql);
     assert!(
-        has_signal(&report, "BQ-ASSERT-CFG"),
+        has_finding(&report, "BQ-ASSERT-CFG"),
         "ASSERT should trigger BQ-ASSERT-CFG"
     );
     assert!(
-        has_signal(&report, "BQ-ASSERT-NODESC"),
+        has_finding(&report, "BQ-ASSERT-NODESC"),
         "ASSERT without description should trigger BQ-ASSERT-NODESC"
     );
 }
 
 // ============================================================================
-// EXPORT DATA governance signals
+// EXPORT DATA governance findings
 // ============================================================================
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
+}
+
+#[test]
+fn an_assert_is_bigquerys_statement_in_bigquery_and_the_generic_assertion_elsewhere() {
+    use lexega_core::analyzer::AnalysisConfig;
+    use lexega_core::api::analyze_risk_with_policy_config;
+    use lexega_core::dialect;
+    use lexega_core::rules::{build_v1_rule_corpus, load_v1_rules};
+    const KIND_RULES: &str = r#"
+rules:
+  - id: TEST-KIND-ASSERT
+    risk_level: info
+    message: "an assertion"
+    triggers:
+      all_of:
+        - kind: assert
+  - id: TEST-KIND-BQ-ASSERT
+    risk_level: info
+    message: "a BigQuery assertion"
+    triggers:
+      all_of:
+        - kind: bq_assert
+"#;
+    let analyze = |sql: &str, dialect: lexega_core::dialect::DialectRef| {
+        let custom = load_v1_rules(KIND_RULES).expect("custom rules parse");
+        let merged = build_v1_rule_corpus(custom, true).expect("merge against built-ins");
+        let cfg = AnalysisConfig {
+            dialect: Some(dialect),
+            custom_rules: Some(merged.into()),
+            ..Default::default()
+        };
+        analyze_risk_with_policy_config(sql, &cfg).expect("should analyze")
+    };
+    // (dialect, script, the kind's rule, BigQuery's rules raised)
+    let cases = [
+        (
+            dialect::postgres(),
+            "CREATE FUNCTION chk() RETURNS void LANGUAGE plpgsql AS $$ BEGIN ASSERT 1 = 1; END $$;",
+            "TEST-KIND-ASSERT",
+            false,
+        ),
+        (
+            dialect::postgres(),
+            "DO $$ BEGIN ASSERT (SELECT count(*) FROM orders) > 0, 'orders empty'; END $$;",
+            "TEST-KIND-ASSERT",
+            false,
+        ),
+        (
+            dialect::snowflake(),
+            "ASSERT 1 = 1;",
+            "TEST-KIND-ASSERT",
+            false,
+        ),
+        (
+            dialect::bigquery(),
+            "ASSERT 1 = 1;",
+            "TEST-KIND-BQ-ASSERT",
+            true,
+        ),
+        (
+            dialect::bigquery(),
+            "BEGIN ASSERT (SELECT COUNT(*) FROM d.t) > 0 AS 'nonempty'; END;",
+            "TEST-KIND-BQ-ASSERT",
+            true,
+        ),
+    ];
+    for (dialect, sql, kind_rule, bq_rules) in cases {
+        let report = analyze(sql, dialect);
+        assert!(has_finding(&report, kind_rule), "{kind_rule} on {sql}");
+        let other = if kind_rule == "TEST-KIND-ASSERT" {
+            "TEST-KIND-BQ-ASSERT"
+        } else {
+            "TEST-KIND-ASSERT"
+        };
+        assert!(!has_finding(&report, other), "{other} on {sql}");
+        assert_eq!(has_finding(&report, "BQ-ASSERT-CFG"), bq_rules, "{sql}");
+        assert_eq!(report.summary.statements_skipped, 0, "{sql}");
+    }
+    // A message after the condition is read: the statement after it is too.
+    let report = analyze(
+        "DO $$ BEGIN ASSERT current_setting('x') = 'y', 'bad'; DELETE FROM orders; END $$;",
+        dialect::postgres(),
+    );
+    assert_eq!(report.summary.statements_skipped, 0);
+    assert!(has_finding(&report, "DML-WRITE-UNBOUNDED"));
 }
 
 // ── BQ-EXPORT-UNBOUNDED: Unbounded export (no WHERE clause) ───────────
@@ -569,10 +659,10 @@ fn test_export_data_unbounded_fires_bq_export_unbounded() {
     let sql =
         "EXPORT DATA OPTIONS(uri='gs://bucket/path/*', format='CSV') AS SELECT * FROM my_table;";
     let report = analyze_risk(sql).expect("should analyze");
-    assert!(has_signal(&report, "BQ-EXPORT-UNBOUNDED"),
-        "EXPORT DATA without WHERE should trigger BQ-EXPORT-UNBOUNDED (unbounded export). Signals: {:?}",
-        report.signals.iter().filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(&g.matched_rule),
+    assert!(has_finding(&report, "BQ-EXPORT-UNBOUNDED"),
+        "EXPORT DATA without WHERE should trigger BQ-EXPORT-UNBOUNDED (unbounded export). Findings: {:?}",
+        report.entries().map(|s| match s {
+            RuleMatch::Analysis(g) => &g.matched_rule,
         }).collect::<Vec<_>>());
 }
 
@@ -582,13 +672,12 @@ fn test_export_data_with_where_no_bq_export_unbounded() {
     let sql = "EXPORT DATA OPTIONS(uri='gs://bucket/path/*', format='CSV') AS SELECT * FROM my_table WHERE created_at > '2024-01-01';";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        !has_signal(&report, "BQ-EXPORT-UNBOUNDED"),
-        "EXPORT DATA with WHERE should NOT trigger BQ-EXPORT-UNBOUNDED. Signals: {:?}",
+        !has_finding(&report, "BQ-EXPORT-UNBOUNDED"),
+        "EXPORT DATA with WHERE should NOT trigger BQ-EXPORT-UNBOUNDED. Findings: {:?}",
         report
-            .signals
-            .iter()
-            .filter_map(|s| match s {
-                RuleMatch::Analysis(g) => Some(&g.matched_rule),
+            .entries()
+            .map(|s| match s {
+                RuleMatch::Analysis(g) => &g.matched_rule,
             })
             .collect::<Vec<_>>()
     );
@@ -600,7 +689,7 @@ fn test_export_data_with_connection_unbounded() {
     let sql = "EXPORT DATA WITH CONNECTION myproject.us.myconn OPTIONS(uri='gs://bucket/*', format='JSON') AS SELECT id, name FROM users;";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        has_signal(&report, "BQ-EXPORT-UNBOUNDED"),
+        has_finding(&report, "BQ-EXPORT-UNBOUNDED"),
         "EXPORT DATA WITH CONNECTION without WHERE should trigger BQ-EXPORT-UNBOUNDED"
     );
 }
@@ -611,7 +700,7 @@ fn test_export_data_with_connection_bounded() {
     let sql = "EXPORT DATA WITH CONNECTION myproject.us.myconn OPTIONS(uri='gs://bucket/*', format='JSON') AS SELECT id, name FROM users WHERE active = TRUE;";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        !has_signal(&report, "BQ-EXPORT-UNBOUNDED"),
+        !has_finding(&report, "BQ-EXPORT-UNBOUNDED"),
         "EXPORT DATA WITH CONNECTION with WHERE should NOT trigger BQ-EXPORT-UNBOUNDED"
     );
 }
@@ -640,10 +729,9 @@ fn test_export_data_multi_statement_evidence() {
     assert_eq!(report.summary.statements_parsed, 2);
     assert_eq!(report.summary.statements_analyzed, 2);
 
-    // Both should produce unbounded export signals — test evidence_count
+    // Both should produce unbounded export findings — test evidence_count
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-EXPORT-UNBOUNDED"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -672,7 +760,7 @@ fn test_export_data_subquery_roundtrip() {
 }
 
 // ============================================================================
-// LOAD DATA governance signals
+// LOAD DATA governance findings
 // ============================================================================
 
 // ── Tables written extraction ─────────────────────────────────────────
@@ -709,10 +797,10 @@ fn test_load_data_overwrite_tables_written() {
 fn test_load_data_gcs_uri_fires_bq_load_extstore() {
     let sql = "LOAD DATA INTO my_dataset.my_table FROM FILES(format='CSV', uris=['gs://bucket/path/*.csv']);";
     let report = analyze_risk(sql).expect("should analyze");
-    assert!(has_signal(&report, "BQ-LOAD-EXTSTORE"),
-        "LOAD DATA with gs:// URI should trigger BQ-LOAD-EXTSTORE (external cloud storage). Signals: {:?}",
-        report.signals.iter().filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(&g.matched_rule),
+    assert!(has_finding(&report, "BQ-LOAD-EXTSTORE"),
+        "LOAD DATA with gs:// URI should trigger BQ-LOAD-EXTSTORE (external cloud storage). Findings: {:?}",
+        report.entries().map(|s| match s {
+            RuleMatch::Analysis(g) => &g.matched_rule,
         }).collect::<Vec<_>>());
 }
 
@@ -722,7 +810,7 @@ fn test_load_data_s3_uri_fires_bq_load_extstore() {
         "LOAD DATA INTO my_table FROM FILES(format='PARQUET', uris=['s3://my-bucket/data/*']);";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        has_signal(&report, "BQ-LOAD-EXTSTORE"),
+        has_finding(&report, "BQ-LOAD-EXTSTORE"),
         "LOAD DATA with s3:// URI should trigger BQ-LOAD-EXTSTORE"
     );
 }
@@ -732,7 +820,7 @@ fn test_load_data_azure_uri_fires_bq_load_extstore() {
     let sql = "LOAD DATA INTO my_table FROM FILES(format='CSV', uris=['azure://myaccount.blob.core/data/*']);";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        has_signal(&report, "BQ-LOAD-EXTSTORE"),
+        has_finding(&report, "BQ-LOAD-EXTSTORE"),
         "LOAD DATA with azure:// URI should trigger BQ-LOAD-EXTSTORE"
     );
 }
@@ -744,13 +832,12 @@ fn test_load_data_hardcoded_aws_key() {
     let sql = "LOAD DATA INTO my_table FROM FILES(format='CSV', uris=['s3://bucket/*'], aws_access_key_id='AKIAIOSFODNN7EXAMPLE');";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        has_signal(&report, "BQ-LOAD-AWS-LEAK"),
-        "Hardcoded AWS key in LOAD DATA should trigger BQ-LOAD-AWS-LEAK. Signals: {:?}",
+        has_finding(&report, "BQ-LOAD-AWS-LEAK"),
+        "Hardcoded AWS key in LOAD DATA should trigger BQ-LOAD-AWS-LEAK. Findings: {:?}",
         report
-            .signals
-            .iter()
-            .filter_map(|s| match s {
-                RuleMatch::Analysis(g) => Some(&g.matched_rule),
+            .entries()
+            .map(|s| match s {
+                RuleMatch::Analysis(g) => &g.matched_rule,
             })
             .collect::<Vec<_>>()
     );
@@ -760,10 +847,10 @@ fn test_load_data_hardcoded_aws_key() {
 fn test_load_data_hardcoded_password_in_connection() {
     let sql = "LOAD DATA INTO my_table FROM FILES(format='CSV', uris=['gs://bucket/*']) WITH CONNECTION 'postgresql://user:password123@host:5432/db';";
     let report = analyze_risk(sql).expect("should analyze");
-    assert!(has_signal(&report, "BQ-LOAD-PWD-LEAK"),
-        "Hardcoded password in LOAD DATA WITH CONNECTION should trigger BQ-LOAD-PWD-LEAK. Signals: {:?}",
-        report.signals.iter().filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(&g.matched_rule),
+    assert!(has_finding(&report, "BQ-LOAD-PWD-LEAK"),
+        "Hardcoded password in LOAD DATA WITH CONNECTION should trigger BQ-LOAD-PWD-LEAK. Findings: {:?}",
+        report.entries().map(|s| match s {
+            RuleMatch::Analysis(g) => &g.matched_rule,
         }).collect::<Vec<_>>());
 }
 
@@ -779,10 +866,9 @@ fn test_load_data_multi_statement_evidence() {
     assert_eq!(report.summary.statements_parsed, 2);
     assert_eq!(report.summary.statements_analyzed, 2);
 
-    // Both should produce external cloud storage signals — test evidence_count
+    // Both should produce external cloud storage findings — test evidence_count
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == "BQ-LOAD-EXTSTORE"))
         .map(|s| match s {
             RuleMatch::Analysis(g) => g.evidence_count.unwrap_or(1),
@@ -804,7 +890,7 @@ fn test_load_data_full_syntax_roundtrip() {
 }
 
 // ============================================================================
-// CREATE EXTERNAL TABLE governance signals
+// CREATE EXTERNAL TABLE governance findings
 // ============================================================================
 
 #[test]
@@ -825,8 +911,8 @@ fn test_create_external_table_semantic_ddl() {
         "CREATE EXTERNAL TABLE should be DDL"
     );
     assert!(
-        has_signal(&report, "EXTTBL-NEW"),
-        "Should emit external table created signal"
+        has_finding(&report, "EXTTBL-NEW"),
+        "Should emit external table created finding"
     );
 }
 
@@ -835,13 +921,12 @@ fn test_create_external_table_external_cloud_storage_fires_br055() {
     let sql = "CREATE EXTERNAL TABLE my_dataset.ext_table OPTIONS(format='PARQUET', uris=['gs://bucket/data/*']);";
     let report = analyze_risk(sql).expect("should analyze");
     assert!(
-        has_signal(&report, "BQ-EXTTBL-EXTSTORE"),
-        "CREATE EXTERNAL TABLE with gs:// URI should trigger BQ-EXTTBL-EXTSTORE. Signals: {:?}",
+        has_finding(&report, "BQ-EXTTBL-EXTSTORE"),
+        "CREATE EXTERNAL TABLE with gs:// URI should trigger BQ-EXTTBL-EXTSTORE. Findings: {:?}",
         report
-            .signals
-            .iter()
-            .filter_map(|s| match s {
-                RuleMatch::Analysis(g) => Some(&g.matched_rule),
+            .entries()
+            .map(|s| match s {
+                RuleMatch::Analysis(g) => &g.matched_rule,
             })
             .collect::<Vec<_>>()
     );
@@ -851,9 +936,9 @@ fn test_create_external_table_external_cloud_storage_fires_br055() {
 fn test_create_external_table_hardcoded_aws_key_fires_c052_a_bq_ext() {
     let sql = "CREATE EXTERNAL TABLE my_dataset.ext_table OPTIONS(format='CSV', uris=['s3://bucket/*'], aws_access_key_id='AKIAIOSFODNN7EXAMPLE');";
     let report = analyze_risk(sql).expect("should analyze");
-    assert!(has_signal(&report, "BQ-EXTTBL-AWS-LEAK"),
-        "Hardcoded AWS key in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-AWS-LEAK. Signals: {:?}",
-        report.signals.iter().filter_map(|s| match s {
-            RuleMatch::Analysis(g) => Some(&g.matched_rule),
+    assert!(has_finding(&report, "BQ-EXTTBL-AWS-LEAK"),
+        "Hardcoded AWS key in CREATE EXTERNAL TABLE should trigger BQ-EXTTBL-AWS-LEAK. Findings: {:?}",
+        report.entries().map(|s| match s {
+            RuleMatch::Analysis(g) => &g.matched_rule,
         }).collect::<Vec<_>>());
 }

@@ -10,11 +10,11 @@ use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use lexega_core::{format_sql_with_config, verify_formatting_safe, FormatterConfig};
 
-fn rule_ids(signals: &[RuleMatch]) -> Vec<String> {
-    signals
-        .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+fn rule_ids<'a>(findings: impl IntoIterator<Item = &'a RuleMatch>) -> Vec<String> {
+    findings
+        .into_iter()
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
@@ -59,7 +59,7 @@ fn test_synonym_reaches_analyzer_not_skipped() {
 #[test]
 fn test_synonym_info_fires() {
     let report = analyze_risk("CREATE SYNONYM s FOR dbo.t;").expect("should analyze");
-    let ids = rule_ids(&report.signals);
+    let ids = rule_ids(report.entries());
     assert!(
         ids.contains(&"INFO-SYNONYM-NEW".to_string()),
         "INFO-SYNONYM-NEW should fire. Got: {:?}",
@@ -71,7 +71,7 @@ fn test_synonym_info_fires() {
 fn test_synonym_server_qualified_fires_remote_rule() {
     // Four-part referent = server.database.schema.object → linked/remote server.
     let report = analyze_risk("CREATE SYNONYM s FOR linkedsrv.db.dbo.t;").expect("should analyze");
-    let ids = rule_ids(&report.signals);
+    let ids = rule_ids(report.entries());
     assert!(
         ids.contains(&"SYNONYM-REMOTE-REFERENT".to_string()),
         "SYNONYM-REMOTE-REFERENT should fire for a four-part referent. Got: {:?}",
@@ -83,7 +83,7 @@ fn test_synonym_server_qualified_fires_remote_rule() {
 fn test_synonym_local_referent_no_remote_rule() {
     // Two-part referent (schema.object) is local — the remote rule must NOT fire.
     let report = analyze_risk("CREATE SYNONYM s FOR dbo.t;").expect("should analyze");
-    let ids = rule_ids(&report.signals);
+    let ids = rule_ids(report.entries());
     assert!(
         !ids.contains(&"SYNONYM-REMOTE-REFERENT".to_string()),
         "SYNONYM-REMOTE-REFERENT must NOT fire for a local referent. Got: {:?}",

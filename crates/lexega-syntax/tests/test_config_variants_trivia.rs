@@ -154,8 +154,10 @@ fn test_scattered_comments_compact_idempotent() {
 
 #[test]
 fn test_scattered_comments_clauses_on_newlines_preserves_comments() {
-    let mut config = FormatterConfig::default();
-    config.clauses_on_newlines = true;
+    let config = FormatterConfig {
+        clauses_on_newlines: true,
+        ..Default::default()
+    };
 
     let formatted = format_sql_with_config(SCATTERED_COMMENTS_INPUT, &config)
         .expect("formatting should succeed");
@@ -175,8 +177,10 @@ fn test_scattered_comments_clauses_on_newlines_preserves_comments() {
 
 #[test]
 fn test_scattered_comments_clauses_on_newlines_idempotent() {
-    let mut config = FormatterConfig::default();
-    config.clauses_on_newlines = true;
+    let config = FormatterConfig {
+        clauses_on_newlines: true,
+        ..Default::default()
+    };
 
     let formatted_once = format_sql_with_config(SCATTERED_COMMENTS_INPUT, &config)
         .expect("first format should succeed");
@@ -196,8 +200,10 @@ fn test_scattered_comments_clauses_on_newlines_idempotent() {
 
 #[test]
 fn test_scattered_comments_select_items_on_newlines_preserves_comments() {
-    let mut config = FormatterConfig::default();
-    config.select_items_on_newlines = true;
+    let config = FormatterConfig {
+        select_items_on_newlines: true,
+        ..Default::default()
+    };
 
     let formatted = format_sql_with_config(SCATTERED_COMMENTS_INPUT, &config)
         .expect("formatting should succeed");
@@ -217,8 +223,10 @@ fn test_scattered_comments_select_items_on_newlines_preserves_comments() {
 
 #[test]
 fn test_scattered_comments_select_items_on_newlines_idempotent() {
-    let mut config = FormatterConfig::default();
-    config.select_items_on_newlines = true;
+    let config = FormatterConfig {
+        select_items_on_newlines: true,
+        ..Default::default()
+    };
 
     let formatted_once = format_sql_with_config(SCATTERED_COMMENTS_INPUT, &config)
         .expect("first format should succeed");
@@ -370,7 +378,7 @@ fn test_all_configs_preserve_tokens() {
 
     for (name, config) in configs {
         let formatted = format_sql_with_config(SCATTERED_COMMENTS_INPUT, &config)
-            .expect(&format!("{} should format", name));
+            .unwrap_or_else(|_| panic!("{} should format", name));
         let fmt_tokens = extract_significant_tokens(&formatted);
 
         assert_eq!(

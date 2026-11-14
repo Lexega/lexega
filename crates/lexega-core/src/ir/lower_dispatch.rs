@@ -15,9 +15,10 @@
 //!
 //! # Routing
 //!
-//! - **Rel** (15 variants) — query-bearing (`SELECT` / `INSERT` /
+//! - **Rel** — query-bearing (`SELECT` / `INSERT` /
 //!   `UPDATE` / `DELETE` / `MERGE` / `EXPLAIN` / set-operations /
-//!   `VALUES`) plus policy DDL whose predicate trees lower in a
+//!   `VALUES`, a view, materialized view or dynamic table, and
+//!   `CREATE TABLE … AS`) plus policy DDL whose predicate trees lower in a
 //!   synthetic binding scope (`CREATE/ALTER ROW ACCESS POLICY`,
 //!   `CREATE/ALTER MASKING POLICY`, `CREATE/ALTER POLICY ... ON <table>`
 //!   for PostgreSQL row-level security). Routed through
@@ -27,14 +28,14 @@
 //!   [`PolicyStatementFacts`](super::policy_facts::PolicyStatementFacts)
 //!   that entry point produces.
 //!
-//! - **Opaque** (6 variants) — AST-level placeholders that are not
+//! - **Opaque** (5 variants) — AST-level placeholders that are not
 //!   structurally lowerable (`OpaqueContent`, `ClauseFragment`,
-//!   `JinjaPlaceholder`, `JinjaConditionalStmt`, `Error`,
-//!   `GoBatchSeparator`). Returns [`LowerError::opaque`] with
-//!   [`OpaqueReason::NonSelectTopLevel`]; callers under permissive
-//!   strict-mode treat this as "no plan".
+//!   `JinjaPlaceholder`, `JinjaConditionalStmt`, `Error`), and
+//!   **Separator** (`GoBatchSeparator`). Each returns
+//!   [`LowerError::opaque`] with [`OpaqueReason::NonSelectTopLevel`];
+//!   callers under permissive strict-mode treat this as "no plan".
 //!
-//! - **Ddl** (220 variants) — every other `AstStmt` variant. Routed
+//! - **Ddl** — every other `AstStmt` variant. Routed
 //!   through [`lower_ddl_stmt`]; the resulting
 //!   [`LoweredStatement::Ddl`] arm carries just the [`DdlPlan`](crate::ir::ddl_plan::DdlPlan).
 //!   `lower_ddl_stmt` itself is closed-enum exhaustive over
@@ -44,28 +45,59 @@
 
 use crate::ast::types::AstStmt;
 
-use super::lower::lower_query_full_with_bindings_models_and_policy_facts;
 use super::lower::LowerError;
+use super::lower::{lower_query_with_declared_names, AroundStatement};
 use super::lower_ddl::lower_ddl_stmt;
 use super::lower_inputs::{IrLowerInputs, LoweredStatement};
 use super::strict::OpaqueReason;
+use super::types::SessionContext;
 
 /// Lower an [`AstStmt`] to a [`LoweredStatement`] under the supplied
 /// inputs.
 ///
-/// The single closed-enum dispatch point: every `AstStmt` variant is
-/// listed explicitly in one of three arms (Rel / Opaque / Ddl). Adding
-/// a new variant breaks the build and forces a routing decision.
+/// The single closed-enum dispatch point: `route` lists every
+/// `AstStmt` variant explicitly in one of four arms (Rel / Opaque /
+/// Separator / Ddl). Adding a new variant breaks the build and forces a routing
+/// decision.
 ///
 /// Under [`super::strict::StrictMode::Permissive`] the function returns
-/// `Err` only for the six opaque-AST arms (`OpaqueContent` /
+/// `Err` only for the six opaque and separator arms (`OpaqueContent` /
 /// `ClauseFragment` / `JinjaPlaceholder` / `JinjaConditionalStmt` /
 /// `Error` / `GoBatchSeparator`); query-bearing and DDL arms always
 /// succeed (opaque sub-trees become [`super::plan::RelPlan::Opaque`]
 /// terminals inside the lowered tree).
 pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredStatement, LowerError> {
+    match route(stmt) {
+        StatementRoute::Relational => lower_via_rel(stmt, inputs),
+        StatementRoute::Ddl => lower_via_ddl(stmt, inputs),
+        StatementRoute::Opaque | StatementRoute::Separator => Err(LowerError::opaque(
+            stmt.span(),
+            OpaqueReason::NonSelectTopLevel,
+        )),
+    }
+}
+
+/// Which lowering [`lower_stmt`] gives a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatementRoute {
+    /// The relational lowering: a query, a DML statement, a relation made
+    /// from a query, or policy DDL with predicates.
+    Relational,
+    /// The DDL lowering.
+    Ddl,
+    /// No lowering: text not parsed as a statement.
+    Opaque,
+    /// No lowering: a batch separator, which runs nothing.
+    Separator,
+}
+
+/// The lowering [`lower_stmt`] gives `stmt`: every `AstStmt` variant is
+/// listed explicitly, so a new variant breaks the build and forces a
+/// routing decision.
+pub(crate) fn route(stmt: &AstStmt) -> StatementRoute {
     match stmt {
         AstStmt::Select(_)
+        | AstStmt::Perform(_)
         | AstStmt::SetSelect(_)
         | AstStmt::ValuesQuery(_)
         | AstStmt::Insert(_)
@@ -75,54 +107,68 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::Delete(_)
         | AstStmt::Merge(_)
         | AstStmt::Explain(_)
+        | AstStmt::PsqlGexec(_)
         | AstStmt::CreateRowAccessPolicy(_)
         | AstStmt::AlterRowAccessPolicy(_)
         | AstStmt::CreateMaskingPolicy(_)
         | AstStmt::AlterMaskingPolicy(_)
         | AstStmt::CreatePgPolicy(_)
-        | AstStmt::AlterPgPolicy(_)
-        // `PREPARE name AS <query-bearing-body>` — wrapper around a
-        // query-bearing statement; `LowerCtx::lower_stmt` recurses
-        // into the inner body and returns its `RelPlan`. Routes Rel
-        // so `derive_facts_from_plan` walks the body and surfaces
-        // `tables_read` / `tables_written` etc. through the wrapper.
-        | AstStmt::PgPrepare(_) => lower_via_rel(stmt, inputs),
+        | AstStmt::AlterPgPolicy(_) => StatementRoute::Relational,
 
-        // `COPY (<query>) TO ...` recurses into the inner query for
-        // the same reason as `PREPARE`; `COPY <table> FROM ...`
+        // `COPY (<query>) TO ...` recurses into the inner query so its
+        // tables surface through the wrapper; `COPY <table> FROM ...`
         // (table-subject form) has no relational body and stays in
         // the Ddl arm via `lower_ddl_stmt`. Closed-enum match on
         // `PgCopySubject` keeps the split typed.
         AstStmt::PgCopy(c) => match &c.subject {
-            crate::ast::PgCopySubject::Query(..) => lower_via_rel(stmt, inputs),
-            crate::ast::PgCopySubject::Table(_) => lower_via_ddl(stmt, inputs),
+            crate::ast::PgCopySubject::Query(..) => StatementRoute::Relational,
+            crate::ast::PgCopySubject::Table(_) => StatementRoute::Ddl,
         },
 
         // `DECLARE c CURSOR FOR <query>` — always wraps a parsed
         // inner query; routes Rel via `LowerCtx::lower_stmt`'s
         // `DeclareCursor` arm.
-        AstStmt::DeclareCursor { .. } => lower_via_rel(stmt, inputs),
+        AstStmt::DeclareCursor { .. } => StatementRoute::Relational,
+
+        // A view, a materialized view and a dynamic table hold their
+        // query; `CREATE TABLE` holds one only as `CREATE TABLE … AS`.
+        AstStmt::CreateView(_) | AstStmt::CreateDynamicTable(_) => StatementRoute::Relational,
+        AstStmt::CreateTable(ct) => match ct.variant {
+            crate::ast::AstCreateTableVariant::Ctas => StatementRoute::Relational,
+            crate::ast::AstCreateTableVariant::Plain
+            | crate::ast::AstCreateTableVariant::Like
+            | crate::ast::AstCreateTableVariant::Clone
+            | crate::ast::AstCreateTableVariant::Copy
+            | crate::ast::AstCreateTableVariant::UsingTemplate
+            | crate::ast::AstCreateTableVariant::FromArchive
+            | crate::ast::AstCreateTableVariant::FromSnapshotSet => StatementRoute::Ddl,
+        },
 
         // `LET c CURSOR FOR <query>` — splits on whether the
         // parser produced a parsed query. `Some` → Rel via
         // recursion; `None` → Ddl shape (best-effort, the
         // wrapper has no body to fold).
         AstStmt::LetCursor { parsed_query, .. } => match parsed_query {
-            Some(_) => lower_via_rel(stmt, inputs),
-            None => lower_via_ddl(stmt, inputs),
+            Some(_) => StatementRoute::Relational,
+            None => StatementRoute::Ddl,
         },
 
         AstStmt::OpaqueContent { .. }
         | AstStmt::ClauseFragment { .. }
         | AstStmt::JinjaPlaceholder { .. }
         | AstStmt::JinjaConditionalStmt(_)
-        | AstStmt::Error { .. }
-        | AstStmt::GoBatchSeparator { .. } => Err(LowerError::opaque(
-            stmt.span(),
-            OpaqueReason::NonSelectTopLevel,
-        )),
+        | AstStmt::Error { .. } => StatementRoute::Opaque,
+        // A client's command line: `:r` runs a file not read here.
+        AstStmt::SqlcmdCommand { .. } => StatementRoute::Opaque,
+        // A body's statement no statement parser read, kept as written as
+        // an assignment that has no assignment operator.
+        AstStmt::Assign {
+            assign_op_span: None,
+            ..
+        } => StatementRoute::Opaque,
+        AstStmt::GoBatchSeparator { .. } => StatementRoute::Separator,
 
-        // ---- DDL arms (220 variants) ----
+        // ---- DDL arms ----
         // Every non-Rel non-Opaque `AstStmt` variant. Closed-enum
         // exhaustive — `lower_ddl_stmt` returns `Some(_)` for
         // each of these (verified by its own closed-enum match).
@@ -226,7 +272,6 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::CreateConnection(_)
         | AstStmt::CreateDatabase(_)
         | AstStmt::CreateDomain(_)
-        | AstStmt::CreateDynamicTable(_)
         | AstStmt::CreateExtension(_)
         | AstStmt::CreateExternalAccessIntegration(_)
         | AstStmt::CreateExternalLocation(_)
@@ -251,11 +296,9 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::CreateStorageCredential(_)
         | AstStmt::CreateStorageIntegration(_)
         | AstStmt::CreateStream(_)
-        | AstStmt::CreateTable(_)
         | AstStmt::CreateTableFunction(_)
         | AstStmt::CreateTask(_)
         | AstStmt::CreateType(_)
-        | AstStmt::CreateView(_)
         | AstStmt::CreateVolume(_)
         | AstStmt::CreateWarehouse(_)
         | AstStmt::Declare { .. }
@@ -296,6 +339,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::DropExternalLocation(_)
         | AstStmt::DropMaskingPolicy(_)
         | AstStmt::DropMssqlTrigger(_)
+        | AstStmt::MssqlTriggerState(_)
         | AstStmt::DropNetworkPolicy(_)
         | AstStmt::DropPasswordPolicy(_)
         | AstStmt::DropPgPolicy(_)
@@ -335,6 +379,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::MssqlRaiserror(_)
         | AstStmt::MssqlSetOption(_)
         | AstStmt::MysqlSet(_)
+        | AstStmt::MysqlUnlockTables(_)
         | AstStmt::MssqlThrow(_)
         | AstStmt::MssqlTryCatch(_)
         | AstStmt::MssqlWaitfor(_)
@@ -352,6 +397,11 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::PgCreateOperator(_)
         | AstStmt::CreatePrincipal(_)
         | AstStmt::PgCreateRule(_)
+        | AstStmt::MssqlCreateRule(_)
+        | AstStmt::MysqlDo(_)
+        | AstStmt::ExecuteTask(_)
+        | AstStmt::MysqlCreateLoadableFunction(_)
+        | AstStmt::MysqlAdmin(_)
         | AstStmt::PgCreateTablespace(_)
         | AstStmt::PgDeallocate(_)
         | AstStmt::PgDiscard(_)
@@ -363,6 +413,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::PgDropSequence(_)
         | AstStmt::PgDropTablespace(_)
         | AstStmt::PgDropType(_)
+        | AstStmt::PgPrepare(_)
         | AstStmt::PgExecute(_)
         | AstStmt::PgListen(_)
         | AstStmt::PgLockTable(_)
@@ -376,6 +427,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::PipeChain { .. }
         | AstStmt::Raise { .. }
         | AstStmt::Reconfigure { .. }
+        | AstStmt::MssqlServerCommand { .. }
         | AstStmt::Reindex(_)
         | AstStmt::RepairTable(_)
         | AstStmt::Repeat(_)
@@ -384,6 +436,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::Return { .. }
         | AstStmt::Revoke(_)
         | AstStmt::Rollback { .. }
+        | AstStmt::Savepoint(_)
         | AstStmt::SetVariable { .. }
         | AstStmt::Show(_)
         | AstStmt::Signal { .. }
@@ -436,7 +489,7 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
         | AstStmt::AlterAlert(_)
         | AstStmt::Use(_)
         | AstStmt::Vacuum(_)
-        | AstStmt::While(_) => lower_via_ddl(stmt, inputs),
+        | AstStmt::While(_) => StatementRoute::Ddl,
     }
 }
 
@@ -444,16 +497,16 @@ pub fn lower_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredState
 /// through the relational lowering entry point and wrap the result as
 /// [`LoweredStatement::Rel`].
 fn lower_via_rel(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredStatement, LowerError> {
-    let (plan, catalog_ctx, bindings, facts, policy_facts) =
-        lower_query_full_with_bindings_models_and_policy_facts(
-            stmt,
-            inputs.source,
-            inputs.strict,
-            inputs.func_catalog,
-            inputs.session,
-            inputs.catalog,
-            inputs.model_catalog,
-        )?;
+    let (plan, catalog_ctx, bindings, facts, policy_facts) = lower_query_with_declared_names(
+        stmt,
+        inputs.source,
+        inputs.strict,
+        inputs.func_catalog,
+        inputs.session,
+        inputs.catalog,
+        inputs.model_catalog,
+        AroundStatement::under(inputs.meaning),
+    )?;
     Ok(LoweredStatement::Rel {
         plan,
         bindings,
@@ -461,6 +514,81 @@ fn lower_via_rel(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredStatem
         facts,
         policy_facts,
     })
+}
+
+/// Place the name of the relation `plan` acts on in `session`, as the
+/// relational lowering places every relation it names, so a statement is
+/// named alike whichever arm lowers it. Other objects keep the name as
+/// written.
+fn place_relation_target(plan: &mut crate::ir::ddl_plan::DdlPlan, session: &SessionContext) {
+    use crate::facts::identity::ObjectKind;
+    let relation = match plan.object_kind {
+        ObjectKind::Table
+        | ObjectKind::View
+        | ObjectKind::MaterializedView
+        | ObjectKind::DynamicTable
+        | ObjectKind::ExternalTable => true,
+        ObjectKind::Schema
+        | ObjectKind::Database
+        | ObjectKind::Tag
+        | ObjectKind::Procedure
+        | ObjectKind::Function
+        | ObjectKind::Trigger
+        | ObjectKind::Stage
+        | ObjectKind::FileFormat
+        | ObjectKind::Pipe
+        | ObjectKind::Stream
+        | ObjectKind::ApiIntegration
+        | ObjectKind::StorageIntegration
+        | ObjectKind::ExternalAccessIntegration
+        | ObjectKind::NotificationIntegration
+        | ObjectKind::SecurityIntegration
+        | ObjectKind::Warehouse
+        | ObjectKind::Task
+        | ObjectKind::Alert
+        | ObjectKind::NetworkRule
+        | ObjectKind::ResourceMonitor
+        | ObjectKind::Secret
+        | ObjectKind::Sequence
+        | ObjectKind::Role
+        | ObjectKind::User
+        | ObjectKind::Share
+        | ObjectKind::Account
+        | ObjectKind::Session
+        | ObjectKind::MaskingPolicy
+        | ObjectKind::RowAccessPolicy
+        | ObjectKind::NetworkPolicy
+        | ObjectKind::SessionPolicy
+        | ObjectKind::PasswordPolicy
+        | ObjectKind::AggregationPolicy
+        | ObjectKind::ProjectionPolicy
+        | ObjectKind::JoinPolicy
+        | ObjectKind::DataMetricFunction
+        | ObjectKind::ReplicationGroup
+        | ObjectKind::AuthenticationPolicy
+        | ObjectKind::PgExtension
+        | ObjectKind::PgDomain
+        | ObjectKind::PgType
+        | ObjectKind::PgPublication
+        | ObjectKind::PgSubscription
+        | ObjectKind::PgRule
+        | ObjectKind::BqModel
+        | ObjectKind::Catalog
+        | ObjectKind::Volume
+        | ObjectKind::ExternalLocation
+        | ObjectKind::StorageCredential
+        | ObjectKind::Metastore
+        | ObjectKind::Datashare
+        | ObjectKind::Index
+        | ObjectKind::Group
+        | ObjectKind::ExternalSchema
+        | ObjectKind::FailoverGroup
+        | ObjectKind::Synonym
+        | ObjectKind::Generic => false,
+    };
+    if let (true, Some(target)) = (relation, plan.target.as_mut()) {
+        session.place(&mut target.db, &mut target.schema);
+    }
 }
 
 /// Route a non-query DDL statement through [`lower_ddl_stmt`] and wrap
@@ -474,7 +602,8 @@ fn lower_via_rel(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredStatem
 /// downstream callers from observing an inconsistent attachment shape.
 fn lower_via_ddl(stmt: &AstStmt, inputs: &IrLowerInputs) -> Result<LoweredStatement, LowerError> {
     match lower_ddl_stmt(stmt, inputs) {
-        Some(plan) => {
+        Some(mut plan) => {
+            place_relation_target(&mut plan, inputs.session);
             let privilege_plan = match stmt {
                 AstStmt::Grant(g) => Some(super::lower_grant_to_privilege_plan(g)),
                 AstStmt::Revoke(r) => Some(super::lower_revoke_to_privilege_plan(r)),

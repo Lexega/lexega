@@ -628,6 +628,7 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
 
     fn consume_parenthesized_block(&mut self) -> ParseResult<u32> {
+        let from = self.idx;
         let lparen = self
             .advance()
             .ok_or_eof(self.current_span(), vec!["(".to_string()])?;
@@ -650,7 +651,11 @@ impl<'a> Parser<'a> {
                 TokenKind::Punctuation(Punctuation::RParen) => {
                     depth -= 1;
                     if depth == 0 {
-                        return Ok(tok.span.end);
+                        let end = tok.span.end;
+                        // The text is not read: its secrets are recorded as
+                        // unparsed text's are.
+                        self.record_unparsed_secrets(from, self.idx);
+                        return Ok(end);
                     }
                 }
                 TokenKind::Eof => {

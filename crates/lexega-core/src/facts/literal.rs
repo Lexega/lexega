@@ -72,6 +72,73 @@ pub enum LiteralValue {
     },
 }
 
+impl LiteralValue {
+    /// This literal as a report prints it where its source is masked: each
+    /// string it holds masked, and a number, a binary value, a date, a time
+    /// or an interval masked whole; a truth value and NULL as they are.
+    pub(crate) fn masked(&self) -> LiteralValue {
+        let masked = || LiteralValue::Other {
+            repr: super::MASKED_VALUE.to_string(),
+        };
+        match self {
+            LiteralValue::Integer { .. }
+            | LiteralValue::Decimal { .. }
+            | LiteralValue::Float { .. }
+            | LiteralValue::Date { .. }
+            | LiteralValue::Time { .. }
+            | LiteralValue::Timestamp { .. }
+            | LiteralValue::Interval(_)
+            | LiteralValue::Bytes { .. } => masked(),
+            LiteralValue::String { .. } | LiteralValue::Other { .. } => {
+                let mut literal = self.clone();
+                literal.for_each_written_text_mut(&mut |text| {
+                    *text = super::MASKED_VALUE.to_string();
+                });
+                literal
+            }
+            LiteralValue::Array { elements } => LiteralValue::Array {
+                elements: elements.iter().map(LiteralValue::masked).collect(),
+            },
+            LiteralValue::Object { fields } => LiteralValue::Object {
+                fields: fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.masked()))
+                    .collect(),
+            },
+            LiteralValue::Null | LiteralValue::Bool { .. } => self.clone(),
+        }
+    }
+
+    /// Visit each string this literal holds as written: a string's value
+    /// and an unparsed literal's text, in arrays and objects too.
+    pub(crate) fn for_each_written_text_mut(&mut self, f: &mut dyn FnMut(&mut String)) {
+        match self {
+            LiteralValue::String { value } => f(value),
+            LiteralValue::Other { repr } => f(repr),
+            LiteralValue::Array { elements } => {
+                for element in elements {
+                    element.for_each_written_text_mut(f);
+                }
+            }
+            LiteralValue::Object { fields } => {
+                for value in fields.values_mut() {
+                    value.for_each_written_text_mut(f);
+                }
+            }
+            LiteralValue::Null
+            | LiteralValue::Bool { .. }
+            | LiteralValue::Integer { .. }
+            | LiteralValue::Decimal { .. }
+            | LiteralValue::Float { .. }
+            | LiteralValue::Date { .. }
+            | LiteralValue::Time { .. }
+            | LiteralValue::Timestamp { .. }
+            | LiteralValue::Interval(_)
+            | LiteralValue::Bytes { .. } => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]

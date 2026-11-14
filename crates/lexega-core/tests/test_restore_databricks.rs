@@ -6,7 +6,7 @@
 //! Covers:
 //! - Parsing (TIMESTAMP AS OF, VERSION AS OF, optional TABLE/TO, qualified names)
 //! - Formatting (semantic preservation)
-//! - Risk analysis (signal generation, tables_written, multi-statement)
+//! - Risk analysis (finding generation, tables_written, multi-statement)
 //! - Regression with existing Databricks statements
 
 use lexega_core::analyzer::RuleMatch;
@@ -45,10 +45,9 @@ fn dbx_analyze(sql: &str) -> lexega_core::analyzer::AnalysisReport {
     analyze_risk_with_policy_config(sql, &config).expect("analysis should succeed")
 }
 
-fn has_signal(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
+fn has_finding(report: &lexega_core::analyzer::AnalysisReport, rule_id: &str) -> bool {
     report
-        .signals
-        .iter()
+        .entries()
         .any(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == rule_id))
 }
 
@@ -224,28 +223,28 @@ fn format_restore_backtick_quoted_preserves() {
 // ============================================================================
 
 #[test]
-fn risk_restore_high_signal() {
+fn risk_restore_medium_finding() {
     let sql = "RESTORE TABLE my_table TO TIMESTAMP AS OF '2024-01-01';";
     let report = dbx_analyze(sql);
 
     assert!(
-        report.summary.high_count >= 1,
-        "Should have high signal for RESTORE, got: {:?}",
+        report.summary.medium_count >= 1,
+        "Should have medium finding for RESTORE, got: {:?}",
         report.summary
     );
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
-        "Should find DBX-TBL-RESTORE signal"
+        has_finding(&report, "DBX-TBL-RESTORE"),
+        "Should find DBX-TBL-RESTORE finding"
     );
 }
 
 #[test]
-fn risk_restore_version_signal() {
+fn risk_restore_version_finding() {
     let sql = "RESTORE TABLE events TO VERSION AS OF 5;";
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
+        has_finding(&report, "DBX-TBL-RESTORE"),
         "VERSION AS OF should also trigger DBX-TBL-RESTORE"
     );
 }
@@ -268,7 +267,7 @@ fn risk_restore_qualified_table() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
+        has_finding(&report, "DBX-TBL-RESTORE"),
         "Should find DBX-TBL-RESTORE for qualified name"
     );
 }
@@ -291,7 +290,7 @@ fn risk_restore_minimal_form() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
+        has_finding(&report, "DBX-TBL-RESTORE"),
         "Minimal RESTORE should also trigger DBX-TBL-RESTORE"
     );
 }
@@ -306,8 +305,7 @@ fn risk_multi_restore() {
     let report = dbx_analyze(sql);
 
     let total_evidence: usize = report
-        .signals
-        .iter()
+        .entries()
         .filter(|f| matches!(f, RuleMatch::Analysis(g) if g.matched_rule == "DBX-TBL-RESTORE"))
         .map(|f| {
             let RuleMatch::Analysis(ref p) = f;
@@ -335,12 +333,12 @@ fn combined_restore_and_optimize() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
-        "Should detect RESTORE signal"
+        has_finding(&report, "DBX-TBL-RESTORE"),
+        "Should detect RESTORE finding"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-OPT"),
-        "Should detect OPTIMIZE signal"
+        has_finding(&report, "DBX-TBL-OPT"),
+        "Should detect OPTIMIZE finding"
     );
 }
 
@@ -353,12 +351,12 @@ fn combined_restore_and_vacuum() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
-        "Should detect RESTORE signal"
+        has_finding(&report, "DBX-TBL-RESTORE"),
+        "Should detect RESTORE finding"
     );
     assert!(
-        has_signal(&report, "DBX-VACUUM-LOWRET"),
-        "Should detect VACUUM low retention signal"
+        has_finding(&report, "DBX-VACUUM-LOWRET"),
+        "Should detect VACUUM low retention finding"
     );
 }
 
@@ -371,12 +369,12 @@ fn combined_restore_and_describe_history() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
-        "Should detect DESCRIBE HISTORY signal"
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
+        "Should detect DESCRIBE HISTORY finding"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
-        "Should detect RESTORE signal"
+        has_finding(&report, "DBX-TBL-RESTORE"),
+        "Should detect RESTORE finding"
     );
 }
 
@@ -391,15 +389,15 @@ fn combined_all_delta_operations() {
     let report = dbx_analyze(sql);
 
     assert!(
-        has_signal(&report, "INFO-DBX-TBL-HIST"),
-        "Should detect DESCRIBE HISTORY signal"
+        has_finding(&report, "INFO-DBX-TBL-HIST"),
+        "Should detect DESCRIBE HISTORY finding"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-RESTORE"),
-        "Should detect RESTORE signal"
+        has_finding(&report, "DBX-TBL-RESTORE"),
+        "Should detect RESTORE finding"
     );
     assert!(
-        has_signal(&report, "DBX-TBL-OPT"),
-        "Should detect OPTIMIZE signal"
+        has_finding(&report, "DBX-TBL-OPT"),
+        "Should detect OPTIMIZE finding"
     );
 }

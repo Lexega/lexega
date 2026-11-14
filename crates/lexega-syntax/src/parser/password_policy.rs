@@ -22,6 +22,7 @@ use crate::ast::{
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
+use crate::parser::tag::TagListShape;
 use crate::syntax::{
     SyntaxAlterPasswordPolicy, SyntaxAlterPasswordPolicyAction, SyntaxCreatePasswordPolicy,
     SyntaxDropPasswordPolicy,
@@ -662,31 +663,14 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume TAG
                     let tag_span = Some(next_tok.span);
 
-                    // Parse tag assignments (TAG_NAME = 'value', ...)
-                    let tags_start = self.current_span().start;
-
-                    // Consume until we hit something else or run out of tokens
-                    let mut tag_end = tags_start;
-                    while let Some(tok) = self.peek_non_trivia() {
-                        if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
-                            || matches!(tok.kind, TokenKind::Keyword(Keyword::Set))
-                            || matches!(tok.kind, TokenKind::Keyword(Keyword::Unset))
-                        {
-                            break;
-                        }
-                        tag_end = tok.span.end;
-                        self.advance();
-                    }
-
-                    let tags_span = Span {
-                        start: tags_start,
-                        end: tag_end,
-                    };
+                    let (assignments_span, tags) =
+                        self.parse_tag_list(TagListShape::Assignments)?;
 
                     AstAlterPasswordPolicyActionKind::SetTag {
                         set_span,
                         tag_span,
-                        assignments_span: tags_span,
+                        assignments_span,
+                        tags,
                     }
                 } else {
                     // Delegate to shared SET property parser
@@ -707,30 +691,13 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume TAG
                     let tag_span = Some(next_tok.span);
 
-                    // Parse tag names
-                    let tags_start = self.current_span().start;
-
-                    let mut tag_end = tags_start;
-                    while let Some(tok) = self.peek_non_trivia() {
-                        if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Semi))
-                            || matches!(tok.kind, TokenKind::Keyword(Keyword::Set))
-                            || matches!(tok.kind, TokenKind::Keyword(Keyword::Unset))
-                        {
-                            break;
-                        }
-                        tag_end = tok.span.end;
-                        self.advance();
-                    }
-
-                    let tags_span = Span {
-                        start: tags_start,
-                        end: tag_end,
-                    };
+                    let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
                     AstAlterPasswordPolicyActionKind::UnsetTag {
                         unset_span,
                         tag_span,
                         tags_span,
+                        tags,
                     }
                 } else {
                     // Delegate to shared UNSET property parser

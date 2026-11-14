@@ -24,11 +24,14 @@ pub fn format_set_select(
 ) -> Result<(), FormatterError> {
     printer.enter_recursion("set_select")?;
 
-    // Emit opening paren if this SetSelect is parenthesized
+    // Emit opening paren if this SetSelect is parenthesized, from its `(`
+    // on, so the comments after it are its own.
     if let Some(paren_id) = set_select.paren_syntax_id {
-        if let Some(subquery) = printer.get_subquery(paren_id) {
-            printer.push_token_id(subquery.l_paren);
+        if let Some(parens) = printer.get_subquery(paren_id) {
+            printer.reset_token_index_at(parens.span.start);
+            printer.emit_comments_before(parens.span.start);
         }
+        super::select::push_open_parens(printer, paren_id);
     }
 
     // Format left operand - dispatch handles Select vs nested SetSelect
@@ -66,9 +69,7 @@ pub fn format_set_select(
 
     // Emit closing paren if this SetSelect is parenthesized
     if let Some(paren_id) = set_select.paren_syntax_id {
-        if let Some(subquery) = printer.get_subquery(paren_id) {
-            printer.push_token_id(subquery.r_paren);
-        }
+        super::select::push_close_parens(printer, paren_id, set_select.outer_tail.as_deref())?;
     }
 
     // Emit semicolon if present (scripting/Jinja context)

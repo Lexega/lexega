@@ -4,18 +4,18 @@
 //! Tests for built-in rule BQ-VECIDX-DROP
 //!
 //! Rule: Vector Index Dropped
-//! Risk Level: Medium
+//! Risk Level: Low
 //! Syntax: DROP VECTOR INDEX [IF EXISTS] name ON table
 
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 
 /// Helper: collect all rule IDs from an analysis report.
-fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> Vec<String> {
+    findings
         .iter()
-        .filter_map(|s| match s {
-            RuleMatch::Analysis(a) => Some(a.matched_rule.clone()),
+        .map(|s| match s {
+            RuleMatch::Analysis(a) => a.matched_rule.clone(),
         })
         .collect()
 }
@@ -28,7 +28,7 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> Vec<String> {
 fn test_basic_drop_vector_index() {
     let sql = "DROP VECTOR INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "Should detect BQ-VECIDX-DROP. Got: {:?}",
@@ -40,7 +40,7 @@ fn test_basic_drop_vector_index() {
 fn test_if_exists_variant() {
     let sql = "DROP VECTOR INDEX IF EXISTS my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "IF EXISTS variant should trigger. Got: {:?}",
@@ -52,7 +52,7 @@ fn test_if_exists_variant() {
 fn test_qualified_table_name() {
     let sql = "DROP VECTOR INDEX my_idx ON ds.my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "Qualified table name should trigger. Got: {:?}",
@@ -64,7 +64,7 @@ fn test_qualified_table_name() {
 fn test_fully_qualified_table_name() {
     let sql = "DROP VECTOR INDEX my_idx ON proj.ds.my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "Fully-qualified 3-part table name should trigger. Got: {:?}",
@@ -76,7 +76,7 @@ fn test_fully_qualified_table_name() {
 fn test_if_exists_with_qualified_table() {
     let sql = "DROP VECTOR INDEX IF EXISTS idx ON ds.tbl;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "IF EXISTS + qualified name should trigger. Got: {:?}",
@@ -89,20 +89,20 @@ fn test_if_exists_with_qualified_table() {
 // ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_risk_level_is_medium() {
+fn test_risk_level_is_low() {
     let sql = "DROP VECTOR INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-VECIDX-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert_eq!(
                 a.risk_level,
-                lexega_core::analyzer::RiskLevel::Medium,
-                "BQ-VECIDX-DROP should be Medium risk"
+                lexega_core::analyzer::RiskLevel::Low,
+                "BQ-VECIDX-DROP should be Low risk"
             );
         }
     }
@@ -112,12 +112,12 @@ fn test_risk_level_is_medium() {
 fn test_message_content() {
     let sql = "DROP VECTOR INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-VECIDX-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    match signal.unwrap() {
+    assert!(finding.is_some(), "Finding should exist");
+    match finding.unwrap() {
         RuleMatch::Analysis(a) => {
             assert!(
                 a.message.contains("Vector index dropped"),
@@ -142,9 +142,9 @@ fn test_summary_counts() {
     let sql = "DROP VECTOR INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
     assert!(
-        report.summary.medium_count >= 1,
-        "medium_count should be at least 1. Got: {}",
-        report.summary.medium_count
+        report.summary.low_count >= 1,
+        "low_count should be at least 1. Got: {}",
+        report.summary.low_count
     );
     assert_eq!(
         report.summary.statements_analyzed, 1,
@@ -169,7 +169,7 @@ fn test_multi_statement_evidence_count() {
     let report = analyze_risk(sql).expect("analysis should succeed");
 
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-VECIDX-DROP"))
         .map(|s| match s {
@@ -198,20 +198,20 @@ fn test_multi_statement_both_analyzed() {
 }
 
 // ──────────────────────────────────────────────────────────
-// Signal evidence and details
+// Finding evidence and details
 // ──────────────────────────────────────────────────────────
 
 #[test]
-fn test_signal_evidence_present() {
+fn test_finding_evidence_present() {
     let sql = "DROP VECTOR INDEX my_idx ON embeddings_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(a) if a.matched_rule == "BQ-VECIDX-DROP"));
-    assert!(signal.is_some(), "Signal should exist");
-    let evidence = signal.unwrap().evidence();
-    assert!(!evidence.is_empty(), "Signal should have evidence entries");
+    assert!(finding.is_some(), "Finding should exist");
+    let evidence = finding.unwrap().evidence();
+    assert!(!evidence.is_empty(), "Finding should have evidence entries");
 }
 
 // ──────────────────────────────────────────────────────────
@@ -222,7 +222,7 @@ fn test_signal_evidence_present() {
 fn test_not_triggered_by_create_vector_index() {
     let sql = "CREATE VECTOR INDEX my_idx ON my_table(embedding) OPTIONS(index_type='IVF');";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "CREATE VECTOR INDEX should NOT trigger BQ-VECIDX-DROP. Got: {:?}",
@@ -234,7 +234,7 @@ fn test_not_triggered_by_create_vector_index() {
 fn test_not_triggered_by_drop_search_index() {
     let sql = "DROP SEARCH INDEX my_idx ON my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "DROP SEARCH INDEX should NOT trigger BQ-VECIDX-DROP. Got: {:?}",
@@ -246,7 +246,7 @@ fn test_not_triggered_by_drop_search_index() {
 fn test_not_triggered_by_drop_table() {
     let sql = "DROP TABLE my_table;";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
     assert!(
         !ids.contains(&"BQ-VECIDX-DROP".to_string()),
         "DROP TABLE should NOT trigger BQ-VECIDX-DROP. Got: {:?}",
@@ -258,11 +258,12 @@ fn test_not_triggered_by_drop_table() {
 fn test_create_triggers_new_rule_not_drop() {
     let sql = "CREATE VECTOR INDEX my_idx ON my_table(embedding) OPTIONS(index_type='IVF');";
     let report = analyze_risk(sql).expect("analysis should succeed");
-    let ids = extract_rule_ids(&report.signals);
+    let ids = extract_rule_ids(&report.findings);
+    let context_ids = extract_rule_ids(&report.context);
     assert!(
-        ids.contains(&"BQ-VECIDX-NEW".to_string()),
+        context_ids.contains(&"BQ-VECIDX-NEW".to_string()),
         "CREATE VECTOR INDEX should trigger BQ-VECIDX-NEW. Got: {:?}",
-        ids
+        context_ids
     );
     assert!(
         !ids.contains(&"BQ-VECIDX-DROP".to_string()),

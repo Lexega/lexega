@@ -16,20 +16,23 @@ pub mod error;
 pub mod formatter;
 pub mod lexer;
 pub mod parser;
+pub mod secrets;
 pub mod span_utils;
 pub mod syntax;
 
 pub use ast::{AstExpr, AstScript, AstSelect, AstStmt};
+pub use context::CopiedSpan;
 pub use cst::{Cst, TokenId};
 pub use dialect::{
-    dialect_from_name, BigQueryDialect, DatabricksDialect, Dialect, DialectRef, MsSqlDialect,
-    MySqlDialect, PostgresDialect, RedshiftDialect, SnowflakeDialect,
+    dialect_from_name, BigQueryDialect, CaretOperator, DatabricksDialect, Dialect, DialectRef,
+    DollarNumber, DoubleAmpersand, MsSqlDialect, MySqlDialect, NumberLiteralGrammar,
+    PostgresDialect, RadixPrefix, RedshiftDialect, SnowflakeDialect, WordOperator,
 };
 pub use error::{ParseError, ParseErrorKind, ParseResult};
 pub use formatter::config::{
     ArrayLiteralStyle, BooleanOperatorPosition, CommaStyle, CopyIntoOptionsStyle,
     CreateStageClauseStyle, CteIndentStyle, FlattenStyle, FormatterConfig, IdentifierCase,
-    IndentStyle, KeywordCase, MatchRecognizeDefineStyle, MatchRecognizeFormat,
+    IndentStyle, KeywordCase, LineBreak, MatchRecognizeDefineStyle, MatchRecognizeFormat,
     MatchRecognizeMeasuresStyle, NewlineStyle, ObjectLiteralStyle, ParamListStyle,
     ParenthesizedExprStyle, PipeChainStyle, SubqueryParenStyle, WindowFrameStyle,
 };
@@ -224,118 +227,15 @@ pub fn verify_formatting_safe_with_dialect(
     verify_formatting_impl_with_dialect(original, formatted, dialect)
 }
 
-/// Internal implementation of formatting verification.
+/// Verification over the plain lexer, the Snowflake one.
 fn verify_formatting_impl(original: &str, formatted: &str) -> Result<(), String> {
-    let orig_tokens = tokenize(original).tokens;
-    let fmt_tokens = tokenize(formatted).tokens;
-
-    // Extract significant tokens (exclude comments and pure whitespace)
-    let orig_significant: Vec<&str> = orig_tokens
-        .iter()
-        .filter(|t| !matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
-        .filter(|t| !t.lexeme(original).is_empty()) // Exclude empty tokens (e.g., EOF with empty lexeme)
-        .map(|t| t.lexeme(original))
-        .collect();
-
-    let fmt_significant: Vec<&str> = fmt_tokens
-        .iter()
-        .filter(|t| !matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
-        .filter(|t| !t.lexeme(formatted).is_empty()) // Exclude empty tokens (e.g., EOF with empty lexeme)
-        .map(|t| t.lexeme(formatted))
-        .collect();
-
-    // Quick check: if token counts match, likely OK (will catch in tests if normalization issue)
-    if orig_significant.len() == fmt_significant.len() {
-        // Only check comments and patterns if counts match (most common fast path)
-        check_comment_preservation(&orig_tokens, &fmt_tokens, original, formatted)?;
-        check_critical_syntax_patterns(original, formatted, &orig_significant, &fmt_significant)?;
-
-        // CRITICAL: Verify tokens are actually equivalent, not just same count
-        // This catches semantic changes like value substitution, operator changes, etc.
-        for (i, (orig_tok, fmt_tok)) in orig_significant
-            .iter()
-            .zip(fmt_significant.iter())
-            .enumerate()
-        {
-            if !orig_tok.eq_ignore_ascii_case(fmt_tok) {
-                return Err(format!(
-                    "Token content mismatch at position {}!\n\
-                     Original token: '{}'\n\
-                     Formatted token: '{}'\n\
-                     \n\
-                     Token counts match but content differs - this indicates semantic changes!\n\
-                     This could be value substitution, operator change, or function swap.\n\
-                     First 10 tokens: {:?}\n\
-                     Context around position {}: {:?}",
-                    i,
-                    orig_tok,
-                    fmt_tok,
-                    &orig_significant[..orig_significant.len().min(10)],
-                    i,
-                    &orig_significant[i.saturating_sub(3)..(i + 4).min(orig_significant.len())]
-                ));
-            }
-        }
-
-        return Ok(());
-    }
-
-    // Token counts differ - check if it's acceptable normalization
-    // Check comments before detailed analysis
-    check_comment_preservation(&orig_tokens, &fmt_tokens, original, formatted)?;
-    check_critical_syntax_patterns(original, formatted, &orig_significant, &fmt_significant)?;
-
-    // Check for acceptable normalizations
-    if is_acceptable_token_difference(&orig_significant, &fmt_significant) {
-        return Ok(());
-    }
-
-    // Find first divergence
-    let mut first_diff_idx = 0;
-    for (i, (o, f)) in orig_significant
-        .iter()
-        .zip(fmt_significant.iter())
-        .enumerate()
-    {
-        if !o.eq_ignore_ascii_case(f) {
-            first_diff_idx = i;
-            break;
-        }
-        first_diff_idx = i + 1;
-    }
-
-    // Data loss detected!
-    Err(format!(
-        "Token count mismatch!\n\
-         Original tokens: {} significant tokens\n\
-         Formatted tokens: {} significant tokens\n\
-         \n\
-         First divergence at index {}: orig='{}' vs fmt='{}'\n\
-         Context (idx-5 to idx+5):\n\
-         Original: {:?}\n\
-         Formatted: {:?}\n\
-         \n\
-         First 20 original tokens: {:?}\n\
-         First 20 formatted tokens: {:?}",
-        orig_significant.len(),
-        fmt_significant.len(),
-        first_diff_idx,
-        orig_significant.get(first_diff_idx).unwrap_or(&"<none>"),
-        fmt_significant.get(first_diff_idx).unwrap_or(&"<none>"),
-        &orig_significant
-            [first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(orig_significant.len())],
-        &fmt_significant
-            [first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(fmt_significant.len())],
-        &orig_significant[..orig_significant.len().min(20)],
-        &fmt_significant[..fmt_significant.len().min(20)]
-    ))
+    verify_formatting_impl_with_dialect(original, formatted, &dialect::SnowflakeDialect)
 }
 
-/// Dialect-aware implementation of formatting verification.
-///
-/// Mirrors [`verify_formatting_impl`] but tokenizes with the given dialect so that
-/// dialect-specific constructs (backtick identifiers, bracket identifiers, @variables,
-/// #temp tables, etc.) are lexed correctly for comparison.
+/// Dialect-aware implementation of formatting verification: tokenizes with
+/// the given dialect so that dialect-specific constructs (backtick
+/// identifiers, bracket identifiers, @variables, #temp tables, etc.) are
+/// lexed correctly for comparison.
 fn verify_formatting_impl_with_dialect(
     original: &str,
     formatted: &str,
@@ -343,76 +243,300 @@ fn verify_formatting_impl_with_dialect(
 ) -> Result<(), String> {
     let orig_tokens = lexer::tokenize_with_dialect(original, dialect).tokens;
     let fmt_tokens = lexer::tokenize_with_dialect(formatted, dialect).tokens;
+    verify_token_streams(original, formatted, &orig_tokens, &fmt_tokens, dialect)
+}
 
-    // Extract significant tokens (exclude comments and pure whitespace)
-    let orig_significant: Vec<&str> = orig_tokens
+/// Rejects `formatted` where a span the formatter copied from `original` as
+/// written (`copied`, the formatter's own record,
+/// [`context::FormattedContext::copied_spans`]: a routine body in another
+/// language, a function body, a type written as read) does not read byte for
+/// byte where it was written, at whatever depth the span lies. `formatted` is
+/// the text as it will be written, so a change made to it after formatting is
+/// seen too; a line break appended at its end moves no span.
+pub fn verify_copied_spans(
+    original: &str,
+    formatted: &str,
+    copied: &[CopiedSpan],
+) -> Result<(), String> {
+    let describe = |text: Option<&str>| {
+        text.map_or_else(
+            || "outside the text".to_string(),
+            |text| format!("{text:?}"),
+        )
+    };
+    for span in copied {
+        let source = original.get(span.source.start as usize..span.source.end as usize);
+        let output = formatted.get(span.output.start as usize..span.output.end as usize);
+        if source.is_some() && source == output {
+            continue;
+        }
+        return Err(format!(
+            "Copied text changed: text the formatter copies as written reads differently in the output.\n\
+             Original: {}\n\
+             Formatted: {}",
+            describe(source),
+            describe(output)
+        ));
+    }
+    Ok(())
+}
+
+/// The tokens a reader of `source` sees: not comments, not empty (EOF).
+fn significant_tokens<'t>(tokens: &'t [Token], source: &str) -> Vec<&'t Token> {
+    tokens
         .iter()
         .filter(|t| !matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
-        .filter(|t| !t.lexeme(original).is_empty())
-        .map(|t| t.lexeme(original))
-        .collect();
+        .filter(|t| !t.lexeme(source).is_empty())
+        .collect()
+}
 
-    let fmt_significant: Vec<&str> = fmt_tokens
-        .iter()
-        .filter(|t| !matches!(t.kind, TokenKind::LineComment | TokenKind::BlockComment))
-        .filter(|t| !t.lexeme(formatted).is_empty())
-        .map(|t| t.lexeme(formatted))
-        .collect();
+/// Whether `formatted` reads as `original`: every comment kept, the
+/// significant tokens the same and in order (only the insertions
+/// [`inserted_token_count`] names added), and no two tokens written against
+/// each other set apart where that changes how they read
+/// ([`reads_as_one_with`]), and every batch separator where it was
+/// ([`check_batch_separators`]).
+fn verify_token_streams(
+    original: &str,
+    formatted: &str,
+    orig_tokens: &[Token],
+    fmt_tokens: &[Token],
+    dialect: &dyn dialect::Dialect,
+) -> Result<(), String> {
+    let orig = significant_tokens(orig_tokens, original);
+    let fmt = significant_tokens(fmt_tokens, formatted);
+    let orig_lexemes: Vec<&str> = orig.iter().map(|t| t.lexeme(original)).collect();
+    let fmt_lexemes: Vec<&str> = fmt.iter().map(|t| t.lexeme(formatted)).collect();
 
-    if orig_significant.len() == fmt_significant.len() {
-        check_comment_preservation(&orig_tokens, &fmt_tokens, original, formatted)?;
-        check_critical_syntax_patterns(original, formatted, &orig_significant, &fmt_significant)?;
+    check_comment_preservation(orig_tokens, fmt_tokens, original, formatted)?;
+    check_critical_syntax_patterns(original, formatted, &orig_lexemes, &fmt_lexemes)?;
 
-        for (i, (orig_tok, fmt_tok)) in orig_significant
+    let matched = align_significant_tokens(&orig, &fmt, original, formatted)
+        .map_err(|at| token_mismatch_message(&orig_lexemes, &fmt_lexemes, at))?;
+    let streams = TokenStreams {
+        original,
+        formatted,
+        orig_tokens,
+        fmt_tokens,
+    };
+    check_batch_separators(&streams, &orig, &fmt, &matched, dialect)?;
+    check_sqlcmd_lines(&streams, dialect)?;
+    check_tokens_kept_together(&orig, &fmt, &matched, original, formatted)
+}
+
+/// Rejects `formatted` where the sqlcmd command lines
+/// ([`parser::sqlcmd_command_line`]) differ from the original's: sqlcmd
+/// reads a command only from its own line, as written.
+fn check_sqlcmd_lines(
+    streams: &TokenStreams<'_>,
+    dialect: &dyn dialect::Dialect,
+) -> Result<(), String> {
+    let lines = |source: &'_ str, tokens: &[Token]| -> Vec<String> {
+        tokens
             .iter()
-            .zip(fmt_significant.iter())
-            .enumerate()
-        {
-            if !orig_tok.eq_ignore_ascii_case(fmt_tok) {
-                return Err(format!(
-                    "Token content mismatch at position {}!\n\
-                     Original token: '{}'\n\
-                     Formatted token: '{}'\n\
-                     \n\
-                     Token counts match but content differs - this indicates semantic changes!\n\
-                     First 10 tokens: {:?}\n\
-                     Context around position {}: {:?}",
-                    i,
-                    orig_tok,
-                    fmt_tok,
-                    &orig_significant[..orig_significant.len().min(10)],
-                    i,
-                    &orig_significant[i.saturating_sub(3)..(i + 4).min(orig_significant.len())]
-                ));
+            .filter_map(|tok| {
+                let line = parser::sqlcmd_command_line(source, tokens, tok, dialect)?;
+                source
+                    .get(tok.span.start as usize..line.end as usize)
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    let kept = lines(streams.original, streams.orig_tokens);
+    let written = lines(streams.formatted, streams.fmt_tokens);
+    match kept.iter().zip(&written).find(|(k, w)| k != w) {
+        Some((k, w)) => Err(format!(
+            "sqlcmd command line changed: `{k}` is written `{w}`."
+        )),
+        None if kept.len() != written.len() => Err(format!(
+            "sqlcmd command lines changed: {} in the original, {} formatted.",
+            kept.len(),
+            written.len()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The original and formatted text with every token the lexer read in each.
+struct TokenStreams<'s> {
+    original: &'s str,
+    formatted: &'s str,
+    orig_tokens: &'s [Token],
+    fmt_tokens: &'s [Token],
+}
+
+/// Rejects `formatted` where a batch separator is not the original's own
+/// ([`parser::is_batch_separator`]): a `go` name set alone on its line ends
+/// the batch there for `sqlcmd` and SSMS, and a separator moved off its line
+/// joins two batches. A line the original starts with `GO`, separator or
+/// not ([`parser::go_line_start`]), must start a line in the output too.
+fn check_batch_separators(
+    streams: &TokenStreams<'_>,
+    orig: &[&Token],
+    fmt: &[&Token],
+    matched: &[usize],
+    dialect: &dyn dialect::Dialect,
+) -> Result<(), String> {
+    let TokenStreams {
+        original,
+        formatted,
+        orig_tokens,
+        fmt_tokens,
+    } = *streams;
+    let line_of = |tok: &Token| formatted[..tok.span.start as usize].matches('\n').count() + 1;
+    let kept: Vec<usize> = orig
+        .iter()
+        .zip(matched)
+        .filter(|(tok, _)| parser::is_batch_separator(original, orig_tokens, tok, dialect))
+        .map(|(_, at)| *at)
+        .collect();
+    let written: Vec<usize> = fmt
+        .iter()
+        .enumerate()
+        .filter(|(_, tok)| parser::is_batch_separator(formatted, fmt_tokens, tok, dialect))
+        .map(|(at, _)| at)
+        .collect();
+    if kept != written {
+        let message = match written.iter().find(|at| !kept.contains(at)) {
+            Some(at) => format!(
+                "Batch separator added: `{}` stands alone on formatted line {}, where sqlcmd and SSMS end the batch.",
+                fmt[*at].lexeme(formatted),
+                line_of(fmt[*at]),
+            ),
+            None => "Batch separator lost: a GO that stood alone on its line no longer does."
+                .to_string(),
+        };
+        return Err(message);
+    }
+    let joined = orig.iter().zip(matched).find(|(tok, at)| {
+        parser::go_line_start(original, orig_tokens, tok, dialect).is_some()
+            && parser::go_line_start(formatted, fmt_tokens, fmt[**at], dialect).is_none()
+    });
+    match joined {
+        Some((_, at)) => Err(format!(
+            "GO line joined: the `{}` that starts its line in the original does not start formatted line {}.",
+            fmt[*at].lexeme(formatted),
+            line_of(fmt[*at]),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Whether two tokens are the same token: words compare without regard to
+/// case (keyword and identifier casing are formatter options), a string or
+/// a quoted name byte for byte.
+fn same_token(orig: &Token, orig_lexeme: &str, fmt_lexeme: &str) -> bool {
+    let exact = matches!(
+        orig.kind,
+        TokenKind::Literal(LiteralKind::String | LiteralKind::StringFragment)
+            | TokenKind::Identifier {
+                kind: IdentifierKind::Quoted,
+                ..
+            }
+    );
+    if exact {
+        orig_lexeme == fmt_lexeme
+    } else {
+        orig_lexeme.eq_ignore_ascii_case(fmt_lexeme)
+    }
+}
+
+/// How many tokens at `fmt[j]` the formatter inserted before the original's
+/// token `orig[i]`, by the normalizations it makes: an `AS` before an alias,
+/// `INNER` before a bare `JOIN`, `OUTER` after `LEFT` / `RIGHT` / `FULL`.
+/// Zero if none.
+fn inserted_token_count(orig: &[&str], fmt: &[&str], i: usize, j: usize) -> usize {
+    let is = |s: Option<&&str>, w: &str| s.is_some_and(|s| s.eq_ignore_ascii_case(w));
+    let before_orig = |k: usize| {
+        fmt.get(k)
+            .zip(orig.get(i))
+            .is_some_and(|(f, o)| f.eq_ignore_ascii_case(o))
+    };
+    let previous = i.checked_sub(1).and_then(|p| orig.get(p));
+    if is(fmt.get(j), "AS") && before_orig(j + 1) {
+        return 1;
+    }
+    if is(fmt.get(j), "INNER") && is(orig.get(i), "JOIN") && before_orig(j + 1) {
+        return 1;
+    }
+    let outer_join_side = ["LEFT", "RIGHT", "FULL"].iter().any(|w| is(previous, w));
+    if is(fmt.get(j), "OUTER") && outer_join_side && is(orig.get(i), "JOIN") && before_orig(j + 1) {
+        return 1;
+    }
+    0
+}
+
+/// Pairs each significant token of the original with the formatted token
+/// that is the same ([`same_token`]), allowing only the formatter's
+/// insertions ([`inserted_token_count`]) and a `;` added at the end. Returns
+/// the formatted index of each original token, or the original index at
+/// which the two diverge.
+fn align_significant_tokens(
+    orig: &[&Token],
+    fmt: &[&Token],
+    orig_src: &str,
+    fmt_src: &str,
+) -> Result<Vec<usize>, usize> {
+    let orig_lexemes: Vec<&str> = orig.iter().map(|t| t.lexeme(orig_src)).collect();
+    let fmt_lexemes: Vec<&str> = fmt.iter().map(|t| t.lexeme(fmt_src)).collect();
+    let mut matched = Vec::with_capacity(orig.len());
+    let mut j = 0;
+    for (i, tok) in orig.iter().enumerate() {
+        loop {
+            let Some(fmt_lexeme) = fmt_lexemes.get(j) else {
+                return Err(i);
+            };
+            if same_token(tok, orig_lexemes[i], fmt_lexeme) {
+                break;
+            }
+            match inserted_token_count(&orig_lexemes, &fmt_lexemes, i, j) {
+                0 => return Err(i),
+                n => j += n,
             }
         }
+        matched.push(j);
+        j += 1;
+    }
+    let rest = &fmt_lexemes[j.min(fmt_lexemes.len())..];
+    let semicolon_added = rest == [";"] && orig_lexemes.last() != Some(&";");
+    if rest.is_empty() || semicolon_added {
+        Ok(matched)
+    } else {
+        Err(orig.len())
+    }
+}
 
-        return Ok(());
+/// The error for token streams that diverge at original index `at`.
+fn token_mismatch_message(orig: &[&str], fmt: &[&str], at: usize) -> String {
+    if orig.len() == fmt.len() {
+        let i = at.min(orig.len().saturating_sub(1));
+        return format!(
+            "Token content mismatch at position {}!\n\
+             Original token: '{}'\n\
+             Formatted token: '{}'\n\
+             \n\
+             Token counts match but content differs - this indicates semantic changes!\n\
+             This could be value substitution, operator change, or function swap.\n\
+             First 10 tokens: {:?}\n\
+             Context around position {}: {:?}",
+            i,
+            orig.get(i).unwrap_or(&"<none>"),
+            fmt.get(i).unwrap_or(&"<none>"),
+            &orig[..orig.len().min(10)],
+            i,
+            &orig[i.saturating_sub(3)..(i + 4).min(orig.len())]
+        );
     }
 
-    // Token counts differ
-    check_comment_preservation(&orig_tokens, &fmt_tokens, original, formatted)?;
-    check_critical_syntax_patterns(original, formatted, &orig_significant, &fmt_significant)?;
-
-    if is_acceptable_token_difference(&orig_significant, &fmt_significant) {
-        return Ok(());
-    }
-
-    // Find first divergence
     let mut first_diff_idx = 0;
-    for (i, (o, f)) in orig_significant
-        .iter()
-        .zip(fmt_significant.iter())
-        .enumerate()
-    {
+    for (i, (o, f)) in orig.iter().zip(fmt.iter()).enumerate() {
         if !o.eq_ignore_ascii_case(f) {
             first_diff_idx = i;
             break;
         }
         first_diff_idx = i + 1;
     }
-
-    Err(format!(
+    format!(
         "Token count mismatch!\n\
          Original tokens: {} significant tokens\n\
          Formatted tokens: {} significant tokens\n\
@@ -424,18 +548,223 @@ fn verify_formatting_impl_with_dialect(
          \n\
          First 20 original tokens: {:?}\n\
          First 20 formatted tokens: {:?}",
-        orig_significant.len(),
-        fmt_significant.len(),
+        orig.len(),
+        fmt.len(),
         first_diff_idx,
-        orig_significant.get(first_diff_idx).unwrap_or(&"<none>"),
-        fmt_significant.get(first_diff_idx).unwrap_or(&"<none>"),
-        &orig_significant
-            [first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(orig_significant.len())],
-        &fmt_significant
-            [first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(fmt_significant.len())],
-        &orig_significant[..orig_significant.len().min(20)],
-        &fmt_significant[..fmt_significant.len().min(20)]
-    ))
+        orig.get(first_diff_idx).unwrap_or(&"<none>"),
+        fmt.get(first_diff_idx).unwrap_or(&"<none>"),
+        &orig[first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(orig.len())],
+        &fmt[first_diff_idx.saturating_sub(5)..(first_diff_idx + 5).min(fmt.len())],
+        &orig[..orig.len().min(20)],
+        &fmt[..fmt.len().min(20)]
+    )
+}
+
+/// Whether a token of this kind ends in a character that runs on into a
+/// word written against it: a keyword, a name, a number, a boolean, `NULL`,
+/// `$1`, the close of a template expression or statement.
+fn ends_in_word_character(kind: &TokenKind) -> bool {
+    match kind {
+        TokenKind::Keyword(_) | TokenKind::JinjaExprClose | TokenKind::JinjaStmtClose => true,
+        TokenKind::Identifier { kind, .. } => match kind {
+            IdentifierKind::Unquoted
+            | IdentifierKind::AtVariable
+            | IdentifierKind::TempTable
+            | IdentifierKind::DollarQuoteDelimiter => true,
+            IdentifierKind::Quoted => false,
+        },
+        TokenKind::Literal(literal) => match literal {
+            LiteralKind::Number
+            | LiteralKind::Position
+            | LiteralKind::Parameter
+            | LiteralKind::Money
+            | LiteralKind::Boolean
+            | LiteralKind::Null => true,
+            LiteralKind::String | LiteralKind::StringFragment => false,
+        },
+        TokenKind::Operator(_)
+        | TokenKind::Punctuation(_)
+        | TokenKind::LineComment
+        | TokenKind::BlockComment
+        | TokenKind::JinjaComment
+        | TokenKind::JinjaExprOpen
+        | TokenKind::JinjaStmtOpen
+        | TokenKind::JinjaPipe
+        | TokenKind::JinjaTilde
+        | TokenKind::JinjaDoubleStar
+        | TokenKind::JinjaDoubleSlash
+        | TokenKind::JinjaDoubleEq
+        | TokenKind::JinjaAnd
+        | TokenKind::JinjaOr
+        | TokenKind::JinjaNot
+        | TokenKind::JinjaIn
+        | TokenKind::JinjaIs
+        | TokenKind::JinjaTrue
+        | TokenKind::JinjaFalse
+        | TokenKind::JinjaNull
+        | TokenKind::JinjaIf
+        | TokenKind::JinjaElif
+        | TokenKind::JinjaElse
+        | TokenKind::JinjaEndIf
+        | TokenKind::JinjaFor
+        | TokenKind::JinjaEndFor
+        | TokenKind::JinjaSet
+        | TokenKind::JinjaEndSet
+        | TokenKind::JinjaDocs
+        | TokenKind::JinjaEndDocs
+        | TokenKind::JinjaFilter
+        | TokenKind::JinjaEndFilter
+        | TokenKind::JinjaCall
+        | TokenKind::JinjaEndCall
+        | TokenKind::Placeholder
+        | TokenKind::Eof
+        | TokenKind::Unknown => false,
+    }
+}
+
+/// Whether a token of this kind starts with a character a word written
+/// against it runs on into: a keyword, an unquoted name, a number, a
+/// boolean, `NULL`, the open of a template expression or statement.
+fn starts_with_word_character(kind: &TokenKind) -> bool {
+    match kind {
+        TokenKind::Keyword(_) | TokenKind::JinjaExprOpen | TokenKind::JinjaStmtOpen => true,
+        TokenKind::Identifier { kind, .. } => match kind {
+            IdentifierKind::Unquoted | IdentifierKind::DollarQuoteDelimiter => true,
+            IdentifierKind::Quoted | IdentifierKind::AtVariable | IdentifierKind::TempTable => {
+                false
+            }
+        },
+        TokenKind::Literal(literal) => match literal {
+            LiteralKind::Number | LiteralKind::Boolean | LiteralKind::Null => true,
+            LiteralKind::Position
+            | LiteralKind::Parameter
+            | LiteralKind::Money
+            | LiteralKind::String
+            | LiteralKind::StringFragment => false,
+        },
+        TokenKind::Operator(_)
+        | TokenKind::Punctuation(_)
+        | TokenKind::LineComment
+        | TokenKind::BlockComment
+        | TokenKind::JinjaComment
+        | TokenKind::JinjaExprClose
+        | TokenKind::JinjaStmtClose
+        | TokenKind::JinjaPipe
+        | TokenKind::JinjaTilde
+        | TokenKind::JinjaDoubleStar
+        | TokenKind::JinjaDoubleSlash
+        | TokenKind::JinjaDoubleEq
+        | TokenKind::JinjaAnd
+        | TokenKind::JinjaOr
+        | TokenKind::JinjaNot
+        | TokenKind::JinjaIn
+        | TokenKind::JinjaIs
+        | TokenKind::JinjaTrue
+        | TokenKind::JinjaFalse
+        | TokenKind::JinjaNull
+        | TokenKind::JinjaIf
+        | TokenKind::JinjaElif
+        | TokenKind::JinjaElse
+        | TokenKind::JinjaEndIf
+        | TokenKind::JinjaFor
+        | TokenKind::JinjaEndFor
+        | TokenKind::JinjaSet
+        | TokenKind::JinjaEndSet
+        | TokenKind::JinjaDocs
+        | TokenKind::JinjaEndDocs
+        | TokenKind::JinjaFilter
+        | TokenKind::JinjaEndFilter
+        | TokenKind::JinjaCall
+        | TokenKind::JinjaEndCall
+        | TokenKind::Placeholder
+        | TokenKind::Eof
+        | TokenKind::Unknown => false,
+    }
+}
+
+/// Whether two tokens written against each other read as one piece of text,
+/// so that setting them apart changes what the text says: word characters
+/// on both sides (`0x41` lexed as `0` and `x41`, a template expression and
+/// the name written against it), or an unquoted word and the string it
+/// prefixes (`X'41'`, `N'…'`, `_utf8mb4'…'`), or a dollar-quote delimiter
+/// and a string written against it.
+fn reads_as_one_with(left: &TokenKind, right: &TokenKind) -> bool {
+    let prefixes_string = matches!(
+        left,
+        TokenKind::Identifier {
+            kind: IdentifierKind::Unquoted | IdentifierKind::DollarQuoteDelimiter,
+            ..
+        }
+    ) && matches!(
+        right,
+        TokenKind::Literal(LiteralKind::String | LiteralKind::StringFragment)
+    );
+    prefixes_string || (ends_in_word_character(left) && starts_with_word_character(right))
+}
+
+/// Rejects formatted text that sets apart two tokens the original writes
+/// against each other where they read as one ([`reads_as_one_with`]).
+/// `matched[i]` is the formatted index of original token `i`.
+fn check_tokens_kept_together(
+    orig: &[&Token],
+    fmt: &[&Token],
+    matched: &[usize],
+    orig_src: &str,
+    fmt_src: &str,
+) -> Result<(), String> {
+    let touches = |a: &Token, b: &Token| a.span.end == b.span.start;
+    for (i, pair) in orig.windows(2).enumerate() {
+        let (left, right) = (pair[0], pair[1]);
+        if !touches(left, right) || !reads_as_one_with(&left.kind, &right.kind) {
+            continue;
+        }
+        // A template statement (`{% … %}`) renders nothing: the word after
+        // it reads against the word before it only if both touch the tag.
+        if matches!(left.kind, TokenKind::JinjaStmtClose) {
+            let open = orig[..i]
+                .iter()
+                .rposition(|t| matches!(t.kind, TokenKind::JinjaStmtOpen));
+            let word_before = open.and_then(|k| k.checked_sub(1)).is_some_and(|k| {
+                touches(orig[k], orig[k + 1]) && ends_in_word_character(&orig[k].kind)
+            });
+            if !word_before {
+                continue;
+            }
+        }
+        if matches!(right.kind, TokenKind::JinjaStmtOpen) {
+            let close = orig[i + 1..]
+                .iter()
+                .position(|t| matches!(t.kind, TokenKind::JinjaStmtClose))
+                .map(|k| i + 1 + k);
+            let word_after = close.is_some_and(|k| {
+                orig.get(k + 1).is_some_and(|next| {
+                    touches(orig[k], next) && starts_with_word_character(&next.kind)
+                })
+            });
+            if !word_after {
+                continue;
+            }
+        }
+        let (fl, fr) = (matched[i], matched[i + 1]);
+        if fr == fl + 1 && fmt[fl].span.end == fmt[fr].span.start {
+            continue;
+        }
+        let written = orig_src
+            .get(left.span.start as usize..right.span.end as usize)
+            .unwrap_or("");
+        let printed = fmt_src
+            .get(fmt[fl].span.start as usize..fmt[fr].span.end as usize)
+            .unwrap_or("");
+        return Err(format!(
+            "Token separation detected!\n\
+             Original: {:?}\n\
+             Formatted: {:?}\n\
+             \n\
+             The original writes these tokens against each other; set apart, they read differently.",
+            written, printed
+        ));
+    }
+    Ok(())
 }
 
 /// Check that all comments from the original are preserved in the formatted output.
@@ -752,114 +1081,4 @@ fn check_critical_syntax_patterns(
     }
 
     Ok(())
-}
-
-/// Check if token differences are acceptable SQL normalizations.
-///
-/// Returns true for known safe transformations like:
-/// - JOIN -> INNER JOIN
-/// - LEFT JOIN -> LEFT OUTER JOIN
-/// - Adding optional AS keyword before aliases
-/// - Adding trailing semicolon
-fn is_acceptable_token_difference(orig: &[&str], fmt: &[&str]) -> bool {
-    // Quick check: if formatted has fewer tokens, definitely not acceptable
-    if fmt.len() < orig.len() {
-        return false;
-    }
-
-    let token_diff = fmt.len() - orig.len();
-
-    // Normalization 0: Trailing semicolon addition
-    // If the only difference is a trailing semicolon, that's OK
-    if token_diff == 1 {
-        // Check if formatted ends with semicolon and original doesn't
-        let fmt_ends_with_semi = !fmt.is_empty() && fmt[fmt.len() - 1] == ";";
-        let orig_ends_with_semi = !orig.is_empty() && orig[orig.len() - 1] == ";";
-
-        if fmt_ends_with_semi && !orig_ends_with_semi {
-            // Check that everything before the semicolon matches
-            let fmt_without_semi = &fmt[..fmt.len() - 1];
-            if orig == fmt_without_semi {
-                return true;
-            }
-        }
-    }
-
-    // Normalization 1: Combined check for multiple acceptable transformations
-    // (AS additions, TABLE() unwrapping, etc.)
-    if is_only_acceptable_normalizations(orig, fmt) {
-        return true;
-    }
-
-    // Normalization 2: JOIN -> INNER JOIN (avoid string allocation)
-    if has_token_sequence(orig, &["JOIN"]) && has_token_sequence(fmt, &["INNER", "JOIN"]) {
-        return true;
-    }
-
-    // Normalization 3: LEFT/RIGHT/FULL JOIN -> LEFT/RIGHT/FULL OUTER JOIN
-    if (has_token_sequence(orig, &["LEFT", "JOIN"])
-        && has_token_sequence(fmt, &["LEFT", "OUTER", "JOIN"]))
-        || (has_token_sequence(orig, &["RIGHT", "JOIN"])
-            && has_token_sequence(fmt, &["RIGHT", "OUTER", "JOIN"]))
-        || (has_token_sequence(orig, &["FULL", "JOIN"])
-            && has_token_sequence(fmt, &["FULL", "OUTER", "JOIN"]))
-    {
-        return true;
-    }
-
-    // Normalization 4: UNPIVOT -> UNPIVOT EXCLUDE NULLS
-    if has_token_sequence(orig, &["UNPIVOT"])
-        && has_token_sequence(fmt, &["UNPIVOT", "EXCLUDE", "NULLS"])
-    {
-        return true;
-    }
-
-    false
-}
-
-/// Check if token sequence contains a pattern (case-insensitive).
-fn has_token_sequence(tokens: &[&str], pattern: &[&str]) -> bool {
-    if pattern.is_empty() || tokens.len() < pattern.len() {
-        return false;
-    }
-    tokens.windows(pattern.len()).any(|window| {
-        window
-            .iter()
-            .zip(pattern)
-            .all(|(t, p)| t.eq_ignore_ascii_case(p))
-    })
-}
-
-/// Check if the formatted token stream differs from original only by acceptable normalizations:
-/// - AS keyword insertions before aliases
-fn is_only_acceptable_normalizations(orig: &[&str], fmt: &[&str]) -> bool {
-    let mut orig_idx = 0;
-    let mut fmt_idx = 0;
-    let mut normalizations = 0;
-
-    while orig_idx < orig.len() && fmt_idx < fmt.len() {
-        // If tokens match, advance both
-        if orig[orig_idx].eq_ignore_ascii_case(fmt[fmt_idx]) {
-            orig_idx += 1;
-            fmt_idx += 1;
-            continue;
-        }
-
-        // Check for AS keyword insertion
-        if fmt[fmt_idx].eq_ignore_ascii_case("AS")
-            && fmt_idx + 1 < fmt.len()
-            && orig_idx < orig.len()
-            && fmt[fmt_idx + 1].eq_ignore_ascii_case(orig[orig_idx])
-        {
-            normalizations += 1;
-            fmt_idx += 1; // Skip the AS keyword in formatted
-            continue;
-        }
-
-        // Tokens don't match and it's not an acceptable normalization
-        return false;
-    }
-
-    // Verify we consumed all tokens and found at least one normalization
-    orig_idx == orig.len() && fmt_idx == fmt.len() && normalizations > 0
 }

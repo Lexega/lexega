@@ -7,7 +7,7 @@
 //! - CREATE EXTERNAL ACCESS INTEGRATION parsing and formatting
 //! - ALTER EXTERNAL ACCESS INTEGRATION parsing and formatting
 //! - DROP EXTERNAL ACCESS INTEGRATION parsing and formatting
-//! - Risk analysis signals for External Access Integration (SNW-EXTACC-*)
+//! - Risk analysis findings for External Access Integration (SNW-EXTACC-*)
 
 use lexega_core::{
     analyzer::RuleMatch, format_sql_with_config, verify_formatting_safe, FormatterConfig,
@@ -20,12 +20,12 @@ use std::collections::HashSet;
 // Helper Functions
 // =============================================================================
 
-/// Helper to extract rule IDs from signals
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+/// Helper to extract rule IDs from findings
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
@@ -33,7 +33,17 @@ fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
 /// Helper to run analysis and get rule IDs
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
+        Err(e) => {
+            eprintln!("Parse error: {:?}", e);
+            HashSet::new()
+        }
+    }
+}
+
+fn analyze_and_get_context(sql: &str) -> HashSet<String> {
+    match analyze_risk(sql) {
+        Ok(report) => extract_rule_ids(&report.context),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -300,7 +310,7 @@ fn test_drop_integration_short_form() {
 }
 
 // =============================================================================
-// RISK ANALYSIS - Signal Tests (SNW-EXTACC-*)
+// RISK ANALYSIS - Finding Tests (SNW-EXTACC-*)
 // =============================================================================
 
 #[test]
@@ -416,7 +426,7 @@ fn test_snw_extacc_comment_chg() {
     // SNW-EXTACC-COMMENT-CHG: External access comment changed
     let sql = "ALTER EXTERNAL ACCESS INTEGRATION my_ext_access SET COMMENT = 'New comment';";
 
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-EXTACC-COMMENT-CHG"),
         "SNW-EXTACC-COMMENT-CHG should fire for comment changed. Got: {:?}",
@@ -429,7 +439,7 @@ fn test_snw_extacc_tag_add() {
     // SNW-EXTACC-TAG-ADD: Tag added to external access integration
     let sql = "ALTER EXTERNAL ACCESS INTEGRATION my_ext_access SET TAG env = 'prod';";
 
-    let rules = analyze_and_get_rules(sql);
+    let rules = analyze_and_get_context(sql);
     assert!(
         rules.contains("SNW-EXTACC-TAG-ADD"),
         "SNW-EXTACC-TAG-ADD should fire for tag added. Got: {:?}",
@@ -456,7 +466,7 @@ fn test_snw_extacc_tag_rmv() {
 
 #[test]
 fn test_multi_statement_external_access_integration() {
-    // Test that multiple statements in one script all produce distinct signals
+    // Test that multiple statements in one script all produce distinct findings
     let sql = r#"
         CREATE EXTERNAL ACCESS INTEGRATION ext1
           ALLOWED_NETWORK_RULES = (rule1)
@@ -469,8 +479,8 @@ fn test_multi_statement_external_access_integration() {
 
     let report = analyze_risk(sql).expect("Should analyze multi-statement");
 
-    // Should have signals for all three statements
-    let rules = extract_rule_ids(&report.signals);
+    // Should have findings for all three statements
+    let rules = extract_rule_ids(&report.findings);
 
     assert!(
         rules.contains("SNW-EXTACC-NEW"),

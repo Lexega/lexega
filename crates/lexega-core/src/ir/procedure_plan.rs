@@ -23,12 +23,13 @@
 //! is a renamed rule verdict.
 
 use crate::ast::{
-    AstAlterProcedure, AstAlterProcedureActionKind, AstCreateProcedureStmt, AstDrop, AstStmt,
-    ExecuteAsMode, NodeId,
+    AstAlterProcedure, AstAlterProcedureActionKind, AstCreateMssqlTrigger, AstCreateMysqlTrigger,
+    AstCreateProcedureStmt, AstDefinitionVerb, AstDrop, AstStmt, ExecuteAsMode, NodeId,
 };
+use crate::context::node_metadata::IdentKey;
 use crate::ir::dynamic_sql::{
-    classify_execute_immediate_parameterization, collect_inner_stmts_from_expr, DynamicSqlArgIr,
-    DynamicSqlCallIr, DynamicSqlParameterizationIr, DynamicSqlSurfaceIr,
+    collect_inner_stmts_from_expr, parameter_keys, push_sql_run, push_sql_runs_held_in_values,
+    DynamicSqlCallIr,
 };
 use crate::lexer::token::Span;
 
@@ -37,13 +38,18 @@ pub struct ProcedurePlan {
     pub action: ProcedureAction,
     pub target: Option<ProcedureTarget>,
     pub options: ProcedureOptions,
-    /// Some only when `action == Create` and the body was parseable.
+    /// Some only for a statement that defines the body (`CREATE`, or a
+    /// T-SQL `ALTER` restating it) and only when the body was parseable.
     pub create_body: Option<ProcedureBodyShape>,
-    /// Non-empty only when `action == Alter`.
+    /// Non-empty only for an `ALTER` of a procedure's properties.
     pub alter_actions: Vec<ProcedureAlterActionShape>,
     /// MySQL `DEFINER =` security context, when present on a CREATE.
     /// The body runs under this account's privileges.
     pub definer: Option<crate::ir::DefinerLowered>,
+    /// For a statement that defines the procedure: the rights it runs
+    /// with, its `EXECUTE AS` or else the dialect's default (Snowflake:
+    /// owner). `None` where neither says, and for any other statement.
+    pub runs_as: Option<ExecuteAsMode>,
     pub node_id: NodeId,
     pub span: Span,
 }
@@ -152,6 +158,12 @@ pub enum ProcedurePropertyKeyIr {
     Other,
 }
 
+/// A routine's body block, unless it did not parse (an `AstStmt::Error`
+/// over the whole body, counted as a statement not analysed).
+pub(crate) fn parsed_body(body: Option<&AstStmt>) -> Option<&AstStmt> {
+    body.filter(|b| !matches!(b, AstStmt::Error { .. }))
+}
+
 /// Lower a typed [`AstCreateProcedureStmt`] into a [`ProcedurePlan`].
 pub fn lower_create_procedure_to_procedure_plan(
     s: &AstCreateProcedureStmt,
@@ -162,12 +174,29 @@ pub fn lower_create_procedure_to_procedure_plan(
     // *or* the prelude carried an EXECUTE AS clause — the latter is a
     // policy-relevant property on its own (PROC-EXECAS-* rules) and
     // shouldn't be lost when the body is opaque.
-    let create_body = if s.body_stmt.is_some() || s.execute_as_mode.is_some() {
-        let mut shape = s
-            .body_stmt
-            .as_deref()
-            .map(|b| project_create_body(b, source, reasoning))
-            .unwrap_or_default();
+    let body_stmt = parsed_body(s.body_stmt.as_deref());
+    let parameters = parameter_keys(s.params.iter().map(|p| p.name_span), source);
+    let runs_as = s.execute_as_mode.or_else(|| {
+        crate::ir::normalize::dialect_in_force()
+            .procedure_runs_as_owner_by_default()
+            .then_some(ExecuteAsMode::Owner)
+    });
+    let create_body = if body_stmt.is_some()
+        || !s.body_statements.is_empty()
+        || s.execute_as_mode.is_some()
+    {
+        let mut shape = match body_stmt {
+            Some(b) => {
+                project_create_body(b, std::slice::from_ref(b), source, reasoning, &parameters)
+            }
+            None if s.body_statements.is_empty() => ProcedureBodyShape::default(),
+            None => {
+                // The body's classifier is seeded with the routine itself,
+                // whose body is the statement list.
+                let routine = AstStmt::CreateProcedure(Box::new(s.clone()));
+                project_create_body(&routine, &s.body_statements, source, reasoning, &parameters)
+            }
+        };
         shape.execute_as_mode = s.execute_as_mode;
         Some(shape)
     } else {
@@ -175,7 +204,10 @@ pub fn lower_create_procedure_to_procedure_plan(
     };
 
     ProcedurePlan {
-        action: ProcedureAction::Create,
+        action: match s.verb {
+            AstDefinitionVerb::Create | AstDefinitionVerb::CreateOrAlter => ProcedureAction::Create,
+            AstDefinitionVerb::Alter => ProcedureAction::Alter,
+        },
         target: Some(target_from_span(source, s.name_span)),
         options: ProcedureOptions {
             or_replace: s.or_replace_span.is_some(),
@@ -189,6 +221,7 @@ pub fn lower_create_procedure_to_procedure_plan(
             .definer
             .as_ref()
             .map(|d| crate::ir::lower_definer(d, source)),
+        runs_as,
         node_id: s.node_id,
         span: s.span,
     }
@@ -218,6 +251,7 @@ pub fn lower_alter_procedure_to_procedure_plan(
         create_body: None,
         alter_actions: vec![action_shape],
         definer: None,
+        runs_as: None,
         node_id: s.node_id,
         span: s.span,
     }
@@ -234,7 +268,12 @@ pub fn lower_drop_procedure_to_procedure_plan(s: &AstDrop, source: &str) -> Opti
     if !text.trim().eq_ignore_ascii_case("PROCEDURE") {
         return None;
     }
-    let target = s.target_name_span.map(|sp| target_from_span(source, sp));
+    let target = s
+        .targets
+        .first()
+        .map(|target| &target.name)
+        .or(s.target_name.as_ref())
+        .map(|name| target_from_name(source, name));
     Some(ProcedurePlan {
         action: ProcedureAction::Drop,
         target,
@@ -247,6 +286,7 @@ pub fn lower_drop_procedure_to_procedure_plan(s: &AstDrop, source: &str) -> Opti
         create_body: None,
         alter_actions: Vec::new(),
         definer: None,
+        runs_as: None,
         node_id: s.node_id,
         span: s.span,
     })
@@ -350,10 +390,52 @@ fn project_properties_clause(source: &str, span: Span) -> ProcedurePropertiesSha
     ProcedurePropertiesShape { keys }
 }
 
-fn project_create_body(
-    body: &AstStmt,
+/// The body of a T-SQL trigger, projected as a procedure's body is; `None`
+/// for a trigger without body statements.
+pub(crate) fn project_mssql_trigger_body(
+    s: &AstCreateMssqlTrigger,
     source: &str,
     reasoning: &dyn crate::facts::reasoning::ScriptReasoning,
+) -> Option<ProcedureBodyShape> {
+    if s.body.is_empty() {
+        return None;
+    }
+    // The body's classifier is seeded with the trigger, whose body is the
+    // statement list.
+    let trigger = AstStmt::CreateMssqlTrigger(Box::new(s.clone()));
+    // A trigger takes no parameters.
+    let mut shape = project_create_body(&trigger, &s.body, source, reasoning, &[]);
+    shape.execute_as_mode = s.execute_as_mode;
+    Some(shape)
+}
+
+/// The body of a MySQL trigger, projected as a procedure's body is; `None`
+/// for a trigger whose body was not parsed.
+pub(crate) fn project_mysql_trigger_body(
+    s: &AstCreateMysqlTrigger,
+    source: &str,
+    reasoning: &dyn crate::facts::reasoning::ScriptReasoning,
+) -> Option<ProcedureBodyShape> {
+    let body = parsed_body(s.body_stmt.as_deref())?;
+    // A trigger takes no parameters.
+    Some(project_create_body(
+        body,
+        std::slice::from_ref(body),
+        source,
+        reasoning,
+        &[],
+    ))
+}
+
+/// Project the body `stmts`; `seed` is what the body's dynamic-SQL
+/// classifier reads its assignments from (the body, or the routine
+/// holding it), `parameters` the routine's.
+fn project_create_body(
+    seed: &AstStmt,
+    stmts: &[AstStmt],
+    source: &str,
+    reasoning: &dyn crate::facts::reasoning::ScriptReasoning,
+    parameters: &[IdentKey],
 ) -> ProcedureBodyShape {
     let mut kinds: Vec<ProcedureBodyStatementKindIr> = Vec::new();
     let mut calls: Vec<DynamicSqlCallIr> = Vec::new();
@@ -362,15 +444,18 @@ fn project_create_body(
     // it was built with (Unknown → Concat / Format / Literal), so the
     // walk below reports via-variable dynamic SQL by how it was
     // assembled.
-    let classifier = reasoning.dynamic_sql_for_body(body);
-    collect_body_statement_kinds(
-        body,
-        &mut kinds,
-        &mut count,
-        &mut calls,
-        classifier.as_ref(),
-        source,
-    );
+    let classifier = reasoning.dynamic_sql_for_body(seed);
+    for stmt in stmts {
+        collect_body_statement_kinds(
+            stmt,
+            &mut kinds,
+            &mut count,
+            &mut calls,
+            classifier.as_ref(),
+            source,
+            parameters,
+        );
+    }
     ProcedureBodyShape {
         statement_kinds: kinds,
         statements_count: count,
@@ -393,7 +478,8 @@ fn push_kind(kinds: &mut Vec<ProcedureBodyStatementKindIr>, k: ProcedureBodyStat
 ///
 /// Closed-enum exhaustive over [`AstStmt`] (no `_ =>` arm). Adding a
 /// new [`AstStmt`] variant breaks this build and forces a deliberate
-/// recursion-or-leaf decision.
+/// decision on what it counts; the bodies it holds are
+/// [`AstStmt::bodies`]'s.
 fn collect_body_statement_kinds(
     stmt: &AstStmt,
     kinds: &mut Vec<ProcedureBodyStatementKindIr>,
@@ -401,208 +487,40 @@ fn collect_body_statement_kinds(
     dynamic_sql_calls: &mut Vec<DynamicSqlCallIr>,
     taint: &dyn crate::facts::reasoning::DynamicSqlClassifier,
     source: &str,
+    parameters: &[IdentKey],
 ) {
+    // A body nested deeper than the stack lets the analyzer walk is not read.
+    let Some(_frame) = crate::ir::lower::enter_nested() else {
+        return;
+    };
     match stmt {
         // ───────── Trigger leaves ─────────
-        AstStmt::ExecuteImmediate {
-            node_id,
-            span,
-            sql_expr,
-            using_span,
-            using_args,
-            ..
-        } => {
+        AstStmt::ExecuteImmediate { .. } => {
             push_kind(kinds, ProcedureBodyStatementKindIr::ExecuteImmediate);
             *count += 1;
-            dynamic_sql_calls.push(DynamicSqlCallIr {
-                surface: DynamicSqlSurfaceIr::ExecuteImmediate,
-                // Resolve a bare variable argument through the body's
-                // classifier (`v := '…' || x; EXECUTE v;` → Concat).
-                argument: taint.classify_arg(sql_expr, source),
-                splices: taint.classify_arg_splices(sql_expr, source),
-                parameterization: classify_execute_immediate_parameterization(
-                    using_args,
-                    *using_span,
-                ),
-                node_id: *node_id,
-                source_span: *span,
-                argument_span: Some(sql_expr.span()),
-                provenance: Vec::new(),
-            });
+            push_sql_run(stmt, dynamic_sql_calls, taint, source, parameters);
         }
-        AstStmt::PgPrepare(p) => {
+        // MySQL's `PREPARE … FROM <expr>`, T-SQL's `EXEC (…)` and `EXEC
+        // sp_executesql …` run SQL text; PostgreSQL's `PREPARE … AS` and an
+        // `EXEC` of another procedure do not.
+        AstStmt::PgPrepare(_) | AstStmt::MssqlExec(_) => {
             *count += 1;
-            // PostgreSQL form (`PREPARE … AS <stmt>`) — body is the
-            // parsed statement; no dynamic-SQL injection vector at the
-            // PREPARE site itself. MySQL form (`PREPARE … FROM <expr>`)
-            // — the FROM expression is the dynamic-SQL string under
-            // construction; classify its shape.
-            if let Some(from_expr) = &p.from_expr {
-                // Resolve a bare variable argument through the body's
-                // classifier, same as the EXECUTE IMMEDIATE arm above.
-                let argument = taint.classify_arg(from_expr, source);
-                dynamic_sql_calls.push(DynamicSqlCallIr {
-                    surface: DynamicSqlSurfaceIr::Prepare,
-                    argument,
-                    splices: taint.classify_arg_splices(from_expr, source),
-                    parameterization: DynamicSqlParameterizationIr::NotApplicable,
-                    node_id: p.node_id,
-                    source_span: p.span,
-                    argument_span: Some(from_expr.span()),
-                    provenance: Vec::new(),
-                });
-            }
+            push_sql_run(stmt, dynamic_sql_calls, taint, source, parameters);
         }
-        AstStmt::MssqlExec(e) => {
-            *count += 1;
-            // EXEC has two forms: dynamic `EXEC(@sql)` (no proc name) and
-            // procedure call `EXEC proc_name [args]`. Only the dynamic form
-            // and the parameterized `sp_executesql` form are dynamic-SQL
-            // surfaces; ordinary EXEC <proc_name> calls do not emit.
-            let variable = crate::ir::dynamic_sql::mssql_exec_bare_variable(e.args_span, source)
-                .and_then(|name| taint.variable_shape(name));
-            match e.procedure_name_span {
-                None => {
-                    // Prefer the parser-lifted argument expression so a
-                    // direct `EXEC('…' + @v)` concat classifies (and yields
-                    // splice positions) through the same taint taxonomy as
-                    // `EXECUTE IMMEDIATE` / `sp_executesql`. Fall back to the
-                    // bare-`@var` span resolver when the parser could not lift
-                    // the parenthesised expression.
-                    let (argument, splices) = match e.args.first() {
-                        Some(arg) => (
-                            taint.classify_arg(&arg.value, source),
-                            taint.classify_arg_splices(&arg.value, source),
-                        ),
-                        None => variable.unwrap_or((DynamicSqlArgIr::Unknown, Vec::new())),
-                    };
-                    dynamic_sql_calls.push(DynamicSqlCallIr {
-                        surface: DynamicSqlSurfaceIr::MssqlExecDynamic,
-                        argument,
-                        splices,
-                        parameterization: DynamicSqlParameterizationIr::NotApplicable,
-                        node_id: e.node_id,
-                        source_span: e.span,
-                        argument_span: e.args_span,
-                        provenance: Vec::new(),
-                    });
-                }
-                Some(_) => {
-                    if crate::ir::dynamic_sql::is_sp_executesql(e, source) {
-                        dynamic_sql_calls.push(DynamicSqlCallIr {
-                            surface: DynamicSqlSurfaceIr::MssqlSpExecutesql,
-                            // `sp_executesql`'s @stmt SQL string is the first
-                            // argument; classify it through the shared taxonomy
-                            // (a bare @var resolves via the classifier, an inline
-                            // literal is Literal not Unknown, a concat is Concat)
-                            // and recover its splice positions.
-                            argument: e
-                                .args
-                                .first()
-                                .map(|a| taint.classify_arg(&a.value, source))
-                                .unwrap_or(DynamicSqlArgIr::Unknown),
-                            splices: e
-                                .args
-                                .first()
-                                .map(|a| taint.classify_arg_splices(&a.value, source))
-                                .unwrap_or_default(),
-                            parameterization:
-                                crate::ir::dynamic_sql::classify_sp_executesql_parameterization(
-                                    &e.args,
-                                ),
-                            node_id: e.node_id,
-                            source_span: e.span,
-                            argument_span: e.args_span,
-                            provenance: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // ───────── Body-bearing scripting variants — recurse ─────────
-        AstStmt::Block(b) => {
-            for s in &b.decls {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-            for s in &b.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::If(i) => {
-            for br in &i.branches {
-                for s in &br.body {
-                    collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-                }
-            }
-            for s in &i.else_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::CaseStmt(c) => {
-            for br in &c.branches {
-                for s in &br.body {
-                    collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-                }
-            }
-            for s in &c.else_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::While(w) => {
-            for s in &w.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::For(f) => {
-            for s in &f.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::ForEach(f) => {
-            for s in &f.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::Loop(l) => {
-            for s in &l.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::Repeat(r) => {
-            for s in &r.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::DeclareHandler(h) => collect_body_statement_kinds(
-            &h.handler_action,
-            kinds,
-            count,
-            dynamic_sql_calls,
-            taint,
-            source,
-        ),
-        AstStmt::MssqlTryCatch(t) => {
-            for s in &t.try_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-            for s in &t.catch_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::MssqlIf(i) => {
-            for s in &i.then_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-            for s in &i.else_body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
-        AstStmt::MssqlWhile(w) => {
-            for s in &w.body {
-                collect_body_statement_kinds(s, kinds, count, dynamic_sql_calls, taint, source);
-            }
-        }
+        // ───────── Body-bearing scripting variants ─────────
+        // Their bodies are read below; the statement itself does not count.
+        AstStmt::Block(_)
+        | AstStmt::If(_)
+        | AstStmt::CaseStmt(_)
+        | AstStmt::While(_)
+        | AstStmt::For(_)
+        | AstStmt::ForEach(_)
+        | AstStmt::Loop(_)
+        | AstStmt::Repeat(_)
+        | AstStmt::DeclareHandler(_)
+        | AstStmt::MssqlTryCatch(_)
+        | AstStmt::MssqlIf(_)
+        | AstStmt::MssqlWhile(_) => {}
 
         // RESULTSET / assignment forms can wrap a statement-form EXECUTE
         // IMMEDIATE in expression position (Snowflake scripting:
@@ -611,7 +529,15 @@ fn collect_body_statement_kinds(
         // inner statements, then recurse on each.
         AstStmt::Assign { expr, .. } | AstStmt::Let { expr, .. } => {
             for inner in collect_inner_stmts_from_expr(expr) {
-                collect_body_statement_kinds(inner, kinds, count, dynamic_sql_calls, taint, source);
+                collect_body_statement_kinds(
+                    inner,
+                    kinds,
+                    count,
+                    dynamic_sql_calls,
+                    taint,
+                    source,
+                    parameters,
+                );
             }
         }
 
@@ -630,24 +556,38 @@ fn collect_body_statement_kinds(
                         dynamic_sql_calls,
                         taint,
                         source,
+                        parameters,
                     );
                 }
             }
+        }
+
+        // A T-SQL `INSERT … EXEC` counts, and so does its EXEC (read below).
+        AstStmt::Insert(_) => {
+            *count += 1;
+        }
+
+        // A value a `DECLARE` or `SET` assigns can run SQL text (Snowflake
+        // `DECLARE res RESULTSET DEFAULT (EXECUTE IMMEDIATE :q)`).
+        AstStmt::Declare { .. } | AstStmt::SetVariable { .. } | AstStmt::MysqlSet(_) => {
+            *count += 1;
+            push_sql_runs_held_in_values(stmt, dynamic_sql_calls, taint, source, parameters);
         }
 
         // ───────── Non-body-bearing leaves ─────────
         // Listed exhaustively so the closed-enum contract remains
         // compiler-enforced.
         AstStmt::Select(_)
+        | AstStmt::Perform(_)
         | AstStmt::SetSelect(_)
         | AstStmt::ValuesQuery(_)
-        | AstStmt::Insert(_)
         | AstStmt::ReplaceInto(_)
         | AstStmt::MultiInsert(_)
         | AstStmt::Update(_)
         | AstStmt::Delete(_)
         | AstStmt::Merge(_)
         | AstStmt::Explain(_)
+        | AstStmt::PsqlGexec(_)
         // `EXECUTE IMMEDIATE FROM <stage_file>` loads SQL from an external
         // file; no in-body statement to recurse into. Top-level recognition
         // is handled at the statement dispatch.
@@ -658,7 +598,9 @@ fn collect_body_statement_kinds(
         | AstStmt::JinjaConditionalStmt(_)
         | AstStmt::Error { .. }
         | AstStmt::GoBatchSeparator { .. }
+        | AstStmt::SqlcmdCommand { .. }
         | AstStmt::Reconfigure { .. }
+        | AstStmt::MssqlServerCommand { .. }
         | AstStmt::AlterAccount(_)
         | AstStmt::AlterAggregationPolicy(_)
         | AstStmt::AlterApiIntegration(_)
@@ -794,7 +736,6 @@ fn collect_body_statement_kinds(
         | AstStmt::CreateView(_)
         | AstStmt::CreateVolume(_)
         | AstStmt::CreateWarehouse(_)
-        | AstStmt::Declare { .. }
         | AstStmt::DeclareCondition { .. }
         | AstStmt::DeclareCursor { .. }
         | AstStmt::DeclareTable { .. }
@@ -821,6 +762,7 @@ fn collect_body_statement_kinds(
         | AstStmt::DropExternalLocation(_)
         | AstStmt::DropMaskingPolicy(_)
         | AstStmt::DropMssqlTrigger(_)
+        | AstStmt::MssqlTriggerState(_)
         | AstStmt::DropNetworkPolicy(_)
         | AstStmt::DropPasswordPolicy(_)
         | AstStmt::DropPgPolicy(_)
@@ -851,7 +793,7 @@ fn collect_body_statement_kinds(
         | AstStmt::MssqlPrint(_)
         | AstStmt::MssqlRaiserror(_)
         | AstStmt::MssqlSetOption(_)
-        | AstStmt::MysqlSet(_)
+        | AstStmt::MysqlUnlockTables(_)
         | AstStmt::MssqlThrow(_)
         | AstStmt::MssqlWaitfor(_)
         | AstStmt::Null { .. }
@@ -868,6 +810,11 @@ fn collect_body_statement_kinds(
         | AstStmt::PgCreateOperator(_)
         | AstStmt::CreatePrincipal(_)
         | AstStmt::PgCreateRule(_)
+        | AstStmt::MssqlCreateRule(_)
+        | AstStmt::MysqlDo(_)
+        | AstStmt::ExecuteTask(_)
+        | AstStmt::MysqlCreateLoadableFunction(_)
+        | AstStmt::MysqlAdmin(_)
         | AstStmt::PgCreateTablespace(_)
         | AstStmt::PgDeallocate(_)
         | AstStmt::PgDiscard(_)
@@ -908,7 +855,7 @@ fn collect_body_statement_kinds(
         | AstStmt::PgAlterDefaultPrivileges(_)
         | AstStmt::Revoke(_)
         | AstStmt::Rollback { .. }
-        | AstStmt::SetVariable { .. }
+        | AstStmt::Savepoint(_)
         | AstStmt::Show(_)
         | AstStmt::Signal { .. }
         | AstStmt::Truncate(_)
@@ -962,6 +909,61 @@ fn collect_body_statement_kinds(
         | AstStmt::Vacuum(_) => {
             *count += 1;
         }
+    }
+    // Every body it holds but that of a procedure, function or trigger
+    // defined in this one.
+    for body in stmt.bodies() {
+        match body.role {
+            crate::ast::BodyRole::Routine if defines_reported_routine(stmt) => continue,
+            crate::ast::BodyRole::Routine
+            | crate::ast::BodyRole::ExceptionHandler
+            | crate::ast::BodyRole::Declarations
+            | crate::ast::BodyRole::Block
+            | crate::ast::BodyRole::Branch
+            | crate::ast::BodyRole::Else
+            | crate::ast::BodyRole::Loop
+            | crate::ast::BodyRole::LoopQuery
+            | crate::ast::BodyRole::Catch
+            | crate::ast::BodyRole::HandlerAction
+            | crate::ast::BodyRole::InsertExec => {}
+        }
+        for s in body.stmts {
+            collect_body_statement_kinds(
+                s,
+                kinds,
+                count,
+                dynamic_sql_calls,
+                taint,
+                source,
+                parameters,
+            );
+        }
+    }
+}
+
+/// Whether `stmt` defines a procedure, function or trigger, whose body is
+/// its own and not that of a routine holding it.
+pub(crate) fn defines_reported_routine(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::CreateProcedure(_)
+            | AstStmt::CreateFunction(_)
+            | AstStmt::CreateMssqlTrigger(_)
+            | AstStmt::CreateMysqlTrigger(_)
+    )
+}
+
+/// The target `name` names, each part as written; a name the parser did
+/// not read as `[[db.]schema.]name` is read from its text.
+fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> ProcedureTarget {
+    let Some((db, schema, name_text)) = crate::ir::utils::routine_name_parts(source, name) else {
+        return target_from_span(source, name.span);
+    };
+    ProcedureTarget {
+        name: name_text,
+        schema,
+        db,
+        span: name.span,
     }
 }
 

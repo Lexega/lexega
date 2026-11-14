@@ -13,7 +13,7 @@
 //! under `ddl`.
 //!
 //! The destination literal is intentionally not surfaced: backup URLs
-//! commonly carry SAS credentials, and the governance signal — backing up to
+//! commonly carry SAS credentials, and the governance concern — backing up to
 //! an offsite object store — is fully captured by the device class.
 //!
 //! Predicate examples:

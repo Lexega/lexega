@@ -158,6 +158,7 @@ impl<'a> Parser<'a> {
                 options_present = true;
                 self.advance()
                     .ok_or_eof(self.current_span(), vec!["OPTIONS".to_string()])?;
+                self.record_option_list_secrets(self.idx);
                 end = self.expect_balanced_parens()?.end;
             }
 

@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod catalog_context;
 pub mod catalog_plan;
 pub mod column;
+pub(crate) mod column_registry;
 pub mod compute_pool_plan;
 pub mod connection_plan;
 pub mod constraint_types;
@@ -96,10 +97,12 @@ pub mod network_rule_plan;
 pub mod normalize;
 pub mod notebook_plan;
 pub mod outer_refs;
+pub mod pairing;
 pub mod pg_copy_plan;
 pub mod pg_default_privileges_plan;
 pub mod pipe_plan;
 pub mod plan;
+pub mod plan_identity;
 pub mod policy_attachment_plan;
 pub mod policy_facts;
 pub mod policy_plan;
@@ -128,6 +131,7 @@ pub mod stage_file_command_plan;
 pub mod stage_plan;
 pub mod statement_facts;
 pub mod statement_plan;
+pub mod statement_values;
 pub mod storage_credential_plan;
 pub mod stream_plan;
 pub mod streamlit_plan;
@@ -173,8 +177,8 @@ pub use backup_plan::{
     lower_backup_to_backup_plan, BackupDestinationKind, BackupTargetKind, MssqlBackupPlan,
 };
 pub use catalog::{
-    ArgShape, CatalogDialect, Determinism, FunctionCatalog, FunctionId, FunctionKind,
-    FunctionSignature, NullBehavior,
+    ArgShape, CatalogDialect, Determinism, DialectCatalogs, FunctionCatalog, FunctionId,
+    FunctionKind, FunctionSignature, NullBehavior, ScriptFunctions,
 };
 pub use catalog_context::{
     CatalogContext, ColumnConstraints, ColumnMetadata, DefaultExpr, EmptyCatalogContext, FkEdge,
@@ -263,6 +267,7 @@ pub use foreign_server_plan::{
     ForeignServerPlan,
 };
 pub use foreign_table_plan::{lower_create_foreign_table_to_plan, ForeignTablePlan};
+pub(crate) use function_plan::lower_loadable_function_to_function_plan;
 pub use function_plan::{
     lower_alter_function_to_function_plan, lower_create_function_to_function_plan,
     lower_create_table_function_to_function_plan, lower_drop_function_to_function_plan,
@@ -335,8 +340,9 @@ pub use network_rule_plan::{
     NetworkRulePlan, NetworkRuleTarget,
 };
 pub use normalize::{
-    is_ignore_quoted_active, normalize_identifier, reset_identifier_case_mode_cache,
-    set_normalization_dialect, CaseFold, NormalizationConfig, QuotedHandling,
+    is_ignore_quoted_active, normalize_identifier, normalize_identifier_as, normalize_string_name,
+    reset_identifier_case_mode_cache, set_normalization_dialect, CaseFold, NameKind,
+    NormalizationConfig, QuotedHandling,
 };
 pub(crate) use notebook_plan::NotebookAlterActionIr;
 pub use notebook_plan::{
@@ -453,7 +459,8 @@ pub use stage_plan::{
     lower_alter_stage_to_stage_plan, lower_copy_into_location_to_stage_plan,
     lower_copy_into_table_to_stage_plan, lower_create_stage_to_stage_plan,
     lower_drop_stage_to_stage_plan, lower_redshift_copy_to_stage_plan, lower_unload_to_stage_plan,
-    StageAction, StageCredentialOption, StageCredentialValue, StageCredentials, StagePlan,
+    StageAction, StageCredentialOption, StageCredentialValue, StageCredentials, StageLocation,
+    StagePlan,
 };
 pub use statement_facts::{
     ForUpdateFact, IntoVarTarget, JinjaFragmentRef, LockStrength, OutputFormat, SelectAsKind,
@@ -501,6 +508,7 @@ pub use tag_plan::{
     lower_undrop_tag_to_tag_plan, TagAction, TagAlterActionIr, TagOptions, TagPlan, TagPolicyRefIr,
     TagTarget,
 };
+pub(crate) use task_plan::lower_execute_task_to_task_plan;
 pub use task_plan::{
     lower_alter_task_to_task_plan, lower_create_task_to_task_plan, lower_drop_task_to_task_plan,
     TaskAction, TaskAlterActionKindIr, TaskAlterActionShape, TaskBodyParseStatusIr,

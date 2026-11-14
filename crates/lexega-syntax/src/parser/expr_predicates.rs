@@ -6,6 +6,7 @@
 //! Handles complex predicates that follow a left-hand expression:
 //! - `expr IS [NOT] NULL`
 //! - `expr IS [NOT] DISTINCT FROM expr`
+//! - `expr IS [NOT] {TRUE | FALSE | UNKNOWN | JSON [type] | [form] NORMALIZED}`
 //! - `expr [NOT] IN (values)` or `expr [NOT] IN (SELECT ...)`
 //! - `expr [NOT] BETWEEN low AND high`
 //! - `expr [NOT] LIKE pattern [ESCAPE char]`
@@ -14,8 +15,9 @@
 //!
 //! Reference: <https://docs.snowflake.com/en/sql-reference/operators>
 
-use crate::ast::AstExpr;
-use crate::error::{ParseError, ParseResult};
+use crate::ast::{AstExpr, AstIsPredicate};
+use crate::dialect::WordOperator;
+use crate::error::{ExpectInvariant, ParseError, ParseResult};
 use crate::lexer::{Keyword, Span, TokenKind};
 use crate::parser::core::Parser;
 
@@ -27,7 +29,37 @@ pub(crate) struct ParsedEscapeClause {
     pub(crate) odbc_span: Option<Span>,
 }
 
+/// What an `IS [NOT]` predicate tests, by the words written after it; a
+/// longer spelling before the shorter one it starts with.
+const IS_PREDICATES: &[(&[&str], AstIsPredicate)] = &[
+    (&["TRUE"], AstIsPredicate::True),
+    (&["FALSE"], AstIsPredicate::False),
+    (&["JSON", "VALUE"], AstIsPredicate::JsonValue),
+    (&["JSON", "ARRAY"], AstIsPredicate::JsonArray),
+    (&["JSON", "OBJECT"], AstIsPredicate::JsonObject),
+    (&["JSON", "SCALAR"], AstIsPredicate::JsonScalar),
+    (&["JSON"], AstIsPredicate::JsonValue),
+    (&["NFC", "NORMALIZED"], AstIsPredicate::NfcNormalized),
+    (&["NFD", "NORMALIZED"], AstIsPredicate::NfdNormalized),
+    (&["NFKC", "NORMALIZED"], AstIsPredicate::NfkcNormalized),
+    (&["NFKD", "NORMALIZED"], AstIsPredicate::NfkdNormalized),
+    (&["NORMALIZED"], AstIsPredicate::NfcNormalized),
+];
+
 impl<'a> Parser<'a> {
+    /// The predicate an `IS [NOT]` tests written from token `i`: what it
+    /// tests, the span of its words and the index past them.
+    fn is_predicate_at(&self, i: usize) -> Option<(AstIsPredicate, Span, usize)> {
+        let (predicate, end) = IS_PREDICATES
+            .iter()
+            .find_map(|(words, predicate)| self.words_end(i, words).map(|end| (*predicate, end)))?;
+        let span = Span {
+            start: self.tokens.get(i)?.span.start,
+            end: self.tokens.get(end.checked_sub(1)?)?.span.end,
+        };
+        Some((predicate, span, end))
+    }
+
     /// Parse an optional escape clause after a LIKE/SIMILAR TO pattern:
     /// `ESCAPE <expr>` or the ODBC escape form `{escape <expr>}`. Returns
     /// `Ok(None)` with the parser position unchanged when neither follows.
@@ -95,6 +127,52 @@ impl<'a> Parser<'a> {
             None => return Ok(expr),
         };
 
+        // Postfix NULL test: <expr> ISNULL, <expr> NOTNULL. The word is the
+        // `IS` of the one and the `NOT` of the other.
+        let is_null_word = matches!(
+            tok.kind,
+            TokenKind::Identifier {
+                word_operator: Some(WordOperator::IsNull),
+                ..
+            }
+        );
+        let not_null_word = matches!(
+            tok.kind,
+            TokenKind::Identifier {
+                word_operator: Some(WordOperator::NotNull),
+                ..
+            }
+        );
+        if is_null_word || not_null_word {
+            let word = self.advance().ok_or_else(|| {
+                ParseError::unexpected_eof(self.current_span(), vec!["ISNULL".to_string()])
+            })?;
+            let before = Span {
+                start: word.span.start,
+                end: word.span.start,
+            };
+            let after = Span {
+                start: word.span.end,
+                end: word.span.end,
+            };
+            let (is_span, not_span) = if not_null_word {
+                (before, Some(word.span))
+            } else {
+                (word.span, None)
+            };
+            return Ok(AstExpr::IsNull {
+                node_id: self.id_gen.next(),
+                span: Span {
+                    start: crate::parser::scripting::expr_span_start(&expr),
+                    end: word.span.end,
+                },
+                expr: Box::new(expr),
+                is_span,
+                not_span,
+                null_span: after,
+            });
+        }
+
         // IS [NOT] NULL or IS [NOT] DISTINCT FROM predicate
         if matches!(tok.kind, TokenKind::Keyword(Keyword::Is)) {
             let is_tok = self.advance().ok_or_else(|| {
@@ -110,6 +188,37 @@ impl<'a> Parser<'a> {
                     })?;
                     not_span = Some(not_tok.span);
                 }
+            }
+
+            // `IS [NOT] UNKNOWN` tests a value for NULL as `IS [NOT] NULL` does.
+            if self.word_at(self.idx, "UNKNOWN") {
+                let unknown_tok = self.advance().expect_invariant("UNKNOWN after peek");
+                return Ok(AstExpr::IsNull {
+                    node_id: self.id_gen.next(),
+                    span: Span {
+                        start: crate::parser::scripting::expr_span_start(&expr),
+                        end: unknown_tok.span.end,
+                    },
+                    expr: Box::new(expr),
+                    is_span: is_tok.span,
+                    not_span,
+                    null_span: unknown_tok.span,
+                });
+            }
+            if let Some((predicate, predicate_span, end)) = self.is_predicate_at(self.idx) {
+                self.idx = end;
+                return Ok(AstExpr::IsPredicate {
+                    node_id: self.id_gen.next(),
+                    span: Span {
+                        start: crate::parser::scripting::expr_span_start(&expr),
+                        end: predicate_span.end,
+                    },
+                    expr: Box::new(expr),
+                    is_span: is_tok.span,
+                    not_span,
+                    predicate,
+                    predicate_span,
+                });
             }
 
             // Check what follows: NULL or DISTINCT
@@ -187,7 +296,7 @@ impl<'a> Parser<'a> {
                     });
                 }
             }
-            // IS TRUE/FALSE not supported yet - error
+            // Nothing else follows `IS [NOT]`
             return Err(ParseError::invalid_expression(
                 self.current_span(),
                 "Expected NULL or DISTINCT after IS [NOT]".to_string(),
@@ -327,66 +436,55 @@ impl<'a> Parser<'a> {
                 ));
             }
 
-            // Check if this is a subquery (starts with SELECT)
-            if let Some(next) = self.peek() {
-                if matches!(
-                    next.kind,
-                    TokenKind::Keyword(Keyword::Select) | TokenKind::Keyword(Keyword::Values)
+            // A subquery, or the list of an IN list.
+            if let Some(subquery) = crate::parser::set_operations::in_subquery(self)? {
+                let rparen = self.advance().ok_or_else(|| {
+                    ParseError::unexpected_eof(
+                        self.current_span(),
+                        vec![") after subquery".to_string()],
+                    )
+                })?;
+                if !matches!(
+                    rparen.kind,
+                    TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
                 ) {
-                    let subquery = if matches!(next.kind, TokenKind::Keyword(Keyword::Values)) {
-                        self.try_parse_values_query_stmt()?
-                    } else {
-                        self.try_parse_set_or_select_stmt()?
-                    };
-
-                    let rparen = self.advance().ok_or_else(|| {
-                        ParseError::unexpected_eof(
-                            self.current_span(),
-                            vec![") after subquery".to_string()],
-                        )
-                    })?;
-                    if !matches!(
-                        rparen.kind,
-                        TokenKind::Punctuation(crate::lexer::Punctuation::RParen)
-                    ) {
-                        return Err(ParseError::unexpected_token(
-                            rparen.span,
-                            vec![")".to_string()],
-                            Parser::token_description(rparen, self.source),
-                        ));
-                    }
-                    let rparen_token_id = self.last_token_id();
-
-                    let left_start = crate::parser::scripting::expr_span_start(&expr);
-                    let span = Span {
-                        start: match not_span {
-                            Some(s) => s.start.min(left_start),
-                            None => left_start,
-                        },
-                        end: rparen.span.end,
-                    };
-
-                    let syntax_in_subquery = crate::syntax::SyntaxInSubquery {
-                        not_keyword: not_token_id,
-                        in_keyword: in_token_id,
-                        l_paren: lparen_token_id,
-                        r_paren: rparen_token_id,
-                        span: Span {
-                            start: not_span.unwrap_or(in_tok.span).start,
-                            end: in_tok.span.end,
-                        },
-                    };
-                    let syntax_id = self.syntax_arena.alloc_in_subquery(syntax_in_subquery);
-
-                    return Ok(AstExpr::InSubquery {
-                        node_id: self.id_gen.next(),
-                        syntax_id,
-                        expr: Box::new(expr),
-                        subquery: Box::new(subquery),
-                        negated: not_token_id.is_some(),
-                        span,
-                    });
+                    return Err(ParseError::unexpected_token(
+                        rparen.span,
+                        vec![")".to_string()],
+                        Parser::token_description(rparen, self.source),
+                    ));
                 }
+                let rparen_token_id = self.last_token_id();
+
+                let left_start = crate::parser::scripting::expr_span_start(&expr);
+                let span = Span {
+                    start: match not_span {
+                        Some(s) => s.start.min(left_start),
+                        None => left_start,
+                    },
+                    end: rparen.span.end,
+                };
+
+                let syntax_in_subquery = crate::syntax::SyntaxInSubquery {
+                    not_keyword: not_token_id,
+                    in_keyword: in_token_id,
+                    l_paren: lparen_token_id,
+                    r_paren: rparen_token_id,
+                    span: Span {
+                        start: not_span.unwrap_or(in_tok.span).start,
+                        end: in_tok.span.end,
+                    },
+                };
+                let syntax_id = self.syntax_arena.alloc_in_subquery(syntax_in_subquery);
+
+                return Ok(AstExpr::InSubquery {
+                    node_id: self.id_gen.next(),
+                    syntax_id,
+                    expr: Box::new(expr),
+                    subquery: Box::new(subquery),
+                    negated: not_token_id.is_some(),
+                    span,
+                });
             }
 
             // Parse list of expressions

@@ -1,9 +1,9 @@
 // Copyright (c) 2025-2026 Lexega LLC
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Signal output type.
+//! Finding output type.
 //!
-//! Every signal has the uniform shape
+//! Every finding has the uniform shape
 //! `{ rule_id, evidence, source_span, risk_level, message }`; `rule_id` is
 //! the sole rule-level identifier.
 
@@ -15,19 +15,19 @@ use schemars::JsonSchema;
 use crate::facts::RiskLevel;
 use crate::lexer::token::Span;
 
-/// A signal fires when a rule's predicate matches a statement's facts.
+/// A finding fires when a rule's predicate matches a statement's facts.
 /// Carries the rule id, the matching evidence, the source span, and the
 /// rendered message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub struct Signal {
+pub struct Finding {
     pub rule_id: String,
-    pub evidence: SignalEvidence,
+    pub evidence: FindingEvidence,
     pub source_span: Option<Span>,
     pub risk_level: RiskLevel,
     pub message: String,
-    /// Populated when running with `--explain-signals`; omitted otherwise.
+    /// Populated when running with `--explain-findings`; omitted otherwise.
     pub explanation: Option<RuleExplanation>,
 }
 
@@ -39,7 +39,7 @@ pub struct Signal {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub struct SignalEvidence {
+pub struct FindingEvidence {
     pub witnesses: Vec<FactWitness>,
 }
 
@@ -49,7 +49,7 @@ pub struct SignalEvidence {
 /// (quantifier-origin tagging, intermediate match bookkeeping) lives
 /// on and is never
 /// promoted across the public boundary, so the generated JSON
-/// schema for `Signal.evidence.witnesses[*]` stays the contract
+/// schema for `Finding.evidence.witnesses[*]` stays the contract
 /// customer rule-authoring tooling builds against.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
@@ -62,7 +62,7 @@ pub struct FactWitness {
     pub value: serde_json::Value,
 }
 
-/// Optional debug payload for `--explain-signals` mode.
+/// Optional debug payload for `--explain-findings` mode.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -71,17 +71,17 @@ pub struct RuleExplanation {
     pub unmatched_paths: Vec<String>,
 }
 
-/// How many signals fire when a rule matches a statement.
+/// How many findings a rule raises when it matches a statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EmissionMode {
-    /// One signal per matching statement (default). All items that
-    /// contributed to the match are reported as evidence on that
-    /// single signal.
+    /// One finding per matching statement (default). All items that
+    /// contributed to the match are reported as evidence on that one
+    /// finding.
     #[default]
     Once,
-    /// One signal per matching item. Use this when the rule has an
+    /// One finding per matching item. Use this when the rule has an
     /// `each:` clause and you want a separate finding for every item
     /// the rule visits.
     PerWitness,

@@ -20,9 +20,10 @@ use crate::ast::{
     SetUrlAction, UnknownKind, UnsetStageTagAction,
 };
 use crate::error::{ExpectInvariant, ParseError, ParseErrorKind, ParseResult, ParseResultExt};
-use crate::lexer::{Keyword, Operator, Punctuation, Span, TokenKind};
+use crate::lexer::{decode_string_literal, Keyword, Operator, Punctuation, Span, TokenKind};
 use crate::parser::core::Parser;
-use crate::parser::create_stage::{try_parse_credential_option, unquote_sql_string};
+use crate::parser::create_stage::try_parse_credential_option;
+use crate::parser::tag::TagListShape;
 
 /// Return value from `parse_parenthesized_spec` — full span plus paren token IDs.
 struct ParenSpec {
@@ -39,6 +40,7 @@ struct ParenSpec {
 /// and its end byte offset. Used as the shape-divergence fallback when
 /// `try_parse_credential_option` rejects the body.
 fn consume_until_balanced_rparen(p: &mut Parser<'_>) -> ParseResult<(crate::cst::TokenId, u32)> {
+    let from = p.idx;
     let mut depth = 1;
     loop {
         let tok = p.peek_non_trivia().ok_or_else(|| {
@@ -60,7 +62,11 @@ fn consume_until_balanced_rparen(p: &mut Parser<'_>) -> ParseResult<(crate::cst:
                 .advance()
                 .expect_invariant("RParen consumed after kind match");
             if depth == 0 {
-                return Ok((p.last_token_id(), consumed.span.end));
+                let end = consumed.span.end;
+                // The text is not read: its secrets are recorded as unparsed
+                // text's are.
+                p.record_unparsed_secrets(from, p.idx);
+                return Ok((p.last_token_id(), end));
             }
             continue;
         }
@@ -100,7 +106,7 @@ impl<'a> Parser<'a> {
         let (if_exists_span, if_keyword, exists_keyword) = self.parse_if_exists_clause_stage()?;
 
         // Stage name
-        let name_span = self.parse_stage_name()?;
+        let name_span = self.parse_object_name_span()?;
 
         // Parse action(s) with defensive unknown handling
         let actions_start = self.current_span().start;
@@ -189,61 +195,6 @@ impl<'a> Parser<'a> {
             }
         }
         Ok((None, None, None))
-    }
-
-    fn parse_stage_name(&mut self) -> ParseResult<Span> {
-        // Parse identifier (possibly qualified: db.schema.stage)
-        let first_tok = if let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Identifier { .. }) {
-                self.advance()
-                    .expect_invariant("identifier consumed after kind match")
-            } else {
-                return Err(ParseError::new(
-                    tok.span,
-                    ParseErrorKind::UnexpectedToken {
-                        expected: vec!["identifier".to_string()],
-                        found: tok.lexeme(self.source).to_string(),
-                    },
-                ));
-            }
-        } else {
-            return Err(ParseError::new(
-                self.current_span(),
-                ParseErrorKind::UnexpectedEof {
-                    expected: vec!["stage name".to_string()],
-                },
-            ));
-        };
-
-        let start_pos = first_tok.span.start;
-        let mut end_pos = first_tok.span.end;
-
-        // Handle qualified names (db.schema.stage)
-        while let Some(tok) = self.peek_non_trivia() {
-            if matches!(tok.kind, TokenKind::Punctuation(Punctuation::Dot)) {
-                self.advance();
-                // Consume next identifier
-                if let Some(next_tok) = self.peek_non_trivia() {
-                    if matches!(next_tok.kind, TokenKind::Identifier { .. }) {
-                        let t = self
-                            .advance()
-                            .expect_invariant("qualified identifier consumed after kind match");
-                        end_pos = t.span.end;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Ok(Span {
-            start: start_pos,
-            end: end_pos,
-        })
     }
 
     /// Parse ALTER STAGE action with defensive unknown handling.
@@ -471,7 +422,7 @@ impl<'a> Parser<'a> {
         let to_span = Some(to_tok.span);
 
         // New name
-        let new_name_span = self.parse_stage_name()?;
+        let new_name_span = self.parse_object_name_span()?;
 
         Ok(AstAlterStageActionKind::RenameTo {
             rename_span,
@@ -617,15 +568,14 @@ impl<'a> Parser<'a> {
             .expect_invariant("TAG keyword consumed after caller lexeme check");
         let tag_span = Some(tag_tok.span);
 
-        // Parse tag assignments until statement end
-        let _assignments_start = self.current_span().start;
-        let assignments_span = self.consume_until_statement_end()?;
+        let (assignments_span, tags) = self.parse_tag_list(TagListShape::Assignments)?;
 
         Ok(AstAlterStageActionKind::SetTag(Box::new(
             SetStageTagAction {
                 set_span,
                 tag_span,
                 assignments_span,
+                tags,
             },
         )))
     }
@@ -778,7 +728,9 @@ impl<'a> Parser<'a> {
                 consumed.kind,
                 TokenKind::Literal(crate::lexer::LiteralKind::String)
             ) {
-                unquote_sql_string(consumed.lexeme(self.source))
+                let written = consumed.lexeme(self.source);
+                decode_string_literal(written, self.dialect)
+                    .map_or_else(|| written.to_string(), |d| d.value)
             } else {
                 String::new()
             };
@@ -1105,14 +1057,14 @@ impl<'a> Parser<'a> {
             .expect_invariant("TAG keyword consumed after caller lexeme check");
         let tag_span = Some(tag_tok.span);
 
-        // Parse tag names until statement end
-        let tags_span = self.consume_until_statement_end()?;
+        let (tags_span, tags) = self.parse_tag_list(TagListShape::Names)?;
 
         Ok(AstAlterStageActionKind::UnsetTag(Box::new(
             UnsetStageTagAction {
                 unset_span,
                 tag_span,
                 tags_span,
+                tags,
             },
         )))
     }
@@ -1187,6 +1139,7 @@ impl<'a> Parser<'a> {
         };
 
         // Consume until )
+        let from = self.idx;
         let mut depth = 1;
         let mut end = start;
         let mut rparen_token = lparen_token; // placeholder, will be overwritten
@@ -1210,6 +1163,8 @@ impl<'a> Parser<'a> {
             end = t.span.end;
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(ParenSpec {
             span: Span { start, end },
             lparen_token,
@@ -1218,6 +1173,7 @@ impl<'a> Parser<'a> {
     }
 
     fn consume_until_statement_end(&mut self) -> ParseResult<Span> {
+        let from = self.idx;
         let start = self.current_span().start;
         let mut end = start;
 
@@ -1236,11 +1192,14 @@ impl<'a> Parser<'a> {
             end = t.span.end;
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(Span { start, end })
     }
 
     /// Consume tokens until matching closing paren, handling nested parens
     pub(crate) fn consume_balanced_parens(&mut self) -> ParseResult<Span> {
+        let from = self.idx;
         let lparen = self
             .advance()
             .expect_invariant("LParen consumed after caller verified"); // consume opening (
@@ -1270,6 +1229,8 @@ impl<'a> Parser<'a> {
             end = t.span.end;
         }
 
+        // The text is not read: its secrets are recorded as unparsed text's are.
+        self.record_unparsed_secrets(from, self.idx);
         Ok(Span { start, end })
     }
 }

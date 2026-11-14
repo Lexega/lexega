@@ -25,12 +25,12 @@ use crate::ast::NodeId;
 use crate::context::node_metadata::{IdentKey, TableRef};
 use crate::ir::column::{ColumnBinding, ColumnId, ColumnIdAllocator, ColumnOrigin};
 use crate::ir::plan::{
-    AfterMatchSkip, AggregateCall, CteBinding, CteBody, FilterKind, FrameBound, FrameExclusion,
-    FrameMode, GroupingSpec, JoinKind, MatchRecognizeBody, MatchRecognizeDefine,
-    MatchRecognizeMeasure, MergeAction, MergeBranch, MergeBranchKind, NullTreatment, PatternExpr,
-    PatternQuantKind, ProjectExpr, ProjectItem, RelPlan, ResolvedFunc, ResolvedModel, RowsPerMatch,
-    SampleKeyword, SampleSize, ScanModifier, SetOpKind, SortKey, SymbolId, SymbolTable,
-    TableSample, WindowCall, WindowFrame,
+    AfterMatchSkip, AggregateCall, AssignedValue, Assignment, CteBinding, CteBody, FilterKind,
+    FrameBound, FrameExclusion, FrameMode, GroupingSpec, JoinKind, MatchRecognizeBody,
+    MatchRecognizeDefine, MatchRecognizeMeasure, MergeAction, MergeBranch, MergeBranchKind,
+    NullTreatment, PatternExpr, PatternQuantKind, ProjectExpr, ProjectItem, RelPlan, ResolvedFunc,
+    ResolvedModel, RowsPerMatch, SampleKeyword, SampleSize, ScanModifier, SetOpKind, SortKey,
+    SymbolId, SymbolTable, TableSample, WindowCall, WindowFrame,
 };
 use crate::ir::scalar::{
     ComparisonOp, FieldStep, Lit, QuantifiedRhs, Quantifier, ScalarExpr, ScopeId, SqlType,
@@ -170,11 +170,13 @@ fn relplan_values_span() {
 
 #[test]
 fn relplan_cte_ref_span() {
+    let _folding = crate::ir::normalize::default_folding();
     let s = span(1, 2);
     let plan = RelPlan::CteRef {
         name: ident("c"),
         scope: ScopeId(0),
         columns: vec![ColumnId::new(0)],
+        demanded: Vec::new(),
         alias: Some(ident("a")),
         node_id: nid(),
         span: s,
@@ -234,6 +236,7 @@ fn relplan_filter_span() {
     let mut alloc = ColumnIdAllocator::new();
     let s = span(7, 8);
     let plan = RelPlan::Filter {
+        computed: Vec::new(),
         input: Box::new(scan(&mut alloc, 1, span(0, 0))),
         predicate: lit_int(1),
         kind: FilterKind::Where,
@@ -255,6 +258,7 @@ fn relplan_aggregate_span() {
         aggregates: vec![aggregate_call(out)],
         having: None,
         output_columns: vec![out],
+        computed: Vec::new(),
         node_id: nid(),
         span: s,
         hints: Vec::new(),
@@ -271,6 +275,7 @@ fn relplan_window_span() {
         input: Box::new(scan(&mut alloc, 1, span(0, 0))),
         windows: vec![window_call(out)],
         window_outputs: vec![out],
+        computed: Vec::new(),
         node_id: nid(),
         span: s,
         hints: Vec::new(),
@@ -358,13 +363,18 @@ fn relplan_insert_span() {
     let s = span(21, 22);
     let plan = RelPlan::Insert {
         target: tref("t"),
+        target_node: nid(),
+        target_read_columns: Vec::new(),
         target_columns: vec![alloc.fresh_test()],
+        unplaced_columns: Vec::new(),
+        defaulted_columns: Vec::new(),
         source: crate::ir::plan::InsertSource::Query(Box::new(scan(&mut alloc, 1, span(0, 0)))),
         on_conflict: None,
-        overwrite: false,
+        overwrite: None,
         replace_into: false,
         overriding: None,
         returning: None,
+        returned_merges: Vec::new(),
         output: None,
         target_hints: Vec::new(),
         node_id: nid(),
@@ -380,8 +390,16 @@ fn relplan_update_span() {
     let s = span(23, 24);
     let plan = RelPlan::Update {
         target: tref("t"),
-        assignments: vec![(alloc.fresh_test(), lit_int(1))],
+        target_node: nid(),
+        target_read_columns: Vec::new(),
+        only: None,
+        assignments: vec![Assignment {
+            written_node: nid(),
+            columns: vec![alloc.fresh_test()],
+            value: AssignedValue::Row(vec![lit_int(1)]),
+        }],
         from: None,
+        target_row: None,
         predicate: None,
         top: None,
         returning: None,
@@ -398,7 +416,11 @@ fn relplan_delete_span() {
     let s = span(25, 26);
     let plan = RelPlan::Delete {
         target: tref("t"),
+        target_node: nid(),
+        target_read_columns: Vec::new(),
         using: None,
+        target_row: None,
+        deleted_sources: Vec::new(),
         predicate: None,
         top: None,
         returning: None,
@@ -416,6 +438,9 @@ fn relplan_merge_span() {
     let s = span(27, 28);
     let plan = RelPlan::Merge {
         target: tref("t"),
+        target_node: nid(),
+        target_read_columns: Vec::new(),
+        only: None,
         source: Box::new(scan(&mut alloc, 1, span(0, 0))),
         on: lit_int(1),
         branches: vec![MergeBranch {
@@ -426,6 +451,8 @@ fn relplan_merge_span() {
         }],
         with_schema_evolution: false,
         output: None,
+        returning: None,
+        returned_merges: Vec::new(),
         node_id: nid(),
         span: s,
         hints: Vec::new(),
@@ -435,10 +462,12 @@ fn relplan_merge_span() {
 
 #[test]
 fn relplan_with_scope_span() {
+    let _folding = crate::ir::normalize::default_folding();
     let mut alloc = ColumnIdAllocator::new();
     let s = span(29, 30);
     let cte_cols = vec![alloc.fresh_test()];
     let cte_inner = scan(&mut alloc, 1, span(0, 0));
+    let slot_columns = cte_inner.output_schema().into_iter().map(Some).collect();
     let plan = RelPlan::WithScope {
         ctes: vec![CteBinding {
             name: ident("c"),
@@ -446,6 +475,7 @@ fn relplan_with_scope_span() {
             declared_columns: None,
             body: CteBody::NonRecursive(Box::new(cte_inner)),
             output_columns: cte_cols,
+            slot_columns,
             node_id: nid(),
             span: span(0, 0),
         }],
@@ -553,6 +583,7 @@ fn relplan_match_recognize_span() {
 /// shape, and that the visitor walks every leaf in the body.
 #[test]
 fn relplan_match_recognize_typed_body_full_shape() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::visitor::{walk_rel_plan, walk_scalar_expr, RelPlanVisitor};
 
     let mut alloc = ColumnIdAllocator::new();
@@ -696,6 +727,7 @@ fn relplan_connect_by_span() {
         connect: lit_int(1),
         nocycle: false,
         output_columns: vec![alloc.fresh_test()],
+        pseudo_columns: Vec::new(),
         node_id: nid(),
         span: s,
         hints: Vec::new(),
@@ -751,11 +783,14 @@ fn relplan_derived_table_span_and_schema() {
     let mut alloc = ColumnIdAllocator::new();
     let s = span(45, 46);
     let c = alloc.fresh_test();
+    let input = scan(&mut alloc, 1, span(0, 0));
+    let body_columns = input.output_schema().into_iter().map(Some).collect();
     let plan = RelPlan::DerivedTable {
-        input: Box::new(scan(&mut alloc, 1, span(0, 0))),
+        input: Box::new(input),
         alias: None,
         columns: vec![c],
         alias_columns: Vec::new(),
+        body_columns,
         node_id: nid(),
         span: s,
         hints: Vec::new(),
@@ -824,6 +859,7 @@ fn scalar_unaryop_span() {
 
 #[test]
 fn scalar_funccall_span() {
+    let _folding = crate::ir::normalize::default_folding();
     let s = span(11, 12);
     let e = ScalarExpr::FuncCall {
         func: resolved_func(),
@@ -834,6 +870,7 @@ fn scalar_funccall_span() {
         )],
         distinct: false,
         span: s,
+        non_values: Vec::new(),
     };
     assert_eq!(e.span(), s);
 }
@@ -855,7 +892,10 @@ fn scalar_cast_span() {
     let s = span(15, 16);
     let e = ScalarExpr::Cast {
         expr: Box::new(lit_int(1)),
-        target_type: SqlType { repr: "INT".into() },
+        target_type: SqlType {
+            repr: "INT".into(),
+            params: String::new(),
+        },
         try_cast: false,
         span: s,
     };
@@ -927,6 +967,24 @@ fn scalar_quantified_cmp_span() {
 }
 
 #[test]
+fn scalar_row_cmp_span() {
+    let mut alloc = ColumnIdAllocator::new();
+    let s = span(25, 40);
+    let e = ScalarExpr::RowCmp {
+        op: ComparisonOp::Eq,
+        quantifier: None,
+        negated: false,
+        left: vec![col(0), col(1)],
+        left_span: span(25, 30),
+        subquery: Box::new(scan(&mut alloc, 1, span(0, 0))),
+        correlates_with: vec![],
+        subquery_span: span(33, 40),
+        span: s,
+    };
+    assert_eq!(e.span(), s);
+}
+
+#[test]
 fn scalar_window_fn_span() {
     let mut alloc = ColumnIdAllocator::new();
     let s = span(27, 28);
@@ -948,7 +1006,10 @@ fn scalar_field_access_span() {
             FieldStep::Index(2),
             FieldStep::IndexExpr(Box::new(lit_int(1))),
         ],
-        cast: Some(SqlType { repr: "INT".into() }),
+        cast: Some(SqlType {
+            repr: "INT".into(),
+            params: String::new(),
+        }),
         span: s,
     };
     assert_eq!(e.span(), s);
@@ -1097,8 +1158,11 @@ fn grouping_spec_all_shapes_constructible() {
     let g1 = GroupingSpec::Standard(vec![]);
     let g2 = GroupingSpec::Cube(vec![]);
     let g3 = GroupingSpec::Rollup(vec![]);
-    let g4 = GroupingSpec::GroupingSets(vec![]);
-    let g5 = GroupingSpec::All(vec![]);
+    let g4 = GroupingSpec::GroupingSets(crate::ir::plan::GroupingSets::default());
+    let g5 = GroupingSpec::All {
+        keys: vec![],
+        complete: true,
+    };
     // Compile-time exhaustiveness: exercise a match with all five arms.
     for g in [g0, g1, g2, g3, g4, g5] {
         match g {
@@ -1107,7 +1171,7 @@ fn grouping_spec_all_shapes_constructible() {
             | GroupingSpec::Cube(_)
             | GroupingSpec::Rollup(_)
             | GroupingSpec::GroupingSets(_)
-            | GroupingSpec::All(_) => {}
+            | GroupingSpec::All { .. } => {}
         }
     }
 }
@@ -1215,7 +1279,10 @@ fn roundtrip_field_access_preserves_path_shape() {
             FieldStep::Index(2),
             FieldStep::IndexExpr(Box::new(lit_int(42))),
         ],
-        cast: Some(SqlType { repr: "INT".into() }),
+        cast: Some(SqlType {
+            repr: "INT".into(),
+            params: String::new(),
+        }),
         span: span(3, 4),
     };
     assert_roundtrip(&e);
@@ -1254,6 +1321,7 @@ fn roundtrip_nested_mixing_column_outerref_fieldaccess() {
         named_args: vec![],
         distinct: false,
         span: span(10, 20),
+        non_values: Vec::new(),
     };
     assert_roundtrip(&e);
     let c = collect(&e);
@@ -1277,6 +1345,7 @@ fn roundtrip_nested_mixing_column_outerref_fieldaccess() {
 
 #[test]
 fn field_path_empty_is_prefix_of_everything() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::{FieldPath, FieldPathSegment};
 
     let empty = FieldPath::empty();
@@ -1304,6 +1373,7 @@ fn field_path_empty_is_prefix_of_everything() {
 
 #[test]
 fn field_path_field_segment_normalizes_case() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::FieldPath;
 
     // Unquoted identifiers fold case via `IdentKey::new`.
@@ -1316,6 +1386,7 @@ fn field_path_field_segment_normalizes_case() {
 
 #[test]
 fn field_path_dynamic_index_collapses() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::{FieldPath, FieldPathSegment};
 
     let dyn_path = FieldPath::from_field_steps(&[
@@ -1333,6 +1404,7 @@ fn field_path_dynamic_index_collapses() {
 
 #[test]
 fn field_path_prefix_dynamic_widens_match() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::FieldPath;
 
     // Constraint over `payload[expr]` covers `payload[5]` (dynamic
@@ -1351,6 +1423,7 @@ fn field_path_prefix_dynamic_widens_match() {
 
 #[test]
 fn field_path_disjoint_paths_are_not_prefixes() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::FieldPath;
 
     let id = FieldPath::from_field_steps(&[
@@ -1367,6 +1440,7 @@ fn field_path_disjoint_paths_are_not_prefixes() {
 
 #[test]
 fn field_path_static_prefix_covers_descendants() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::scalar::FieldPath;
 
     // `payload` covers `payload.id` and `payload.id[3]`.
@@ -1400,6 +1474,7 @@ fn field_path_static_prefix_covers_descendants() {
 
 #[test]
 fn scan_modifier_default_projects_to_minimal_fact() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::derived_facts::{derive_scan_modifier_facts, OriginTag, ScanModifierFact};
 
     let mut alloc = ColumnIdAllocator::new();
@@ -1423,6 +1498,7 @@ fn scan_modifier_default_projects_to_minimal_fact() {
 
 #[test]
 fn scan_modifier_every_field_round_trips() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::derived_facts::{
         derive_scan_modifier_facts, ChangesTag, OriginTag, TimeTravelTag,
     };
@@ -1485,6 +1561,7 @@ fn scan_modifier_every_field_round_trips() {
 
 #[test]
 fn scan_modifier_walk_descends_through_wrappers() {
+    let _folding = crate::ir::normalize::default_folding();
     use crate::ir::derived_facts::derive_scan_modifier_facts;
 
     // `WithScope { ctes: [..], body: Project(Filter(Join(Scan, Scan))) }`
@@ -1509,6 +1586,7 @@ fn scan_modifier_walk_descends_through_wrappers() {
         hints: Vec::new(),
     };
     let filter = RelPlan::Filter {
+        computed: Vec::new(),
         input: Box::new(join),
         kind: FilterKind::Where,
         predicate: lit_int(1),
@@ -1533,6 +1611,7 @@ fn scan_modifier_walk_descends_through_wrappers() {
             declared_columns: None,
             body: CteBody::NonRecursive(Box::new(cte_inner)),
             output_columns: vec![],
+            slot_columns: Vec::new(),
             node_id: nid(),
             span: span(13, 14),
         }],

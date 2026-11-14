@@ -16,9 +16,10 @@
 use super::predicate::{FieldName, FieldPath, Predicate, PredicateLiteral, ScalarOp};
 use crate::facts::{category_of_kind, RuleCategory, StatementKind};
 
-/// `ddl.table` fact fields that signal a data-protection (policy-attachment)
-/// concern even though the coarse statement kind is `alter_table`.
-const TABLE_POLICY_FIELDS: &[&str] = &[
+/// `ddl.table` and `ddl.view` fact fields that indicate a data-protection
+/// (policy-attachment) concern even though the coarse statement kind is
+/// `alter_table` or `alter_view`.
+const POLICY_FIELDS: &[&str] = &[
     "row_access_policy_added",
     "row_access_policy_removed",
     "masking_policy_added",
@@ -39,6 +40,9 @@ const FAMILY_FALLBACK: &[(&str, RuleCategory)] = &[
     ("algebra", RuleCategory::Query),
     ("use_stmt", RuleCategory::AccessControl),
     ("pg_copy", RuleCategory::DataMovement),
+    // A call that runs SQL text, in a routine body or a script: the code
+    // around it builds what runs.
+    ("dynamic_sql_calls", RuleCategory::Code),
 ];
 
 /// The recognition surface gathered from one walk of a rule's predicate:
@@ -65,7 +69,7 @@ pub(crate) fn category_of_rule(p: &Predicate) -> RuleCategory {
     if s.paths.iter().any(|segs| root_is(segs, "diff")) {
         return RuleCategory::ChangeSafety;
     }
-    if s.paths.iter().any(|segs| is_table_policy_path(segs)) {
+    if s.paths.iter().any(|segs| is_policy_path(segs)) {
         return RuleCategory::DataProtection;
     }
     if let Some(kind) = s.kinds.first() {
@@ -147,6 +151,9 @@ fn collect_kinds(path: &FieldPath, op: &ScalarOp, out: &mut Surface) {
         | ScalarOp::Contains(_)
         | ScalarOp::ContainsAny(_)
         | ScalarOp::ContainsAll(_)
+        | ScalarOp::InList(_)
+        | ScalarOp::NotInList(_)
+        | ScalarOp::AllInField(_)
         | ScalarOp::Exists(_)
         | ScalarOp::IsNull(_)
         | ScalarOp::Range { .. } => {}
@@ -175,9 +182,11 @@ fn kind_from_literal(lit: &PredicateLiteral) -> Option<StatementKind> {
     }
 }
 
-fn is_table_policy_path(segs: &[String]) -> bool {
+fn is_policy_path(segs: &[String]) -> bool {
     match segs {
-        [a, b, c, ..] => a == "ddl" && b == "table" && TABLE_POLICY_FIELDS.contains(&c.as_str()),
+        [a, b, c, ..] => {
+            a == "ddl" && (b == "table" || b == "view") && POLICY_FIELDS.contains(&c.as_str())
+        }
         _ => false,
     }
 }
@@ -265,6 +274,18 @@ mod tests {
     }
 
     #[test]
+    fn alter_view_masking_removal_is_data_protection() {
+        let p = Predicate::AllOf(vec![
+            kind_eq("alter_view"),
+            scalar(
+                "ddl.view.masking_policy_removed",
+                ScalarOp::Eq(PredicateLiteral::Bool(true)),
+            ),
+        ]);
+        assert_eq!(category_of_rule(&p), RuleCategory::DataProtection);
+    }
+
+    #[test]
     fn plain_alter_table_is_schema_design() {
         let p = Predicate::AllOf(vec![
             kind_eq("alter_table"),
@@ -282,6 +303,19 @@ mod tests {
             category_of_rule(&kind_eq("create_masking_policy")),
             RuleCategory::DataProtection
         );
+    }
+
+    #[test]
+    fn dynamic_sql_call_rule_without_kind_is_code() {
+        // DYNSQL-CONCAT shape: no kind gate, reads dynamic_sql_calls.
+        let p = Predicate::Relational(RelationalMatch {
+            path: FieldPath::parse("dynamic_sql_calls"),
+            quantifier: Quantifier::Exists(Box::new(scalar(
+                "argument",
+                ScalarOp::In(vec![PredicateLiteral::String("concat".to_string())]),
+            ))),
+        });
+        assert_eq!(category_of_rule(&p), RuleCategory::Code);
     }
 
     #[test]

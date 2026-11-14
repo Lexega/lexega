@@ -237,6 +237,7 @@ impl<'a> Parser<'a> {
                 "OPTIONS" => {
                     let clause_start = tok.span.start;
                     self.advance(); // OPTIONS
+                    self.record_option_list_secrets(self.idx);
                     let paren_span = self.consume_balanced_parens()?;
                     end = paren_span.end;
                     options_span = Some(Span {
@@ -334,7 +335,9 @@ impl<'a> Parser<'a> {
                 // principal (qualified name — may be backtick-quoted)
                 let principal_span = self.parse_qualified_name_span()?;
                 end = principal_span.end;
-                action_kind = AlterCatalogActionKind::OwnerTo;
+                action_kind = AlterCatalogActionKind::OwnerTo {
+                    principal: principal_span,
+                };
             }
             "SET" => {
                 self.advance(); // SET
@@ -362,7 +365,9 @@ impl<'a> Parser<'a> {
                     let _ = to_tok;
                     let principal_span = self.parse_qualified_name_span()?;
                     end = principal_span.end;
-                    action_kind = AlterCatalogActionKind::OwnerTo;
+                    action_kind = AlterCatalogActionKind::OwnerTo {
+                        principal: principal_span,
+                    };
                 } else {
                     // Unknown SET action - consume to end of statement
                     end = self.consume_until_semi_or_eof()?;
@@ -431,6 +436,7 @@ impl<'a> Parser<'a> {
             }
             "OPTIONS" => {
                 self.advance(); // OPTIONS
+                self.record_option_list_secrets(self.idx);
                 let paren_span = self.consume_balanced_parens()?;
                 end = paren_span.end;
                 action_kind = AlterCatalogActionKind::Options;

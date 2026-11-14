@@ -60,7 +60,7 @@ pub fn format_create_dynamic_table(
 
     // Table name
     printer.space();
-    printer.push_identifier_span_v2(dt.name_span);
+    printer.push_identifier_span_v2(dt.name.span);
 
     // Column definitions (if present)
     if let Some(columns_span) = dt.columns_span {

@@ -4,30 +4,30 @@
 /// Tests for DBX-GRT-EXTUSE-LOC — Grant EXTERNAL USE LOCATION
 ///
 /// Rule ID: DBX-GRT-EXTUSE-LOC
-/// Risk: Critical
+/// Risk: High
 /// YAML detail pattern: privilege=EXTERNAL USE LOCATION* (glob — trailing wildcard)
 ///
 /// Databricks design: ALL PRIVILEGES intentionally EXCLUDES this privilege.
 /// Tests must cover the ALL PRIVILEGES exclusion boundary, sibling rule
-/// EXTERNAL USE SCHEMA distinction, and dual-signal with GRANT TO PUBLIC.
+/// EXTERNAL USE SCHEMA distinction, and dual-finding with GRANT TO PUBLIC.
 use lexega_core::analyzer::RuleMatch;
 use lexega_core::api::analyze_risk;
 use std::collections::HashSet;
 
 const RULE_ID: &str = "DBX-GRT-EXTUSE-LOC";
 
-fn extract_rule_ids(signals: &[RuleMatch]) -> HashSet<String> {
-    signals
+fn extract_rule_ids(findings: &[RuleMatch]) -> HashSet<String> {
+    findings
         .iter()
-        .filter_map(|f| match f {
-            RuleMatch::Analysis(g) => Some(g.matched_rule.clone()),
+        .map(|f| match f {
+            RuleMatch::Analysis(g) => g.matched_rule.clone(),
         })
         .collect()
 }
 
 fn analyze_and_get_rules(sql: &str) -> HashSet<String> {
     match analyze_risk(sql) {
-        Ok(report) => extract_rule_ids(&report.signals),
+        Ok(report) => extract_rule_ids(&report.findings),
         Err(e) => {
             eprintln!("Parse error: {:?}", e);
             HashSet::new()
@@ -47,16 +47,16 @@ fn test_basic_detection() {
 }
 
 #[test]
-fn test_risk_level_is_critical() {
+fn test_risk_level_is_high() {
     let report = analyze_risk("GRANT EXTERNAL USE LOCATION ON CATALOG main TO data_eng;")
         .expect("should succeed");
-    let signal = report
-        .signals
+    let finding = report
+        .findings
         .iter()
         .find(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
-        .expect("signal must exist");
-    let RuleMatch::Analysis(g) = signal;
-    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::Critical);
+        .expect("finding must exist");
+    let RuleMatch::Analysis(g) = finding;
+    assert_eq!(g.risk_level, lexega_core::analyzer::RiskLevel::High);
 }
 
 // ─── Privilege Boundary ───
@@ -123,7 +123,7 @@ fn test_revoke_does_not_trigger() {
 // ─── Mixed Script ───
 
 #[test]
-fn test_grant_signal_survives_in_mixed_script() {
+fn test_grant_finding_survives_in_mixed_script() {
     let sql = r#"
         CREATE TABLE staging.events (id INT);
         GRANT EXTERNAL USE LOCATION ON CATALOG main TO data_eng;
@@ -132,7 +132,7 @@ fn test_grant_signal_survives_in_mixed_script() {
     let rules = analyze_and_get_rules(sql);
     assert!(
         rules.contains(RULE_ID),
-        "EXTUSE-LOC signal must survive mixed DDL — got: {rules:?}"
+        "EXTUSE-LOC finding must survive mixed DDL — got: {rules:?}"
     );
 }
 
@@ -147,7 +147,7 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     "#;
     let report = analyze_risk(sql).expect("should succeed");
     let total_evidence: usize = report
-        .signals
+        .findings
         .iter()
         .filter(|s| matches!(s, RuleMatch::Analysis(g) if g.matched_rule == RULE_ID))
         .map(|s| match s {
@@ -160,10 +160,10 @@ fn test_multiple_grants_produce_correct_evidence_count() {
     );
 }
 
-// ─── GRANT TO PUBLIC (dual-signal) ───
+// ─── GRANT TO PUBLIC (dual-finding) ───
 
 /// EXTERNAL USE LOCATION TO PUBLIC fires both privilege-level and public-grant rules.
-/// Both are Critical, so critical_count must reflect accumulation.
+/// EXTUSE-LOC is High and the PUBLIC grant is Critical, so both counts must reflect it.
 #[test]
 fn test_grant_to_public_fires_both_privilege_and_public_rule() {
     let sql = "GRANT EXTERNAL USE LOCATION ON CATALOG main TO PUBLIC;";
@@ -174,8 +174,9 @@ fn test_grant_to_public_fires_both_privilege_and_public_rule() {
     );
     let report = analyze_risk(sql).expect("should succeed");
     assert!(
-        report.summary.critical_count >= 2,
-        "Should have critical from BOTH EXTUSE-LOC and PUBLIC grant, got: {}",
+        report.summary.high_count >= 1 && report.summary.critical_count >= 1,
+        "Should have high from EXTUSE-LOC and critical from PUBLIC grant, got: high={} critical={}",
+        report.summary.high_count,
         report.summary.critical_count
     );
 }

@@ -14,8 +14,9 @@
 //! keyword casing and spacing.
 
 use crate::ast::types::{
-    AstCacheTable, AstCreateFlow, AstDescribeHistory, AstOptimize, AstRepairTable, AstRestore,
-    AstRestoreTimeTravel, AstStmt, AstUncacheTable, RepairPartitionsMode, RestoreTimeTravelKind,
+    AstCacheTable, AstCreateFlow, AstDescribeHistory, AstObjectRef, AstOptimize, AstRepairTable,
+    AstRestore, AstRestoreTimeTravel, AstStmt, AstUncacheTable, RepairPartitionsMode,
+    RestoreTimeTravelKind,
 };
 use crate::error::{ParseError, ParseErrorKind, ParseResult, ParseResultExt};
 use crate::lexer::{Keyword, Punctuation, Span, TokenKind};
@@ -567,6 +568,7 @@ impl<'a> Parser<'a> {
                     .advance()
                     .ok_or_eof(self.current_span(), vec!["OPTIONS".to_string()])?;
                 let options_start = options_tok.span.start;
+                self.record_option_list_secrets(self.idx);
 
                 // Expect LParen
                 let lp_tok = self
@@ -918,6 +920,51 @@ impl<'a> Parser<'a> {
         Ok(AstStmt::RepairTable(Box::new(ast)))
     }
 
+    /// The name of a flow, its target or its source, consumed; one string
+    /// literal standing for it is consumed and held as no name.
+    fn flow_object(&mut self) -> ParseResult<Option<AstObjectRef>> {
+        let literal = self.peek_non_trivia().is_some_and(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Literal(crate::lexer::LiteralKind::String)
+            )
+        });
+        if literal {
+            self.advance();
+            return Ok(None);
+        }
+        self.parse_required_object_ref().map(Some)
+    }
+
+    /// The source after `FROM`: a relation, or `STREAM(t)`, whose `t` is the
+    /// name held when the parentheses hold only one name.
+    fn flow_source(&mut self) -> ParseResult<Option<AstObjectRef>> {
+        let Some(src_peek) = self.peek_non_trivia() else {
+            return Ok(None);
+        };
+        let is_stream = matches!(src_peek.kind, TokenKind::Identifier { .. })
+            && src_peek.lexeme(self.source).eq_ignore_ascii_case("STREAM");
+        if !is_stream {
+            return self.flow_object();
+        }
+        self.advance()
+            .ok_or_eof(self.current_span(), vec!["STREAM".to_string()])?;
+        let Some(lp) = self.peek_non_trivia() else {
+            return Ok(None);
+        };
+        if !matches!(lp.kind, TokenKind::Punctuation(Punctuation::LParen)) {
+            return Ok(None);
+        }
+        let open = self.idx;
+        let node_id = self.id_gen.next();
+        let held = self
+            .object_ref_at(open + 1, node_id)
+            .filter(|(end, _)| self.closing_paren_index(open) == Some(*end))
+            .map(|(_, name)| name);
+        self.consume_balanced_parens()?;
+        Ok(held)
+    }
+
     /// Parse Databricks Lakeflow CREATE FLOW statement.
     ///
     /// Supported heads:
@@ -991,7 +1038,7 @@ impl<'a> Parser<'a> {
         let _flow_tok = flow_tok;
 
         // Flow name
-        let _flow_name_span = self.parse_qualified_name_span()?;
+        let name = self.flow_object()?;
 
         // AS
         let as_peek = self.peek_non_trivia().ok_or_else(|| {
@@ -1114,7 +1161,7 @@ impl<'a> Parser<'a> {
             .ok_or_eof(self.current_span(), vec!["INTO".to_string()])?;
 
         // Target table/view name
-        let _target_name_span = self.parse_qualified_name_span()?;
+        let target = self.flow_object()?;
 
         // FROM <source>
         let from_peek = self.peek_non_trivia().ok_or_else(|| {
@@ -1138,22 +1185,7 @@ impl<'a> Parser<'a> {
             .ok_or_eof(self.current_span(), vec!["FROM".to_string()])?;
 
         // Source can be STREAM(...) or a regular relation.
-        if let Some(src_peek) = self.peek_non_trivia() {
-            if matches!(src_peek.kind, TokenKind::Identifier { .. })
-                && src_peek.lexeme(self.source).eq_ignore_ascii_case("STREAM")
-            {
-                let _stream_tok = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["STREAM".to_string()])?;
-                if let Some(lp) = self.peek_non_trivia() {
-                    if matches!(lp.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        let _stream_args = self.consume_balanced_parens()?;
-                    }
-                }
-            } else {
-                let _src_name_span = self.parse_qualified_name_span()?;
-            }
-        }
+        let source = self.flow_source()?;
 
         // KEYS (...) is required
         let keys_peek = self.peek_non_trivia().ok_or_else(|| {
@@ -1214,6 +1246,9 @@ impl<'a> Parser<'a> {
         let stmt = AstCreateFlow {
             node_id: self.id_gen.next(),
             span: Span { start, end },
+            name,
+            target,
+            source,
         };
         Ok(AstStmt::CreateFlow(Box::new(stmt)))
     }
@@ -1277,7 +1312,7 @@ impl<'a> Parser<'a> {
             .advance()
             .ok_or_eof(self.current_span(), vec!["INTO".to_string()])?;
 
-        let _target_name_span = self.parse_qualified_name_span()?;
+        let target = self.flow_object()?;
 
         let from_peek = self.peek_non_trivia().ok_or_else(|| {
             ParseError::new(
@@ -1299,22 +1334,7 @@ impl<'a> Parser<'a> {
             .advance()
             .ok_or_eof(self.current_span(), vec!["FROM".to_string()])?;
 
-        if let Some(src_peek) = self.peek_non_trivia() {
-            if matches!(src_peek.kind, TokenKind::Identifier { .. })
-                && src_peek.lexeme(self.source).eq_ignore_ascii_case("STREAM")
-            {
-                let _stream_tok = self
-                    .advance()
-                    .ok_or_eof(self.current_span(), vec!["STREAM".to_string()])?;
-                if let Some(lp) = self.peek_non_trivia() {
-                    if matches!(lp.kind, TokenKind::Punctuation(Punctuation::LParen)) {
-                        let _stream_args = self.consume_balanced_parens()?;
-                    }
-                }
-            } else {
-                let _src_name_span = self.parse_qualified_name_span()?;
-            }
-        }
+        let source = self.flow_source()?;
 
         let keys_peek = self.peek_non_trivia().ok_or_else(|| {
             ParseError::new(
@@ -1373,6 +1393,9 @@ impl<'a> Parser<'a> {
         let stmt = AstCreateFlow {
             node_id: self.id_gen.next(),
             span: Span { start, end },
+            name: None,
+            target,
+            source,
         };
         Ok(AstStmt::CreateFlow(Box::new(stmt)))
     }
