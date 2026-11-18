@@ -6,7 +6,7 @@
 
 use lexega_core::analyzer::{AnalysisConfig, AnalysisReport, RiskEvidence, RuleMatch};
 use lexega_core::api::analyze_risk_with_policy_config;
-use lexega_core::dialect::{mssql, postgres, snowflake, DialectRef};
+use lexega_core::dialect::{mssql, mysql, postgres, snowflake, DialectRef};
 use lexega_core::facts::{StatementFacts, StatementKind};
 use lexega_core::rules::{build_v1_rule_corpus, load_v1_rules};
 
@@ -119,6 +119,47 @@ fn a_ddl_or_grant_statement_is_one_record() {
     assert!(calls.iter().all(|f| f.query.is_none()));
 }
 
+/// The names a record's `targets` holds, as written.
+fn written(targets: &[lexega_core::facts::ObjectRef]) -> Vec<&str> {
+    targets.iter().map(|t| t.name.written.as_str()).collect()
+}
+
+#[test]
+fn a_list_statement_is_one_record_naming_each_object() {
+    for sql in [
+        "DROP TABLE prod.orders, prod.payroll;",
+        "TRUNCATE TABLE prod.orders, prod.payroll;",
+    ] {
+        let record = records(sql, postgres());
+        assert_eq!(record.len(), 1, "{sql}");
+        let ddl = record[0].ddl.as_ref().expect("ddl facts");
+        assert_eq!(
+            written(&ddl.targets),
+            ["prod.orders", "prod.payroll"],
+            "{sql}"
+        );
+        assert_eq!(ddl.target.as_ref(), ddl.targets.first(), "{sql}");
+    }
+    let optimize = records("OPTIMIZE TABLE prod.orders, prod.payroll;", mysql());
+    assert_eq!(kinds(&optimize), [StatementKind::OptimizeTable]);
+    let ddl = optimize[0].ddl.as_ref().expect("ddl facts");
+    assert_eq!(written(&ddl.targets), ["prod.orders", "prod.payroll"]);
+
+    let grant = records(
+        "GRANT SELECT ON TABLE prod.orders, prod.payroll TO analyst;",
+        postgres(),
+    );
+    assert_eq!(grant.len(), 1);
+    let privilege = grant[0].privilege.as_ref().expect("privilege facts");
+    assert_eq!(written(&privilege.targets), ["prod.orders", "prod.payroll"]);
+    assert_eq!(privilege.target.as_ref(), privilege.targets.first());
+
+    // A lone object is the one target listed.
+    let drop = records("DROP TABLE x;", snowflake());
+    let ddl = drop[0].ddl.as_ref().expect("ddl facts");
+    assert_eq!(written(&ddl.targets), ["x"]);
+}
+
 #[test]
 fn a_create_as_query_is_one_record_with_its_query() {
     for (sql, kind) in [
@@ -156,7 +197,7 @@ fn each_body_statement_and_each_script_statement_is_one_record() {
         kinds(&procedure),
         [
             StatementKind::CreateProcedure,
-            StatementKind::Opaque,
+            StatementKind::Block,
             StatementKind::Insert,
             StatementKind::Delete,
         ]
@@ -169,10 +210,29 @@ fn each_body_statement_and_each_script_statement_is_one_record() {
         kinds(&script),
         [
             StatementKind::Declare,
-            StatementKind::Opaque,
+            StatementKind::Set,
             StatementKind::Grant,
         ]
     );
+}
+
+#[test]
+fn each_statement_of_a_pipe_chain_is_a_record_of_its_own() {
+    let chain = records("SHOW TABLES ->> DELETE FROM prod.core.orders;", snowflake());
+    let kinds = kinds(&chain);
+    assert!(kinds.contains(&StatementKind::Show), "{kinds:?}");
+    assert!(kinds.contains(&StatementKind::Delete), "{kinds:?}");
+    let report = analyze_risk_with_policy_config(
+        "SELECT 1 ->> DELETE FROM prod.core.orders;",
+        &AnalysisConfig {
+            dialect: Some(snowflake()),
+            ..Default::default()
+        },
+    )
+    .expect("analyzes");
+    assert!(report
+        .entries()
+        .any(|entry| entry.rule_id() == Some("DML-WRITE-UNBOUNDED")));
 }
 
 /// Where each entry `rule` raises on `sql` points.

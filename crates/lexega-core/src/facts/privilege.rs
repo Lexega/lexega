@@ -17,8 +17,14 @@ use super::identity::{IdentName, ObjectRef, PrincipalRef};
 pub struct PrivilegeFacts {
     pub kind: PrivilegeChangeKind,
     pub privileges: Vec<Privilege>,
-    /// Omitted for `GRANT … ON FUTURE …` without an explicit target.
+    /// The object the privileges are on; for a list (`GRANT SELECT ON a,
+    /// b`), the first of `targets`. Omitted for `GRANT … ON FUTURE …`
+    /// without an explicit target.
     pub target: Option<ObjectRef>,
+    /// Every object the privileges are on, in the order written: `target`
+    /// alone, or each object of a list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ObjectRef>,
     pub grantees: Vec<PrincipalRef>,
     pub with_grant_option: bool,
     pub on_future: bool,

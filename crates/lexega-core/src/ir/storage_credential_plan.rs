@@ -35,6 +35,8 @@ use crate::lexer::token::Span;
 #[derive(Debug, Clone)]
 pub struct StorageCredentialPlan {
     pub action: StorageCredentialAction,
+    /// The credential the statement names, as written.
+    pub target: Option<super::ddl_plan::DdlTarget>,
     pub credential_kind: StorageCredentialKindIr,
     pub if_not_exists: bool,
     pub provider: Option<StorageCredentialProvider>,
@@ -130,6 +132,7 @@ pub fn lower_create_storage_credential_to_storage_credential_plan(
 ) -> StorageCredentialPlan {
     StorageCredentialPlan {
         action: StorageCredentialAction::Create,
+        target: super::lower_ddl::target_from(s.credential_name_span, source),
         credential_kind: lower_credential_kind(s.credential_kind),
         if_not_exists: s.if_not_exists,
         provider: s
@@ -149,9 +152,11 @@ pub fn lower_create_storage_credential_to_storage_credential_plan(
 
 pub fn lower_drop_storage_credential_to_storage_credential_plan(
     s: &AstDropStorageCredential,
+    source: &str,
 ) -> StorageCredentialPlan {
     StorageCredentialPlan {
         action: StorageCredentialAction::Drop,
+        target: super::lower_ddl::target_from(s.credential_name_span, source),
         credential_kind: lower_credential_kind(s.credential_kind),
         if_not_exists: false,
         provider: None,
@@ -182,6 +187,7 @@ pub fn lower_alter_storage_credential_to_storage_credential_plan(
     };
     StorageCredentialPlan {
         action: StorageCredentialAction::Alter,
+        target: super::lower_ddl::target_from(s.credential_name_span, source),
         credential_kind: lower_credential_kind(s.credential_kind),
         if_not_exists: false,
         provider,

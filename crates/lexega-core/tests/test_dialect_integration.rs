@@ -998,3 +998,48 @@ fn test_bq_format_backtick_identifiers() {
     let sql = "SELECT `column_name` FROM `project.dataset.table`";
     format_and_verify(sql, &bq_config());
 }
+
+/// The rules the analysis of `sql` in `dialect` reports, and how many
+/// statements it could not read.
+fn rules_and_skipped(sql: &str, dialect: lexega_core::dialect::DialectRef) -> (Vec<String>, usize) {
+    let config = lexega_core::analyzer::AnalysisConfig {
+        dialect: Some(dialect),
+        ..Default::default()
+    };
+    let report =
+        lexega_core::api::analyze_risk_with_policy_config(sql, &config).expect("analysis succeeds");
+    let rules = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let lexega_core::analyzer::RuleMatch::Analysis(finding) = finding;
+            finding.matched_rule.clone()
+        })
+        .collect();
+    (rules, report.summary.statements_skipped)
+}
+
+#[test]
+fn test_no_comment_form_hides_a_statement_the_database_runs() {
+    let hidden = "SELECT 4 //* x */ 2; DROP TABLE users";
+    for dialect in [postgres(), mysql(), mssql(), bigquery()] {
+        let name = dialect.name();
+        let (rules, _) = rules_and_skipped(hidden, dialect);
+        assert!(rules.contains(&"TBL-DROP".to_string()), "{name}: {rules:?}");
+    }
+    for executable in ["/*! DROP TABLE users */", "/*!50000 DROP TABLE users */"] {
+        let (rules, _) = rules_and_skipped(executable, mysql());
+        assert!(
+            rules.contains(&"TBL-DROP".to_string()),
+            "{executable}: {rules:?}"
+        );
+    }
+    let nested = "/* /* */ SELECT '*/ DROP TABLE users; --'";
+    let (rules, _) = rules_and_skipped(nested, lexega_core::dialect::databricks());
+    assert!(
+        rules.contains(&"TBL-DROP".to_string()),
+        "databricks: {rules:?}"
+    );
+    let (_, skipped) = rules_and_skipped(nested, lexega_core::dialect::redshift());
+    assert!(skipped >= 1, "redshift reads the comment as unreadable");
+}

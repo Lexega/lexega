@@ -863,11 +863,11 @@ pub enum DdlAction {
 /// table a query reads is; any other target holds each folded.
 #[derive(Debug, Clone)]
 pub struct DdlTarget {
-    /// Bare object name (last identifier component).
+    /// Bare object name (last identifier component), as written.
     pub name: String,
-    /// Schema component when present.
+    /// Schema component when present, as written.
     pub schema: Option<String>,
-    /// Database component when present.
+    /// Database component when present, as written.
     pub db: Option<String>,
     /// Source span of the (qualified) name in the original SQL.
     pub span: Span,

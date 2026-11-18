@@ -3,6 +3,39 @@
 The rule corpus is versioned in lockstep with the Lexega engine. Entries
 describe rules added, removed or renamed, and changes in what a rule matches.
 
+## 3.1.0
+
+**Added.** Thirteen new rules. The corpus now has 97 critical, 85 high, 288 medium, 194 low and 306 info rules.
+
+*Critical*
+- `DB-REPLACE` and `SCHEMA-REPLACE`: `CREATE OR REPLACE DATABASE` and `CREATE OR REPLACE SCHEMA`, which drop everything the old database or schema held.
+- `TBL-SWAP`: `ALTER TABLE … SWAP WITH`.
+- `GRT-UNMASK`: SQL Server's `GRANT UNMASK`, on the database, a schema, a table or its columns.
+- `MSSQL-XP-REGISTRY-WRITE`: `xp_regwrite`, `xp_regdeletekey`, `xp_regdeletevalue`, the multi-string procedures and their `xp_instance_` forms.
+- `MYSQL-GRT-SUPER`: `GRANT SUPER`.
+
+*High*
+- `MSSQL-XP-REGISTRY-READ`: `xp_regread`, `xp_regenumkeys`, `xp_regenumvalues` and their `xp_instance_` forms.
+- `MSSQL-XP-FILESYSTEM`: `xp_dirtree`, `xp_fileexist` and `xp_subdirs`.
+- `MSSQL-STARTUP-PROC`: `sp_procoption`, except when it sets the option to `off` or `false`.
+- `MYSQL-GRT-FILE`: `GRANT FILE`.
+- `MYSQL-LOAD-FILE`: a call of `LOAD_FILE()` anywhere in a statement.
+
+*Medium*
+- `MSSQL-DBMAIL-EGRESS`: `sp_send_dbmail` with `@query` or `@file_attachments`.
+- `MYSQL-GRT-PROCESS`: `GRANT PROCESS`.
+
+Each SQL Server rule catches its procedure however the name is qualified, quoted or capitalized.
+
+**Changed.** `TBL-REPLACE`'s message now says that `CREATE OR REPLACE TABLE` drops every row the old table held. `DML-WRITE-UNBOUNDED`'s message now says that `id = id` leaves out only the rows where `id` is NULL.
+
+**Catches more.**
+- `DML-WRITE-UNBOUNDED` catches a `WHERE` made only of constants that is always true, such as `WHERE 1 + 1 = 2` or MySQL's `WHERE 1`.
+- `DML-WRITE-UNBOUNDED` catches `LIMIT 18446744073709551615`, MySQL's way of writing "no limit".
+- `DML-WRITE-UNBOUNDED` catches `WHERE id = id`, which matches every row that has an `id`. It also catches conditions that cover every value of a column, such as `WHERE x >= 5 OR x < 5`. It used to catch these only on a column the catalog marks `NOT NULL`. `WHERE x IS NOT NULL` still counts as a filter.
+- `TBL-MASK-RMV` catches SQL Server's `ALTER COLUMN … DROP MASKED`.
+- `GRT-TO-PUBLIC` and the other grant rules catch column-level grants, such as `GRANT SELECT (a, b) ON t TO PUBLIC`. Lexega used to read these grants only in part.
+
 ## 3.0.0
 
 Levels are retuned, a cause is reported by one rule, and rule files can hold lists. A policy or exception that names a rule should be checked against the sections below; the rule reference lists every rule at its level.

@@ -1884,8 +1884,8 @@ impl<'a> Parser<'a> {
         };
         let mut starts = vec![open + 1];
         let mut depth = 0u32;
-        for i in open + 1..past - 1 {
-            let kind = &self.tokens[i].kind;
+        for (i, token) in self.tokens.iter().enumerate().take(past - 1).skip(open + 1) {
+            let kind = &token.kind;
             if matches!(kind, TokenKind::Punctuation(Punctuation::LParen)) {
                 depth += 1;
             } else if matches!(kind, TokenKind::Punctuation(Punctuation::RParen)) {
@@ -1950,8 +1950,8 @@ impl<'a> Parser<'a> {
         // The commas between the arguments.
         let mut commas = Vec::new();
         let mut depth = 0u32;
-        for i in open + 1..past - 1 {
-            let kind = &self.tokens[i].kind;
+        for (i, token) in self.tokens.iter().enumerate().take(past - 1).skip(open + 1) {
+            let kind = &token.kind;
             if matches!(kind, TokenKind::Punctuation(Punctuation::LParen)) {
                 depth += 1;
             } else if matches!(kind, TokenKind::Punctuation(Punctuation::RParen)) {

@@ -12,13 +12,16 @@
 //! Three shapes are every-row only when a column holds no NULLs:
 //! `col IS NOT NULL`, reflexive `x = x`, and a domain-exhausting
 //! disjunction with no `IS NULL` arm. They escalate only when the caller
-//! supplies a [`NonNullProof`]; without one they stay bounded.
+//! supplies a [`NonNullProof`]; without one they stay bounded. Counting
+//! [`RowsCounted::ExceptNullCompared`], the last two hold without a proof:
+//! the rows they spare are those in which the column they compare is NULL.
 
 use super::column::{BindingTable, ColumnId, ColumnOrigin};
 use super::plan::{FilterKind, ProjectItem, RelPlan};
 use super::queries::for_each_immediate;
 use super::scalar::{
-    BinOpKind, ComparisonOp, FieldPath, FieldStep, Lit, QuantifiedRhs, ScalarExpr, SqlType,
+    BinOpKind, ComparisonOp, FieldPath, FieldStep, IsPredicate, Lit, QuantifiedRhs, ScalarExpr,
+    SqlType,
 };
 use crate::ast::{AstExpr, NodeId};
 use crate::context::node_metadata::{IdentKey, TableRef};
@@ -53,6 +56,41 @@ impl NonNullProof for DeclaredAt<'_> {
     }
 }
 
+/// The rows a predicate must hold on to hold "for every row".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsCounted {
+    /// Every row.
+    All,
+    /// Every row but one in which a column the predicate compares with
+    /// itself (`x = x`), or whose values its disjuncts cover
+    /// (`x = 1 OR x <> 1`), is NULL. A test of NULL itself
+    /// (`x IS NOT NULL`) is judged as under [`RowsCounted::All`].
+    ExceptNullCompared,
+}
+
+/// What one judgment knows of NULLs: the proof of columns that hold none,
+/// and the rows it counts.
+#[derive(Clone, Copy)]
+struct Nulls<'p> {
+    proof: Option<&'p dyn NonNullProof>,
+    counted: RowsCounted,
+}
+
+impl Nulls<'_> {
+    fn proven_not_null(&self, col: ColumnId) -> bool {
+        self.proof.is_some_and(|p| p.proven_not_null(col))
+    }
+
+    /// Whether the rows in which `col`, compared with itself or with every
+    /// value, is NULL need not be matched.
+    fn compared_null_rows_spared(&self, col: Option<ColumnId>) -> bool {
+        match self.counted {
+            RowsCounted::ExceptNullCompared => true,
+            RowsCounted::All => col.is_some_and(|col| self.proven_not_null(col)),
+        }
+    }
+}
+
 /// Whether the statement's outer-scope WHERE / ON predicate holds for every row.
 ///
 /// Returns `true` when the statement's outer-scope WHERE / ON
@@ -74,16 +112,18 @@ impl NonNullProof for DeclaredAt<'_> {
 /// `reasoning` answers whether a column is never NULL where a
 /// predicate reads it: at the predicate's `Filter`, or at the node of
 /// the statement that writes. Without it nothing is proven non-null.
+/// `counted` is the rows the predicate must hold on.
 pub fn has_tautology_where(
     plan: &RelPlan,
     source: &str,
     bindings: &BindingTable,
     reasoning: Option<&dyn QueryReasoning>,
+    counted: RowsCounted,
 ) -> bool {
     let judged = |pred: &ScalarExpr, target: Option<&TableRef>, node: &RelPlan| {
         let proof = reasoning.map(|reasoning| DeclaredAt { reasoning, node });
         let proof = proof.as_ref().map(|proof| proof as &dyn NonNullProof);
-        is_always_true(pred, source, target, bindings, proof)
+        constant_truth(pred, source, target, bindings, Nulls { proof, counted }) == Some(true)
     };
     match plan {
         RelPlan::Update {
@@ -105,7 +145,7 @@ pub fn has_tautology_where(
         // MERGE target is an obscure shape left as a sound under-call.
         RelPlan::Merge { on, .. } => judged(on, None, plan),
         RelPlan::Explain { body, .. } | RelPlan::WithScope { body, .. } => {
-            has_tautology_where(body, source, bindings, reasoning)
+            has_tautology_where(body, source, bindings, reasoning, counted)
         }
 
         RelPlan::Update {
@@ -260,7 +300,7 @@ fn collect_or_leaves<'a>(expr: &'a ScalarExpr, out: &mut Vec<&'a ScalarExpr>) {
 fn or_chain_domain_exhaustion(
     or_expr: &ScalarExpr,
     bindings: &BindingTable,
-    proof: Option<&dyn NonNullProof>,
+    nulls: Nulls<'_>,
 ) -> bool {
     use super::constraint_types::{detect_tautologies_in_scope, pred_to_col_key};
     use super::predicate_atom::expr_to_simple_fact;
@@ -287,23 +327,18 @@ fn or_chain_domain_exhaustion(
         // The detected tautology covers every non-NULL row. It is
         // every-row iff the NULL row is also covered: either by an
         // explicit `IS NULL` disjunct on the same column, or because the
-        // column is *proven* non-null (no NULL row exists to spare) — the
-        // same proof that escalates reflexive `x = x` and
-        // `col IS NOT NULL`.
+        // column's NULL row is spared — it is *proven* non-null, as for
+        // reflexive `x = x` and `col IS NOT NULL`, or the judgment does
+        // not count it.
         let null_disjunct = facts.iter().any(|f| {
             matches!(f.operator, PredicateOp::IsNull)
                 && pred_to_col_key(f, bindings).as_str() == finding.column
         });
-        if null_disjunct {
-            return true;
-        }
-        match proof {
-            Some(p) => facts.iter().any(|f| {
+        null_disjunct
+            || facts.iter().any(|f| {
                 pred_to_col_key(f, bindings).as_str() == finding.column
-                    && f.column_id.is_some_and(|cid| p.proven_not_null(cid))
-            }),
-            None => false,
-        }
+                    && nulls.compared_null_rows_spared(f.column_id)
+            })
     })
 }
 
@@ -359,7 +394,11 @@ pub fn is_always_true(
     bindings: &BindingTable,
     proof: Option<&dyn NonNullProof>,
 ) -> bool {
-    constant_truth(predicate, source, target, bindings, proof) == Some(true)
+    let nulls = Nulls {
+        proof,
+        counted: RowsCounted::All,
+    };
+    constant_truth(predicate, source, target, bindings, nulls) == Some(true)
 }
 
 /// Whether `predicate` is true on every row (`Some(true)`), false on
@@ -381,9 +420,13 @@ fn constant_truth(
     source: &str,
     target: Option<&TableRef>,
     bindings: &BindingTable,
-    proof: Option<&dyn NonNullProof>,
+    nulls: Nulls<'_>,
 ) -> Option<bool> {
-    let truth = |operand: &ScalarExpr| constant_truth(operand, source, target, bindings, proof);
+    // A predicate that reads nothing of the row has one value on every row.
+    if let Some(value) = fold(predicate, source) {
+        return value.truth();
+    }
+    let truth = |operand: &ScalarExpr| constant_truth(operand, source, target, bindings, nulls);
     match predicate {
         ScalarExpr::Lit { value, span } => match value {
             Lit::Bool(true) => span_text(source, *span)
@@ -409,7 +452,7 @@ fn constant_truth(
                 conjunction_truth([left.as_ref(), right.as_ref()], truth)
             } else if matches!(op, BinOpKind::Or) {
                 disjunction_truth([left.as_ref(), right.as_ref()], truth, || {
-                    or_chain_domain_exhaustion(predicate, bindings, proof)
+                    or_chain_domain_exhaustion(predicate, bindings, nulls)
                 })
             } else if matches!(op, BinOpKind::Xor) {
                 // True where exactly one side is.
@@ -418,7 +461,7 @@ fn constant_truth(
                     (None, _) | (_, None) => None,
                 }
             } else if let BinOpKind::Cmp(cmp) = op {
-                if comparison_is_always_true(*cmp, left, right, source, proof) {
+                if comparison_is_always_true(*cmp, left, right, source, nulls) {
                     Some(true)
                 } else if literal_comparison(*cmp, left, right, source) == Some(false) {
                     Some(false)
@@ -437,7 +480,7 @@ fn constant_truth(
         ScalarExpr::LogicalChain { op, operands, .. } => match op {
             crate::ir::scalar::LogicalOp::And => conjunction_truth(operands, truth),
             crate::ir::scalar::LogicalOp::Or => disjunction_truth(operands, truth, || {
-                or_chain_domain_exhaustion(predicate, bindings, proof)
+                or_chain_domain_exhaustion(predicate, bindings, nulls)
             }),
         },
 
@@ -471,9 +514,7 @@ fn constant_truth(
                 // NULL rows to spare), without one it stays bounded
                 // (`DELETE FROM t WHERE deleted_at IS NOT NULL` keeps
                 // the rows that were never deleted).
-                ScalarExpr::Column { column, .. } => proof
-                    .is_some_and(|p| p.proven_not_null(*column))
-                    .then_some(true),
+                ScalarExpr::Column { column, .. } => nulls.proven_not_null(*column).then_some(true),
                 ScalarExpr::OuterRef { .. }
                 | ScalarExpr::LogicalChain { .. }
                 | ScalarExpr::OperatorChain { .. }
@@ -503,9 +544,9 @@ fn constant_truth(
                 // non-null, so `NOT (col IS NULL)` is every-row on a
                 // catalog-NOT-NULL column. Symmetric with the
                 // `IS NOT NULL` arm.
-                ScalarExpr::Column { column, .. } => proof
-                    .is_some_and(|p| p.proven_not_null(*column))
-                    .then_some(false),
+                ScalarExpr::Column { column, .. } => {
+                    nulls.proven_not_null(*column).then_some(false)
+                }
                 ScalarExpr::Lit { .. }
                 | ScalarExpr::OuterRef { .. }
                 | ScalarExpr::LogicalChain { .. }
@@ -628,6 +669,512 @@ fn constant_truth(
     }
 }
 
+/// The value of an expression that reads nothing of the row: no column,
+/// subquery, variable or function whose result can vary.
+#[derive(Debug, Clone, PartialEq)]
+enum Const {
+    Null,
+    Bool(bool),
+    /// A number, and whether it is whole by type: written as an integer
+    /// and kept whole by the arithmetic over it.
+    Num {
+        value: f64,
+        whole: bool,
+    },
+    /// A string's text, its quotes removed and `''` read as `'`.
+    Str(String),
+}
+
+/// Numbers larger than this are not compared exactly as `f64`.
+const EXACT_LIMIT: f64 = 9.0e15;
+
+impl Const {
+    /// The value as a condition: a non-zero number is true where a number
+    /// stands as one (MySQL); NULL and a string prove nothing.
+    fn truth(&self) -> Option<bool> {
+        match self {
+            Const::Bool(b) => Some(*b),
+            Const::Num { value, .. } => Some(*value != 0.0),
+            Const::Null | Const::Str(_) => None,
+        }
+    }
+
+    /// Three-valued logic: `None` is NULL; a string has no truth value
+    /// this reading decides, so the whole is unknown (`Err`).
+    fn logic(&self) -> Result<Option<bool>, ()> {
+        match self {
+            Const::Null => Ok(None),
+            Const::Bool(_) | Const::Num { .. } => Ok(self.truth()),
+            Const::Str(_) => Err(()),
+        }
+    }
+}
+
+fn from_logic(value: Option<bool>) -> Const {
+    value.map_or(Const::Null, Const::Bool)
+}
+
+/// The value `expr` has on every row, where it reads nothing of the row
+/// and its value does not depend on the dialect, the collation or the
+/// session. `None` where it does, or where it is not decided here.
+///
+/// Closed-enum exhaustive over [`ScalarExpr`].
+fn fold(expr: &ScalarExpr, source: &str) -> Option<Const> {
+    let fold_one = |operand: &ScalarExpr| fold(operand, source);
+    match expr {
+        ScalarExpr::Lit { value, span } => match value {
+            Lit::Null => Some(Const::Null),
+            Lit::Bool(b) => {
+                let text = span_text(source, *span);
+                let written = if *b { "TRUE" } else { "FALSE" };
+                text.eq_ignore_ascii_case(written)
+                    .then_some(Const::Bool(*b))
+            }
+            Lit::Integer(_) => span_text(source, *span)
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|value| Const::Num { value, whole: true }),
+            Lit::Float(_) => span_text(source, *span)
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .map(|value| Const::Num {
+                    value,
+                    whole: false,
+                }),
+            Lit::Str(raw) => string_text(raw).map(Const::Str),
+            Lit::Bytes { .. } | Lit::Typed { .. } | Lit::Variant(_) | Lit::Variable { .. } => None,
+        },
+
+        ScalarExpr::UnaryOp { op, arg, .. } => {
+            use crate::ir::scalar::UnaryOpKind as U;
+            let value = fold_one(arg)?;
+            match op {
+                U::Not => Some(from_logic(value.logic().ok()?.map(|b| !b))),
+                U::Neg | U::Plus => match value {
+                    Const::Null => Some(Const::Null),
+                    Const::Num { value, whole } => Some(Const::Num {
+                        value: if matches!(op, U::Neg) { -value } else { value },
+                        whole,
+                    }),
+                    Const::Bool(_) | Const::Str(_) => None,
+                },
+                U::IsNull => Some(Const::Bool(value == Const::Null)),
+                U::IsNotNull => Some(Const::Bool(value != Const::Null)),
+                U::Is(IsPredicate::True) => Some(Const::Bool(value.logic().ok()? == Some(true))),
+                U::Is(IsPredicate::False) => Some(Const::Bool(value.logic().ok()? == Some(false))),
+                U::IsNot(IsPredicate::True) => Some(Const::Bool(value.logic().ok()? != Some(true))),
+                U::IsNot(IsPredicate::False) => {
+                    Some(Const::Bool(value.logic().ok()? != Some(false)))
+                }
+                U::Is(_)
+                | U::IsNot(_)
+                | U::AtLocal
+                | U::Collate
+                | U::Prior
+                | U::Spread
+                | U::BitwiseNot
+                | U::SquareRoot
+                | U::AbsoluteValue => None,
+            }
+        }
+
+        ScalarExpr::BinOp {
+            op, left, right, ..
+        } => fold_binary(*op, fold_one(left)?, fold_one(right)?),
+
+        ScalarExpr::LogicalChain { op, operands, .. } => {
+            let values: Option<Vec<Const>> = operands.iter().map(fold_one).collect();
+            let op = match op {
+                crate::ir::scalar::LogicalOp::And => BinOpKind::And,
+                crate::ir::scalar::LogicalOp::Or => BinOpKind::Or,
+            };
+            values?
+                .into_iter()
+                .try_fold(None, |folded: Option<Const>, value| match folded {
+                    None => Some(Some(value)),
+                    Some(left) => fold_binary(op, left, value).map(Some),
+                })
+                .flatten()
+        }
+
+        ScalarExpr::OperatorChain {
+            operands,
+            operators,
+            ..
+        } => {
+            let mut values = operands.iter().map(fold_one);
+            let mut folded = values.next()??;
+            for (op, value) in operators.iter().zip(values) {
+                folded = fold_binary(*op, folded, value?)?;
+            }
+            Some(folded)
+        }
+
+        ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+            ..
+        } => {
+            let (value, low, high) = (fold_one(expr)?, fold_one(low)?, fold_one(high)?);
+            let above = compare(ComparisonOp::GtEq, &value, &low)?;
+            let below = compare(ComparisonOp::LtEq, &value, &high)?;
+            let within = fold_binary(BinOpKind::And, above, below)?;
+            if *negated {
+                Some(from_logic(within.logic().ok()?.map(|b| !b)))
+            } else {
+                Some(within)
+            }
+        }
+
+        ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+            ..
+        } => {
+            let needle = fold_one(expr)?;
+            let mut found = Const::Bool(false);
+            for item in list {
+                let equal = compare(ComparisonOp::Eq, &needle, &fold_one(item)?)?;
+                found = fold_binary(BinOpKind::Or, found, equal)?;
+            }
+            if *negated {
+                Some(from_logic(found.logic().ok()?.map(|b| !b)))
+            } else {
+                Some(found)
+            }
+        }
+
+        ScalarExpr::Like {
+            kind,
+            negated,
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            if escape.is_some() {
+                return None;
+            }
+            let matched = match (fold_one(expr)?, fold_one(pattern)?) {
+                (Const::Null, _) | (_, Const::Null) => return Some(Const::Null),
+                (Const::Str(text), Const::Str(pattern)) => like(kind, &text, &pattern)?,
+                (Const::Bool(_) | Const::Num { .. } | Const::Str(_), _) => return None,
+            };
+            Some(Const::Bool(matched != *negated))
+        }
+
+        ScalarExpr::Case {
+            operand,
+            branches,
+            else_,
+            ..
+        } => {
+            let subject = match operand {
+                Some(operand) => Some(fold_one(operand)?),
+                None => None,
+            };
+            for (when, then) in branches {
+                let condition = fold_one(when)?;
+                let taken = match &subject {
+                    Some(subject) => compare(ComparisonOp::Eq, subject, &condition)?
+                        .logic()
+                        .ok()?,
+                    None => condition.logic().ok()?,
+                };
+                if taken == Some(true) {
+                    return fold_one(then);
+                }
+            }
+            match else_ {
+                Some(else_) => fold_one(else_),
+                None => Some(Const::Null),
+            }
+        }
+
+        ScalarExpr::Cast {
+            expr, target_type, ..
+        } => cast(fold_one(expr)?, target_type),
+
+        ScalarExpr::FuncCall { func, args, .. } => {
+            let name = span_text(source, func.span()).to_ascii_uppercase();
+            match (name.as_str(), args.as_slice()) {
+                ("COALESCE" | "NVL" | "IFNULL", _) | ("ISNULL", [_, _]) => {
+                    for arg in args {
+                        let value = fold_one(arg)?;
+                        if value != Const::Null {
+                            return Some(value);
+                        }
+                    }
+                    Some(Const::Null)
+                }
+                ("ISNULL", [arg]) => Some(Const::Bool(fold_one(arg)? == Const::Null)),
+                ("NULLIF", [left, right]) => {
+                    let left = fold_one(left)?;
+                    match compare(ComparisonOp::Eq, &left, &fold_one(right)?)?
+                        .logic()
+                        .ok()?
+                    {
+                        Some(true) => Some(Const::Null),
+                        Some(false) | None => Some(left),
+                    }
+                }
+                ("IF" | "IIF" | "IFF", [condition, then, otherwise]) => {
+                    match fold_one(condition)?.logic().ok()? {
+                        Some(true) => fold_one(then),
+                        Some(false) | None => fold_one(otherwise),
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        ScalarExpr::Column { .. }
+        | ScalarExpr::OuterRef { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::QuantifiedCmp { .. }
+        | ScalarExpr::RowCmp { .. }
+        | ScalarExpr::WindowFn { .. }
+        | ScalarExpr::FieldAccess { .. }
+        | ScalarExpr::Lambda { .. }
+        | ScalarExpr::PatternVarRef { .. }
+        | ScalarExpr::Opaque { .. } => None,
+    }
+}
+
+/// `left op right` over two constants.
+fn fold_binary(op: BinOpKind, left: Const, right: Const) -> Option<Const> {
+    let number = |value: &Const| match value {
+        Const::Num { value, whole } => Some((*value, *whole)),
+        Const::Null | Const::Bool(_) | Const::Str(_) => None,
+    };
+    let either_null = left == Const::Null || right == Const::Null;
+    match op {
+        BinOpKind::And => {
+            let (l, r) = (left.logic().ok()?, right.logic().ok()?);
+            Some(match (l, r) {
+                (Some(false), _) | (_, Some(false)) => Const::Bool(false),
+                (Some(true), Some(true)) => Const::Bool(true),
+                (None, _) | (_, None) => Const::Null,
+            })
+        }
+        BinOpKind::Or | BinOpKind::LogicalOr => {
+            let (l, r) = (left.logic().ok()?, right.logic().ok()?);
+            Some(match (l, r) {
+                (Some(true), _) | (_, Some(true)) => Const::Bool(true),
+                (Some(false), Some(false)) => Const::Bool(false),
+                (None, _) | (_, None) => Const::Null,
+            })
+        }
+        BinOpKind::Xor => {
+            let (l, r) = (left.logic().ok()?, right.logic().ok()?);
+            Some(from_logic(l.zip(r).map(|(l, r)| l != r)))
+        }
+        BinOpKind::Cmp(cmp) => compare(cmp, &left, &right),
+        BinOpKind::IsDistinctFrom | BinOpKind::IsNotDistinctFrom => {
+            let same = match (&left, &right) {
+                (Const::Null, Const::Null) => true,
+                (Const::Null, _) | (_, Const::Null) => false,
+                _ => compare(ComparisonOp::Eq, &left, &right)?.logic().ok()??,
+            };
+            Some(Const::Bool(
+                same == matches!(op, BinOpKind::IsNotDistinctFrom),
+            ))
+        }
+        BinOpKind::Add
+        | BinOpKind::Sub
+        | BinOpKind::Mul
+        | BinOpKind::Div
+        | BinOpKind::Mod
+        | BinOpKind::IntDiv => {
+            if either_null {
+                return Some(Const::Null);
+            }
+            let ((l, l_whole), (r, r_whole)) = (number(&left)?, number(&right)?);
+            let whole = l_whole && r_whole;
+            let value = match op {
+                BinOpKind::Add => l + r,
+                BinOpKind::Sub => l - r,
+                BinOpKind::Mul => l * r,
+                // Whole numbers divide to a whole number in some dialects
+                // and to a fraction in others: only an exact quotient is
+                // the same everywhere.
+                BinOpKind::Div if r == 0.0 => return None,
+                BinOpKind::Div if whole && l % r != 0.0 => return None,
+                BinOpKind::Div => l / r,
+                BinOpKind::Mod | BinOpKind::IntDiv if r == 0.0 || !whole => return None,
+                BinOpKind::Mod => l % r,
+                BinOpKind::IntDiv => (l / r).trunc(),
+                _ => return None,
+            };
+            (value.is_finite() && value.abs() < EXACT_LIMIT).then_some(Const::Num { value, whole })
+        }
+        BinOpKind::Concat => match (left, right) {
+            (Const::Null, _) | (_, Const::Null) => Some(Const::Null),
+            (Const::Str(l), Const::Str(r)) => Some(Const::Str(l + &r)),
+            (Const::Bool(_) | Const::Num { .. } | Const::Str(_), _) => None,
+        },
+        _ => None,
+    }
+}
+
+/// `left cmp right` over two constants, where every dialect and collation
+/// agrees: numbers by value, strings that are equal byte for byte or
+/// differ in more than case and trailing spaces, booleans for equality.
+fn compare(cmp: ComparisonOp, left: &Const, right: &Const) -> Option<Const> {
+    use std::cmp::Ordering;
+    let ordering = match (left, right) {
+        (Const::Null, _) | (_, Const::Null) => return Some(Const::Null),
+        (Const::Num { value: l, .. }, Const::Num { value: r, .. }) => {
+            if l.abs() >= EXACT_LIMIT || r.abs() >= EXACT_LIMIT {
+                return None;
+            }
+            l.partial_cmp(r)?
+        }
+        (Const::Str(l), Const::Str(r)) => {
+            let equal = if l == r {
+                true
+            } else if !l.is_ascii()
+                || !r.is_ascii()
+                || l.eq_ignore_ascii_case(r)
+                || l.trim_end_matches(' ') == r.trim_end_matches(' ')
+            {
+                return None;
+            } else {
+                false
+            };
+            return match cmp {
+                ComparisonOp::Eq => Some(Const::Bool(equal)),
+                ComparisonOp::NotEq => Some(Const::Bool(!equal)),
+                ComparisonOp::Lt | ComparisonOp::LtEq | ComparisonOp::Gt | ComparisonOp::GtEq => {
+                    None
+                }
+            };
+        }
+        (Const::Bool(l), Const::Bool(r)) => {
+            return match cmp {
+                ComparisonOp::Eq => Some(Const::Bool(l == r)),
+                ComparisonOp::NotEq => Some(Const::Bool(l != r)),
+                ComparisonOp::Lt | ComparisonOp::LtEq | ComparisonOp::Gt | ComparisonOp::GtEq => {
+                    None
+                }
+            };
+        }
+        (Const::Num { .. } | Const::Str(_) | Const::Bool(_), _) => return None,
+    };
+    Some(Const::Bool(match cmp {
+        ComparisonOp::Eq => ordering == Ordering::Equal,
+        ComparisonOp::NotEq => ordering != Ordering::Equal,
+        ComparisonOp::Lt => ordering == Ordering::Less,
+        ComparisonOp::LtEq => ordering != Ordering::Greater,
+        ComparisonOp::Gt => ordering == Ordering::Greater,
+        ComparisonOp::GtEq => ordering != Ordering::Less,
+    }))
+}
+
+/// A cast of a constant, where every dialect casts it alike.
+fn cast(value: Const, target: &SqlType) -> Option<Const> {
+    const WHOLE: &[&str] = &[
+        "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "INT2", "INT4", "INT8", "BYTEINT",
+    ];
+    const FRACTIONAL: &[&str] = &[
+        "NUMBER", "NUMERIC", "DECIMAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "REAL",
+    ];
+    const TEXT: &[&str] = &["VARCHAR", "CHAR", "TEXT", "STRING", "NVARCHAR", "NCHAR"];
+    let name = target.repr.split(['(', ' ']).next().unwrap_or_default();
+    let whole_target = WHOLE.contains(&name);
+    match value {
+        Const::Null => Some(Const::Null),
+        // A fraction cast to a whole number is truncated in some dialects
+        // and rounded in others.
+        Const::Num { value, .. } if whole_target => {
+            (value.fract() == 0.0).then_some(Const::Num { value, whole: true })
+        }
+        Const::Num { value, whole } if FRACTIONAL.contains(&name) => {
+            Some(Const::Num { value, whole })
+        }
+        Const::Str(text) if whole_target || FRACTIONAL.contains(&name) => {
+            let value = text.trim().parse::<f64>().ok()?;
+            (!whole_target || value.fract() == 0.0).then_some(Const::Num {
+                value,
+                whole: whole_target,
+            })
+        }
+        Const::Str(text) if TEXT.contains(&name) && target.params.is_empty() => {
+            Some(Const::Str(text))
+        }
+        Const::Bool(b) if matches!(name, "BOOLEAN" | "BOOL") => Some(Const::Bool(b)),
+        Const::Num { .. } | Const::Str(_) | Const::Bool(_) => None,
+    }
+}
+
+/// A string literal's text as written between single quotes, `''` read
+/// as `'`. `None` for a prefixed literal or one holding a backslash, which
+/// dialects read differently.
+fn string_text(raw: &str) -> Option<String> {
+    let inner = raw.strip_prefix('\'')?.strip_suffix('\'')?;
+    if inner.contains('\\') {
+        return None;
+    }
+    Some(inner.replace("''", "'"))
+}
+
+/// Whether `text` matches `pattern`, where every collation agrees: ASCII
+/// text with no trailing space, matched alike with case and without (or
+/// without, for `ILIKE`).
+fn like(kind: &crate::ir::scalar::LikeKind, text: &str, pattern: &str) -> Option<bool> {
+    use crate::ir::scalar::LikeKind;
+    if !text.is_ascii() || !pattern.is_ascii() || text.ends_with(' ') || pattern.ends_with(' ') {
+        return None;
+    }
+    let exact = like_matches(text.as_bytes(), pattern.as_bytes(), false);
+    let folded = like_matches(text.as_bytes(), pattern.as_bytes(), true);
+    match kind {
+        LikeKind::Like => (exact == folded).then_some(exact),
+        LikeKind::ILike => Some(folded),
+        LikeKind::RLike | LikeKind::SimilarTo => None,
+    }
+}
+
+/// `%` matches any run of characters, `_` one character.
+fn like_matches(text: &[u8], pattern: &[u8], fold_case: bool) -> bool {
+    let same = |a: u8, b: u8| {
+        if fold_case {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
+    };
+    let (mut t, mut p) = (0usize, 0usize);
+    let mut resume: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'%') => {
+                resume = Some((p, t));
+                p += 1;
+            }
+            Some(&c) if c == b'_' || same(c, text[t]) => {
+                t += 1;
+                p += 1;
+            }
+            Some(_) | None => match resume {
+                Some((star, matched)) => {
+                    p = star + 1;
+                    t = matched + 1;
+                    resume = Some((star, matched + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&c| c == b'%')
+}
+
 /// `AND` of `operands`, each judged once: always false where one is,
 /// always true where all are.
 fn conjunction_truth<'a>(
@@ -672,7 +1219,7 @@ fn equality_is_always_true(
     left: &ScalarExpr,
     right: &ScalarExpr,
     source: &str,
-    proof: Option<&dyn NonNullProof>,
+    nulls: Nulls<'_>,
 ) -> bool {
     if is_null_lit(left) && is_null_lit(right) {
         return false;
@@ -699,22 +1246,21 @@ fn equality_is_always_true(
         return true;
     }
 
-    // Reflexive column equality `x = x`. Under three-valued logic
-    // `NULL = NULL` is UNKNOWN, so the NULL row is unmatched and the
-    // predicate is every-row ONLY when `x` is *proven* non-null —
-    // then there are no NULL rows to spare. Without that proof it is
-    // merely a non-NULL tautology, surfaced as the Medium
-    // `Q-PRED-TAUTOLOGY` by `detect_tautologies_in_scope`, not the
-    // every-row Critical.
+    reflexive_holds(left, right, nulls)
+}
+
+/// Whether `x = x`, `x <= x` or `x >= x` holds on every row counted.
+/// Under three-valued logic `NULL = NULL` is UNKNOWN, so the NULL row is
+/// unmatched: it holds only when `x` is *proven* non-null, or the rows
+/// where `x` is NULL are not counted.
+fn reflexive_holds(left: &ScalarExpr, right: &ScalarExpr, nulls: Nulls<'_>) -> bool {
     if let (ScalarExpr::Column { column: lcol, .. }, ScalarExpr::Column { column: rcol, .. }) =
         (left, right)
     {
-        if lcol == rcol {
-            return proof.is_some_and(|p| p.proven_not_null(*lcol));
-        }
+        lcol == rcol && nulls.compared_null_rows_spared(Some(*lcol))
+    } else {
+        false
     }
-
-    false
 }
 
 fn is_null_lit(expr: &ScalarExpr) -> bool {
@@ -834,22 +1380,24 @@ fn in_list_static_truth(
 }
 
 /// Static truth of a comparison: `<lit> <cmp> <lit>` folds to a known value,
-/// and `col = col` self-equality is always true. Non-constant operands (other
-/// than the column-identity case) are not provably true.
+/// and `col = col`, `col <= col`, `col >= col` hold as [`reflexive_holds`]
+/// says. Other non-constant operands are not provably true.
 fn comparison_is_always_true(
     op: ComparisonOp,
     left: &ScalarExpr,
     right: &ScalarExpr,
     source: &str,
-    proof: Option<&dyn NonNullProof>,
+    nulls: Nulls<'_>,
 ) -> bool {
     match op {
-        ComparisonOp::Eq => equality_is_always_true(left, right, source, proof),
-        ComparisonOp::NotEq
-        | ComparisonOp::Lt
-        | ComparisonOp::LtEq
-        | ComparisonOp::Gt
-        | ComparisonOp::GtEq => literal_comparison(op, left, right, source) == Some(true),
+        ComparisonOp::Eq => equality_is_always_true(left, right, source, nulls),
+        ComparisonOp::LtEq | ComparisonOp::GtEq => {
+            reflexive_holds(left, right, nulls)
+                || literal_comparison(op, left, right, source) == Some(true)
+        }
+        ComparisonOp::NotEq | ComparisonOp::Lt | ComparisonOp::Gt => {
+            literal_comparison(op, left, right, source) == Some(true)
+        }
     }
 }
 
@@ -1168,7 +1716,119 @@ mod tests {
             None,
         )
         .expect("lower");
-        has_tautology_where(&plan, src, &bindings, None)
+        has_tautology_where(&plan, src, &bindings, None, RowsCounted::All)
+    }
+
+    /// Whether the `WHERE` of `src` holds on every row but those where a
+    /// column it compares is NULL.
+    fn non_null_tautology(src: &str) -> bool {
+        let tokens = tokenize(src);
+        let script = parse_script(src, &tokens.tokens).expect("parse");
+        let (plan, _catalog_ctx, bindings, _facts) = lower_query_full_with_bindings(
+            &script.stmts[0],
+            src,
+            StrictMode::Permissive,
+            &FunctionCatalog::for_dialect(CatalogDialect::Default),
+            &SessionContext::default(),
+            None,
+        )
+        .expect("lower");
+        has_tautology_where(&plan, src, &bindings, None, RowsCounted::ExceptNullCompared)
+    }
+
+    #[test]
+    fn a_comparison_of_a_column_with_itself_spares_only_its_null_rows() {
+        let _folding = crate::ir::normalize::default_folding();
+        for spares_nulls in [
+            "DELETE FROM t WHERE x = x",
+            "DELETE FROM t WHERE x >= x",
+            "DELETE FROM t WHERE x <= x",
+            "DELETE FROM t WHERE x = 1 OR x <> 1",
+            "DELETE FROM t WHERE x < 10 OR x > 5",
+            "DELETE FROM t WHERE x = x OR c > 0",
+            "DELETE FROM t WHERE NOT (NOT (x = x))",
+        ] {
+            assert!(!tautology(spares_nulls), "{spares_nulls}");
+            assert!(non_null_tautology(spares_nulls), "{spares_nulls}");
+        }
+        assert!(non_null_tautology("UPDATE t SET a = 1 WHERE 1 = 1"));
+        for bounded in [
+            // A test of NULL itself is a filter.
+            "DELETE FROM t WHERE x IS NOT NULL",
+            "DELETE FROM t WHERE NOT (x IS NULL)",
+            "DELETE FROM t WHERE x = x AND c > 0",
+            "DELETE FROM t WHERE x <> x",
+            "DELETE FROM t WHERE x < x",
+            "DELETE FROM t WHERE x = y",
+            "DELETE FROM t WHERE x < 5 OR x > 10",
+        ] {
+            assert!(!non_null_tautology(bounded), "{bounded}");
+        }
+    }
+
+    #[test]
+    fn a_predicate_that_reads_nothing_of_the_row_is_judged_by_its_value() {
+        let _folding = crate::ir::normalize::default_folding();
+        for every_row in [
+            "DELETE FROM t WHERE 1 BETWEEN 0 AND 2",
+            "DELETE FROM t WHERE 'x' LIKE '%'",
+            "DELETE FROM t WHERE 'abc' LIKE 'a_c'",
+            "DELETE FROM t WHERE 2 > 1 AND 'a' = 'a'",
+            "DELETE FROM t WHERE 1 + 1 = 2",
+            "DELETE FROM t WHERE 1 = 1.0",
+            "DELETE FROM t WHERE 6 / 3 = 2",
+            "DELETE FROM t WHERE CAST('1' AS INT) = 1",
+            "DELETE FROM t WHERE COALESCE(NULL, 1) = 1",
+            "DELETE FROM t WHERE NULLIF(1, 2) = 1",
+            "DELETE FROM t WHERE CASE WHEN 1 = 1 THEN TRUE ELSE FALSE END",
+            "DELETE FROM t WHERE CASE 2 WHEN 1 THEN FALSE WHEN 2 THEN TRUE END",
+            "DELETE FROM t WHERE 1 IN (3, 2, 1)",
+            "DELETE FROM t WHERE 4 NOT IN (3, 2, 1)",
+            "DELETE FROM t WHERE NOT 1 = 2",
+            "DELETE FROM t WHERE NULL IS NULL",
+            "DELETE FROM t WHERE 'a' || 'b' = 'ab'",
+            "UPDATE t SET a = 1 WHERE -1 < 0 OR c > 0",
+        ] {
+            assert!(tautology(every_row), "{every_row}");
+        }
+        for bounded in [
+            "DELETE FROM t WHERE 1 BETWEEN 2 AND 3",
+            "DELETE FROM t WHERE c BETWEEN 0 AND 2",
+            // NULL holds for no row.
+            "DELETE FROM t WHERE NULL = NULL",
+            "DELETE FROM t WHERE 1 BETWEEN NULL AND 2",
+            "DELETE FROM t WHERE 1 IN (2, NULL)",
+            // Collations differ on case and trailing spaces.
+            "DELETE FROM t WHERE 'a' = 'A'",
+            "DELETE FROM t WHERE 'ab' LIKE 'A%'",
+            "DELETE FROM t WHERE 'a' = 'a '",
+            // Dialects divide whole numbers apart, and cast a fraction
+            // to a whole number apart.
+            "DELETE FROM t WHERE 5 / 2 = 2",
+            "DELETE FROM t WHERE CAST(1.5 AS INT) = 1",
+            // A string's truth is not read.
+            "DELETE FROM t WHERE 'yes'",
+            "DELETE FROM t WHERE 1 / 0 = 1",
+        ] {
+            assert!(!tautology(bounded), "{bounded}");
+        }
+    }
+
+    #[test]
+    fn a_number_or_a_truth_test_stands_as_a_condition() {
+        let _folding = crate::ir::normalize::default_folding();
+        for every_row in [
+            "DELETE FROM t WHERE 1",
+            "DELETE FROM t WHERE 1 IS TRUE",
+            "DELETE FROM t WHERE 0 IS NOT TRUE",
+            "DELETE FROM t WHERE NULL IS NOT TRUE",
+            "DELETE FROM t WHERE (1 = 2) IS FALSE",
+        ] {
+            assert!(mysql_tautology(every_row), "{every_row}");
+        }
+        for bounded in ["DELETE FROM t WHERE 0", "DELETE FROM t WHERE NULL IS TRUE"] {
+            assert!(!mysql_tautology(bounded), "{bounded}");
+        }
     }
 
     #[test]

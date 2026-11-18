@@ -18,6 +18,17 @@ accepted = [
     "Unicode-DFS-2016",
 ]
 
+# The targets release.yml builds: a crate only another target uses (such as
+# a wasm32-only certificate bundle) is in no shipped binary.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
 # Ignore dev-only dependencies (not shipped in binary)
 ignore-build-dependencies = true
 ignore-dev-dependencies = true

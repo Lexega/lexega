@@ -137,6 +137,15 @@ pub struct StatementFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mssql_exec: Option<super::ddl::MssqlExecFacts>,
 
+    /// The arguments a `CALL` or T-SQL `EXEC` passes to the routine it
+    /// calls, which is `ddl.target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<super::ddl::CallFacts>,
+
+    /// The variables a `DECLARE` makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declare: Option<super::ddl::DeclareFacts>,
+
     /// Execution-context impersonation properties. Populated for
     /// statements with [`StatementKind::MssqlExecuteAs`] (`EXECUTE AS
     /// LOGIN/USER = …`).
@@ -508,6 +517,9 @@ pub enum StatementKind {
     Use,
     /// `SHOW <objects> [LIKE …] [IN …]` — metadata introspection.
     Show,
+    /// `DESCRIBE <object>` — the metadata of one object, named in
+    /// `ddl.target`.
+    Describe,
     Set,
     Reset,
     BeginTransaction,
@@ -678,6 +690,9 @@ pub enum StatementKind {
 
     // ───────────── MySQL-specific ─────────────
     MysqlLoadData,
+    /// MySQL `DO <expr>, …` — expressions evaluated for their effect
+    /// (`DO SLEEP(30)`).
+    MysqlDo,
     /// MySQL `CREATE EVENT` — a scheduled SQL job.
     CreateEvent,
     /// MySQL `ALTER EVENT` — reschedule / enable / rename / rebind body.
@@ -733,6 +748,14 @@ pub enum StatementKind {
 
     // ───────────── MSSQL-specific ─────────────
     MssqlExec,
+    /// T-SQL `WAITFOR { DELAY | TIME } …` — holds the connection for a time.
+    MssqlWaitfor,
+    /// T-SQL `PRINT` — a message to the client.
+    MssqlPrint,
+    /// T-SQL `THROW` — raises an error.
+    MssqlThrow,
+    /// T-SQL `RAISERROR` — raises an error or message.
+    MssqlRaiserror,
     /// T-SQL `RECONFIGURE [WITH OVERRIDE]` — applies pending
     /// `sp_configure` server option changes to the running configuration.
     Reconfigure,
@@ -825,6 +848,9 @@ pub enum StatementKind {
     Repeat,
     TryCatch,
     Block,
+    /// A Snowflake pipe chain (`a ->> b`): each statement runs in turn and
+    /// is read as a statement of its own.
+    PipeChain,
     /// `DECLARE @var <type> [= <init>]` — scalar local variable declaration
     /// (T-SQL / scripting). Not a CREATE; lives in a procedural body.
     Declare,
@@ -874,6 +900,22 @@ fn absorb_carrier<T: PartialEq + std::fmt::Debug>(kept: &mut Option<T>, other: O
 }
 
 impl StatementFacts {
+    /// List a lone DDL or privilege target in its `targets`, where the
+    /// reading filled no list.
+    pub(crate) fn complete_targets(&mut self) {
+        let lone = |targets: &mut Vec<super::ObjectRef>, target: &Option<super::ObjectRef>| {
+            if targets.is_empty() {
+                targets.extend(target.iter().cloned());
+            }
+        };
+        if let Some(ddl) = self.ddl.as_mut() {
+            lone(&mut ddl.targets, &ddl.target);
+        }
+        if let Some(privilege) = self.privilege.as_mut() {
+            lone(&mut privilege.targets, &privilege.target);
+        }
+    }
+
     /// Add to these facts what `other`, another reading of the same
     /// statement, holds: each carrier these facts lack, every entry of each
     /// list, and its query where the query holds something. The statement's
@@ -904,6 +946,8 @@ impl StatementFacts {
             handler,
             dynamic_sql_calls,
             mssql_exec,
+            call,
+            declare,
             impersonation,
             execute_immediate_from,
             audit,
@@ -937,6 +981,8 @@ impl StatementFacts {
         absorb_carrier(&mut self.handler, handler);
         self.dynamic_sql_calls.extend(dynamic_sql_calls);
         absorb_carrier(&mut self.mssql_exec, mssql_exec);
+        absorb_carrier(&mut self.call, call);
+        absorb_carrier(&mut self.declare, declare);
         absorb_carrier(&mut self.impersonation, impersonation);
         absorb_carrier(&mut self.execute_immediate_from, execute_immediate_from);
         absorb_carrier(&mut self.audit, audit);

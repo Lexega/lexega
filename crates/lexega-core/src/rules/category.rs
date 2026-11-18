@@ -43,6 +43,10 @@ const FAMILY_FALLBACK: &[(&str, RuleCategory)] = &[
     // A call that runs SQL text, in a routine body or a script: the code
     // around it builds what runs.
     ("dynamic_sql_calls", RuleCategory::Code),
+    // The arguments a statement passes to the routine it calls.
+    ("call", RuleCategory::Code),
+    // The variables a script declares.
+    ("declare", RuleCategory::Code),
 ];
 
 /// The recognition surface gathered from one walk of a rule's predicate:

@@ -2565,11 +2565,13 @@ impl<'a> Parser<'a> {
     }
 
     fn is_drop_mask_pattern(&self) -> bool {
-        // Check for: DROP MASK
+        // Check for: DROP MASK, or SQL Server's DROP MASKED
         if let Some(tok1) = self.peek_at(self.idx) {
             if tok1.lexeme(self.source).eq_ignore_ascii_case("DROP") {
                 if let Some(tok2) = self.peek_at(self.idx + 1) {
-                    return tok2.lexeme(self.source).eq_ignore_ascii_case("MASK");
+                    let word = tok2.lexeme(self.source);
+                    return word.eq_ignore_ascii_case("MASK")
+                        || word.eq_ignore_ascii_case("MASKED");
                 }
             }
         }

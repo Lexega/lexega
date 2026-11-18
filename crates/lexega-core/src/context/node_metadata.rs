@@ -254,7 +254,9 @@ pub struct TableKey {
 }
 
 impl TableKey {
-    /// The key of the table `table` names.
+    /// The key of the table `table` names: each part folded as the dialect
+    /// folds a relation's part. The parts are the reference's own, read from
+    /// SQL text where it was built (`crate::ir::utils::relation_written_parts`).
     pub fn of(table: &TableRef) -> Self {
         Self {
             server: table.server.as_deref().map(IdentKey::new),
@@ -294,12 +296,17 @@ impl TableKey {
     }
 }
 
+/// The parts joined with `.`, a part holding a `.` or a `"` in double
+/// quotes, as a canonical name is written: a one-part name holding dots
+/// never reads as the name of its parts.
 impl std::fmt::Display for TableKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for part in [&self.server, &self.db, &self.schema].into_iter().flatten() {
-            write!(f, "{part}.")?;
-        }
-        write!(f, "{}", self.name)
+        let parts = [&self.server, &self.db, &self.schema]
+            .into_iter()
+            .flatten()
+            .chain(std::iter::once(&self.name))
+            .map(IdentKey::as_str);
+        f.write_str(&crate::facts::identity::join_canonical(parts))
     }
 }
 
@@ -2771,5 +2778,25 @@ mod expression_fact_hash_tests {
         let added: Vec<_> = current.difference(&baseline).collect();
         assert_eq!(added.len(), 1, "Should detect one new expression");
         assert!(matches!(added[0], ExpressionFact::Function { name, .. } if name == "UPPER"));
+    }
+}
+
+#[cfg(test)]
+mod table_key_tests {
+    use super::*;
+
+    /// A one-part name holding dots is written quoted, so it never reads as
+    /// the name of its parts.
+    #[test]
+    fn a_one_part_name_holding_dots_is_not_written_as_its_parts() {
+        let _folding = crate::ir::normalize::default_folding();
+        let one_part = TableKey::of(&TableRef::new("\"sales.purge_refunds\"".to_string()));
+        let two_parts = TableKey::of(&TableRef {
+            schema: Some("sales".to_string()),
+            ..TableRef::new("purge_refunds".to_string())
+        });
+        assert_eq!(two_parts.to_string(), "SALES.PURGE_REFUNDS");
+        assert_eq!(one_part.to_string(), "\"sales.purge_refunds\"");
+        assert_ne!(one_part.to_string(), two_parts.to_string());
     }
 }

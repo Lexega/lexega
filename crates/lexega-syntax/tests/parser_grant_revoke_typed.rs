@@ -457,3 +457,52 @@ fn grant_unparsed_falls_back_for_unknown_form() {
     let g = expect_grant(parse_one("GRANT GIBBERISH NONSENSE FOO BAR;"));
     assert!(matches!(g.shape, AstGrantShape::Unparsed { .. }));
 }
+
+/// A statement that reads into a typed grant or revoke, and formats back
+/// to text that reads the same.
+fn typed_and_round_trips(src: &str, dialect: lexega_syntax::DialectRef) {
+    let script = lexega_syntax::parse_sql_with_dialect(src, dialect.as_ref()).expect("parse");
+    match &script.stmts[0] {
+        AstStmt::Grant(grant) => assert!(
+            !matches!(
+                grant.shape,
+                lexega_syntax::ast::AstGrantShape::Unparsed { .. }
+            ),
+            "{src}"
+        ),
+        AstStmt::Revoke(revoke) => assert!(
+            !matches!(
+                revoke.shape,
+                lexega_syntax::ast::AstRevokeShape::Unparsed { .. }
+            ),
+            "{src}"
+        ),
+        other => panic!("{src}: not a grant or revoke: {other:?}"),
+    }
+    let config = lexega_syntax::FormatterConfig {
+        dialect: dialect.clone(),
+        ..Default::default()
+    };
+    let formatted = lexega_syntax::format_sql_with_config(src, &config).expect("format");
+    lexega_syntax::verify_formatting_safe_with_dialect(src, &formatted, dialect.as_ref())
+        .expect("round trip");
+}
+
+#[test]
+fn a_column_level_grant_reads_into_a_typed_grant() {
+    use lexega_syntax::dialect::{mssql, mysql, postgres};
+    typed_and_round_trips(
+        "GRANT SELECT (ssn, email) ON customers TO PUBLIC",
+        postgres(),
+    );
+    typed_and_round_trips("REVOKE UPDATE (ssn) ON customers FROM analyst", postgres());
+    typed_and_round_trips("GRANT SELECT (SSN) ON dbo.Customers TO public", mssql());
+    typed_and_round_trips(
+        "GRANT UNMASK ON dbo.Customers(SSN) TO ReportingRole",
+        mssql(),
+    );
+    typed_and_round_trips(
+        "GRANT SELECT (ssn), INSERT ON db.customers TO ''@'%'",
+        mysql(),
+    );
+}

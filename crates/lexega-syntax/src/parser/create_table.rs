@@ -179,8 +179,7 @@ impl Parser<'_> {
         let mut item_start = start_idx;
         let mut depth = 0;
 
-        for i in start_idx..end_idx {
-            let t = &self.tokens[i];
+        for (i, t) in self.tokens.iter().enumerate().take(end_idx).skip(start_idx) {
             match &t.kind {
                 TokenKind::Punctuation(crate::lexer::Punctuation::LParen) => depth += 1,
                 TokenKind::Punctuation(crate::lexer::Punctuation::RParen) => depth -= 1,
@@ -3018,8 +3017,8 @@ impl Parser<'_> {
         let first = i + 1;
         let mut depth = 0usize;
         let mut last = None;
-        for k in first..end_idx {
-            let kind = &self.tokens[k].kind;
+        for (k, token) in self.tokens.iter().enumerate().take(end_idx).skip(first) {
+            let kind = &token.kind;
             if matches!(
                 kind,
                 TokenKind::Punctuation(crate::lexer::Punctuation::LParen)

@@ -6,14 +6,14 @@
 use crate::dialect::Dialect;
 use crate::facts::reasoning::{Reasoning, RecognitionOnly};
 use crate::{
-    adopt_dialect, analyze_carrying, analyze_for_comparison, analyze_reading_last,
-    analyze_risk_core, analyzer, ast, build_script_context_fold,
-    builtin_load_failure_to_parse_error, ddl_facts, error, evaluate_statements, facts,
-    flat_stmts_for_rules, ir, parse_sql, parse_sql_with_dialect, parse_with_optional_dialect,
-    policy_attachment_facts, prepare_and_parse_for_analysis, prepare_sql_for_analysis_with_context,
-    privilege_facts, query_facts, reported_unwalked, rules, script_relations, template,
-    CarriedRelations, DdlReading, DialectScope, LastStatement, PreparedScript, QueryReading,
-    ScriptAnalysis,
+    adopt_dialect, alter_account_facts, alter_user_facts, analyze_carrying, analyze_for_comparison,
+    analyze_reading_last, analyze_risk_core, analyzer, ast, build_script_context_fold,
+    builtin_load_failure_to_parse_error, ddl_family, ddl_statement_facts, error,
+    evaluate_statements, facts, flat_stmts_for_rules, ir, parse_sql, parse_sql_with_dialect,
+    parse_with_optional_dialect, prepare_and_parse_for_analysis,
+    prepare_sql_for_analysis_with_context, privilege_plan_facts, query_facts, reported_unwalked,
+    rules, script_relations, template, CarriedRelations, DdlFamily, DdlReading, DialectScope,
+    FamilyReader, LastStatement, PreparedScript, QueryReading, ScriptAnalysis,
 };
 
 /// Runs analysis with the semantic depth its reasoning provider supplies.
@@ -326,9 +326,11 @@ impl<'r> Engine<'r> {
             None,
             None,
             |_, stmt, _, readings| {
-                readings
-                    .families
-                    .extend(privilege_facts(stmt, sql, None, self.reasoning));
+                if let DdlFamily::Privilege(plan) = ddl_family(stmt, sql, &[]) {
+                    readings
+                        .families
+                        .push(privilege_plan_facts(&plan, sql, None, self.reasoning));
+                }
             },
         ))
     }
@@ -358,9 +360,14 @@ impl<'r> Engine<'r> {
             None,
             None,
             |_, stmt, _, readings| {
-                readings
-                    .families
-                    .extend(privilege_facts(stmt, sql, Some(catalog), self.reasoning));
+                if let DdlFamily::Privilege(plan) = ddl_family(stmt, sql, &[]) {
+                    readings.families.push(privilege_plan_facts(
+                        &plan,
+                        sql,
+                        Some(catalog),
+                        self.reasoning,
+                    ));
+                }
             },
         ))
     }
@@ -487,12 +494,13 @@ impl<'r> Engine<'r> {
             None,
             None,
             |_, stmt, sink, readings| {
-                ddl_facts(
+                ddl_statement_facts(
                     stmt,
                     &ddl,
                     script_reasoning.as_ref(),
                     sink,
                     &mut readings.families,
+                    Some(FamilyReader::Ddl),
                 );
             },
         ))
@@ -680,7 +688,12 @@ impl<'r> Engine<'r> {
             None,
             None,
             |_, stmt, _, readings| {
-                readings.families.extend(policy_attachment_facts(stmt, sql));
+                let family = ddl_family(stmt, sql, &[]);
+                if let DdlFamily::AlterUser(u) = family {
+                    readings.families.push(alter_user_facts(u, sql));
+                } else if let DdlFamily::AlterAccount(a) = family {
+                    readings.families.extend(alter_account_facts(a, sql));
+                }
             },
         ))
     }

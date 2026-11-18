@@ -7,12 +7,15 @@
 //! Each rule's compiled predicate runs against `StatementFacts`;
 //! matches become `Finding` records.
 
+use sha2::{Digest, Sha256};
+
 use crate::facts::secrets::{PrintedAt, QuotingStrings};
 use crate::facts::{RiskLevel, StatementFacts};
 use crate::lexer::token::Span;
 
 use super::compile::{CompiledPredicate, EvalResult, WitnessCandidate};
 use super::finding::{EmissionMode, FactWitness, Finding, FindingEvidence, RuleExplanation};
+use super::lists::ValueLists;
 
 /// A loaded, compiled rule. Cloneable; shares the underlying predicate
 /// closure across clones via `Arc` (inside `CompiledPredicate`).
@@ -29,6 +32,8 @@ pub struct Rule {
     pub risk_level: RiskLevel,
     pub enabled: bool,
     pub triggers: CompiledPredicate,
+    /// Identifies what `triggers` was compiled from.
+    pub triggers_digest: TriggersDigest,
     pub message_template: Option<MessageTemplate>,
     pub emission: EmissionMode,
     /// When `true`, the analyzer's deduplication pass keeps each
@@ -37,6 +42,48 @@ pub struct Rule {
     /// produce per-occurrence artifacts (`SNW-UNKNOWN`) set this; most
     /// rules leave it `false` so dedup collapses duplicates.
     pub per_statement: bool,
+}
+
+/// SHA-256 of a rule's `triggers` as authored, whatever the file format
+/// and the order of its keys, and of the lists it was compiled against
+/// where it names one. Two rules with one digest match the same statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TriggersDigest([u8; 32]);
+
+impl TriggersDigest {
+    /// The digest of `triggers`, compiled against `lists` if it names one.
+    pub fn of(triggers: &serde_json::Value, lists: Option<&ValueLists>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(sorted_keys(triggers).to_string().as_bytes());
+        if let Some(lists) = lists {
+            hasher.update([0]);
+            hasher.update(lists.as_json().to_string().as_bytes());
+        }
+        Self(hasher.finalize().into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// `value` with the keys of every object in sorted order.
+fn sorted_keys(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(fields) => {
+            let mut sorted: Vec<(&String, &Value)> = fields.iter().collect();
+            sorted.sort_by_key(|(key, _)| *key);
+            Value::Object(
+                sorted
+                    .into_iter()
+                    .map(|(key, field)| (key.clone(), sorted_keys(field)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
+    }
 }
 
 /// Message template — a string with `{path.to.field}` interpolation
@@ -560,6 +607,8 @@ mod tests {
 
     fn empty_facts(kind: StatementKind) -> StatementFacts {
         StatementFacts {
+            declare: None,
+            call: None,
             kind,
             source_span: None,
             query: None,
@@ -607,6 +656,7 @@ mod tests {
             risk_level: RiskLevel::High,
             enabled: true,
             triggers: compiled,
+            triggers_digest: TriggersDigest::of(&val, None),
             message_template: None,
             emission: EmissionMode::Once,
             per_statement: false,
@@ -903,7 +953,7 @@ mod tests {
             let render = crate::template::RenderArtifacts::raw(sql.to_string());
             let relations = crate::ReadRelations::default();
             let mut metrics = crate::analyzer::MetricsCollector::new();
-            let mut sink = crate::StatementFactsSink::new(&mut metrics, &[], true);
+            let mut sink = crate::StatementFactsSink::new(&mut metrics, &[], &[], true);
             let mut script_reasoning = crate::facts::reasoning::Reasoning::for_script(
                 &reasoning,
                 crate::facts::reasoning::ScriptInputs {

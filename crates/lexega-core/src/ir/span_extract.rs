@@ -404,7 +404,12 @@ pub fn extract_table_ref_from_object_span(
         }
     }
 
-    // Build TableRef from collected parts
+    // Build TableRef from collected parts, read as a relation's are.
+    let parts: Vec<String> =
+        crate::ir::utils::relation_written_parts(parts.into_iter().map(Some).collect())
+            .into_iter()
+            .flatten()
+            .collect();
     let mut table_ref = match parts.len() {
         0 => TableRef {
             server: None,

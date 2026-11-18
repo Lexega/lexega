@@ -22,13 +22,22 @@ pub struct MssqlSecurityPolicyPlan {
     pub state: PolicyState,
     pub has_filter_predicate: bool,
     pub has_block_predicate: bool,
+    /// The policy the statement names, as written.
+    pub target: Option<super::ddl_plan::DdlTarget>,
     pub node_id: NodeId,
     pub span: Span,
 }
 
 /// Lower a typed [`AstMssqlSecurityPolicy`] into a [`MssqlSecurityPolicyPlan`].
-pub fn lower_security_policy_to_plan(s: &AstMssqlSecurityPolicy) -> MssqlSecurityPolicyPlan {
+pub fn lower_security_policy_to_plan(
+    s: &AstMssqlSecurityPolicy,
+    source: &str,
+) -> MssqlSecurityPolicyPlan {
     MssqlSecurityPolicyPlan {
+        target: s
+            .name
+            .as_ref()
+            .and_then(|name| super::lower_ddl::target_from_name(name, source)),
         action: s.action,
         state: s.state,
         has_filter_predicate: s.has_filter_predicate,

@@ -566,9 +566,9 @@ pub enum TriviaKind {
     BlockComment,
     /// Jinja comment: {# ... #}
     JinjaComment,
-    /// MySQL version comment: /*! ... */ or /*!50100 ... */
-    /// These contain executable SQL in MySQL but are comments in other dialects.
-    /// Preserved as distinct trivia so downstream tools can handle them specially.
+    /// A marker of a MySQL executable comment: the opening `/*!`,
+    /// `/*!50100` or MariaDB `/*M!…`, or its closing `*/`. The text between
+    /// the markers is lexed as SQL, as the server runs it.
     MysqlVersionComment,
     /// A psql command that sends the query written before it, to the end
     /// of its line. The `;` of no width after it ends the statement.

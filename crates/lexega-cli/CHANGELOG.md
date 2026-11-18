@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.1.0
+
+### Added
+
+- `io::write_new_uri` writes to a local path, `s3://`, `gs://` or `az://` only where nothing is there yet, and says whether it wrote or found something already there.
+- `io::HttpClient` (and `io::shared_http_client`) makes HTTP requests with rustls, the operating system's certificate store and the proxy the standard environment variables name, follows no redirect, and streams the response body (`io::HttpRequest`, `io::HttpResponse`, `io::HttpMethod`).
+
+### Changed
+
+- `io::HttpClient` fetches `https://` inputs and posts `--pr-comment`. `curl` is no longer run.
+
+### Fixed
+
+- `analyze --mode runtime` writes its decision to standard output unless `--decision-out` names a file. `--decision-out -` also means standard output.
+- `--explain-findings` lists a finding raised in SQL a statement runs (an `EXECUTE IMMEDIATE` body) under the statement that holds it.
+
 ## 3.0.0
 
 Reports say "finding", info-level rules report context, values are masked unless shown safe, and files are named by their path in the repository. Several usage mistakes that passed quietly in 2.0.0 now exit 1.

@@ -4649,77 +4649,116 @@ fn a_pr_comment_that_cannot_be_posted_leaves_the_report_on_stdout_whole() {
     }
 }
 
-/// A `curl` that never reaches a network: it logs each request's method
-/// and URL to `requests.log` and its payload to `payload-<n>.json` in its
-/// own directory, answers a GET with `page<n>.json` for the URL's
-/// `page=<n>` (`page1.json` without one), and anything else with `{}`.
+/// A code host's API on 127.0.0.1 that never reaches a network: it logs
+/// each request's method and URL to `requests.log` and its body to
+/// `payload-<n>.json` in its own directory, answers a GET with
+/// `page<n>.json` for the URL's `page=<n>` (`page1.json` without one), and
+/// anything else with `{}`.
 #[cfg(unix)]
-fn fake_curl(pages: &[String]) -> TempDir {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = TempDir::new().expect("temp dir");
-    for (n, page) in pages.iter().enumerate() {
-        std::fs::write(dir.path().join(format!("page{}.json", n + 1)), page).expect("write page");
-    }
-    let script = format!(
-        r#"#!/bin/sh
-here='{}'
-out=""; method=GET; url=""; payload=""; prev=""
-for a in "$@"; do
-  case "$prev" in -o) out="$a";; -X) method="$a";; esac
-  case "$a" in @*) payload="${{a#@}}";; http*) url="$a";; esac
-  prev="$a"
-done
-cat > /dev/null
-echo "$method $url" >> "$here/requests.log"
-if [ -n "$payload" ]; then
-  n=$(wc -l < "$here/requests.log")
-  cp "$payload" "$here/payload-$n.json"
-fi
-if [ "$method" = GET ]; then
-  page=$(printf '%s' "$url" | sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p')
-  cat "$here/page${{page:-1}}.json" > "$out" 2>/dev/null || printf '[]' > "$out"
-else
-  printf '{{}}' > "$out"
-fi
-printf 200
-"#,
-        dir.path().display()
-    );
-    let curl = dir.path().join("curl");
-    std::fs::write(&curl, script).expect("write curl");
-    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("chmod curl");
-    dir
+struct FakeApi {
+    dir: TempDir,
+    base: String,
 }
 
-/// A pull-request run on `platform` whose API calls go to the `curl` in
-/// `curl_dir`.
 #[cfg(unix)]
-fn pull_request_env(platform: &str, curl_dir: &Path) -> Vec<(&'static str, String)> {
-    let path = format!(
-        "{}:{}",
-        curl_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut vars = vec![("PATH", path)];
-    let platform_vars: &[(&'static str, &str)] = match platform {
-        "github" => &[
-            ("GITHUB_ACTIONS", "true"),
-            ("GITHUB_TOKEN", "test-token"),
-            ("GITHUB_REPOSITORY", "acme/models"),
-            ("GITHUB_REF", "refs/pull/7/merge"),
-            ("GITHUB_API_URL", "https://api.github.invalid"),
+impl FakeApi {
+    fn start(pages: &[String]) -> Self {
+        use std::io::{BufRead, BufReader, Read};
+
+        let dir = TempDir::new().expect("temp dir");
+        for (n, page) in pages.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("page{}.json", n + 1)), page)
+                .expect("write page");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let here = dir.path().to_path_buf();
+        let host = base.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let target = parts.next().unwrap_or("").to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut field = String::new();
+                    reader.read_line(&mut field).expect("header");
+                    let field = field.trim_end();
+                    if field.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = field.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().expect("length");
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).expect("body");
+                let log = here.join("requests.log");
+                let mut entries = std::fs::read_to_string(&log).unwrap_or_default();
+                entries.push_str(&format!("{method} {host}{target}\n"));
+                std::fs::write(&log, &entries).expect("log");
+                if !body.is_empty() {
+                    let n = entries.lines().count();
+                    std::fs::write(here.join(format!("payload-{n}.json")), &body).expect("payload");
+                }
+                let answer = if method == "GET" {
+                    let page = target
+                        .split(['?', '&'])
+                        .find_map(|p| p.strip_prefix("page="))
+                        .unwrap_or("1");
+                    std::fs::read_to_string(here.join(format!("page{page}.json")))
+                        .unwrap_or_else(|_| "[]".to_string())
+                } else {
+                    "{}".to_string()
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        answer.len(),
+                        answer
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        FakeApi { dir, base }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// A pull-request run on `platform` whose API calls go to `api_base`.
+#[cfg(unix)]
+fn pull_request_env(platform: &str, api_base: &str) -> Vec<(&'static str, String)> {
+    match platform {
+        "github" => vec![
+            ("GITHUB_ACTIONS", "true".to_string()),
+            ("GITHUB_TOKEN", "test-token".to_string()),
+            ("GITHUB_REPOSITORY", "acme/models".to_string()),
+            ("GITHUB_REF", "refs/pull/7/merge".to_string()),
+            ("GITHUB_API_URL", api_base.to_string()),
         ],
-        _ => &[
-            ("GITLAB_CI", "true"),
-            ("GITLAB_TOKEN", "test-token"),
-            ("CI_PROJECT_ID", "42"),
-            ("CI_MERGE_REQUEST_IID", "7"),
-            ("CI_API_V4_URL", "https://gitlab.invalid/api/v4"),
+        _ => vec![
+            ("GITLAB_CI", "true".to_string()),
+            ("GITLAB_TOKEN", "test-token".to_string()),
+            ("CI_PROJECT_ID", "42".to_string()),
+            ("CI_MERGE_REQUEST_IID", "7".to_string()),
+            ("CI_API_V4_URL", format!("{api_base}/api/v4")),
         ],
-    };
-    vars.extend(platform_vars.iter().map(|(k, v)| (*k, v.to_string())));
-    vars
+    }
 }
 
 // The review comment of an earlier run is found on any page of a busy pull
@@ -4735,18 +4774,19 @@ fn a_review_comment_is_updated_wherever_the_earlier_one_is_listed() {
     for (platform, update) in [
         (
             "github",
-            "PATCH https://api.github.invalid/repos/acme/models/issues/comments/4242",
+            "PATCH {base}/repos/acme/models/issues/comments/4242",
         ),
         (
             "gitlab",
-            "PUT https://gitlab.invalid/api/v4/projects/42/merge_requests/7/notes/4242",
+            "PUT {base}/api/v4/projects/42/merge_requests/7/notes/4242",
         ),
     ] {
-        let curl = fake_curl(&[
+        let api = FakeApi::start(&[
             serde_json::Value::Array(others.clone()).to_string(),
             marked.to_string(),
         ]);
-        let vars = pull_request_env(platform, curl.path());
+        let update = update.replace("{base}", &api.base);
+        let vars = pull_request_env(platform, &api.base);
         let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let out = run_in_ci(
             repo.path(),
@@ -4754,50 +4794,54 @@ fn a_review_comment_is_updated_wherever_the_earlier_one_is_listed() {
             &vars,
         );
         assert_eq!(out.code, 0, "{platform}\n{}", out.stderr);
-        let log = std::fs::read_to_string(curl.path().join("requests.log")).expect("requests");
+        let log = std::fs::read_to_string(api.path().join("requests.log")).expect("requests");
         let writes: Vec<&str> = log.lines().filter(|l| !l.starts_with("GET ")).collect();
-        assert_eq!(writes, [update], "{platform}\n{log}\n{}", out.stderr);
+        assert_eq!(
+            writes,
+            [update.as_str()],
+            "{platform}\n{log}\n{}",
+            out.stderr
+        );
     }
 }
 
-// A pull-request comment's request and response are files in a private
-// directory of an unpredictable name, made exclusively and removed when the
-// call ends whether curl succeeded or not.
+// A pull-request comment is posted without running curl and without
+// writing anything to the temporary directory, whether the API answers or
+// cannot be reached.
 #[cfg(unix)]
 #[test]
-fn a_pr_comment_is_staged_privately_and_removed() {
+fn a_pr_comment_runs_no_curl_and_writes_nothing_to_disk() {
     use std::os::unix::fs::PermissionsExt;
 
     let repo = repo_with_a_change();
-    for code in [0, 22] {
+    let reachable = FakeApi::start(&[]);
+    // Nothing listens on a port that was bound and released.
+    let unreachable = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        )
+    };
+    for base in [reachable.base.as_str(), unreachable.as_str()] {
         let bin = TempDir::new().expect("temp dir");
         let tmp = TempDir::new().expect("temp dir");
-        let script = format!(
-            r#"#!/bin/sh
-here='{dir}'
-out=""; payload=""; prev=""
-for a in "$@"; do
-  case "$prev" in -o) out="$a";; esac
-  case "$a" in @*) payload="${{a#@}}";; esac
-  prev="$a"
-done
-cat > /dev/null
-echo "$out" >> "$here/out-paths.txt"
-ls -ld "$(dirname "$out")" | cut -c1-10 >> "$here/dir-modes.txt"
-if [ -n "$payload" ]; then
-  echo "$payload" >> "$here/payload-paths.txt"
-  ls -l "$payload" | cut -c1-10 >> "$here/payload-modes.txt"
-fi
-if [ {code} -ne 0 ]; then exit {code}; fi
-printf '[]' > "$out"
-printf 200
-"#,
-            dir = bin.path().display(),
-        );
         let curl = bin.path().join("curl");
-        std::fs::write(&curl, script).expect("write curl");
+        std::fs::write(
+            &curl,
+            format!("#!/bin/sh\ntouch '{}/curl-ran'\n", bin.path().display()),
+        )
+        .expect("write curl");
         std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let mut vars = pull_request_env("github", bin.path());
+        let mut vars = pull_request_env("github", base);
+        vars.push((
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        ));
         vars.push((
             "TMPDIR",
             tmp.path().to_str().expect("utf-8 path").to_string(),
@@ -4808,25 +4852,16 @@ printf 200
             &["review", "HEAD~1..HEAD", "--pr-comment", "-q"],
             &vars,
         );
-        assert_eq!(out.code, 0, "curl exits {code}\n{}", out.stderr);
-        let read = |name: &str| std::fs::read_to_string(bin.path().join(name)).unwrap_or_default();
-        let paths = read("out-paths.txt");
-        assert!(!paths.is_empty(), "curl ran (exits {code})");
-        for path in paths.lines().chain(read("payload-paths.txt").lines()) {
-            let path = std::path::Path::new(path);
-            let dir = path.parent().expect("a staging directory");
-            assert_eq!(dir.parent(), Some(tmp.path()), "{path:?}");
-            let name = dir.file_name().and_then(|n| n.to_str()).expect("name");
-            assert!(name.starts_with("lexega-upload-"), "{name}");
-        }
-        assert!(read("dir-modes.txt").lines().all(|m| m == "drwx------"));
-        assert!(read("payload-modes.txt").lines().all(|m| m == "-rw-------"));
+        assert_eq!(out.code, 0, "{base}\n{}", out.stderr);
+        assert!(!bin.path().join("curl-ran").exists(), "{base}: curl ran");
         assert_eq!(
             std::fs::read_dir(tmp.path()).expect("read tmp").count(),
             0,
-            "the staged files are removed (curl exits {code})"
+            "{base}: something was written to the temporary directory"
         );
     }
+    let log = std::fs::read_to_string(reachable.path().join("requests.log")).expect("requests");
+    assert!(log.lines().any(|l| l.starts_with("POST ")), "{log}");
 }
 
 // A review whose Markdown is longer than a comment may be is posted cut at
@@ -4855,8 +4890,8 @@ fn a_review_comment_longer_than_a_comment_may_be_is_cut() {
     let full = run_in(root, &["review", "HEAD~1..HEAD", "-q"], None);
     assert!(full.stdout.len() > 65_536, "{} bytes", full.stdout.len());
 
-    let curl = fake_curl(&[]);
-    let vars = pull_request_env("github", curl.path());
+    let api = FakeApi::start(&[]);
+    let vars = pull_request_env("github", &api.base);
     let vars: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let out = run_in_ci(
         root,
@@ -4871,12 +4906,12 @@ fn a_review_comment_longer_than_a_comment_may_be_is_cut() {
         &vars,
     );
     assert_eq!(out.code, 0, "{}", out.stderr);
-    let log = std::fs::read_to_string(curl.path().join("requests.log")).expect("requests");
+    let log = std::fs::read_to_string(api.path().join("requests.log")).expect("requests");
     let posted = log
         .lines()
         .position(|l| l.starts_with("POST "))
         .unwrap_or_else(|| panic!("no comment posted\n{log}"));
-    let payload = std::fs::read_to_string(curl.path().join(format!("payload-{}.json", posted + 1)))
+    let payload = std::fs::read_to_string(api.path().join(format!("payload-{}.json", posted + 1)))
         .expect("payload");
     let payload: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
     let body = payload["body"].as_str().expect("body");

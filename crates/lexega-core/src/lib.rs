@@ -811,6 +811,15 @@ fn analyze_with_run_bodies(
         .filter(|body| is_routine_body(body.role))
         .flat_map(|body| body.stmts.iter().map(ast::AstStmt::span))
         .collect();
+    // The routine bodies the script defines and does not run: every one
+    // but a `DO` block's, which runs where it stands.
+    let defined_regions: Vec<lexer::token::Span> = body_flat
+        .iter()
+        .filter(|s| !matches!(s, ast::AstStmt::DoBlock(_)))
+        .flat_map(|s| s.bodies())
+        .filter(|body| is_routine_body(body.role))
+        .flat_map(|body| body.stmts.iter().map(ast::AstStmt::span))
+        .collect();
 
     // IR-native ledger, folded one statement at a time from the same
     // fact stream the rule evaluators read (via `evaluate_facts_into`'s
@@ -818,8 +827,12 @@ fn analyze_with_run_bodies(
     // kept — its retention would dominate peak memory on
     // statement-heavy scripts.
     let mut metrics = analyzer::MetricsCollector::new();
-    let mut facts_sink =
-        StatementFactsSink::new(&mut metrics, &body_regions, policy_config.trace_mode);
+    let mut facts_sink = StatementFactsSink::new(
+        &mut metrics,
+        &body_regions,
+        &defined_regions,
+        policy_config.trace_mode,
+    );
     if keep {
         facts_sink = facts_sink.keeping_facts();
     }
@@ -1304,6 +1317,7 @@ fn analyze_with_run_bodies(
     // Apply derived metrics to summary. Keep the name SETS (not just the
     // counts) so the dynamic-SQL literal-body pass can union the tables read /
     // written inside executed literal bodies, then recompute the counts.
+    report.subjects = derived.subjects;
     report.summary.tables_read_names = derived.tables_read;
     report.summary.tables_read = report.summary.tables_read_names.len();
     report.summary.tables_written_names = derived.tables_written;
@@ -1324,6 +1338,12 @@ fn analyze_with_run_bodies(
     // A body's previews are quoted from the body's analysis, which masks
     // every literal of SQL text a script runs ([`reported_literals`]).
     let mut body_outcome = script_reasoning.dynamic_sql_literal_bodies(script, policy_config);
+    // What a statement runs goes under it.
+    for (runner, ran) in std::mem::take(&mut body_outcome.subjects) {
+        if let Some(subject) = report.subjects.iter_mut().find(|s| s.span == runner) {
+            subject.runs.push(ran);
+        }
+    }
     // A body's finding comes placed at its line and column in the analyzed
     // text; it is placed in the file the user wrote as any other is. With no
     // file it names no location.
@@ -1752,16 +1772,15 @@ fn evaluate_script_families(
         Some(sink),
         trace,
         |position, stmt, mut sink, readings| {
-            readings
-                .families
-                .extend(privilege_facts(stmt, src, catalog, reasoning));
-            ddl_facts(
+            ddl_statement_facts(
                 stmt,
                 &ddl,
                 &*script_reasoning,
                 sink.as_deref_mut(),
                 &mut readings.families,
+                None,
             );
+            name_listed_objects(stmt, src, &mut readings.families);
             // A write a CTE holds reads the CTEs around it.
             let in_scope = around
                 .get(position)
@@ -1779,7 +1798,6 @@ fn evaluate_script_families(
                 sink,
                 Some((dialect, &mut readings.shown)),
             );
-            readings.families.extend(policy_attachment_facts(stmt, src));
         },
     )
 }
@@ -1838,28 +1856,68 @@ pub(crate) fn prepare_sql_for_analysis_with_context(
     Ok(reasoning.render_template(src, file_path))
 }
 
-/// The privilege facts of `stmt`: a GRANT, REVOKE, DENY or ALTER
-/// AUTHORIZATION, read at any depth. With a catalog, the reasoning
-/// provider answers what the grant reaches.
-fn privilege_facts(
-    stmt: &ast::AstStmt,
-    sql: &str,
-    catalog: Option<&crate::catalog::CatalogIndex>,
-    reasoning: &dyn facts::reasoning::Reasoning,
-) -> Option<facts::StatementFacts> {
-    let plan = match stmt {
-        ast::AstStmt::Grant(g) => ir::lower_grant_to_privilege_plan(g),
-        ast::AstStmt::Revoke(r) => ir::lower_revoke_to_privilege_plan(r),
-        ast::AstStmt::Deny(d) => ir::lower_deny_to_privilege_plan(d),
-        ast::AstStmt::AlterAuthorization(a) => ir::lower_alter_authorization_to_privilege_plan(a),
-        _ => return None,
-    };
-    Some(match catalog {
-        Some(_) => {
-            facts::extract::derive_facts_from_privilege_plan_with_reasoning(&plan, sql, reasoning)
+/// Each object `stmt` names in a list (`DROP TABLE a, b`, `TRUNCATE a, b`,
+/// `LOCK TABLE a, b`, MySQL `OPTIMIZE TABLE a, b`), as its facts name an
+/// object; empty where it names one or none.
+fn listed_objects(stmt: &ast::AstStmt, sql: &str) -> Vec<facts::TableRef> {
+    let names =
+        |names: &mut dyn Iterator<Item = &ast::AstObjectRef>| -> Vec<ir::ddl_plan::DdlTarget> {
+            names
+                .filter_map(|name| ir::lower_ddl::target_from_name(name, sql))
+                .collect()
+        };
+    let targets: Vec<ir::ddl_plan::DdlTarget> = if let ast::AstStmt::Drop(s) = stmt {
+        names(&mut s.targets.iter().map(|target| &target.name))
+    } else if let ast::AstStmt::Truncate(s) = stmt {
+        names(&mut s.tables.iter().map(|table| &table.name))
+    } else if let ast::AstStmt::PgLockTable(s) = stmt {
+        names(&mut s.tables.iter())
+    } else if let ast::AstStmt::MysqlAdmin(admin) = stmt {
+        match &admin.kind {
+            ast::AstMysqlAdminKind::TableMaintenance { tables, .. } => tables
+                .iter()
+                .filter_map(|table| ir::lower_ddl::target_from(*table, sql))
+                .collect(),
+            ast::AstMysqlAdminKind::Flush { .. }
+            | ast::AstMysqlAdminKind::Kill { .. }
+            | ast::AstMysqlAdminKind::AlterInstance
+            | ast::AstMysqlAdminKind::Xa
+            | ast::AstMysqlAdminKind::RenameUser { .. } => Vec::new(),
         }
-        None => facts::extract::derive_facts_from_privilege_plan(&plan, sql),
-    })
+    } else {
+        Vec::new()
+    };
+    if targets.len() < 2 {
+        return Vec::new();
+    }
+    targets
+        .iter()
+        .map(facts::extract::ddl_target_name)
+        .collect()
+}
+
+/// Name each object `stmt` names in a list in the DDL facts of `records`:
+/// `target` the first, `targets` every one, each of the kind the record
+/// gives its target.
+fn name_listed_objects(stmt: &ast::AstStmt, sql: &str, records: &mut [facts::StatementFacts]) {
+    let objects = listed_objects(stmt, sql);
+    if objects.is_empty() {
+        return;
+    }
+    for ddl in records.iter_mut().filter_map(|record| record.ddl.as_mut()) {
+        let kind = ddl
+            .target
+            .as_ref()
+            .map_or(ddl.object_kind, |target| target.kind);
+        ddl.targets = objects
+            .iter()
+            .map(|name| facts::ObjectRef {
+                kind,
+                name: name.clone(),
+            })
+            .collect();
+        ddl.target = ddl.targets.first().cloned();
+    }
 }
 
 /// Per-statement sink at the `evaluate_facts_into` seam.
@@ -1873,6 +1931,7 @@ fn privilege_facts(
 pub(crate) struct StatementFactsSink<'a> {
     metrics: &'a mut analyzer::MetricsCollector,
     body_regions: &'a [lexer::token::Span],
+    defined_regions: &'a [lexer::token::Span],
     procedure_bodies_analyzed: usize,
     retained: Option<Vec<facts::StatementFacts>>,
     /// Each statement's facts as recorded, unmasked, and each rule finding
@@ -1891,11 +1950,13 @@ impl<'a> StatementFactsSink<'a> {
     fn new(
         metrics: &'a mut analyzer::MetricsCollector,
         body_regions: &'a [lexer::token::Span],
+        defined_regions: &'a [lexer::token::Span],
         retain: bool,
     ) -> Self {
         StatementFactsSink {
             metrics,
             body_regions,
+            defined_regions,
             procedure_bodies_analyzed: 0,
             retained: if retain { Some(Vec::new()) } else { None },
             kept: None,
@@ -1957,7 +2018,8 @@ impl<'a> StatementFactsSink<'a> {
         fold: &ScriptContextFold,
         reported: &std::rc::Rc<facts::secrets::ReportedLiterals>,
     ) {
-        self.metrics.populate_from_fact(facts, self.body_regions);
+        self.metrics
+            .populate_from_fact(facts, self.body_regions, self.defined_regions);
         if let Some((kept, _)) = &mut self.kept {
             let (database, schema) = fold.namespace_at(statement.start);
             kept.push(StatementFactsAt {
@@ -2039,6 +2101,7 @@ impl StatementReadings {
         for facts in families.chain(query) {
             record.absorb(facts);
         }
+        record.complete_targets();
         Some(record)
     }
 }
@@ -4867,6 +4930,7 @@ fn ddl_statement_facts(
     script_reasoning: &dyn facts::reasoning::ScriptReasoning,
     facts_out: Option<&mut StatementFactsSink<'_>>,
     out: &mut Vec<facts::StatementFacts>,
+    only: Option<FamilyReader>,
 ) {
     let DdlReading {
         sql,
@@ -4876,7 +4940,7 @@ fn ddl_statement_facts(
         reasoning,
         query,
         handlers: _,
-        ref routine_calls,
+        routine_calls: _,
     } = *ddl;
     // Dynamic-SQL argument classifier over the whole script: a bare
     // variable argument resolves to the shape it was assigned, so
@@ -4885,12 +4949,1344 @@ fn ddl_statement_facts(
     // The texts its variables hold name what `IDENTIFIER($v)` names.
     let _values = fold.enter_statement(stmt.span().start);
     let function_catalog = functions.at(stmt.span().start);
-    let stage_plan = match stmt {
+    let family = ddl_family(stmt, sql, placeholders);
+    if only.is_some_and(|reader| family.reader() != reader) {
+        return;
+    }
+    match family {
+        DdlFamily::Stage(plan) => {
+            let mut facts = facts::extract::derive_facts_from_stage_plan(&plan, sql);
+            // A COPY INTO <location> or an UNLOAD: the columns its source
+            // unloads out of the warehouse, each classified as the query it
+            // reads is.
+            if let ast::AstStmt::CopyIntoLocation {
+                source: Some(src), ..
+            }
+            | ast::AstStmt::Unload {
+                source: Some(src), ..
+            } = stmt
+            {
+                let exported = unload_query_facts(src, query)
+                    .and_then(|read| read.query)
+                    .map(|read| script_reasoning.exported_columns(&read))
+                    .unwrap_or_default();
+                if let Some(stage) = facts.ddl.as_mut().and_then(|d| d.stage.as_mut()) {
+                    stage.exported_columns = exported;
+                }
+            }
+            out.push(facts);
+        }
+        DdlFamily::DynamicTable(plan) => {
+            let facts = facts::extract::derive_facts_from_dynamic_table_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Each plan with the name the statement's existing table carries.
+        DdlFamily::Table(plan, existing_name) => {
+            if let Some(sink) = facts_out {
+                if existing_name
+                    .is_some_and(|name| !ir::lower::names_a_catalog_object(name.name_kind))
+                {
+                    sink.record_uncatalogued_ddl_target(stmt.span());
+                }
+            }
+            let mut facts = facts::extract::derive_facts_from_table_plan(&plan, sql);
+            // A table an earlier statement of the script made temporary; a
+            // CREATE states its own. A `TRUNCATE` of a list truncates temporary
+            // tables alone where each it lists is one.
+            let start = stmt.span().start;
+            let creates = matches!(stmt, ast::AstStmt::CreateTable(_));
+            let targets = plan.tables();
+            let made_temporary = !creates
+                && !targets.is_empty()
+                && targets.iter().all(|target| {
+                    let named = crate::context::node_metadata::TableRef {
+                        server: None,
+                        db: target.db.clone(),
+                        schema: target.schema.clone(),
+                        name: target.name.clone(),
+                        span: None,
+                    };
+                    target.temporary
+                        || query
+                            .relations
+                            .relations
+                            .at(start)
+                            .temporary(&named, &fold.session_context_at(start))
+                });
+            if made_temporary {
+                if let Some(table) = facts.ddl.as_mut().and_then(|ddl| ddl.table.as_mut()) {
+                    table.temporary = true;
+                }
+            }
+            out.push(facts);
+        }
+        DdlFamily::TableMaintenance(plan) => {
+            let facts = facts::extract::derive_facts_from_table_maintenance_plan(&plan, sql);
+            out.push(facts);
+        }
+        // View DDL (cross-dialect CREATE / ALTER / DROP VIEW and
+        // ALTER MATERIALIZED VIEW). Same dispatch-filter pattern as
+        // `MssqlDdlKind` / `PgDdlKind` / `BqDdlKind`: the AST variant
+        // resolves the [`facts::extract::ViewDdlKind`], `lower_ddl_stmt`
+        // produces a generic [`ir::DdlPlan`], and
+        // `derive_facts_from_view_ddl_plan` projects to public
+        // `StatementFacts`. Drives VIEW-REPLACE / VIEW-CHG / VIEW-DROP
+        // / VIEW-CASCADE-DROP.
+        DdlFamily::View(kind) => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                let mut facts = facts::extract::derive_facts_from_view_ddl_plan(&plan, kind);
+                // The view lowers through the generic DdlPlan, so the MySQL
+                // security-context prelude (DEFINER / SQL SECURITY) and the
+                // action of an ALTER are projected straight from the AST here
+                // and attached to `ddl.view`.
+                if let ast::AstStmt::CreateView(cv) = stmt {
+                    if let Some(ddl) = facts.ddl.as_mut() {
+                        ddl.view = facts::extract::project_view_prelude_facts(cv, sql);
+                    }
+                }
+                if let ast::AstStmt::AlterView(av) = stmt {
+                    if let Some(ddl) = facts.ddl.as_mut() {
+                        ddl.view = Some(facts::extract::project_alter_view_facts(av));
+                    }
+                }
+                if let ast::AstStmt::AlterMaterializedView(mv) = stmt {
+                    if let Some(ddl) = facts.ddl.as_mut() {
+                        ddl.view = Some(facts::extract::project_alter_materialized_view_facts(mv));
+                    }
+                }
+                out.push(facts);
+            }
+        }
+        DdlFamily::Pipe(plan) => {
+            let facts = facts::extract::derive_facts_from_pipe_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake TAG lifecycle. CREATE / ALTER / UNDROP arrive as
+        // typed variants; DROP TAG arrives as a generic `AstStmt::Drop`
+        // gated on the object type (same pattern as the view family).
+        // Surfaces `ddl.tag.*` facts — masking-policy attach/detach,
+        // allowed-value changes, propagation.
+        DdlFamily::Tag(plan) => {
+            let facts = facts::extract::derive_facts_from_tag_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake CREATE / ALTER / DROP FILE FORMAT — surfaces
+        // `ddl.file_format.*` facts (recognized type, rename target).
+        DdlFamily::FileFormat(plan) => {
+            let facts = facts::extract::derive_facts_from_file_format_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake ALTER SESSION SET/UNSET — session-parameter mutation.
+        // Surfaces `ddl.session.*` facts (parameters configured / reset).
+        DdlFamily::Session(plan) => {
+            let facts = facts::extract::derive_facts_from_session_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Stream(plan) => {
+            let facts = facts::extract::derive_facts_from_stream_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake NETWORK RULE — the destinations/origins that network
+        // policies and external-access integrations reference by name
+        // (`ddl.network_rule.*`). DROP arrives as a generic Drop gated
+        // on the two-word object type.
+        DdlFamily::NetworkRule(plan) => {
+            let facts = facts::extract::derive_facts_from_network_rule_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake RESOURCE MONITOR — compute cost-governance object
+        // (`ddl.resource_monitor.*`). Its triggers decide whether crossing
+        // a credit-usage threshold halts compute or merely notifies. DROP
+        // arrives as a generic Drop gated on the two-word object type.
+        DdlFamily::ResourceMonitor(plan) => {
+            let facts = facts::extract::derive_facts_from_resource_monitor_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake COMPUTE POOL — Snowpark Container Services compute
+        // capacity (`ddl.compute_pool.*`). Its instance family and node
+        // counts drive cost; DROP arrives as a generic Drop gated on the
+        // two-word object type.
+        DdlFamily::ComputePool(plan) => {
+            let facts = facts::extract::derive_facts_from_compute_pool_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake GIT REPOSITORY — connects Snowflake to an external git
+        // remote (`ddl.git_repository.*`); code from it runs via EXECUTE
+        // IMMEDIATE FROM. DROP arrives as a generic Drop gated on the
+        // two-word object type.
+        DdlFamily::GitRepository(plan) => {
+            let facts = facts::extract::derive_facts_from_git_repository_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake EXTERNAL FUNCTION — a UDF that ships row data to an
+        // external HTTPS endpoint via an API integration (`ddl.external_function.*`),
+        // a data-egress surface. ALTER/DROP route through the regular function
+        // paths; only CREATE carries the egress recognition surface.
+        DdlFamily::CreateExternalFunction(s) => {
+            let plan = ir::lower_create_external_function_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_external_function_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake IMAGE REPOSITORY — SPCS container-image registry
+        // (`ddl.image_repository.*`). DROP arrives as a generic Drop gated on
+        // the two-word object type.
+        DdlFamily::ImageRepository(plan) => {
+            let facts = facts::extract::derive_facts_from_image_repository_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake STREAMLIT — Python-app object (`ddl.streamlit.*`); the
+        // recognition surface is EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP
+        // arrives as a generic Drop gated on the object type.
+        DdlFamily::Streamlit(plan) => {
+            let facts = facts::extract::derive_facts_from_streamlit_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake SERVICE — SPCS container service (`ddl.service.*`); the
+        // recognition surface is the compute-pool binding and
+        // EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP arrives as a generic Drop
+        // gated on the object type.
+        DdlFamily::Service(plan) => {
+            let facts = facts::extract::derive_facts_from_service_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake NOTEBOOK — code-from-stage object (`ddl.notebook.*`); the
+        // recognition surface is EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP
+        // arrives as a generic Drop gated on the object type.
+        DdlFamily::Notebook(plan) => {
+            let facts = facts::extract::derive_facts_from_notebook_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake SEMANTIC VIEW — a named model over base tables
+        // (`ddl.semantic_view.*`); the recognition surface is the base-table
+        // access surface. DROP SEMANTIC VIEW arrives as a generic Drop gated
+        // on the object type.
+        DdlFamily::SemanticView(plan) => {
+            let facts = facts::extract::derive_facts_from_semantic_view_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake CORTEX SEARCH SERVICE — AI search index over a source
+        // query (`ddl.cortex_search_service.*`); the recognition surface is the
+        // embedding model and that a source query is indexed. DROP arrives as a
+        // generic Drop gated on the object type.
+        DdlFamily::CortexSearchService(plan) => {
+            let facts = facts::extract::derive_facts_from_cortex_search_service_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake Native Apps: APPLICATION PACKAGE (provider container,
+        // `ddl.application_package.*`). DROP arrives as a generic Drop gated
+        // on the object type.
+        DdlFamily::ApplicationPackage(plan) => {
+            let facts = facts::extract::derive_facts_from_application_package_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake Native Apps: APPLICATION (consumer-installed app,
+        // `ddl.application.*`); the recognition surface is the install-source
+        // provenance and DEBUG_MODE. DROP arrives as a generic Drop gated on
+        // the object type.
+        DdlFamily::Application(plan) => {
+            let facts = facts::extract::derive_facts_from_application_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake LISTING — Marketplace / data-exchange exposure
+        // (`ddl.listing.*`); the recognition surface is whether it is external
+        // (public) and published. DROP arrives as a generic Drop gated on the
+        // object type.
+        DdlFamily::Listing(plan) => {
+            let facts = facts::extract::derive_facts_from_listing_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake MANAGED ACCOUNT — reader account that consumes shares from
+        // outside the org (`ddl.managed_account.*`). Admin credentials are
+        // never carried.
+        DdlFamily::ManagedAccount(plan) => {
+            let facts = facts::extract::derive_facts_from_managed_account_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake CREATE / DROP ACCOUNT — org-level account provisioning
+        // (recognition only). Distinct from ALTER ACCOUNT parameter changes.
+        DdlFamily::OrgAccount(plan) => {
+            let facts = facts::extract::derive_facts_from_org_account_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake client file commands: PUT / GET / REMOVE / LIST. The
+        // operation kind is the recognition surface (GET = data egress to the
+        // client; REMOVE = stage file deletion).
+        DdlFamily::StageFileCommand(s) => {
+            let plan = ir::lower_stage_file_command_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_stage_file_command_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake SECRET — credential-object lifecycle (`ddl.secret.*`).
+        // Property names only; secret values are never carried. DROP
+        // SECRET arrives as a generic Drop gated on the object type.
+        DdlFamily::Secret(plan) => {
+            let facts = facts::extract::derive_facts_from_secret_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake SHARE — consumer-account changes are the cross-account
+        // exposure primitives (`ddl.share.*`). DROP SHARE arrives as a
+        // generic Drop gated on the object type. GRANT … TO SHARE flows
+        // through the privilege substrate, not here.
+        DdlFamily::Share(plan) => {
+            let facts = facts::extract::derive_facts_from_share_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Redshift datashare — dedicated plan path that surfaces typed
+        // `ddl.datashare.*` facts.
+        DdlFamily::Datashare(plan) => {
+            let facts = facts::extract::derive_facts_from_datashare_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Schema(plan) => {
+            let facts = facts::extract::derive_facts_from_schema_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Catalog(plan) => {
+            let facts = facts::extract::derive_facts_from_catalog_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Use(plan) => {
+            let facts = facts::extract::derive_facts_from_use_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Task(plan) => {
+            let facts = facts::extract::derive_facts_from_task_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake ALERT — scheduled SQL condition+action run under the
+        // owner's role (`ddl.alert.*`). Same risk shape as TASK. DROP
+        // ALERT arrives as a generic Drop gated on the object type.
+        DdlFamily::Alert(plan) => {
+            let facts = facts::extract::derive_facts_from_alert_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake DATA METRIC FUNCTION lifecycle (`ddl.data_metric_function`).
+        // The table attachment is on the ALTER TABLE side; this is the
+        // CREATE/DROP of the function object. DROP arrives as a generic Drop
+        // gated on the three-word object type.
+        DdlFamily::Dmf(plan) => {
+            let facts = facts::extract::derive_facts_from_data_metric_function_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Snowflake REPLICATION / FAILOVER GROUP (`ddl.replication_failover_group`).
+        // ALLOWED_ACCOUNTS is the cross-account egress primitive. DROP arrives
+        // as a generic Drop gated on the two-word object type, which also
+        // resolves the group kind.
+        DdlFamily::ReplGroup(plan) => {
+            let facts =
+                facts::extract::derive_facts_from_replication_failover_group_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Functions, a generic `DROP FUNCTION` among them.
+        DdlFamily::Function(plan) => out.push(function_facts(stmt, plan, sql, script_reasoning)),
+        DdlFamily::CreateFunction(f) => out.push(function_facts(
+            stmt,
+            ir::lower_create_function_to_function_plan(f, sql, script_reasoning),
+            sql,
+            script_reasoning,
+        )),
+        DdlFamily::CreateTableFunction(f) => out.push(function_facts(
+            stmt,
+            ir::lower_create_table_function_to_function_plan(f, sql, script_reasoning),
+            sql,
+            script_reasoning,
+        )),
+        // Procedures, a generic `DROP PROCEDURE` among them.
+        DdlFamily::Procedure(plan) => out.push(procedure_facts(stmt, plan, sql, script_reasoning)),
+        DdlFamily::CreateProcedure(p) => out.push(procedure_facts(
+            stmt,
+            ir::lower_create_procedure_to_procedure_plan(p, sql, script_reasoning),
+            sql,
+            script_reasoning,
+        )),
+        DdlFamily::Database(plan) => {
+            let facts = facts::extract::derive_facts_from_database_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Warehouse(plan) => {
+            let facts = facts::extract::derive_facts_from_warehouse_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::StorageCredential(plan) => {
+            let facts = facts::extract::derive_facts_from_storage_credential_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Volume(plan) => {
+            let facts = facts::extract::derive_facts_from_volume_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::ExternalLocation(plan) => {
+            let facts = facts::extract::derive_facts_from_external_location_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Connection(plan) => {
+            let facts = facts::extract::derive_facts_from_connection_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::MssqlCreateExternalDataSource(s) => {
+            let plan = ir::lower_create_external_data_source_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_external_data_source_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::MssqlAlterExternalDataSource(s) => {
+            let plan = ir::lower_alter_external_data_source_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_external_data_source_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::ForeignServer(plan) => {
+            let facts = facts::extract::derive_facts_from_foreign_server_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::MssqlAlterServerConfiguration(s) => {
+            let plan = ir::lower_mssql_alter_server_configuration_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_server_configuration_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::MysqlLoadData(s) => {
+            let plan = ir::lower_mysql_load_data_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_mysql_load_data_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Event(plan) => {
+            let facts = facts::extract::derive_facts_from_event_plan(&plan, sql);
+            out.push(facts);
+            // The DO body was flattened in as later entries, each read on
+            // its own.
+        }
+        DdlFamily::CreateMysqlTrigger(s) => {
+            let plan = ir::lower_create_mysql_trigger_to_plan(s, sql);
+            let mut facts = facts::extract::derive_facts_from_trigger_create_plan(&plan, sql);
+            // Its body is projected as a T-SQL trigger's is.
+            let mut body = ir::procedure_plan::project_mysql_trigger_body(s, sql, script_reasoning);
+            if let (Some(shape), Some(body_stmt)) = (body.as_mut(), s.body_stmt.as_deref()) {
+                shape
+                    .dynamic_sql_calls
+                    .extend(script_reasoning.inter_procedural_calls(body_stmt, &[]));
+            }
+            if let Some(ddl) = facts.ddl.as_mut() {
+                ddl.trigger_body = body.as_ref().map(facts::extract::project_procedure_body);
+            }
+            out.push(facts);
+            // The trigger body was flattened in as later entries, each read on
+            // its own.
+        }
+        // T-SQL `CREATE` / `ALTER` / `CREATE OR ALTER TRIGGER`; its body was
+        // flattened in as later entries, and is projected as a procedure's
+        // body is, inter-procedural findings included.
+        DdlFamily::CreateMssqlTrigger(s) => {
+            let plan = ir::lower_ddl::lower_mssql_trigger_definition(s, sql);
+            let or_alter = matches!(s.verb, ast::AstDefinitionVerb::CreateOrAlter);
+            let mut body = ir::procedure_plan::project_mssql_trigger_body(s, sql, script_reasoning);
+            if let Some(shape) = body.as_mut() {
+                for body_stmt in &s.body {
+                    shape
+                        .dynamic_sql_calls
+                        .extend(script_reasoning.inter_procedural_calls(body_stmt, &[]));
+                }
+            }
+            if let Some(facts) =
+                facts::extract::derive_facts_from_mssql_trigger_plan(&plan, or_alter, body.as_ref())
+            {
+                out.push(facts);
+            }
+        }
+        DdlFamily::CreateForeignTable(s) => {
+            let plan = ir::lower_create_foreign_table_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_foreign_table_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::ImportForeignSchema(s) => {
+            let plan = ir::lower_import_foreign_schema_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_import_foreign_schema_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::UserMapping(plan) => {
+            let facts = facts::extract::derive_facts_from_user_mapping_plan(&plan, sql);
+            out.push(facts);
+        }
+        DdlFamily::Flow(plan) => {
+            let facts = facts::extract::derive_facts_from_flow_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Tag the dialect-of-origin at the AST-variant match site —
+        // each `AstStmt::*Policy` variant is constructed by exactly
+        // one dialect's parser, so the variant itself carries the
+        // dialect. The IR plan stays dialect-clean; the tag is
+        // recovered here and threaded into the projection. Same
+        // pattern as `PgDdlKind` / `MssqlDdlKind` for DDL statements.
+        DdlFamily::Policy(plan, origin) => {
+            let facts = facts::extract::derive_facts_from_policy_plan(&plan, origin, sql);
+            out.push(facts);
+        }
+        DdlFamily::Integration(plan) => {
+            let facts = facts::extract::derive_facts_from_integration_plan(&plan, sql);
+            out.push(facts);
+        }
+        // Postgres DOMAIN DDL (CREATE / ALTER / DROP DOMAIN). The
+        // DdlPlan covers many statement kinds; we filter to the PG
+        // family here via the narrow [`facts::extract::PgDdlKind`]
+        // enum so the downstream projection avoids a `_ =>` catch-all
+        // on the wide public `StatementKind` taxonomy.
+        DdlFamily::Pg(kind) => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                let facts = facts::extract::derive_facts_from_pg_ddl_plan(&plan, kind, sql);
+                out.push(facts);
+            }
+        }
+        // T-SQL BACKUP (data-protection utility — target Database/Log +
+        // destination Disk/Url/Tape). Top-level `StatementFacts.mssql_backup`
+        // (parallel to `pg_copy`) since BACKUP is not DDL. Drives
+        // MSSQL-BACKUP-TO-URL / INFO-MSSQL-BACKUP.
+        DdlFamily::MssqlBackup(s) => {
+            let plan = ir::lower_backup_to_backup_plan(s, sql);
+            let mut facts = facts::extract::derive_facts_from_backup_plan(&plan, sql);
+            facts.ddl = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning)
+                .map(|plan| facts::extract::ddl_of_plan(&plan, facts::ObjectKind::Database));
+            out.push(facts);
+        }
+        // T-SQL DBCC (database console / maintenance command). Top-level
+        // `StatementFacts.mssql_dbcc` (parallel to `mssql_backup`) since DBCC is
+        // not DDL. The command verb is the recognition primitive; which command
+        // is dangerous is a YAML verdict. Drives MSSQL-DBCC-SENSITIVE /
+        // INFO-MSSQL-DBCC.
+        DdlFamily::MssqlDbcc(s) => {
+            let plan = ir::lower_dbcc_to_dbcc_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_dbcc_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL encryption-key activation (OPEN/CLOSE { MASTER | SYMMETRIC }
+        // KEY). Top-level `StatementFacts.mssql_key_management` (parallel to
+        // `mssql_dbcc`) since key activation is a session context switch, not
+        // DDL. Verb + key kind + inline-password presence are the recognition
+        // primitives; severity is a YAML verdict. Drives
+        // MSSQL-KEY-OPEN-INLINE-PASSWORD / MSSQL-OPEN-MASTER-KEY /
+        // INFO-MSSQL-KEY-MANAGEMENT.
+        DdlFamily::MssqlKeyManagement(s) => {
+            let plan = ir::lower_key_management_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_key_management_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL Row-Level Security (CREATE/ALTER SECURITY POLICY). Top-level
+        // `StatementFacts.mssql_security_policy`. Verb + STATE + filter/block
+        // predicate presence are the recognition primitives; the disabled-
+        // control verdict is a YAML rule. Drives MSSQL-RLS-POLICY-DISABLED /
+        // MSSQL-RLS-POLICY-CREATED-DISABLED / INFO-MSSQL-SECURITY-POLICY.
+        DdlFamily::MssqlSecurityPolicy(s) => {
+            let plan = ir::lower_security_policy_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_security_policy_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL key-material protection (BACKUP/RESTORE { SERVICE MASTER KEY |
+        // MASTER KEY | CERTIFICATE | ASYMMETRIC KEY }). Top-level
+        // `StatementFacts.mssql_key_backup`. Verb + key object + inline-password
+        // presence are the recognition primitives; the root-key export/restore
+        // and credential verdicts are YAML rules. Drives MSSQL-MASTER-KEY-EXPORT
+        // / MSSQL-MASTER-KEY-RESTORE / MSSQL-KEY-BACKUP-INLINE-PASSWORD /
+        // INFO-MSSQL-KEY-BACKUP.
+        DdlFamily::MssqlKeyBackup(s) => {
+            let plan = ir::lower_key_backup_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_key_backup_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL CLR assembly (CREATE/ALTER ASSEMBLY). Top-level
+        // `StatementFacts.mssql_assembly`. Verb + permission set +
+        // filesystem-source flag are the recognition primitives; the UNSAFE /
+        // EXTERNAL_ACCESS verdict is a YAML rule. Drives MSSQL-CLR-ASSEMBLY-UNSAFE
+        // / MSSQL-CLR-ASSEMBLY-EXTERNAL-ACCESS / INFO-MSSQL-CLR-ASSEMBLY.
+        DdlFamily::MssqlAssembly(s) => {
+            let plan = ir::lower_assembly_to_plan(s);
+            let facts = facts::extract::derive_facts_from_assembly_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL module signing (ADD [COUNTER] SIGNATURE). Top-level
+        // `StatementFacts.mssql_add_signature`. Counter + signer kind +
+        // inline-password presence are the recognition primitives; the
+        // privilege-delegation / credential verdict is a YAML rule. Drives
+        // MSSQL-MODULE-SIGNATURE-ADDED / MSSQL-SIGNATURE-INLINE-PASSWORD.
+        DdlFamily::MssqlAddSignature(s) => {
+            let plan = ir::lower_add_signature_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_add_signature_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL Service Master Key rotation (ALTER SERVICE MASTER KEY). Top-level
+        // `StatementFacts.mssql_service_master_key`. Operation + force +
+        // inline-password presence are the recognition primitives; the re-key /
+        // data-loss / credential verdicts are YAML rules. Drives
+        // MSSQL-SERVICE-MASTER-KEY-REGENERATE / -FORCE-REGENERATE /
+        // -INLINE-PASSWORD / INFO-MSSQL-SERVICE-MASTER-KEY.
+        DdlFamily::MssqlAlterServiceMasterKey(s) => {
+            let plan = ir::lower_service_master_key_to_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_service_master_key_plan(&plan, sql);
+            out.push(facts);
+        }
+        // PostgreSQL ALTER DEFAULT PRIVILEGES (default-grant policy on future
+        // objects). Top-level `StatementFacts.pg_default_privileges`. Action +
+        // object class + privileges + grantees + role/schema scope are the
+        // recognition primitives; the default-to-PUBLIC / global-scope verdicts
+        // are YAML rules. Drives PG-DEFAULT-PRIV-* / INFO-PG-DEFAULT-PRIVILEGES.
+        DdlFamily::PgAlterDefaultPrivileges(s) => {
+            let plan = ir::lower_pg_default_privileges_to_plan(s);
+            let facts = facts::extract::derive_facts_from_pg_default_privileges_plan(&plan, sql);
+            out.push(facts);
+        }
+        // T-SQL RESTORE (data-protection utility — target Database/Log +
+        // source Disk/Url/Tape). Top-level `StatementFacts.mssql_restore`
+        // (parallel to `mssql_backup`) since RESTORE is not DDL. Drives
+        // MSSQL-RESTORE-FROM-URL / MSSQL-RESTORE-REPLACE / INFO-MSSQL-RESTORE.
+        DdlFamily::MssqlRestore(s) => {
+            let plan = ir::lower_restore_db_to_plan(s, sql);
+            let mut facts = facts::extract::derive_facts_from_restore_plan(&plan, sql);
+            facts.ddl = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning)
+                .map(|plan| facts::extract::ddl_of_plan(&plan, facts::ObjectKind::Database));
+            out.push(facts);
+        }
+        // PG COPY (data-movement utility — direction FROM/TO + target
+        // File/Program/Stdin/Stdout). Sits at the top level of
+        // `StatementFacts` (parallel to `use_stmt`) since COPY is not
+        // DDL. Drives PG-COPY-FROM / PG-COPY-TO / PG-COPY-PROGRAM.
+        DdlFamily::PgCopy(s) => {
+            let plan = ir::lower_pg_copy_to_pg_copy_plan(s, sql);
+            let facts = facts::extract::derive_facts_from_pg_copy_plan(&plan, sql);
+            out.push(facts);
+        }
+        // BigQuery DDL (EXPORT DATA / LOAD DATA / ASSERT / MODEL /
+        // SNAPSHOT TABLE / SEARCH INDEX / VECTOR INDEX). Same filter
+        // pattern as the PG and MSSQL blocks: narrow
+        // [`facts::extract::BqDdlKind`] enum picks the variant from the
+        // AST, [`crate::ir::lower_ddl_stmt`] produces a generic
+        // [`crate::ir::DdlPlan`], and
+        // [`facts::extract::derive_facts_from_bq_ddl_plan`] projects to
+        // public `StatementFacts` exhaustively.
+        DdlFamily::Bq(kind) => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                let facts = facts::extract::derive_facts_from_bq_ddl_plan(&plan, kind, sql);
+                out.push(facts);
+            }
+        }
+        // MSSQL DDL (T-SQL Bulk Insert / External Model / Login / User /
+        // SET option). The DdlPlan covers many statement kinds; we filter
+        // to the MSSQL family here via the narrow
+        // [`facts::extract::MssqlDdlKind`] enum so the downstream
+        // projection avoids a `_ =>` catch-all on the wide public
+        // `StatementKind` taxonomy.
+        DdlFamily::Mssql(kind) => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                let facts = facts::extract::derive_facts_from_mssql_ddl_plan(&plan, kind, sql);
+                out.push(facts);
+            }
+        }
+        // CREATE / ALTER / DROP { USER | ROLE | LOGIN } —
+        // dialect-neutral principal substrate. A T-SQL login or a user made
+        // from one is the `Mssql` family's, so the `kind:
+        // mssql_create_login` / `mssql_create_user` YAML predicates keep
+        // firing. The neutral path projects the
+        // `principal_options` typed bag (kind + password_literal +
+        // mysql_host) under `ddl.principal.*`.
+        DdlFamily::Principal => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                let facts = facts::extract::derive_facts_from_principal_plan(&plan, sql);
+                out.push(facts);
+            }
+        }
+        // `COMMENT ON <target-kind> <name>` — cross-dialect metadata
+        // statement. Drives INFO-COMMENT-CHG (predicates `kind: comment`)
+        // and the Databricks Unity Catalog target-specific variants
+        // INFO-DBX-CAT/VOL/CONN-COMMENT-CHG (predicate
+        // `comment.target_kind: catalog | volume | connection`).
+        DdlFamily::CommentOn(c) => {
+            let facts = facts::extract::derive_facts_from_comment_on(c, sql);
+            out.push(facts);
+        }
+        // SHOW <objects> — metadata introspection. Lowers to a generic
+        // DDL plan carrying the typed `show` recognition sibling; the
+        // facts projection exposes it under `ddl.show.*`.
+        DdlFamily::Show => {
+            let session = ir::types::SessionContext::default();
+            let inputs = ir::IrLowerInputs {
+                source: sql,
+                placeholder_spans: placeholders,
+                strict: ir::StrictMode::Permissive,
+                func_catalog: function_catalog,
+                session: &session,
+                meaning: query.meaning,
+                catalog: None,
+                model_catalog: None,
+                reasoning,
+                flatten_body_into: None,
+            };
+            if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
+                if let Some(facts) = facts::extract::derive_facts_from_show_plan(&plan) {
+                    out.push(facts);
+                }
+            }
+        }
+        DdlFamily::ExecuteImmediate(span) => {
+            let calls = statement_calls_at(stmt, ddl, dynamic_sql);
+            let (run_call, _) = split_calls(calls.as_deref());
+            if let Some(call_ir) = run_call {
+                let call = facts::extract::project_dynamic_sql_call(call_ir);
+                let facts = facts::extract::derive_facts_dynamic_sql_stmt(
+                    facts::StatementKind::ExecuteImmediate,
+                    *span,
+                    call,
+                );
+                out.push(facts);
+            }
+        }
+        DdlFamily::ExecuteImmediateFrom(e) => {
+            // Snowflake `EXECUTE IMMEDIATE FROM <stage_file>` — executes SQL
+            // loaded from a stage file (external/file-based code execution).
+            // Distinct surface from inline `EXECUTE IMMEDIATE <expr>`: the
+            // recognition primitive is the file location + whether it runs,
+            // not an injected string shape.
+            let eif_ir = ir::dynamic_sql::lower_execute_immediate_from(e, sql);
+            let eif_facts = facts::extract::project_execute_immediate_from(&eif_ir);
+            let facts = facts::extract::derive_facts_execute_immediate_from(e.span, eif_facts);
+            out.push(facts);
+        }
+        DdlFamily::PgPrepare(p) => {
+            let calls = statement_calls_at(stmt, ddl, dynamic_sql);
+            let (run_call, _) = split_calls(calls.as_deref());
+            // Top-level `PREPARE`. PG form (`PREPARE … AS <stmt>`)
+            // carries a parsed body and is not itself a dynamic-SQL
+            // surface (the AS branch executes a known statement). MySQL
+            // form (`PREPARE … FROM <expr>`) IS a dynamic-SQL surface
+            // — classify the FROM expression's shape and attach.
+            let mut facts = match run_call {
+                Some(c) => facts::extract::derive_facts_dynamic_sql_stmt(
+                    facts::StatementKind::PgPrepare,
+                    p.span,
+                    facts::extract::project_dynamic_sql_call(c),
+                ),
+                None => facts::extract::derive_facts_stmt_kind_only(
+                    facts::StatementKind::PgPrepare,
+                    p.span,
+                ),
+            };
+            // The prepared statement it names.
+            let plan = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning);
+            facts.ddl = facts::extract::derive_facts_from_command(
+                facts::extract::CommandKind::Prepare,
+                p.span,
+                plan.as_ref(),
+            )
+            .ddl;
+            out.push(facts);
+        }
+        // T-SQL impersonation statements — `EXECUTE AS LOGIN/USER = …`
+        // and `REVERT`. Typed facts drive the MSSQL-EXECAS-* rules.
+        DdlFamily::MssqlExecuteAs(e) => {
+            let raw = sql
+                .get(e.principal_span.start as usize..e.principal_span.end as usize)
+                .unwrap_or("");
+            // A string literal's value; a bare @variable as written.
+            let inner = ir::span_extract::literal_value_or_text(raw);
+            let impersonation = facts::ddl::ImpersonationFacts {
+                principal_kind: match e.principal_kind {
+                    ast::types::AstImpersonationPrincipalKind::Login => {
+                        facts::ddl::ImpersonationPrincipalKind::Login
+                    }
+                    ast::types::AstImpersonationPrincipalKind::User => {
+                        facts::ddl::ImpersonationPrincipalKind::User
+                    }
+                },
+                principal: facts::identity::IdentName::new(inner).written_at(e.principal_span),
+                no_revert: e.no_revert,
+            };
+            let facts = facts::extract::derive_facts_mssql_impersonation(
+                facts::StatementKind::MssqlExecuteAs,
+                e.span,
+                Some(impersonation),
+            );
+            out.push(facts);
+        }
+        DdlFamily::MssqlRevert(span) => {
+            let facts = facts::extract::derive_facts_mssql_impersonation(
+                facts::StatementKind::MssqlRevert,
+                *span,
+                None,
+            );
+            out.push(facts);
+        }
+        // T-SQL `SETUSER ['username']` — the legacy, database-scoped equivalent
+        // of `EXECUTE AS USER`. Reuses the shared `ImpersonationFacts` carrier
+        // (principal kind is always User); a bare `SETUSER` is the revert form
+        // (no principal). Drives MSSQL-SETUSER-IMPERSONATION / INFO-MSSQL-SETUSER.
+        DdlFamily::MssqlSetuser(s) => {
+            let impersonation = s.principal_span.map(|p| {
+                let raw = sql.get(p.start as usize..p.end as usize).unwrap_or("");
+                let inner = ir::span_extract::literal_value_or_text(raw);
+                facts::ddl::ImpersonationFacts {
+                    principal_kind: facts::ddl::ImpersonationPrincipalKind::User,
+                    principal: facts::identity::IdentName::new(inner).written_at(p),
+                    no_revert: false,
+                }
+            });
+            let facts = facts::extract::derive_facts_mssql_impersonation(
+                facts::StatementKind::MssqlSetuser,
+                s.span,
+                impersonation,
+            );
+            out.push(facts);
+        }
+        DdlFamily::MssqlAuditDdl(a) => {
+            let kind = match a.action {
+                ast::types::AstMssqlAuditAction::Create => facts::StatementKind::MssqlCreateAudit,
+                ast::types::AstMssqlAuditAction::Alter => facts::StatementKind::MssqlAlterAudit,
+                ast::types::AstMssqlAuditAction::Drop => facts::StatementKind::MssqlDropAudit,
+            };
+            let name = sql
+                .get(a.name_span.start as usize..a.name_span.end as usize)
+                .unwrap_or("");
+            let audit = facts::ddl::AuditFacts {
+                scope: match a.scope {
+                    ast::types::AstMssqlAuditScope::ServerAudit => {
+                        facts::ddl::AuditScope::ServerAudit
+                    }
+                    ast::types::AstMssqlAuditScope::ServerAuditSpecification => {
+                        facts::ddl::AuditScope::ServerAuditSpecification
+                    }
+                    ast::types::AstMssqlAuditScope::DatabaseAuditSpecification => {
+                        facts::ddl::AuditScope::DatabaseAuditSpecification
+                    }
+                },
+                name: facts::identity::IdentName::new(name),
+                state: a.state.map(|s| match s {
+                    ast::types::AstMssqlAuditState::On => facts::ddl::DatabaseSwitchValue::On,
+                    ast::types::AstMssqlAuditState::Off => facts::ddl::DatabaseSwitchValue::Off,
+                }),
+            };
+            let mut facts = facts::extract::derive_facts_mssql_audit(kind, a.span, audit);
+            facts.ddl = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning)
+                .map(|plan| facts::extract::ddl_of_plan(&plan, facts::ObjectKind::Generic));
+            out.push(facts);
+        }
+        DdlFamily::MssqlSecurityObjectDdl(s) => {
+            let kind = match s.action {
+                ast::types::AstMssqlAuditAction::Create => {
+                    facts::StatementKind::MssqlCreateSecurityObject
+                }
+                ast::types::AstMssqlAuditAction::Alter => {
+                    facts::StatementKind::MssqlAlterSecurityObject
+                }
+                ast::types::AstMssqlAuditAction::Drop => {
+                    facts::StatementKind::MssqlDropSecurityObject
+                }
+            };
+            let slice = |sp: lexer::token::Span| {
+                sql.get(sp.start as usize..sp.end as usize)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let security_object = facts::ddl::SecurityObjectFacts {
+                kind: match s.object {
+                    ast::types::AstMssqlSecurityObjectKind::MasterKey => {
+                        facts::ddl::SecurityObjectKind::MasterKey
+                    }
+                    ast::types::AstMssqlSecurityObjectKind::DatabaseEncryptionKey => {
+                        facts::ddl::SecurityObjectKind::DatabaseEncryptionKey
+                    }
+                    ast::types::AstMssqlSecurityObjectKind::SymmetricKey => {
+                        facts::ddl::SecurityObjectKind::SymmetricKey
+                    }
+                    ast::types::AstMssqlSecurityObjectKind::AsymmetricKey => {
+                        facts::ddl::SecurityObjectKind::AsymmetricKey
+                    }
+                    ast::types::AstMssqlSecurityObjectKind::Certificate => {
+                        facts::ddl::SecurityObjectKind::Certificate
+                    }
+                    ast::types::AstMssqlSecurityObjectKind::Credential => {
+                        facts::ddl::SecurityObjectKind::Credential
+                    }
+                },
+                name: s
+                    .name_span
+                    .map(|sp| facts::identity::IdentName::new(slice(sp))),
+                database_scoped: s.database_scoped,
+                password_literal: s.password_literal.map(slice),
+                secret_literal: s.secret_literal.map(slice),
+            };
+            let mut facts =
+                facts::extract::derive_facts_mssql_security_object(kind, s.span, security_object);
+            facts.ddl = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning)
+                .map(|plan| facts::extract::ddl_of_plan(&plan, facts::ObjectKind::Generic));
+            out.push(facts);
+        }
+        DdlFamily::MssqlExec(e) => {
+            let calls = statement_calls_at(stmt, ddl, dynamic_sql);
+            let (run_call, reached_calls) = split_calls(calls.as_deref());
+            // Distinguish dynamic-SQL surfaces (`EXEC(@sql)` and
+            // `EXEC sp_executesql ...`) from ordinary stored-procedure
+            // calls (`EXEC proc_name args`). Also capture the typed
+            // `mssql_exec` facts (lowercased procedure_name + args_text)
+            // so rules like MSSQL-XP-CMDSHELL can predicate on the
+            // specific procedure being invoked.
+            // Base name part only (`xp_cmdshell` in `master.dbo.xp_cmdshell`),
+            // quote-stripped via the central normalizer, then lowercased per
+            // the facts contract — qualified and bracket-quoted invocations
+            // must match the same rule predicate.
+            let procedure_name_lower = e.procedure_base_name_span.map(|s| {
+                crate::dialect::normalize_identifier(
+                    sql.get(s.start as usize..s.end as usize).unwrap_or(""),
+                )
+                .to_ascii_lowercase()
+            });
+            let args_text_lower = e.args_span.map(|s| {
+                facts::identity::WrittenText::at(
+                    sql.get(s.start as usize..s.end as usize)
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
+                    s,
+                )
+            });
+            let mssql_exec_facts = Some(facts::ddl::MssqlExecFacts {
+                procedure_name: procedure_name_lower.clone(),
+                args_text: args_text_lower,
+                args: facts::extract::project_call_arguments(&e.args, sql),
+            });
+            // An `EXEC` of a procedure names it as a `CALL` does, with its
+            // arguments; `EXEC (@sql)` calls none.
+            let procedure = e.procedure_name_span.map(|_| {
+                let plan =
+                    command_plan(stmt, sql, placeholders, function_catalog, query, reasoning);
+                let ddl = facts::extract::derive_facts_from_command(
+                    facts::extract::CommandKind::MssqlExec,
+                    e.span,
+                    plan.as_ref(),
+                )
+                .ddl;
+                let call = facts::ddl::CallFacts {
+                    arguments: facts::extract::project_call_arguments(&e.args, sql),
+                };
+                (ddl, call)
+            });
+            let named = |mut facts: facts::StatementFacts| {
+                if let Some((ddl, call)) = &procedure {
+                    facts.ddl = ddl.clone();
+                    facts.call = Some(call.clone());
+                }
+                facts
+            };
+
+            // `EXEC (…)` and `EXEC sp_executesql …` run SQL text; any other
+            // `EXEC` calls a procedure.
+            if let Some(call_ir) = run_call {
+                let call = facts::extract::project_dynamic_sql_call(call_ir);
+                let mut facts = facts::extract::derive_facts_dynamic_sql_stmt(
+                    facts::StatementKind::MssqlExec,
+                    e.span,
+                    call,
+                );
+                facts.mssql_exec = mssql_exec_facts;
+                out.push(named(facts));
+            } else {
+                // Ordinary EXEC <proc_name> — no dynamic SQL at the
+                // call itself, but the callee's body may pass an
+                // argument on to a sink. Emit one row per sink it
+                // reaches, each carrying its provenance chain. Always
+                // also surface `mssql_exec` facts so procedure-name-keyed
+                // rules (xp_cmdshell, …) fire.
+                for call_ir in reached_calls {
+                    let call = facts::extract::project_dynamic_sql_call(call_ir);
+                    let mut facts = facts::extract::derive_facts_dynamic_sql_stmt(
+                        facts::StatementKind::MssqlExec,
+                        e.span,
+                        call,
+                    );
+                    facts.mssql_exec = mssql_exec_facts.clone();
+                    out.push(named(facts));
+                }
+                let mut facts = facts::extract::derive_facts_stmt_kind_only(
+                    facts::StatementKind::MssqlExec,
+                    e.span,
+                );
+                facts.mssql_exec = mssql_exec_facts;
+                out.push(named(facts));
+            }
+        }
+        DdlFamily::Call(span, args) => {
+            // A call is one record whether or not the reasoning provider
+            // reports a sink its callee reaches.
+            let calls = statement_calls_at(stmt, ddl, dynamic_sql);
+            let (_, reached_calls) = split_calls(calls.as_deref());
+            for call_ir in reached_calls {
+                let call = facts::extract::project_dynamic_sql_call(call_ir);
+                out.push(facts::extract::derive_facts_dynamic_sql_stmt(
+                    facts::StatementKind::Call,
+                    *span,
+                    call,
+                ));
+            }
+            let plan = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning);
+            let mut facts = facts::extract::derive_facts_from_command(
+                facts::extract::CommandKind::Call,
+                stmt.span(),
+                plan.as_ref(),
+            );
+            facts.call = Some(facts::ddl::CallFacts {
+                arguments: facts::extract::project_call_arguments(args, sql),
+            });
+            out.push(facts);
+        }
+        // The variables a DECLARE makes.
+        DdlFamily::Declare(variables) => {
+            let mut facts = facts::extract::derive_facts_stmt_kind_only(
+                facts::StatementKind::Declare,
+                stmt.span(),
+            );
+            facts.declare = Some(facts::extract::project_declare(variables, sql));
+            out.push(facts);
+        }
+        DdlFamily::DeclareTable(name, table) => {
+            let mut facts = facts::extract::derive_facts_stmt_kind_only(
+                facts::StatementKind::DeclareTable,
+                stmt.span(),
+            );
+            facts.declare = Some(facts::extract::project_declare_table(
+                name.span, *table, sql,
+            ));
+            out.push(facts);
+        }
+        DdlFamily::Stub(Stub::KindOnly(kind, span)) => {
+            out.push(facts::extract::derive_facts_stmt_kind_only(kind, span));
+        }
+        DdlFamily::Stub(Stub::Command(kind)) => {
+            let plan = command_plan(stmt, sql, placeholders, function_catalog, query, reasoning);
+            out.push(facts::extract::derive_facts_from_command(
+                kind,
+                stmt.span(),
+                plan.as_ref(),
+            ));
+        }
+        // With a catalog, the reasoning provider answers what the grant
+        // reaches.
+        DdlFamily::Privilege(plan) => {
+            out.push(privilege_plan_facts(&plan, sql, query.catalog, reasoning))
+        }
+        // Each handler but those in an exception handler, a loop's query or
+        // an `INSERT … EXEC`.
+        DdlFamily::Handler(h) => {
+            if ddl.handlers.contains(&h.node_id) {
+                let plan = ir::lower_declare_handler_to_handler_plan(h, sql);
+                out.push(facts::extract::derive_facts_from_handler_plan(&plan, sql));
+            }
+        }
+        DdlFamily::AlterUser(u) => out.push(alter_user_facts(u, sql)),
+        DdlFamily::AlterAccount(a) => out.extend(alter_account_facts(a, sql)),
+        DdlFamily::Query | DdlFamily::Unparsed | DdlFamily::Unread => {}
+    }
+}
+
+/// The family of facts that reads a statement, with what its selection
+/// lowered: one per family [`ddl_statement_facts`] dispatches on.
+enum DdlFamily<'s> {
+    Stage(ir::StagePlan),
+    DynamicTable(ir::DynamicTablePlan),
+    Table(ir::TablePlan, Option<&'s ast::AstObjectRef>),
+    TableMaintenance(ir::TableMaintenancePlan),
+    View(facts::extract::ViewDdlKind),
+    Pipe(ir::PipePlan),
+    Tag(ir::TagPlan),
+    FileFormat(ir::FileFormatPlan),
+    Session(ir::SessionPlan),
+    Stream(ir::StreamPlan),
+    NetworkRule(ir::NetworkRulePlan),
+    ResourceMonitor(ir::ResourceMonitorPlan),
+    ComputePool(ir::ComputePoolPlan),
+    GitRepository(ir::GitRepositoryPlan),
+    CreateExternalFunction(&'s ast::types::AstCreateExternalFunction),
+    ImageRepository(ir::ImageRepositoryPlan),
+    Streamlit(ir::StreamlitPlan),
+    Service(ir::ServicePlan),
+    Notebook(ir::NotebookPlan),
+    SemanticView(ir::SemanticViewPlan),
+    CortexSearchService(ir::CortexSearchServicePlan),
+    ApplicationPackage(ir::ApplicationPackagePlan),
+    Application(ir::ApplicationPlan),
+    Listing(ir::ListingPlan),
+    ManagedAccount(ir::ManagedAccountPlan),
+    OrgAccount(ir::OrgAccountPlan),
+    StageFileCommand(&'s ast::types::AstStageFileCommand),
+    Secret(ir::SecretPlan),
+    Share(ir::SharePlan),
+    Datashare(ir::DatasharePlan),
+    Schema(ir::SchemaPlan),
+    Catalog(ir::CatalogPlan),
+    Use(ir::UsePlan),
+    Task(ir::TaskPlan),
+    Alert(ir::AlertPlan),
+    Dmf(ir::DataMetricFunctionPlan),
+    ReplGroup(ir::ReplicationFailoverGroupPlan),
+    Function(ir::FunctionPlan),
+    Procedure(ir::ProcedurePlan),
+    Database(ir::DatabasePlan),
+    Warehouse(ir::WarehousePlan),
+    StorageCredential(ir::StorageCredentialPlan),
+    Volume(ir::VolumePlan),
+    ExternalLocation(ir::ExternalLocationPlan),
+    Connection(ir::ConnectionPlan),
+    MssqlCreateExternalDataSource(&'s ast::types::AstMssqlCreateExternalDataSource),
+    MssqlAlterExternalDataSource(&'s ast::types::AstMssqlAlterExternalDataSource),
+    ForeignServer(ir::ForeignServerPlan),
+    MssqlAlterServerConfiguration(&'s ast::types::AstMssqlAlterServerConfiguration),
+    MysqlLoadData(&'s ast::types::AstMysqlLoadData),
+    Event(ir::EventPlan),
+    CreateMysqlTrigger(&'s ast::types::AstCreateMysqlTrigger),
+    CreateMssqlTrigger(&'s ast::types::AstCreateMssqlTrigger),
+    CreateForeignTable(&'s ast::types::AstCreateForeignTable),
+    ImportForeignSchema(&'s ast::types::AstImportForeignSchema),
+    UserMapping(ir::UserMappingPlan),
+    Flow(ir::FlowPlan),
+    Policy(ir::PolicyPlan, facts::extract::PolicyDialectOrigin),
+    Integration(ir::IntegrationPlan),
+    Pg(facts::extract::PgDdlKind),
+    MssqlBackup(&'s ast::types::AstMssqlBackup),
+    MssqlDbcc(&'s ast::types::AstMssqlDbcc),
+    MssqlKeyManagement(&'s ast::types::AstMssqlKeyManagement),
+    MssqlSecurityPolicy(&'s ast::types::AstMssqlSecurityPolicy),
+    MssqlKeyBackup(&'s ast::types::AstMssqlKeyBackup),
+    MssqlAssembly(&'s ast::types::AstMssqlAssembly),
+    MssqlAddSignature(&'s ast::types::AstMssqlAddSignature),
+    MssqlAlterServiceMasterKey(&'s ast::types::AstMssqlAlterServiceMasterKey),
+    PgAlterDefaultPrivileges(&'s ast::types::AstPgAlterDefaultPrivileges),
+    MssqlRestore(&'s ast::types::AstMssqlRestore),
+    PgCopy(&'s ast::types::AstPgCopy),
+    Bq(facts::extract::BqDdlKind),
+    Mssql(facts::extract::MssqlDdlKind),
+    Principal,
+    CommentOn(&'s ast::types::AstCommentOn),
+    Show,
+    ExecuteImmediate(&'s lexer::Span),
+    ExecuteImmediateFrom(&'s ast::types::AstExecuteImmediateFrom),
+    PgPrepare(&'s ast::types::AstPgPrepare),
+    MssqlExecuteAs(&'s ast::types::AstMssqlExecuteAs),
+    MssqlRevert(&'s lexer::Span),
+    MssqlSetuser(&'s ast::types::AstMssqlSetuser),
+    MssqlAuditDdl(&'s ast::types::AstMssqlAuditDdl),
+    MssqlSecurityObjectDdl(&'s ast::types::AstMssqlSecurityObjectDdl),
+    MssqlExec(&'s ast::types::AstMssqlExec),
+    Call(&'s lexer::Span, &'s [ast::AstCallArg]),
+    Stub(Stub),
+    /// Read by the query reading.
+    Query,
+    Declare(&'s [ast::AstDeclaredVariable]),
+    DeclareTable(&'s ast::AstIdentifier, &'s lexer::Span),
+    CreateFunction(&'s ast::types::AstCreateFunctionStmt),
+    CreateTableFunction(&'s ast::types::AstCreateTableFunctionStmt),
+    CreateProcedure(&'s ast::types::AstCreateProcedureStmt),
+    /// A GRANT, REVOKE, DENY or ALTER AUTHORIZATION, read at any depth.
+    Privilege(ir::privilege_plan::PrivilegePlan),
+    /// A `DECLARE … HANDLER`.
+    Handler(&'s ast::types::AstDeclareHandlerStmt),
+    AlterUser(&'s ast::types::AstAlterUser),
+    AlterAccount(&'s ast::types::AstAlterAccount),
+    /// Text not parsed as a statement, or a batch separator.
+    Unparsed,
+    /// Read by no family, and named by no kind: its record is the query
+    /// reading's, of kind `opaque`.
+    Unread,
+}
+
+/// The reader of a family: the entry point whose facts it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyReader {
+    /// The DDL families.
+    Ddl,
+    /// GRANT, REVOKE, DENY and ALTER AUTHORIZATION.
+    Privilege,
+    /// `ALTER USER` and `ALTER ACCOUNT`.
+    PolicyAttachment,
+    /// No family reads it.
+    None,
+}
+
+impl DdlFamily<'_> {
+    /// The reader whose facts this family's are.
+    fn reader(&self) -> FamilyReader {
+        match self {
+            DdlFamily::Stage(..)
+            | DdlFamily::DynamicTable(..)
+            | DdlFamily::Table(..)
+            | DdlFamily::TableMaintenance(..)
+            | DdlFamily::View(..)
+            | DdlFamily::Pipe(..)
+            | DdlFamily::Tag(..)
+            | DdlFamily::FileFormat(..)
+            | DdlFamily::Session(..)
+            | DdlFamily::Stream(..)
+            | DdlFamily::NetworkRule(..)
+            | DdlFamily::ResourceMonitor(..)
+            | DdlFamily::ComputePool(..)
+            | DdlFamily::GitRepository(..)
+            | DdlFamily::CreateExternalFunction(..)
+            | DdlFamily::ImageRepository(..)
+            | DdlFamily::Streamlit(..)
+            | DdlFamily::Service(..)
+            | DdlFamily::Notebook(..)
+            | DdlFamily::SemanticView(..)
+            | DdlFamily::CortexSearchService(..)
+            | DdlFamily::ApplicationPackage(..)
+            | DdlFamily::Application(..)
+            | DdlFamily::Listing(..)
+            | DdlFamily::ManagedAccount(..)
+            | DdlFamily::OrgAccount(..)
+            | DdlFamily::StageFileCommand(..)
+            | DdlFamily::Secret(..)
+            | DdlFamily::Share(..)
+            | DdlFamily::Datashare(..)
+            | DdlFamily::Schema(..)
+            | DdlFamily::Catalog(..)
+            | DdlFamily::Use(..)
+            | DdlFamily::Task(..)
+            | DdlFamily::Alert(..)
+            | DdlFamily::Dmf(..)
+            | DdlFamily::ReplGroup(..)
+            | DdlFamily::Function(..)
+            | DdlFamily::Procedure(..)
+            | DdlFamily::Database(..)
+            | DdlFamily::Warehouse(..)
+            | DdlFamily::StorageCredential(..)
+            | DdlFamily::Volume(..)
+            | DdlFamily::ExternalLocation(..)
+            | DdlFamily::Connection(..)
+            | DdlFamily::MssqlCreateExternalDataSource(..)
+            | DdlFamily::MssqlAlterExternalDataSource(..)
+            | DdlFamily::ForeignServer(..)
+            | DdlFamily::MssqlAlterServerConfiguration(..)
+            | DdlFamily::MysqlLoadData(..)
+            | DdlFamily::Event(..)
+            | DdlFamily::CreateMysqlTrigger(..)
+            | DdlFamily::CreateMssqlTrigger(..)
+            | DdlFamily::CreateForeignTable(..)
+            | DdlFamily::ImportForeignSchema(..)
+            | DdlFamily::UserMapping(..)
+            | DdlFamily::Flow(..)
+            | DdlFamily::Policy(..)
+            | DdlFamily::Integration(..)
+            | DdlFamily::Pg(..)
+            | DdlFamily::MssqlBackup(..)
+            | DdlFamily::MssqlDbcc(..)
+            | DdlFamily::MssqlKeyManagement(..)
+            | DdlFamily::MssqlSecurityPolicy(..)
+            | DdlFamily::MssqlKeyBackup(..)
+            | DdlFamily::MssqlAssembly(..)
+            | DdlFamily::MssqlAddSignature(..)
+            | DdlFamily::MssqlAlterServiceMasterKey(..)
+            | DdlFamily::PgAlterDefaultPrivileges(..)
+            | DdlFamily::MssqlRestore(..)
+            | DdlFamily::PgCopy(..)
+            | DdlFamily::Bq(..)
+            | DdlFamily::Mssql(..)
+            | DdlFamily::Principal
+            | DdlFamily::CommentOn(..)
+            | DdlFamily::Show
+            | DdlFamily::ExecuteImmediate(..)
+            | DdlFamily::ExecuteImmediateFrom(..)
+            | DdlFamily::PgPrepare(..)
+            | DdlFamily::MssqlExecuteAs(..)
+            | DdlFamily::MssqlRevert(..)
+            | DdlFamily::MssqlSetuser(..)
+            | DdlFamily::MssqlAuditDdl(..)
+            | DdlFamily::MssqlSecurityObjectDdl(..)
+            | DdlFamily::MssqlExec(..)
+            | DdlFamily::Call(..)
+            | DdlFamily::Stub(..)
+            | DdlFamily::CreateFunction(..)
+            | DdlFamily::CreateTableFunction(..)
+            | DdlFamily::CreateProcedure(..)
+            | DdlFamily::Handler(..) => FamilyReader::Ddl,
+            DdlFamily::Declare(..) | DdlFamily::DeclareTable(..) => FamilyReader::Ddl,
+            DdlFamily::Privilege(..) => FamilyReader::Privilege,
+            DdlFamily::AlterUser(..) | DdlFamily::AlterAccount(..) => {
+                FamilyReader::PolicyAttachment
+            }
+            DdlFamily::Query | DdlFamily::Unparsed | DdlFamily::Unread => FamilyReader::None,
+        }
+    }
+}
+
+/// The family that reads `stmt`, a statement of the script `sql` parsed
+/// with `placeholders`. Every statement is named here, so a new one is
+/// given a family, or none, before it compiles; where several families
+/// read one statement (`DROP <kind>`), the first that takes it reads it.
+fn ddl_family<'s>(
+    stmt: &'s ast::AstStmt,
+    sql: &str,
+    placeholders: &[lexer::token::Span],
+) -> DdlFamily<'s> {
+    use facts::extract::CommandKind as C;
+    let kind_only = |kind| DdlFamily::Stub(Stub::KindOnly(kind, stmt.span()));
+    match stmt {
         ast::AstStmt::CreateStage(s) => {
-            Some(ir::lower_create_stage_to_stage_plan(s, sql, placeholders))
+            DdlFamily::Stage(ir::lower_create_stage_to_stage_plan(s, sql, placeholders))
         }
         ast::AstStmt::AlterStage(s) => {
-            Some(ir::lower_alter_stage_to_stage_plan(s, sql, placeholders))
+            DdlFamily::Stage(ir::lower_alter_stage_to_stage_plan(s, sql, placeholders))
         }
         ast::AstStmt::CopyIntoLocation {
             node_id,
@@ -4900,8 +6296,9 @@ fn ddl_statement_facts(
             location_url_span,
             credentials,
             copy_options,
+            into_stage,
             ..
-        } => Some(ir::lower_copy_into_location_to_stage_plan(
+        } => DdlFamily::Stage(ir::lower_copy_into_location_to_stage_plan(
             *span,
             *node_id,
             *from_span,
@@ -4913,6 +6310,7 @@ fn ddl_statement_facts(
             },
             credentials,
             copy_options,
+            into_stage.as_deref(),
         )),
         ast::AstStmt::CopyIntoTable {
             node_id,
@@ -4923,7 +6321,7 @@ fn ddl_statement_facts(
             from_location_url_span,
             credentials,
             ..
-        } => Some(ir::lower_copy_into_table_to_stage_plan(
+        } => DdlFamily::Stage(ir::lower_copy_into_table_to_stage_plan(
             *span,
             *node_id,
             table_name.span,
@@ -4945,7 +6343,7 @@ fn ddl_statement_facts(
             location_url_span,
             credentials,
             ..
-        } => Some(ir::lower_unload_to_stage_plan(
+        } => DdlFamily::Stage(ir::lower_unload_to_stage_plan(
             *span,
             *node_id,
             sql,
@@ -4961,11 +6359,12 @@ fn ddl_statement_facts(
         ast::AstStmt::RedshiftCopy {
             node_id,
             span,
+            name_span,
             location_url,
             location_url_span,
             credentials,
             ..
-        } => Some(ir::lower_redshift_copy_to_stage_plan(
+        } => DdlFamily::Stage(ir::lower_redshift_copy_to_stage_plan(
             *span,
             *node_id,
             sql,
@@ -4975,1947 +6374,834 @@ fn ddl_statement_facts(
                 placeholders,
             },
             credentials,
+            *name_span,
         )),
-        ast::AstStmt::Drop(s) => ir::lower_drop_stage_to_stage_plan(s, sql),
-        _ => None,
-    };
-    if let Some(plan) = stage_plan {
-        let mut facts = facts::extract::derive_facts_from_stage_plan(&plan, sql);
-        // A COPY INTO <location> or an UNLOAD: the columns its source
-        // unloads out of the warehouse, each classified as the query it
-        // reads is.
-        if let ast::AstStmt::CopyIntoLocation {
-            source: Some(src), ..
-        }
-        | ast::AstStmt::Unload {
-            source: Some(src), ..
-        } = stmt
-        {
-            let exported = unload_query_facts(src, query)
-                .and_then(|read| read.query)
-                .map(|read| script_reasoning.exported_columns(&read))
-                .unwrap_or_default();
-            if let Some(stage) = facts.ddl.as_mut().and_then(|d| d.stage.as_mut()) {
-                stage.exported_columns = exported;
+        // A DROP is read by the family of the object it drops: each
+        // lowering below returns a plan only for its own object kind, and
+        // where kinds share a word the longer is tried first (DYNAMIC TABLE
+        // before TABLE, APPLICATION PACKAGE before APPLICATION, MANAGED
+        // ACCOUNT before ACCOUNT).
+        ast::AstStmt::Drop(s) => {
+            if let Some(x) = ir::lower_drop_stage_to_stage_plan(s, sql) {
+                return DdlFamily::Stage(x);
             }
+            if let Some(x) = ir::lower_drop_dynamic_table_to_dynamic_table_plan(s, sql) {
+                return DdlFamily::DynamicTable(x);
+            }
+            if let Some(plan) = ir::lower_drop_table_to_table_plan(s, sql) {
+                return DdlFamily::Table(plan, s.target_name.as_ref());
+            }
+            if let Some(x) =
+                drop_target_is_view(s, sql).then_some(facts::extract::ViewDdlKind::DropView)
+            {
+                return DdlFamily::View(x);
+            }
+            if let Some(x) =
+                drop_target_is_tag(s, sql).then(|| ir::lower_drop_tag_to_tag_plan(s, sql))
+            {
+                return DdlFamily::Tag(x);
+            }
+            if let Some(x) = drop_target_is_file_format(s, sql)
+                .then(|| ir::lower_drop_file_format_to_plan(s, sql))
+            {
+                return DdlFamily::FileFormat(x);
+            }
+            if let Some(x) = drop_target_is_network_rule(s, sql)
+                .then(|| ir::lower_drop_network_rule_to_network_rule_plan(s, sql))
+            {
+                return DdlFamily::NetworkRule(x);
+            }
+            if let Some(x) = drop_target_is_resource_monitor(s, sql)
+                .then(|| ir::lower_drop_resource_monitor_to_resource_monitor_plan(s, sql))
+            {
+                return DdlFamily::ResourceMonitor(x);
+            }
+            if let Some(x) = drop_target_is_compute_pool(s, sql)
+                .then(|| ir::lower_drop_compute_pool_to_compute_pool_plan(s, sql))
+            {
+                return DdlFamily::ComputePool(x);
+            }
+            if let Some(x) = drop_target_is_git_repository(s, sql)
+                .then(|| ir::lower_drop_git_repository_to_git_repository_plan(s, sql))
+            {
+                return DdlFamily::GitRepository(x);
+            }
+            if let Some(x) = drop_target_is_image_repository(s, sql)
+                .then(|| ir::lower_drop_image_repository_to_image_repository_plan(s, sql))
+            {
+                return DdlFamily::ImageRepository(x);
+            }
+            if let Some(x) = drop_target_is_streamlit(s, sql)
+                .then(|| ir::lower_drop_streamlit_to_streamlit_plan(s, sql))
+            {
+                return DdlFamily::Streamlit(x);
+            }
+            if let Some(x) = drop_target_is_service(s, sql)
+                .then(|| ir::lower_drop_service_to_service_plan(s, sql))
+            {
+                return DdlFamily::Service(x);
+            }
+            if let Some(x) = drop_target_is_notebook(s, sql)
+                .then(|| ir::lower_drop_notebook_to_notebook_plan(s, sql))
+            {
+                return DdlFamily::Notebook(x);
+            }
+            if let Some(x) = drop_target_is_semantic_view(s, sql)
+                .then(|| ir::lower_drop_semantic_view_to_semantic_view_plan(s, sql))
+            {
+                return DdlFamily::SemanticView(x);
+            }
+            if let Some(x) = drop_target_is_cortex_search_service(s, sql)
+                .then(|| ir::lower_drop_cortex_search_service_to_plan(s, sql))
+            {
+                return DdlFamily::CortexSearchService(x);
+            }
+            if let Some(x) = drop_target_is_application_package(s, sql)
+                .then(|| ir::lower_drop_application_package_to_plan(s, sql))
+            {
+                return DdlFamily::ApplicationPackage(x);
+            }
+            if let Some(x) = drop_target_is_application(s, sql)
+                .then(|| ir::lower_drop_application_to_plan(s, sql))
+            {
+                return DdlFamily::Application(x);
+            }
+            if let Some(x) =
+                drop_target_is_listing(s, sql).then(|| ir::lower_drop_listing_to_plan(s, sql))
+            {
+                return DdlFamily::Listing(x);
+            }
+            if let Some(x) = drop_target_is_managed_account(s, sql)
+                .then(|| ir::lower_drop_managed_account_to_plan(s, sql))
+            {
+                return DdlFamily::ManagedAccount(x);
+            }
+            if let Some(x) =
+                drop_target_is_account(s, sql).then(|| ir::lower_drop_account_to_plan(s, sql))
+            {
+                return DdlFamily::OrgAccount(x);
+            }
+            if let Some(x) =
+                drop_target_is_secret(s, sql).then(|| ir::lower_drop_secret_to_secret_plan(s, sql))
+            {
+                return DdlFamily::Secret(x);
+            }
+            if let Some(x) =
+                drop_target_is_share(s, sql).then(|| ir::lower_drop_share_to_share_plan(s, sql))
+            {
+                return DdlFamily::Share(x);
+            }
+            if let Some(x) =
+                drop_target_is_alert(s, sql).then(|| ir::lower_drop_alert_to_alert_plan(s, sql))
+            {
+                return DdlFamily::Alert(x);
+            }
+            if let Some(x) = drop_target_is_data_metric_function(s, sql)
+                .then(|| ir::lower_drop_data_metric_function_to_plan(s, sql))
+            {
+                return DdlFamily::Dmf(x);
+            }
+            if let Some(x) = drop_replication_failover_group_type(s, sql)
+                .map(|kind| ir::lower_drop_replication_failover_group_to_plan(s, kind, sql))
+            {
+                return DdlFamily::ReplGroup(x);
+            }
+            if let Some(x) = ir::lower_drop_function_to_function_plan(s, sql) {
+                return DdlFamily::Function(x);
+            }
+            if let Some(x) = ir::lower_drop_procedure_to_procedure_plan(s, sql) {
+                return DdlFamily::Procedure(x);
+            }
+            // DROP SECURITY INTEGRATION arrives as a generic Drop (no
+            // typed drop AST for this kind) — gate on the object type.
+            if let Some(x) = drop_target_is_security_integration(s, sql)
+                .then(|| ir::lower_drop_security_integration_to_integration_plan(s))
+            {
+                return DdlFamily::Integration(x);
+            }
+            DdlFamily::Unread
         }
-        out.push(facts);
-        return;
-    }
-
-    let dynamic_table_plan = match stmt {
         ast::AstStmt::CreateDynamicTable(s) => {
-            Some(ir::lower_create_dynamic_table_to_dynamic_table_plan(s, sql))
+            DdlFamily::DynamicTable(ir::lower_create_dynamic_table_to_dynamic_table_plan(s, sql))
         }
         ast::AstStmt::AlterDynamicTable(s) => {
-            Some(ir::lower_alter_dynamic_table_to_dynamic_table_plan(s, sql))
+            DdlFamily::DynamicTable(ir::lower_alter_dynamic_table_to_dynamic_table_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => ir::lower_drop_dynamic_table_to_dynamic_table_plan(s, sql),
-        _ => None,
-    };
-    if let Some(plan) = dynamic_table_plan {
-        let facts = facts::extract::derive_facts_from_dynamic_table_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Table dispatch must come AFTER the dynamic-table dispatch
-    // because both can claim a generic `AstStmt::Drop`; the
-    // dynamic-table lowering returns `Some` only for `DROP DYNAMIC
-    // TABLE`, so falling through here to the table lowering
-    // (`DROP TABLE`) is correct.
-    // Each plan with the name the statement's existing table carries.
-    let table_plan = match stmt {
-        ast::AstStmt::CreateTable(s) => Some((ir::lower_create_table_to_table_plan(s, sql), None)),
+        ast::AstStmt::CreateTable(s) => {
+            DdlFamily::Table(ir::lower_create_table_to_table_plan(s, sql), None)
+        }
         ast::AstStmt::AlterTable(s) => {
-            Some((ir::lower_alter_table_to_table_plan(s, sql), Some(&s.name)))
+            DdlFamily::Table(ir::lower_alter_table_to_table_plan(s, sql), Some(&s.name))
         }
         ast::AstStmt::MysqlRenameTable(s) => {
-            Some((ir::lower_mysql_rename_table_to_table_plan(s, sql), None))
+            DdlFamily::Table(ir::lower_mysql_rename_table_to_table_plan(s, sql), None)
         }
-        ast::AstStmt::Truncate(s) => Some((
+        ast::AstStmt::Truncate(s) => DdlFamily::Table(
             ir::lower_truncate_to_table_plan(s, sql),
             s.target_table.as_ref(),
-        )),
-        ast::AstStmt::DropAllRowAccessPolicies(s) => Some((
+        ),
+        ast::AstStmt::DropAllRowAccessPolicies(s) => DdlFamily::Table(
             ir::lower_drop_all_row_access_policies_to_table_plan(s, sql),
             None,
-        )),
-        ast::AstStmt::Drop(s) => {
-            ir::lower_drop_table_to_table_plan(s, sql).map(|plan| (plan, s.target_name.as_ref()))
+        ),
+        ast::AstStmt::Vacuum(s) => {
+            DdlFamily::TableMaintenance(ir::lower_vacuum_to_table_maintenance_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some((plan, existing_name)) = table_plan {
-        if let Some(sink) = facts_out {
-            if existing_name.is_some_and(|name| !ir::lower::names_a_catalog_object(name.name_kind))
-            {
-                sink.record_uncatalogued_ddl_target(stmt.span());
-            }
+        ast::AstStmt::Optimize(s) => {
+            DdlFamily::TableMaintenance(ir::lower_optimize_to_table_maintenance_plan(s, sql))
         }
-        let mut facts = facts::extract::derive_facts_from_table_plan(&plan, sql);
-        // A table an earlier statement of the script made temporary; a
-        // CREATE states its own. A `TRUNCATE` of a list truncates temporary
-        // tables alone where each it lists is one.
-        let start = stmt.span().start;
-        let creates = matches!(stmt, ast::AstStmt::CreateTable(_));
-        let targets = plan.tables();
-        let made_temporary = !creates
-            && !targets.is_empty()
-            && targets.iter().all(|target| {
-                let named = crate::context::node_metadata::TableRef {
-                    server: None,
-                    db: target.db.clone(),
-                    schema: target.schema.clone(),
-                    name: target.name.clone(),
-                    span: None,
-                };
-                target.temporary
-                    || query
-                        .relations
-                        .relations
-                        .at(start)
-                        .temporary(&named, &fold.session_context_at(start))
-            });
-        if made_temporary {
-            if let Some(table) = facts.ddl.as_mut().and_then(|ddl| ddl.table.as_mut()) {
-                table.temporary = true;
-            }
+        ast::AstStmt::Restore(s) => {
+            DdlFamily::TableMaintenance(ir::lower_restore_to_table_maintenance_plan(s, sql))
         }
-        out.push(facts);
-        return;
-    }
-
-    let table_maintenance_plan = match stmt {
-        ast::AstStmt::Vacuum(s) => Some(ir::lower_vacuum_to_table_maintenance_plan(s, sql)),
-        ast::AstStmt::Optimize(s) => Some(ir::lower_optimize_to_table_maintenance_plan(s, sql)),
-        ast::AstStmt::Restore(s) => Some(ir::lower_restore_to_table_maintenance_plan(s, sql)),
-        ast::AstStmt::DescribeHistory(s) => {
-            Some(ir::lower_describe_history_to_table_maintenance_plan(s, sql))
-        }
+        ast::AstStmt::DescribeHistory(s) => DdlFamily::TableMaintenance(
+            ir::lower_describe_history_to_table_maintenance_plan(s, sql),
+        ),
         ast::AstStmt::RepairTable(s) => {
-            Some(ir::lower_repair_table_to_table_maintenance_plan(s, sql))
+            DdlFamily::TableMaintenance(ir::lower_repair_table_to_table_maintenance_plan(s, sql))
         }
         ast::AstStmt::CacheTable(s) => {
-            Some(ir::lower_cache_table_to_table_maintenance_plan(s, sql))
+            DdlFamily::TableMaintenance(ir::lower_cache_table_to_table_maintenance_plan(s, sql))
         }
         ast::AstStmt::UncacheTable(s) => {
-            Some(ir::lower_uncache_table_to_table_maintenance_plan(s, sql))
+            DdlFamily::TableMaintenance(ir::lower_uncache_table_to_table_maintenance_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = table_maintenance_plan {
-        let facts = facts::extract::derive_facts_from_table_maintenance_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // View DDL (cross-dialect CREATE / ALTER / DROP VIEW and
-    // ALTER MATERIALIZED VIEW). Same dispatch-filter pattern as
-    // `MssqlDdlKind` / `PgDdlKind` / `BqDdlKind`: the AST variant
-    // resolves the [`facts::extract::ViewDdlKind`], `lower_ddl_stmt`
-    // produces a generic [`ir::DdlPlan`], and
-    // `derive_facts_from_view_ddl_plan` projects to public
-    // `StatementFacts`. Drives VIEW-REPLACE / VIEW-CHG / VIEW-DROP
-    // / VIEW-CASCADE-DROP.
-    //
-    // Sits after the table/stage/dynamic-table dispatch so a
-    // generic `AstStmt::Drop` with object_type=VIEW reaches us
-    // (those dispatchers return `None` for non-matching object
-    // types) — the earlier table dispatcher's `lower_drop_table_to_table_plan`
-    // gates on `object_type == TABLE`, so DROP VIEW falls through.
-    let view_kind: Option<facts::extract::ViewDdlKind> = match stmt {
-        ast::AstStmt::CreateView(_) => Some(facts::extract::ViewDdlKind::CreateView),
-        ast::AstStmt::AlterView(_) => Some(facts::extract::ViewDdlKind::AlterView),
+        ast::AstStmt::CreateView(_) => DdlFamily::View(facts::extract::ViewDdlKind::CreateView),
+        ast::AstStmt::AlterView(_) => DdlFamily::View(facts::extract::ViewDdlKind::AlterView),
         ast::AstStmt::AlterMaterializedView(_) => {
-            Some(facts::extract::ViewDdlKind::AlterMaterializedView)
+            DdlFamily::View(facts::extract::ViewDdlKind::AlterMaterializedView)
         }
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_view(s, sql).then_some(facts::extract::ViewDdlKind::DropView)
+        ast::AstStmt::CreatePipe(s) => DdlFamily::Pipe(ir::lower_create_pipe_to_pipe_plan(s, sql)),
+        ast::AstStmt::AlterPipe(s) => DdlFamily::Pipe(ir::lower_alter_pipe_to_pipe_plan(s, sql)),
+        ast::AstStmt::DropPipe(s) => DdlFamily::Pipe(ir::lower_drop_pipe_to_pipe_plan(s, sql)),
+        ast::AstStmt::CreateTag(s) => DdlFamily::Tag(ir::lower_create_tag_to_tag_plan(s, sql)),
+        ast::AstStmt::AlterTag(s) => DdlFamily::Tag(ir::lower_alter_tag_to_tag_plan(s, sql)),
+        ast::AstStmt::UndropTag(s) => DdlFamily::Tag(ir::lower_undrop_tag_to_tag_plan(s, sql)),
+        ast::AstStmt::CreateFileFormat(s) => {
+            DdlFamily::FileFormat(ir::lower_create_file_format_to_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(kind) = view_kind {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            let mut facts = facts::extract::derive_facts_from_view_ddl_plan(&plan, kind);
-            // The view lowers through the generic DdlPlan, so the MySQL
-            // security-context prelude (DEFINER / SQL SECURITY) and the
-            // action of an ALTER are projected straight from the AST here
-            // and attached to `ddl.view`.
-            if let ast::AstStmt::CreateView(cv) = stmt {
-                if let Some(ddl) = facts.ddl.as_mut() {
-                    ddl.view = facts::extract::project_view_prelude_facts(cv, sql);
-                }
-            }
-            if let ast::AstStmt::AlterView(av) = stmt {
-                if let Some(ddl) = facts.ddl.as_mut() {
-                    ddl.view = Some(facts::extract::project_alter_view_facts(av));
-                }
-            }
-            if let ast::AstStmt::AlterMaterializedView(mv) = stmt {
-                if let Some(ddl) = facts.ddl.as_mut() {
-                    ddl.view = Some(facts::extract::project_alter_materialized_view_facts(mv));
-                }
-            }
-            out.push(facts);
+        ast::AstStmt::AlterFileFormat(s) => {
+            DdlFamily::FileFormat(ir::lower_alter_file_format_to_plan(s, sql))
         }
-        return;
-    }
-
-    let pipe_plan = match stmt {
-        ast::AstStmt::CreatePipe(s) => Some(ir::lower_create_pipe_to_pipe_plan(s, sql)),
-        ast::AstStmt::AlterPipe(s) => Some(ir::lower_alter_pipe_to_pipe_plan(s, sql)),
-        ast::AstStmt::DropPipe(s) => Some(ir::lower_drop_pipe_to_pipe_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = pipe_plan {
-        let facts = facts::extract::derive_facts_from_pipe_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake TAG lifecycle. CREATE / ALTER / UNDROP arrive as
-    // typed variants; DROP TAG arrives as a generic `AstStmt::Drop`
-    // gated on the object type (same pattern as the view family).
-    // Surfaces `ddl.tag.*` facts — masking-policy attach/detach,
-    // allowed-value changes, propagation.
-    let tag_plan = match stmt {
-        ast::AstStmt::CreateTag(s) => Some(ir::lower_create_tag_to_tag_plan(s, sql)),
-        ast::AstStmt::AlterTag(s) => Some(ir::lower_alter_tag_to_tag_plan(s, sql)),
-        ast::AstStmt::UndropTag(s) => Some(ir::lower_undrop_tag_to_tag_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_tag(s, sql).then(|| ir::lower_drop_tag_to_tag_plan(s, sql))
+        ast::AstStmt::AlterSession(s) => {
+            DdlFamily::Session(ir::lower_alter_session_to_session_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = tag_plan {
-        let facts = facts::extract::derive_facts_from_tag_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake CREATE / ALTER / DROP FILE FORMAT — surfaces
-    // `ddl.file_format.*` facts (recognized type, rename target).
-    let file_format_plan = match stmt {
-        ast::AstStmt::CreateFileFormat(s) => Some(ir::lower_create_file_format_to_plan(s, sql)),
-        ast::AstStmt::AlterFileFormat(s) => Some(ir::lower_alter_file_format_to_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_file_format(s, sql).then(|| ir::lower_drop_file_format_to_plan(s, sql))
+        ast::AstStmt::CreateStream(s) => {
+            DdlFamily::Stream(ir::lower_create_stream_to_stream_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = file_format_plan {
-        let facts = facts::extract::derive_facts_from_file_format_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake ALTER SESSION SET/UNSET — session-parameter mutation.
-    // Surfaces `ddl.session.*` facts (parameters configured / reset).
-    let session_plan = match stmt {
-        ast::AstStmt::AlterSession(s) => Some(ir::lower_alter_session_to_session_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = session_plan {
-        let facts = facts::extract::derive_facts_from_session_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let stream_plan = match stmt {
-        ast::AstStmt::CreateStream(s) => Some(ir::lower_create_stream_to_stream_plan(s, sql)),
-        ast::AstStmt::DropStream(s) => Some(ir::lower_drop_stream_to_stream_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = stream_plan {
-        let facts = facts::extract::derive_facts_from_stream_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake NETWORK RULE — the destinations/origins that network
-    // policies and external-access integrations reference by name
-    // (`ddl.network_rule.*`). DROP arrives as a generic Drop gated
-    // on the two-word object type.
-    let network_rule_plan = match stmt {
+        ast::AstStmt::DropStream(s) => {
+            DdlFamily::Stream(ir::lower_drop_stream_to_stream_plan(s, sql))
+        }
         ast::AstStmt::CreateNetworkRule(s) => {
-            Some(ir::lower_create_network_rule_to_network_rule_plan(s, sql))
+            DdlFamily::NetworkRule(ir::lower_create_network_rule_to_network_rule_plan(s, sql))
         }
         ast::AstStmt::AlterNetworkRule(s) => {
-            Some(ir::lower_alter_network_rule_to_network_rule_plan(s, sql))
+            DdlFamily::NetworkRule(ir::lower_alter_network_rule_to_network_rule_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_network_rule(s, sql)
-            .then(|| ir::lower_drop_network_rule_to_network_rule_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = network_rule_plan {
-        let facts = facts::extract::derive_facts_from_network_rule_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake RESOURCE MONITOR — compute cost-governance object
-    // (`ddl.resource_monitor.*`). Its triggers decide whether crossing
-    // a credit-usage threshold halts compute or merely notifies. DROP
-    // arrives as a generic Drop gated on the two-word object type.
-    let resource_monitor_plan = match stmt {
-        ast::AstStmt::CreateResourceMonitor(s) => Some(
+        ast::AstStmt::CreateResourceMonitor(s) => DdlFamily::ResourceMonitor(
             ir::lower_create_resource_monitor_to_resource_monitor_plan(s, sql),
         ),
-        ast::AstStmt::AlterResourceMonitor(s) => Some(
+        ast::AstStmt::AlterResourceMonitor(s) => DdlFamily::ResourceMonitor(
             ir::lower_alter_resource_monitor_to_resource_monitor_plan(s, sql),
         ),
-        ast::AstStmt::Drop(s) => drop_target_is_resource_monitor(s, sql)
-            .then(|| ir::lower_drop_resource_monitor_to_resource_monitor_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = resource_monitor_plan {
-        let facts = facts::extract::derive_facts_from_resource_monitor_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake COMPUTE POOL — Snowpark Container Services compute
-    // capacity (`ddl.compute_pool.*`). Its instance family and node
-    // counts drive cost; DROP arrives as a generic Drop gated on the
-    // two-word object type.
-    let compute_pool_plan = match stmt {
         ast::AstStmt::CreateComputePool(s) => {
-            Some(ir::lower_create_compute_pool_to_compute_pool_plan(s, sql))
+            DdlFamily::ComputePool(ir::lower_create_compute_pool_to_compute_pool_plan(s, sql))
         }
         ast::AstStmt::AlterComputePool(s) => {
-            Some(ir::lower_alter_compute_pool_to_compute_pool_plan(s, sql))
+            DdlFamily::ComputePool(ir::lower_alter_compute_pool_to_compute_pool_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_compute_pool(s, sql)
-            .then(|| ir::lower_drop_compute_pool_to_compute_pool_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = compute_pool_plan {
-        let facts = facts::extract::derive_facts_from_compute_pool_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake GIT REPOSITORY — connects Snowflake to an external git
-    // remote (`ddl.git_repository.*`); code from it runs via EXECUTE
-    // IMMEDIATE FROM. DROP arrives as a generic Drop gated on the
-    // two-word object type.
-    let git_repository_plan = match stmt {
-        ast::AstStmt::CreateGitRepository(s) => Some(
+        ast::AstStmt::CreateGitRepository(s) => DdlFamily::GitRepository(
             ir::lower_create_git_repository_to_git_repository_plan(s, sql),
         ),
-        ast::AstStmt::AlterGitRepository(s) => Some(
+        ast::AstStmt::AlterGitRepository(s) => DdlFamily::GitRepository(
             ir::lower_alter_git_repository_to_git_repository_plan(s, sql),
         ),
-        ast::AstStmt::Drop(s) => drop_target_is_git_repository(s, sql)
-            .then(|| ir::lower_drop_git_repository_to_git_repository_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = git_repository_plan {
-        let facts = facts::extract::derive_facts_from_git_repository_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake EXTERNAL FUNCTION — a UDF that ships row data to an
-    // external HTTPS endpoint via an API integration (`ddl.external_function.*`),
-    // a data-egress surface. ALTER/DROP route through the regular function
-    // paths; only CREATE carries the egress recognition surface.
-    if let ast::AstStmt::CreateExternalFunction(s) = stmt {
-        let plan = ir::lower_create_external_function_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_external_function_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake IMAGE REPOSITORY — SPCS container-image registry
-    // (`ddl.image_repository.*`). DROP arrives as a generic Drop gated on
-    // the two-word object type.
-    let image_repository_plan = match stmt {
-        ast::AstStmt::CreateImageRepository(s) => Some(
+        ast::AstStmt::CreateExternalFunction(s) => DdlFamily::CreateExternalFunction(s),
+        ast::AstStmt::CreateImageRepository(s) => DdlFamily::ImageRepository(
             ir::lower_create_image_repository_to_image_repository_plan(s, sql),
         ),
-        ast::AstStmt::AlterImageRepository(s) => Some(
+        ast::AstStmt::AlterImageRepository(s) => DdlFamily::ImageRepository(
             ir::lower_alter_image_repository_to_image_repository_plan(s, sql),
         ),
-        ast::AstStmt::Drop(s) => drop_target_is_image_repository(s, sql)
-            .then(|| ir::lower_drop_image_repository_to_image_repository_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = image_repository_plan {
-        let facts = facts::extract::derive_facts_from_image_repository_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake STREAMLIT — Python-app object (`ddl.streamlit.*`); the
-    // recognition surface is EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP
-    // arrives as a generic Drop gated on the object type.
-    let streamlit_plan = match stmt {
         ast::AstStmt::CreateStreamlit(s) => {
-            Some(ir::lower_create_streamlit_to_streamlit_plan(s, sql))
+            DdlFamily::Streamlit(ir::lower_create_streamlit_to_streamlit_plan(s, sql))
         }
         ast::AstStmt::AlterStreamlit(s) => {
-            Some(ir::lower_alter_streamlit_to_streamlit_plan(s, sql))
+            DdlFamily::Streamlit(ir::lower_alter_streamlit_to_streamlit_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_streamlit(s, sql)
-            .then(|| ir::lower_drop_streamlit_to_streamlit_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = streamlit_plan {
-        let facts = facts::extract::derive_facts_from_streamlit_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake SERVICE — SPCS container service (`ddl.service.*`); the
-    // recognition surface is the compute-pool binding and
-    // EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP arrives as a generic Drop
-    // gated on the object type.
-    let service_plan = match stmt {
-        ast::AstStmt::CreateService(s) => Some(ir::lower_create_service_to_service_plan(s, sql)),
-        ast::AstStmt::AlterService(s) => Some(ir::lower_alter_service_to_service_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_service(s, sql).then(|| ir::lower_drop_service_to_service_plan(s, sql))
+        ast::AstStmt::CreateService(s) => {
+            DdlFamily::Service(ir::lower_create_service_to_service_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = service_plan {
-        let facts = facts::extract::derive_facts_from_service_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake NOTEBOOK — code-from-stage object (`ddl.notebook.*`); the
-    // recognition surface is EXTERNAL_ACCESS_INTEGRATIONS (egress). DROP
-    // arrives as a generic Drop gated on the object type.
-    let notebook_plan = match stmt {
-        ast::AstStmt::CreateNotebook(s) => Some(ir::lower_create_notebook_to_notebook_plan(s, sql)),
-        ast::AstStmt::AlterNotebook(s) => Some(ir::lower_alter_notebook_to_notebook_plan(s, sql)),
-        ast::AstStmt::Drop(s) => drop_target_is_notebook(s, sql)
-            .then(|| ir::lower_drop_notebook_to_notebook_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = notebook_plan {
-        let facts = facts::extract::derive_facts_from_notebook_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake SEMANTIC VIEW — a named model over base tables
-    // (`ddl.semantic_view.*`); the recognition surface is the base-table
-    // access surface. DROP SEMANTIC VIEW arrives as a generic Drop gated
-    // on the object type.
-    let semantic_view_plan = match stmt {
+        ast::AstStmt::AlterService(s) => {
+            DdlFamily::Service(ir::lower_alter_service_to_service_plan(s, sql))
+        }
+        ast::AstStmt::CreateNotebook(s) => {
+            DdlFamily::Notebook(ir::lower_create_notebook_to_notebook_plan(s, sql))
+        }
+        ast::AstStmt::AlterNotebook(s) => {
+            DdlFamily::Notebook(ir::lower_alter_notebook_to_notebook_plan(s, sql))
+        }
         ast::AstStmt::CreateSemanticView(s) => {
-            Some(ir::lower_create_semantic_view_to_semantic_view_plan(s, sql))
+            DdlFamily::SemanticView(ir::lower_create_semantic_view_to_semantic_view_plan(s, sql))
         }
         ast::AstStmt::AlterSemanticView(s) => {
-            Some(ir::lower_alter_semantic_view_to_semantic_view_plan(s, sql))
+            DdlFamily::SemanticView(ir::lower_alter_semantic_view_to_semantic_view_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_semantic_view(s, sql)
-            .then(|| ir::lower_drop_semantic_view_to_semantic_view_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = semantic_view_plan {
-        let facts = facts::extract::derive_facts_from_semantic_view_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake CORTEX SEARCH SERVICE — AI search index over a source
-    // query (`ddl.cortex_search_service.*`); the recognition surface is the
-    // embedding model and that a source query is indexed. DROP arrives as a
-    // generic Drop gated on the object type.
-    let cortex_search_service_plan = match stmt {
         ast::AstStmt::CreateCortexSearchService(s) => {
-            Some(ir::lower_create_cortex_search_service_to_plan(s, sql))
+            DdlFamily::CortexSearchService(ir::lower_create_cortex_search_service_to_plan(s, sql))
         }
         ast::AstStmt::AlterCortexSearchService(s) => {
-            Some(ir::lower_alter_cortex_search_service_to_plan(s, sql))
+            DdlFamily::CortexSearchService(ir::lower_alter_cortex_search_service_to_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_cortex_search_service(s, sql)
-            .then(|| ir::lower_drop_cortex_search_service_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = cortex_search_service_plan {
-        let facts = facts::extract::derive_facts_from_cortex_search_service_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake Native Apps: APPLICATION PACKAGE (provider container,
-    // `ddl.application_package.*`). Checked before APPLICATION so the
-    // two-word DROP routes here. DROP arrives as a generic Drop gated on
-    // the object type.
-    let application_package_plan = match stmt {
         ast::AstStmt::CreateApplicationPackage(s) => {
-            Some(ir::lower_create_application_package_to_plan(s, sql))
+            DdlFamily::ApplicationPackage(ir::lower_create_application_package_to_plan(s, sql))
         }
         ast::AstStmt::AlterApplicationPackage(s) => {
-            Some(ir::lower_alter_application_package_to_plan(s, sql))
+            DdlFamily::ApplicationPackage(ir::lower_alter_application_package_to_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_application_package(s, sql)
-            .then(|| ir::lower_drop_application_package_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = application_package_plan {
-        let facts = facts::extract::derive_facts_from_application_package_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake Native Apps: APPLICATION (consumer-installed app,
-    // `ddl.application.*`); the recognition surface is the install-source
-    // provenance and DEBUG_MODE. DROP arrives as a generic Drop gated on
-    // the object type.
-    let application_plan = match stmt {
-        ast::AstStmt::CreateApplication(s) => Some(ir::lower_create_application_to_plan(s, sql)),
-        ast::AstStmt::AlterApplication(s) => Some(ir::lower_alter_application_to_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_application(s, sql).then(|| ir::lower_drop_application_to_plan(s, sql))
+        ast::AstStmt::CreateApplication(s) => {
+            DdlFamily::Application(ir::lower_create_application_to_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = application_plan {
-        let facts = facts::extract::derive_facts_from_application_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake LISTING — Marketplace / data-exchange exposure
-    // (`ddl.listing.*`); the recognition surface is whether it is external
-    // (public) and published. DROP arrives as a generic Drop gated on the
-    // object type.
-    let listing_plan = match stmt {
-        ast::AstStmt::CreateListing(s) => Some(ir::lower_create_listing_to_plan(s, sql)),
-        ast::AstStmt::AlterListing(s) => Some(ir::lower_alter_listing_to_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_listing(s, sql).then(|| ir::lower_drop_listing_to_plan(s, sql))
+        ast::AstStmt::AlterApplication(s) => {
+            DdlFamily::Application(ir::lower_alter_application_to_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = listing_plan {
-        let facts = facts::extract::derive_facts_from_listing_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake MANAGED ACCOUNT — reader account that consumes shares from
-    // outside the org (`ddl.managed_account.*`). Checked before the bare
-    // ACCOUNT path so the two-word DROP routes here. Admin credentials are
-    // never carried.
-    let managed_account_plan = match stmt {
+        ast::AstStmt::CreateListing(s) => {
+            DdlFamily::Listing(ir::lower_create_listing_to_plan(s, sql))
+        }
+        ast::AstStmt::AlterListing(s) => {
+            DdlFamily::Listing(ir::lower_alter_listing_to_plan(s, sql))
+        }
         ast::AstStmt::CreateManagedAccount(s) => {
-            Some(ir::lower_create_managed_account_to_plan(s, sql))
+            DdlFamily::ManagedAccount(ir::lower_create_managed_account_to_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_managed_account(s, sql)
-            .then(|| ir::lower_drop_managed_account_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = managed_account_plan {
-        let facts = facts::extract::derive_facts_from_managed_account_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake CREATE / DROP ACCOUNT — org-level account provisioning
-    // (recognition only). Distinct from ALTER ACCOUNT parameter changes.
-    let org_account_plan = match stmt {
-        ast::AstStmt::CreateAccount(s) => Some(ir::lower_create_account_to_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_account(s, sql).then(|| ir::lower_drop_account_to_plan(s, sql))
+        ast::AstStmt::CreateAccount(s) => {
+            DdlFamily::OrgAccount(ir::lower_create_account_to_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = org_account_plan {
-        let facts = facts::extract::derive_facts_from_org_account_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake client file commands: PUT / GET / REMOVE / LIST. The
-    // operation kind is the recognition surface (GET = data egress to the
-    // client; REMOVE = stage file deletion).
-    if let ast::AstStmt::StageFileCommand(s) = stmt {
-        let plan = ir::lower_stage_file_command_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_stage_file_command_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake SECRET — credential-object lifecycle (`ddl.secret.*`).
-    // Property names only; secret values are never carried. DROP
-    // SECRET arrives as a generic Drop gated on the object type.
-    let secret_plan = match stmt {
-        ast::AstStmt::CreateSecret(s) => Some(ir::lower_create_secret_to_secret_plan(s, sql)),
-        ast::AstStmt::AlterSecret(s) => Some(ir::lower_alter_secret_to_secret_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_secret(s, sql).then(|| ir::lower_drop_secret_to_secret_plan(s, sql))
+        ast::AstStmt::StageFileCommand(s) => DdlFamily::StageFileCommand(s),
+        ast::AstStmt::CreateSecret(s) => {
+            DdlFamily::Secret(ir::lower_create_secret_to_secret_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = secret_plan {
-        let facts = facts::extract::derive_facts_from_secret_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake SHARE — consumer-account changes are the cross-account
-    // exposure primitives (`ddl.share.*`). DROP SHARE arrives as a
-    // generic Drop gated on the object type. GRANT … TO SHARE flows
-    // through the privilege substrate, not here.
-    let share_plan = match stmt {
-        ast::AstStmt::CreateShare(s) => Some(ir::lower_create_share_to_share_plan(s, sql)),
-        ast::AstStmt::AlterShare(s) => Some(ir::lower_alter_share_to_share_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_share(s, sql).then(|| ir::lower_drop_share_to_share_plan(s, sql))
+        ast::AstStmt::AlterSecret(s) => {
+            DdlFamily::Secret(ir::lower_alter_secret_to_secret_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = share_plan {
-        let facts = facts::extract::derive_facts_from_share_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Redshift datashare — dedicated plan path that surfaces typed
-    // `ddl.datashare.*` facts. Intercepts before the generic minimal-DDL
-    // path (which would yield `ddl: None`, exposing no exposure primitives).
-    let datashare_plan = match stmt {
+        ast::AstStmt::CreateShare(s) => {
+            DdlFamily::Share(ir::lower_create_share_to_share_plan(s, sql))
+        }
+        ast::AstStmt::AlterShare(s) => {
+            DdlFamily::Share(ir::lower_alter_share_to_share_plan(s, sql))
+        }
         ast::AstStmt::CreateDatashare(s) => {
-            Some(ir::lower_create_datashare_to_datashare_plan(s, sql))
+            DdlFamily::Datashare(ir::lower_create_datashare_to_datashare_plan(s, sql))
         }
         ast::AstStmt::AlterDatashare(s) => {
-            Some(ir::lower_alter_datashare_to_datashare_plan(s, sql))
+            DdlFamily::Datashare(ir::lower_alter_datashare_to_datashare_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = datashare_plan {
-        let facts = facts::extract::derive_facts_from_datashare_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let schema_plan = match stmt {
-        ast::AstStmt::CreateSchema(s) => Some(ir::lower_create_schema_to_schema_plan(s, sql)),
-        ast::AstStmt::AlterSchema(s) => Some(ir::lower_alter_schema_to_schema_plan(s, sql)),
-        ast::AstStmt::DropSchema(s) => Some(ir::lower_drop_schema_to_schema_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = schema_plan {
-        let facts = facts::extract::derive_facts_from_schema_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let catalog_plan = match stmt {
-        ast::AstStmt::CreateCatalog(s) => Some(ir::lower_create_catalog_to_catalog_plan(s, sql)),
-        ast::AstStmt::AlterCatalog(s) => Some(ir::lower_alter_catalog_to_catalog_plan(s, sql)),
-        ast::AstStmt::DropCatalog(s) => Some(ir::lower_drop_catalog_to_catalog_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = catalog_plan {
-        let facts = facts::extract::derive_facts_from_catalog_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let use_plan = match stmt {
-        ast::AstStmt::Use(s) => Some(ir::lower_use_to_use_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = use_plan {
-        let facts = facts::extract::derive_facts_from_use_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let task_plan = match stmt {
-        ast::AstStmt::CreateTask(s) => Some(ir::lower_create_task_to_task_plan(s, sql)),
-        ast::AstStmt::AlterTask(s) => Some(ir::lower_alter_task_to_task_plan(s, sql)),
-        ast::AstStmt::DropTask(s) => Some(ir::lower_drop_task_to_task_plan(s, sql)),
-        ast::AstStmt::ExecuteTask(s) => Some(ir::lower_execute_task_to_task_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = task_plan {
-        let facts = facts::extract::derive_facts_from_task_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake ALERT — scheduled SQL condition+action run under the
-    // owner's role (`ddl.alert.*`). Same risk shape as TASK. DROP
-    // ALERT arrives as a generic Drop gated on the object type.
-    let alert_plan = match stmt {
-        ast::AstStmt::CreateAlert(s) => Some(ir::lower_create_alert_to_alert_plan(s, sql)),
-        ast::AstStmt::AlterAlert(s) => Some(ir::lower_alter_alert_to_alert_plan(s, sql)),
-        ast::AstStmt::Drop(s) => {
-            drop_target_is_alert(s, sql).then(|| ir::lower_drop_alert_to_alert_plan(s, sql))
+        ast::AstStmt::CreateSchema(s) => {
+            DdlFamily::Schema(ir::lower_create_schema_to_schema_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = alert_plan {
-        let facts = facts::extract::derive_facts_from_alert_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake DATA METRIC FUNCTION lifecycle (`ddl.data_metric_function`).
-    // The table attachment is on the ALTER TABLE side; this is the
-    // CREATE/DROP of the function object. DROP arrives as a generic Drop
-    // gated on the three-word object type.
-    let dmf_plan = match stmt {
+        ast::AstStmt::AlterSchema(s) => {
+            DdlFamily::Schema(ir::lower_alter_schema_to_schema_plan(s, sql))
+        }
+        ast::AstStmt::DropSchema(s) => {
+            DdlFamily::Schema(ir::lower_drop_schema_to_schema_plan(s, sql))
+        }
+        ast::AstStmt::CreateCatalog(s) => {
+            DdlFamily::Catalog(ir::lower_create_catalog_to_catalog_plan(s, sql))
+        }
+        ast::AstStmt::AlterCatalog(s) => {
+            DdlFamily::Catalog(ir::lower_alter_catalog_to_catalog_plan(s, sql))
+        }
+        ast::AstStmt::DropCatalog(s) => {
+            DdlFamily::Catalog(ir::lower_drop_catalog_to_catalog_plan(s, sql))
+        }
+        ast::AstStmt::Use(s) => DdlFamily::Use(ir::lower_use_to_use_plan(s, sql)),
+        ast::AstStmt::CreateTask(s) => DdlFamily::Task(ir::lower_create_task_to_task_plan(s, sql)),
+        ast::AstStmt::AlterTask(s) => DdlFamily::Task(ir::lower_alter_task_to_task_plan(s, sql)),
+        ast::AstStmt::DropTask(s) => DdlFamily::Task(ir::lower_drop_task_to_task_plan(s, sql)),
+        ast::AstStmt::ExecuteTask(s) => {
+            DdlFamily::Task(ir::lower_execute_task_to_task_plan(s, sql))
+        }
+        ast::AstStmt::CreateAlert(s) => {
+            DdlFamily::Alert(ir::lower_create_alert_to_alert_plan(s, sql))
+        }
+        ast::AstStmt::AlterAlert(s) => {
+            DdlFamily::Alert(ir::lower_alter_alert_to_alert_plan(s, sql))
+        }
         ast::AstStmt::CreateDataMetricFunction(s) => {
-            Some(ir::lower_create_data_metric_function_to_plan(s, sql))
+            DdlFamily::Dmf(ir::lower_create_data_metric_function_to_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_target_is_data_metric_function(s, sql)
-            .then(|| ir::lower_drop_data_metric_function_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = dmf_plan {
-        let facts = facts::extract::derive_facts_from_data_metric_function_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Snowflake REPLICATION / FAILOVER GROUP (`ddl.replication_failover_group`).
-    // ALLOWED_ACCOUNTS is the cross-account egress primitive. DROP arrives
-    // as a generic Drop gated on the two-word object type, which also
-    // resolves the group kind.
-    let repl_group_plan = match stmt {
         ast::AstStmt::CreateReplicationFailoverGroup(s) => {
-            Some(ir::lower_create_replication_failover_group_to_plan(s, sql))
+            DdlFamily::ReplGroup(ir::lower_create_replication_failover_group_to_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => drop_replication_failover_group_type(s, sql)
-            .map(|kind| ir::lower_drop_replication_failover_group_to_plan(s, kind, sql)),
-        _ => None,
-    };
-    if let Some(plan) = repl_group_plan {
-        let facts = facts::extract::derive_facts_from_replication_failover_group_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Function dispatch. Generic `AstStmt::Drop` with object
-    // type == `FUNCTION` is claimed here; the lowering returns
-    // `None` for any other object type so the dispatch falls
-    // through to the next family (procedure).
-    let function_plan = match stmt {
-        ast::AstStmt::CreateFunction(s) => Some(ir::lower_create_function_to_function_plan(
-            s,
-            sql,
-            script_reasoning,
-        )),
-        ast::AstStmt::CreateTableFunction(s) => Some(
-            ir::lower_create_table_function_to_function_plan(s, sql, script_reasoning),
-        ),
-        ast::AstStmt::AlterFunction(s) => Some(ir::lower_alter_function_to_function_plan(s, sql)),
-        ast::AstStmt::Drop(s) => ir::lower_drop_function_to_function_plan(s, sql),
+        // A routine definition is lowered with the script's reasoning,
+        // which the dispatch holds.
+        ast::AstStmt::CreateFunction(s) => DdlFamily::CreateFunction(s),
+        ast::AstStmt::CreateTableFunction(s) => DdlFamily::CreateTableFunction(s),
+        ast::AstStmt::AlterFunction(s) => {
+            DdlFamily::Function(ir::lower_alter_function_to_function_plan(s, sql))
+        }
         ast::AstStmt::MysqlCreateLoadableFunction(s) => {
-            Some(ir::lower_loadable_function_to_function_plan(s, sql))
+            DdlFamily::Function(ir::lower_loadable_function_to_function_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(mut plan) = function_plan {
-        // The sinks a function's body reaches in the routines it calls
-        // are its body's, as a procedure's are.
-        if let ast::AstStmt::CreateFunction(s) = stmt {
-            let body = ir::procedure_plan::parsed_body(s.body_stmt.as_deref());
-            if let (Some(shape), Some(body)) = (plan.create_body.as_mut(), body) {
-                shape
-                    .dynamic_sql_calls
-                    .extend(script_reasoning.inter_procedural_calls(body, &s.params));
-            }
-        }
-        let facts = facts::extract::derive_facts_from_function_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Procedure dispatch. Generic `AstStmt::Drop` with object
-    // type == `PROCEDURE` is claimed here; the earlier table /
-    // stage / dynamic-table / function lowerings return `None`
-    // for non-matching object types so this dispatch reliably
-    // catches it.
-    let procedure_plan = match stmt {
-        ast::AstStmt::CreateProcedure(s) => Some(ir::lower_create_procedure_to_procedure_plan(
-            s,
-            sql,
-            script_reasoning,
-        )),
+        ast::AstStmt::CreateProcedure(s) => DdlFamily::CreateProcedure(s),
         ast::AstStmt::AlterProcedure(s) => {
-            Some(ir::lower_alter_procedure_to_procedure_plan(s, sql))
+            DdlFamily::Procedure(ir::lower_alter_procedure_to_procedure_plan(s, sql))
         }
-        ast::AstStmt::Drop(s) => ir::lower_drop_procedure_to_procedure_plan(s, sql),
-        _ => None,
-    };
-    if let Some(mut plan) = procedure_plan {
-        // Inject inter-procedural findings into the procedure-body
-        // dynamic-SQL-call list so the DYNSQL family's
-        // `ddl.procedure.body.dynamic_sql_calls.exists` predicate
-        // fires on multi-procedure laundering chains.
-        if let ast::AstStmt::CreateProcedure(s) = stmt {
-            for body in s.body_stmt.as_deref().into_iter().chain(&s.body_statements) {
-                let inter_proc = script_reasoning.inter_procedural_calls(body, &s.params);
-                if let Some(body_shape) = plan.create_body.as_mut() {
-                    body_shape.dynamic_sql_calls.extend(inter_proc);
-                }
-            }
+        ast::AstStmt::CreateDatabase(s) => {
+            DdlFamily::Database(ir::lower_create_database_to_database_plan(s, sql))
         }
-        let facts = facts::extract::derive_facts_from_procedure_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let database_plan = match stmt {
-        ast::AstStmt::CreateDatabase(s) => Some(ir::lower_create_database_to_database_plan(s, sql)),
-        ast::AstStmt::AlterDatabase(s) => Some(ir::lower_alter_database_to_database_plan(s, sql)),
-        ast::AstStmt::DropDatabase(s) => Some(ir::lower_drop_database_to_database_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = database_plan {
-        let facts = facts::extract::derive_facts_from_database_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let warehouse_plan = match stmt {
+        ast::AstStmt::AlterDatabase(s) => {
+            DdlFamily::Database(ir::lower_alter_database_to_database_plan(s, sql))
+        }
+        ast::AstStmt::DropDatabase(s) => {
+            DdlFamily::Database(ir::lower_drop_database_to_database_plan(s, sql))
+        }
         ast::AstStmt::CreateWarehouse(s) => {
-            Some(ir::lower_create_warehouse_to_warehouse_plan(s, sql))
+            DdlFamily::Warehouse(ir::lower_create_warehouse_to_warehouse_plan(s, sql))
         }
         ast::AstStmt::AlterWarehouse(s) => {
-            Some(ir::lower_alter_warehouse_to_warehouse_plan(s, sql))
+            DdlFamily::Warehouse(ir::lower_alter_warehouse_to_warehouse_plan(s, sql))
         }
-        ast::AstStmt::DropWarehouse(s) => Some(ir::lower_drop_warehouse_to_warehouse_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = warehouse_plan {
-        let facts = facts::extract::derive_facts_from_warehouse_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let storage_credential_plan = match stmt {
-        ast::AstStmt::CreateStorageCredential(s) => Some(
+        ast::AstStmt::DropWarehouse(s) => {
+            DdlFamily::Warehouse(ir::lower_drop_warehouse_to_warehouse_plan(s, sql))
+        }
+        ast::AstStmt::CreateStorageCredential(s) => DdlFamily::StorageCredential(
             ir::lower_create_storage_credential_to_storage_credential_plan(s, sql, placeholders),
         ),
-        ast::AstStmt::AlterStorageCredential(s) => Some(
+        ast::AstStmt::AlterStorageCredential(s) => DdlFamily::StorageCredential(
             ir::lower_alter_storage_credential_to_storage_credential_plan(s, sql, placeholders),
         ),
-        ast::AstStmt::DropStorageCredential(s) => {
-            Some(ir::lower_drop_storage_credential_to_storage_credential_plan(s))
+        ast::AstStmt::DropStorageCredential(s) => DdlFamily::StorageCredential(
+            ir::lower_drop_storage_credential_to_storage_credential_plan(s, sql),
+        ),
+        ast::AstStmt::CreateVolume(s) => {
+            DdlFamily::Volume(ir::lower_create_volume_to_volume_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = storage_credential_plan {
-        let facts = facts::extract::derive_facts_from_storage_credential_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let volume_plan = match stmt {
-        ast::AstStmt::CreateVolume(s) => Some(ir::lower_create_volume_to_volume_plan(s, sql)),
-        ast::AstStmt::AlterVolume(s) => Some(ir::lower_alter_volume_to_volume_plan(s, sql)),
-        ast::AstStmt::DropVolume(s) => Some(ir::lower_drop_volume_to_volume_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = volume_plan {
-        let facts = facts::extract::derive_facts_from_volume_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let external_location_plan = match stmt {
-        ast::AstStmt::CreateExternalLocation(s) => {
-            Some(ir::lower_create_external_location_to_external_location_plan(s, sql))
+        ast::AstStmt::AlterVolume(s) => {
+            DdlFamily::Volume(ir::lower_alter_volume_to_volume_plan(s, sql))
         }
-        ast::AstStmt::AlterExternalLocation(s) => Some(
+        ast::AstStmt::DropVolume(s) => {
+            DdlFamily::Volume(ir::lower_drop_volume_to_volume_plan(s, sql))
+        }
+        ast::AstStmt::CreateExternalLocation(s) => DdlFamily::ExternalLocation(
+            ir::lower_create_external_location_to_external_location_plan(s, sql),
+        ),
+        ast::AstStmt::AlterExternalLocation(s) => DdlFamily::ExternalLocation(
             ir::lower_alter_external_location_to_external_location_plan(s, sql),
         ),
-        ast::AstStmt::DropExternalLocation(s) => Some(
+        ast::AstStmt::DropExternalLocation(s) => DdlFamily::ExternalLocation(
             ir::lower_drop_external_location_to_external_location_plan(s, sql),
         ),
-        _ => None,
-    };
-    if let Some(plan) = external_location_plan {
-        let facts = facts::extract::derive_facts_from_external_location_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let connection_plan = match stmt {
         ast::AstStmt::CreateConnection(s) => {
-            Some(ir::lower_create_connection_to_connection_plan(s, sql))
+            DdlFamily::Connection(ir::lower_create_connection_to_connection_plan(s, sql))
         }
         ast::AstStmt::AlterConnection(s) => {
-            Some(ir::lower_alter_connection_to_connection_plan(s, sql))
+            DdlFamily::Connection(ir::lower_alter_connection_to_connection_plan(s, sql))
         }
         ast::AstStmt::DropConnection(s) => {
-            Some(ir::lower_drop_connection_to_connection_plan(s, sql))
+            DdlFamily::Connection(ir::lower_drop_connection_to_connection_plan(s, sql))
         }
-        _ => None,
-    };
-    if let Some(plan) = connection_plan {
-        let facts = facts::extract::derive_facts_from_connection_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::MssqlCreateExternalDataSource(s) = stmt {
-        let plan = ir::lower_create_external_data_source_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_external_data_source_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::MssqlAlterExternalDataSource(s) = stmt {
-        let plan = ir::lower_alter_external_data_source_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_external_data_source_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let foreign_server_plan = match stmt {
+        ast::AstStmt::MssqlCreateExternalDataSource(s) => {
+            DdlFamily::MssqlCreateExternalDataSource(s)
+        }
+        ast::AstStmt::MssqlAlterExternalDataSource(s) => DdlFamily::MssqlAlterExternalDataSource(s),
         ast::AstStmt::CreateForeignServer(s) => {
-            Some(ir::lower_create_foreign_server_to_plan(s, sql))
+            DdlFamily::ForeignServer(ir::lower_create_foreign_server_to_plan(s, sql))
         }
-        ast::AstStmt::AlterForeignServer(s) => Some(ir::lower_alter_foreign_server_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = foreign_server_plan {
-        let facts = facts::extract::derive_facts_from_foreign_server_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::MssqlAlterServerConfiguration(s) = stmt {
-        let plan = ir::lower_mssql_alter_server_configuration_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_server_configuration_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::MysqlLoadData(s) = stmt {
-        let plan = ir::lower_mysql_load_data_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_mysql_load_data_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let event_plan = match stmt {
-        ast::AstStmt::CreateEvent(s) => Some(ir::lower_create_event_to_plan(s, sql)),
-        ast::AstStmt::AlterEvent(s) => Some(ir::lower_alter_event_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = event_plan {
-        let facts = facts::extract::derive_facts_from_event_plan(&plan, sql);
-        out.push(facts);
-        // The DO body was flattened in as later entries, each read on
-        // its own.
-        return;
-    }
-
-    if let ast::AstStmt::CreateMysqlTrigger(s) = stmt {
-        let plan = ir::lower_create_mysql_trigger_to_plan(s, sql);
-        let mut facts = facts::extract::derive_facts_from_trigger_create_plan(&plan, sql);
-        // Its body is projected as a T-SQL trigger's is.
-        let mut body = ir::procedure_plan::project_mysql_trigger_body(s, sql, script_reasoning);
-        if let (Some(shape), Some(body_stmt)) = (body.as_mut(), s.body_stmt.as_deref()) {
-            shape
-                .dynamic_sql_calls
-                .extend(script_reasoning.inter_procedural_calls(body_stmt, &[]));
+        ast::AstStmt::AlterForeignServer(s) => {
+            DdlFamily::ForeignServer(ir::lower_alter_foreign_server_to_plan(s, sql))
         }
-        if let Some(ddl) = facts.ddl.as_mut() {
-            ddl.trigger_body = body.as_ref().map(facts::extract::project_procedure_body);
+        ast::AstStmt::MssqlAlterServerConfiguration(s) => {
+            DdlFamily::MssqlAlterServerConfiguration(s)
         }
-        out.push(facts);
-        // The trigger body was flattened in as later entries, each read on
-        // its own.
-        return;
-    }
-
-    // T-SQL `CREATE` / `ALTER` / `CREATE OR ALTER TRIGGER`; its body was
-    // flattened in as later entries, and is projected as a procedure's
-    // body is, inter-procedural findings included.
-    if let ast::AstStmt::CreateMssqlTrigger(s) = stmt {
-        let plan = ir::lower_ddl::lower_mssql_trigger_definition(s, sql);
-        let or_alter = matches!(s.verb, ast::AstDefinitionVerb::CreateOrAlter);
-        let mut body = ir::procedure_plan::project_mssql_trigger_body(s, sql, script_reasoning);
-        if let Some(shape) = body.as_mut() {
-            for body_stmt in &s.body {
-                shape
-                    .dynamic_sql_calls
-                    .extend(script_reasoning.inter_procedural_calls(body_stmt, &[]));
-            }
+        ast::AstStmt::MysqlLoadData(s) => DdlFamily::MysqlLoadData(s),
+        ast::AstStmt::CreateEvent(s) => DdlFamily::Event(ir::lower_create_event_to_plan(s, sql)),
+        ast::AstStmt::AlterEvent(s) => DdlFamily::Event(ir::lower_alter_event_to_plan(s, sql)),
+        ast::AstStmt::CreateMysqlTrigger(s) => DdlFamily::CreateMysqlTrigger(s),
+        ast::AstStmt::CreateMssqlTrigger(s) => DdlFamily::CreateMssqlTrigger(s),
+        ast::AstStmt::CreateForeignTable(s) => DdlFamily::CreateForeignTable(s),
+        ast::AstStmt::ImportForeignSchema(s) => DdlFamily::ImportForeignSchema(s),
+        ast::AstStmt::CreateUserMapping(s) => {
+            DdlFamily::UserMapping(ir::lower_create_user_mapping_to_plan(s, sql))
         }
-        if let Some(facts) =
-            facts::extract::derive_facts_from_mssql_trigger_plan(&plan, or_alter, body.as_ref())
-        {
-            out.push(facts);
+        ast::AstStmt::AlterUserMapping(s) => {
+            DdlFamily::UserMapping(ir::lower_alter_user_mapping_to_plan(s, sql))
         }
-        return;
-    }
-
-    if let ast::AstStmt::CreateForeignTable(s) = stmt {
-        let plan = ir::lower_create_foreign_table_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_foreign_table_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::ImportForeignSchema(s) = stmt {
-        let plan = ir::lower_import_foreign_schema_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_import_foreign_schema_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let user_mapping_plan = match stmt {
-        ast::AstStmt::CreateUserMapping(s) => Some(ir::lower_create_user_mapping_to_plan(s, sql)),
-        ast::AstStmt::AlterUserMapping(s) => Some(ir::lower_alter_user_mapping_to_plan(s, sql)),
-        ast::AstStmt::DropUserMapping(s) => Some(ir::lower_drop_user_mapping_to_plan(s, sql)),
-        _ => None,
-    };
-    if let Some(plan) = user_mapping_plan {
-        let facts = facts::extract::derive_facts_from_user_mapping_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    let flow_plan = match stmt {
-        ast::AstStmt::CreateFlow(s) => Some(ir::lower_create_flow_to_flow_plan(s)),
-        _ => None,
-    };
-    if let Some(plan) = flow_plan {
-        let facts = facts::extract::derive_facts_from_flow_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Tag the dialect-of-origin at the AST-variant match site —
-    // each `AstStmt::*Policy` variant is constructed by exactly
-    // one dialect's parser, so the variant itself carries the
-    // dialect. The IR plan stays dialect-clean; the tag is
-    // recovered here and threaded into the projection. Same
-    // pattern as `PgDdlKind` / `MssqlDdlKind` for DDL statements.
-    let policy_plan: Option<(ir::PolicyPlan, facts::extract::PolicyDialectOrigin)> = match stmt {
-        ast::AstStmt::CreatePasswordPolicy(p) => Some((
+        ast::AstStmt::DropUserMapping(s) => {
+            DdlFamily::UserMapping(ir::lower_drop_user_mapping_to_plan(s, sql))
+        }
+        ast::AstStmt::CreateFlow(s) => DdlFamily::Flow(ir::lower_create_flow_to_flow_plan(s)),
+        ast::AstStmt::CreatePasswordPolicy(p) => DdlFamily::Policy(
             ir::lower_create_password_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterPasswordPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterPasswordPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_password_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropPasswordPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropPasswordPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_password_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateSessionPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateSessionPolicy(p) => DdlFamily::Policy(
             ir::lower_create_session_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterSessionPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterSessionPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_session_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropSessionPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropSessionPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_session_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateNetworkPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateNetworkPolicy(p) => DdlFamily::Policy(
             ir::lower_create_network_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterNetworkPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterNetworkPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_network_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropNetworkPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropNetworkPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_network_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateAuthenticationPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateAuthenticationPolicy(p) => DdlFamily::Policy(
             ir::lower_create_authentication_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterAuthenticationPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterAuthenticationPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_authentication_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropAuthenticationPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropAuthenticationPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_authentication_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateAggregationPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateAggregationPolicy(p) => DdlFamily::Policy(
             ir::lower_create_aggregation_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterAggregationPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterAggregationPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_aggregation_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropAggregationPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropAggregationPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_aggregation_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateProjectionPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateProjectionPolicy(p) => DdlFamily::Policy(
             ir::lower_create_projection_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterProjectionPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterProjectionPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_projection_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropProjectionPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropProjectionPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_projection_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateJoinPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateJoinPolicy(p) => DdlFamily::Policy(
             ir::lower_create_join_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterJoinPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterJoinPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_join_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropJoinPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropJoinPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_join_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateMaskingPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateMaskingPolicy(p) => DdlFamily::Policy(
             ir::lower_create_masking_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterMaskingPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterMaskingPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_masking_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropMaskingPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropMaskingPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_masking_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreateRowAccessPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreateRowAccessPolicy(p) => DdlFamily::Policy(
             ir::lower_create_row_access_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::AlterRowAccessPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterRowAccessPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_row_access_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::DropRowAccessPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropRowAccessPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_row_access_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Standard,
-        )),
-        ast::AstStmt::CreatePgPolicy(p) => Some((
+        ),
+        ast::AstStmt::CreatePgPolicy(p) => DdlFamily::Policy(
             ir::lower_create_pg_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Postgres,
-        )),
-        ast::AstStmt::AlterPgPolicy(p) => Some((
+        ),
+        ast::AstStmt::AlterPgPolicy(p) => DdlFamily::Policy(
             ir::lower_alter_pg_policy_to_policy_plan(p, sql),
             facts::extract::PolicyDialectOrigin::Postgres,
-        )),
-        ast::AstStmt::DropPgPolicy(p) => Some((
+        ),
+        ast::AstStmt::DropPgPolicy(p) => DdlFamily::Policy(
             ir::lower_drop_pg_policy_to_policy_plan(p),
             facts::extract::PolicyDialectOrigin::Postgres,
-        )),
-        _ => None,
-    };
-    if let Some((plan, origin)) = policy_plan {
-        let facts = facts::extract::derive_facts_from_policy_plan(&plan, origin, sql);
-        out.push(facts);
-        return;
-    }
-
-    let integration_plan = match stmt {
+        ),
         ast::AstStmt::CreateApiIntegration(p) => {
-            Some(ir::lower_create_api_integration_to_integration_plan(p, sql))
+            DdlFamily::Integration(ir::lower_create_api_integration_to_integration_plan(p, sql))
         }
         ast::AstStmt::AlterApiIntegration(p) => {
-            Some(ir::lower_alter_api_integration_to_integration_plan(p, sql))
+            DdlFamily::Integration(ir::lower_alter_api_integration_to_integration_plan(p, sql))
         }
         ast::AstStmt::DropApiIntegration(p) => {
-            Some(ir::lower_drop_api_integration_to_integration_plan(p))
+            DdlFamily::Integration(ir::lower_drop_api_integration_to_integration_plan(p))
         }
-        ast::AstStmt::CreateStorageIntegration(p) => Some(
+        ast::AstStmt::CreateStorageIntegration(p) => DdlFamily::Integration(
             ir::lower_create_storage_integration_to_integration_plan(p, sql),
         ),
-        ast::AstStmt::AlterStorageIntegration(p) => Some(
+        ast::AstStmt::AlterStorageIntegration(p) => DdlFamily::Integration(
             ir::lower_alter_storage_integration_to_integration_plan(p, sql),
         ),
         ast::AstStmt::DropStorageIntegration(p) => {
-            Some(ir::lower_drop_storage_integration_to_integration_plan(p))
+            DdlFamily::Integration(ir::lower_drop_storage_integration_to_integration_plan(p))
         }
-        ast::AstStmt::CreateExternalAccessIntegration(p) => {
-            Some(ir::lower_create_external_access_integration_to_integration_plan(p, sql))
-        }
-        ast::AstStmt::AlterExternalAccessIntegration(p) => {
-            Some(ir::lower_alter_external_access_integration_to_integration_plan(p, sql))
-        }
-        ast::AstStmt::DropExternalAccessIntegration(p) => {
-            Some(ir::lower_drop_external_access_integration_to_integration_plan(p))
-        }
-        ast::AstStmt::CreateNotificationIntegration(p) => {
-            Some(ir::lower_create_notification_integration_to_integration_plan(p, sql))
-        }
-        ast::AstStmt::AlterNotificationIntegration(p) => {
-            Some(ir::lower_alter_notification_integration_to_integration_plan(p, sql))
-        }
-        ast::AstStmt::DropNotificationIntegration(p) => Some(
+        ast::AstStmt::CreateExternalAccessIntegration(p) => DdlFamily::Integration(
+            ir::lower_create_external_access_integration_to_integration_plan(p, sql),
+        ),
+        ast::AstStmt::AlterExternalAccessIntegration(p) => DdlFamily::Integration(
+            ir::lower_alter_external_access_integration_to_integration_plan(p, sql),
+        ),
+        ast::AstStmt::DropExternalAccessIntegration(p) => DdlFamily::Integration(
+            ir::lower_drop_external_access_integration_to_integration_plan(p),
+        ),
+        ast::AstStmt::CreateNotificationIntegration(p) => DdlFamily::Integration(
+            ir::lower_create_notification_integration_to_integration_plan(p, sql),
+        ),
+        ast::AstStmt::AlterNotificationIntegration(p) => DdlFamily::Integration(
+            ir::lower_alter_notification_integration_to_integration_plan(p, sql),
+        ),
+        ast::AstStmt::DropNotificationIntegration(p) => DdlFamily::Integration(
             ir::lower_drop_notification_integration_to_integration_plan(p),
         ),
-        ast::AstStmt::CreateSecurityIntegration(p) => Some(
+        ast::AstStmt::CreateSecurityIntegration(p) => DdlFamily::Integration(
             ir::lower_create_security_integration_to_integration_plan(p, sql),
         ),
-        ast::AstStmt::AlterSecurityIntegration(p) => Some(
+        ast::AstStmt::AlterSecurityIntegration(p) => DdlFamily::Integration(
             ir::lower_alter_security_integration_to_integration_plan(p, sql),
         ),
-        // DROP SECURITY INTEGRATION arrives as a generic Drop (no
-        // typed drop AST for this kind) — gate on the object type.
-        ast::AstStmt::Drop(s) => drop_target_is_security_integration(s, sql)
-            .then(|| ir::lower_drop_security_integration_to_integration_plan(s)),
-        _ => None,
-    };
-    if let Some(plan) = integration_plan {
-        let facts = facts::extract::derive_facts_from_integration_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // Postgres DOMAIN DDL (CREATE / ALTER / DROP DOMAIN). The
-    // DdlPlan covers many statement kinds; we filter to the PG
-    // family here via the narrow [`facts::extract::PgDdlKind`]
-    // enum so the downstream projection avoids a `_ =>` catch-all
-    // on the wide public `StatementKind` taxonomy.
-    let pg_kind: Option<facts::extract::PgDdlKind> = match stmt {
-        ast::AstStmt::CreateDomain(_) => Some(facts::extract::PgDdlKind::CreateDomain),
-        ast::AstStmt::AlterDomain(_) => Some(facts::extract::PgDdlKind::AlterDomain),
-        ast::AstStmt::DropDomain(_) => Some(facts::extract::PgDdlKind::DropDomain),
-        ast::AstStmt::CreateExtension(_) => Some(facts::extract::PgDdlKind::CreateExtension),
-        ast::AstStmt::PgRefreshMatview(_) => Some(facts::extract::PgDdlKind::RefreshMatview),
-        ast::AstStmt::Reindex(_) => Some(facts::extract::PgDdlKind::Reindex),
-        ast::AstStmt::CreateIndex(_) => Some(facts::extract::PgDdlKind::CreateIndex),
-        ast::AstStmt::AlterIndex(_) => Some(facts::extract::PgDdlKind::AlterIndex),
-        ast::AstStmt::DoBlock(_) => Some(facts::extract::PgDdlKind::DoBlock),
-        ast::AstStmt::CreatePgTrigger(_) => Some(facts::extract::PgDdlKind::CreatePgTrigger),
-        ast::AstStmt::AlterPgTrigger(_) => Some(facts::extract::PgDdlKind::AlterPgTrigger),
-        ast::AstStmt::DropPgTrigger(_) => Some(facts::extract::PgDdlKind::DropPgTrigger),
-        ast::AstStmt::PgDropIndex(_) => Some(facts::extract::PgDdlKind::DropPgIndex),
-        ast::AstStmt::PgDropExtension(_) => Some(facts::extract::PgDdlKind::DropPgExtension),
+        ast::AstStmt::CreateDomain(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreateDomain),
+        ast::AstStmt::AlterDomain(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterDomain),
+        ast::AstStmt::DropDomain(_) => DdlFamily::Pg(facts::extract::PgDdlKind::DropDomain),
+        ast::AstStmt::CreateExtension(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::CreateExtension)
+        }
+        ast::AstStmt::PgRefreshMatview(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::RefreshMatview)
+        }
+        ast::AstStmt::Reindex(_) => DdlFamily::Pg(facts::extract::PgDdlKind::Reindex),
+        ast::AstStmt::CreateIndex(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreateIndex),
+        ast::AstStmt::AlterIndex(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterIndex),
+        ast::AstStmt::DoBlock(_) => DdlFamily::Pg(facts::extract::PgDdlKind::DoBlock),
+        ast::AstStmt::CreatePgTrigger(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::CreatePgTrigger)
+        }
+        ast::AstStmt::AlterPgTrigger(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterPgTrigger),
+        ast::AstStmt::DropPgTrigger(_) => DdlFamily::Pg(facts::extract::PgDdlKind::DropPgTrigger),
+        ast::AstStmt::PgDropIndex(_) => DdlFamily::Pg(facts::extract::PgDdlKind::DropPgIndex),
+        ast::AstStmt::PgDropExtension(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::DropPgExtension)
+        }
         ast::AstStmt::PgAlterTableTriggerState(_) => {
-            Some(facts::extract::PgDdlKind::AlterPgTableTriggerState)
+            DdlFamily::Pg(facts::extract::PgDdlKind::AlterPgTableTriggerState)
         }
         // CREATE / ALTER / DROP { USER | ROLE | LOGIN } now flow
         // through the dialect-neutral `AstStmt::CreatePrincipal` /
         // `AlterPrincipal` / `DropPrincipal` substrate; their
         // StatementKind mapping happens via `DdlPlan::statement_kind`
         // rather than the PG-prefixed `PgDdlKind` enum.
-        ast::AstStmt::PgSet(_) => Some(facts::extract::PgDdlKind::PgSet),
-        ast::AstStmt::PgDiscard(_) => Some(facts::extract::PgDdlKind::PgDiscard),
-        ast::AstStmt::PgCreateRule(_) => Some(facts::extract::PgDdlKind::CreatePgRule),
-        ast::AstStmt::PgAlterRule(_) => Some(facts::extract::PgDdlKind::AlterPgRule),
-        ast::AstStmt::PgDropRule(_) => Some(facts::extract::PgDdlKind::DropPgRule),
-        ast::AstStmt::PgDropOwned(_) => Some(facts::extract::PgDdlKind::PgDropOwned),
-        ast::AstStmt::PgReassignOwned(_) => Some(facts::extract::PgDdlKind::PgReassignOwned),
-        ast::AstStmt::PgCreateTablespace(_) => Some(facts::extract::PgDdlKind::PgCreateTablespace),
-        ast::AstStmt::PgAlterTablespace(_) => Some(facts::extract::PgDdlKind::PgAlterTablespace),
-        ast::AstStmt::PgDropTablespace(_) => Some(facts::extract::PgDdlKind::PgDropTablespace),
-        ast::AstStmt::PgPublication(_) => Some(facts::extract::PgDdlKind::PgPublication),
-        ast::AstStmt::PgSubscription(_) => Some(facts::extract::PgDdlKind::PgSubscription),
-        ast::AstStmt::PgAlterSystem(_) => Some(facts::extract::PgDdlKind::PgAlterSystem),
-        ast::AstStmt::PgLockTable(_) => Some(facts::extract::PgDdlKind::PgLockTable),
-        ast::AstStmt::PgDropSequence(_) => Some(facts::extract::PgDdlKind::PgDropSequence),
-        ast::AstStmt::PgDropType(_) => Some(facts::extract::PgDdlKind::PgDropType),
-        ast::AstStmt::CreateSequence(_) => Some(facts::extract::PgDdlKind::CreateSequence),
-        ast::AstStmt::AlterSequence(_) => Some(facts::extract::PgDdlKind::AlterSequence),
-        ast::AstStmt::CreateType(_) => Some(facts::extract::PgDdlKind::CreateType),
-        ast::AstStmt::AlterType(_) => Some(facts::extract::PgDdlKind::AlterType),
-        ast::AstStmt::CreateSynonym(_) => Some(facts::extract::PgDdlKind::CreateSynonym),
-        _ => None,
-    };
-    if let Some(kind) = pg_kind {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            let facts = facts::extract::derive_facts_from_pg_ddl_plan(&plan, kind, sql);
-            out.push(facts);
+        ast::AstStmt::PgSet(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgSet),
+        ast::AstStmt::PgDiscard(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgDiscard),
+        ast::AstStmt::PgCreateRule(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreatePgRule),
+        ast::AstStmt::PgAlterRule(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterPgRule),
+        ast::AstStmt::PgDropRule(_) => DdlFamily::Pg(facts::extract::PgDdlKind::DropPgRule),
+        ast::AstStmt::PgDropOwned(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgDropOwned),
+        ast::AstStmt::PgReassignOwned(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::PgReassignOwned)
         }
-        return;
-    }
-
-    // T-SQL BACKUP (data-protection utility — target Database/Log +
-    // destination Disk/Url/Tape). Top-level `StatementFacts.mssql_backup`
-    // (parallel to `pg_copy`) since BACKUP is not DDL. Drives
-    // MSSQL-BACKUP-TO-URL / INFO-MSSQL-BACKUP.
-    if let ast::AstStmt::MssqlBackup(s) = stmt {
-        let plan = ir::lower_backup_to_backup_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_backup_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL DBCC (database console / maintenance command). Top-level
-    // `StatementFacts.mssql_dbcc` (parallel to `mssql_backup`) since DBCC is
-    // not DDL. The command verb is the recognition primitive; which command
-    // is dangerous is a YAML verdict. Drives MSSQL-DBCC-SENSITIVE /
-    // INFO-MSSQL-DBCC.
-    if let ast::AstStmt::MssqlDbcc(s) = stmt {
-        let plan = ir::lower_dbcc_to_dbcc_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_dbcc_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL encryption-key activation (OPEN/CLOSE { MASTER | SYMMETRIC }
-    // KEY). Top-level `StatementFacts.mssql_key_management` (parallel to
-    // `mssql_dbcc`) since key activation is a session context switch, not
-    // DDL. Verb + key kind + inline-password presence are the recognition
-    // primitives; severity is a YAML verdict. Drives
-    // MSSQL-KEY-OPEN-INLINE-PASSWORD / MSSQL-OPEN-MASTER-KEY /
-    // INFO-MSSQL-KEY-MANAGEMENT.
-    if let ast::AstStmt::MssqlKeyManagement(s) = stmt {
-        let plan = ir::lower_key_management_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_key_management_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL Row-Level Security (CREATE/ALTER SECURITY POLICY). Top-level
-    // `StatementFacts.mssql_security_policy`. Verb + STATE + filter/block
-    // predicate presence are the recognition primitives; the disabled-
-    // control verdict is a YAML rule. Drives MSSQL-RLS-POLICY-DISABLED /
-    // MSSQL-RLS-POLICY-CREATED-DISABLED / INFO-MSSQL-SECURITY-POLICY.
-    if let ast::AstStmt::MssqlSecurityPolicy(s) = stmt {
-        let plan = ir::lower_security_policy_to_plan(s);
-        let facts = facts::extract::derive_facts_from_security_policy_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL key-material protection (BACKUP/RESTORE { SERVICE MASTER KEY |
-    // MASTER KEY | CERTIFICATE | ASYMMETRIC KEY }). Top-level
-    // `StatementFacts.mssql_key_backup`. Verb + key object + inline-password
-    // presence are the recognition primitives; the root-key export/restore
-    // and credential verdicts are YAML rules. Drives MSSQL-MASTER-KEY-EXPORT
-    // / MSSQL-MASTER-KEY-RESTORE / MSSQL-KEY-BACKUP-INLINE-PASSWORD /
-    // INFO-MSSQL-KEY-BACKUP.
-    if let ast::AstStmt::MssqlKeyBackup(s) = stmt {
-        let plan = ir::lower_key_backup_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_key_backup_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL CLR assembly (CREATE/ALTER ASSEMBLY). Top-level
-    // `StatementFacts.mssql_assembly`. Verb + permission set +
-    // filesystem-source flag are the recognition primitives; the UNSAFE /
-    // EXTERNAL_ACCESS verdict is a YAML rule. Drives MSSQL-CLR-ASSEMBLY-UNSAFE
-    // / MSSQL-CLR-ASSEMBLY-EXTERNAL-ACCESS / INFO-MSSQL-CLR-ASSEMBLY.
-    if let ast::AstStmt::MssqlAssembly(s) = stmt {
-        let plan = ir::lower_assembly_to_plan(s);
-        let facts = facts::extract::derive_facts_from_assembly_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL module signing (ADD [COUNTER] SIGNATURE). Top-level
-    // `StatementFacts.mssql_add_signature`. Counter + signer kind +
-    // inline-password presence are the recognition primitives; the
-    // privilege-delegation / credential verdict is a YAML rule. Drives
-    // MSSQL-MODULE-SIGNATURE-ADDED / MSSQL-SIGNATURE-INLINE-PASSWORD.
-    if let ast::AstStmt::MssqlAddSignature(s) = stmt {
-        let plan = ir::lower_add_signature_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_add_signature_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL Service Master Key rotation (ALTER SERVICE MASTER KEY). Top-level
-    // `StatementFacts.mssql_service_master_key`. Operation + force +
-    // inline-password presence are the recognition primitives; the re-key /
-    // data-loss / credential verdicts are YAML rules. Drives
-    // MSSQL-SERVICE-MASTER-KEY-REGENERATE / -FORCE-REGENERATE /
-    // -INLINE-PASSWORD / INFO-MSSQL-SERVICE-MASTER-KEY.
-    if let ast::AstStmt::MssqlAlterServiceMasterKey(s) = stmt {
-        let plan = ir::lower_service_master_key_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_service_master_key_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // PostgreSQL ALTER DEFAULT PRIVILEGES (default-grant policy on future
-    // objects). Top-level `StatementFacts.pg_default_privileges`. Action +
-    // object class + privileges + grantees + role/schema scope are the
-    // recognition primitives; the default-to-PUBLIC / global-scope verdicts
-    // are YAML rules. Drives PG-DEFAULT-PRIV-* / INFO-PG-DEFAULT-PRIVILEGES.
-    if let ast::AstStmt::PgAlterDefaultPrivileges(s) = stmt {
-        let plan = ir::lower_pg_default_privileges_to_plan(s);
-        let facts = facts::extract::derive_facts_from_pg_default_privileges_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // T-SQL RESTORE (data-protection utility — target Database/Log +
-    // source Disk/Url/Tape). Top-level `StatementFacts.mssql_restore`
-    // (parallel to `mssql_backup`) since RESTORE is not DDL. Drives
-    // MSSQL-RESTORE-FROM-URL / MSSQL-RESTORE-REPLACE / INFO-MSSQL-RESTORE.
-    if let ast::AstStmt::MssqlRestore(s) = stmt {
-        let plan = ir::lower_restore_db_to_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_restore_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // PG COPY (data-movement utility — direction FROM/TO + target
-    // File/Program/Stdin/Stdout). Sits at the top level of
-    // `StatementFacts` (parallel to `use_stmt`) since COPY is not
-    // DDL. Drives PG-COPY-FROM / PG-COPY-TO / PG-COPY-PROGRAM.
-    if let ast::AstStmt::PgCopy(s) = stmt {
-        let plan = ir::lower_pg_copy_to_pg_copy_plan(s, sql);
-        let facts = facts::extract::derive_facts_from_pg_copy_plan(&plan, sql);
-        out.push(facts);
-        return;
-    }
-
-    // BigQuery DDL (EXPORT DATA / LOAD DATA / ASSERT / MODEL /
-    // SNAPSHOT TABLE / SEARCH INDEX / VECTOR INDEX). Same filter
-    // pattern as the PG and MSSQL blocks: narrow
-    // [`facts::extract::BqDdlKind`] enum picks the variant from the
-    // AST, [`crate::ir::lower_ddl_stmt`] produces a generic
-    // [`crate::ir::DdlPlan`], and
-    // [`facts::extract::derive_facts_from_bq_ddl_plan`] projects to
-    // public `StatementFacts` exhaustively.
-    let bq_kind: Option<facts::extract::BqDdlKind> = match stmt {
-        ast::AstStmt::BqExportData(_) => Some(facts::extract::BqDdlKind::ExportData),
-        ast::AstStmt::BqLoadData(_) => Some(facts::extract::BqDdlKind::LoadData),
-        ast::AstStmt::BqAssert(_) => Some(facts::extract::BqDdlKind::Assert),
-        ast::AstStmt::BqCreateModel(_) => Some(facts::extract::BqDdlKind::CreateModel),
-        ast::AstStmt::BqAlterModel(_) => Some(facts::extract::BqDdlKind::AlterModel),
-        ast::AstStmt::BqDropModel(_) => Some(facts::extract::BqDdlKind::DropModel),
-        ast::AstStmt::BqExportModel(_) => Some(facts::extract::BqDdlKind::ExportModel),
+        ast::AstStmt::PgCreateTablespace(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::PgCreateTablespace)
+        }
+        ast::AstStmt::PgAlterTablespace(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::PgAlterTablespace)
+        }
+        ast::AstStmt::PgDropTablespace(_) => {
+            DdlFamily::Pg(facts::extract::PgDdlKind::PgDropTablespace)
+        }
+        ast::AstStmt::PgPublication(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgPublication),
+        ast::AstStmt::PgSubscription(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgSubscription),
+        ast::AstStmt::PgAlterSystem(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgAlterSystem),
+        ast::AstStmt::PgLockTable(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgLockTable),
+        ast::AstStmt::PgDropSequence(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgDropSequence),
+        ast::AstStmt::PgDropType(_) => DdlFamily::Pg(facts::extract::PgDdlKind::PgDropType),
+        ast::AstStmt::CreateSequence(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreateSequence),
+        ast::AstStmt::AlterSequence(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterSequence),
+        ast::AstStmt::CreateType(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreateType),
+        ast::AstStmt::AlterType(_) => DdlFamily::Pg(facts::extract::PgDdlKind::AlterType),
+        ast::AstStmt::CreateSynonym(_) => DdlFamily::Pg(facts::extract::PgDdlKind::CreateSynonym),
+        ast::AstStmt::MssqlBackup(s) => DdlFamily::MssqlBackup(s),
+        ast::AstStmt::MssqlDbcc(s) => DdlFamily::MssqlDbcc(s),
+        ast::AstStmt::MssqlKeyManagement(s) => DdlFamily::MssqlKeyManagement(s),
+        ast::AstStmt::MssqlSecurityPolicy(s) => DdlFamily::MssqlSecurityPolicy(s),
+        ast::AstStmt::MssqlKeyBackup(s) => DdlFamily::MssqlKeyBackup(s),
+        ast::AstStmt::MssqlAssembly(s) => DdlFamily::MssqlAssembly(s),
+        ast::AstStmt::MssqlAddSignature(s) => DdlFamily::MssqlAddSignature(s),
+        ast::AstStmt::MssqlAlterServiceMasterKey(s) => DdlFamily::MssqlAlterServiceMasterKey(s),
+        ast::AstStmt::PgAlterDefaultPrivileges(s) => DdlFamily::PgAlterDefaultPrivileges(s),
+        ast::AstStmt::MssqlRestore(s) => DdlFamily::MssqlRestore(s),
+        ast::AstStmt::PgCopy(s) => DdlFamily::PgCopy(s),
+        ast::AstStmt::BqExportData(_) => DdlFamily::Bq(facts::extract::BqDdlKind::ExportData),
+        ast::AstStmt::BqLoadData(_) => DdlFamily::Bq(facts::extract::BqDdlKind::LoadData),
+        ast::AstStmt::BqAssert(_) => DdlFamily::Bq(facts::extract::BqDdlKind::Assert),
+        ast::AstStmt::BqCreateModel(_) => DdlFamily::Bq(facts::extract::BqDdlKind::CreateModel),
+        ast::AstStmt::BqAlterModel(_) => DdlFamily::Bq(facts::extract::BqDdlKind::AlterModel),
+        ast::AstStmt::BqDropModel(_) => DdlFamily::Bq(facts::extract::BqDdlKind::DropModel),
+        ast::AstStmt::BqExportModel(_) => DdlFamily::Bq(facts::extract::BqDdlKind::ExportModel),
         ast::AstStmt::BqCreateSnapshotTable(_) => {
-            Some(facts::extract::BqDdlKind::CreateSnapshotTable)
+            DdlFamily::Bq(facts::extract::BqDdlKind::CreateSnapshotTable)
         }
-        ast::AstStmt::BqDropSnapshotTable(_) => Some(facts::extract::BqDdlKind::DropSnapshotTable),
-        ast::AstStmt::BqCreateSearchIndex(_) => Some(facts::extract::BqDdlKind::CreateSearchIndex),
-        ast::AstStmt::BqDropSearchIndex(_) => Some(facts::extract::BqDdlKind::DropSearchIndex),
-        ast::AstStmt::BqCreateVectorIndex(_) => Some(facts::extract::BqDdlKind::CreateVectorIndex),
-        ast::AstStmt::BqAlterVectorIndex(_) => Some(facts::extract::BqDdlKind::AlterVectorIndex),
-        ast::AstStmt::BqDropVectorIndex(_) => Some(facts::extract::BqDdlKind::DropVectorIndex),
+        ast::AstStmt::BqDropSnapshotTable(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::DropSnapshotTable)
+        }
+        ast::AstStmt::BqCreateSearchIndex(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::CreateSearchIndex)
+        }
+        ast::AstStmt::BqDropSearchIndex(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::DropSearchIndex)
+        }
+        ast::AstStmt::BqCreateVectorIndex(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::CreateVectorIndex)
+        }
+        ast::AstStmt::BqAlterVectorIndex(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::AlterVectorIndex)
+        }
+        ast::AstStmt::BqDropVectorIndex(_) => {
+            DdlFamily::Bq(facts::extract::BqDdlKind::DropVectorIndex)
+        }
         // Cross-dialect — only routed here so the BQ-EXTTBL-*-LEAK
         // rules can fire on BQ-style external tables. The lowering
         // populates `bq_options: None` for Snowflake-style external
         // tables (LOCATION / INTEGRATION) so the BQ-side rules
         // correctly stay silent on the non-BQ shape.
         ast::AstStmt::CreateExternalTable(_) => {
-            Some(facts::extract::BqDdlKind::CreateExternalTable)
+            DdlFamily::Bq(facts::extract::BqDdlKind::CreateExternalTable)
         }
         ast::AstStmt::CreateExternalSchema(_) => {
-            Some(facts::extract::BqDdlKind::CreateExternalSchema)
+            DdlFamily::Bq(facts::extract::BqDdlKind::CreateExternalSchema)
         }
-        _ => None,
-    };
-    if let Some(kind) = bq_kind {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            let facts = facts::extract::derive_facts_from_bq_ddl_plan(&plan, kind, sql);
-            out.push(facts);
+        ast::AstStmt::MssqlBulkInsert(_) => {
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::BulkInsert)
         }
-        return;
-    }
-
-    // MSSQL DDL (T-SQL Bulk Insert / External Model / Login / User /
-    // SET option). The DdlPlan covers many statement kinds; we filter
-    // to the MSSQL family here via the narrow
-    // [`facts::extract::MssqlDdlKind`] enum so the downstream
-    // projection avoids a `_ =>` catch-all on the wide public
-    // `StatementKind` taxonomy.
-    let mssql_kind: Option<facts::extract::MssqlDdlKind> = match stmt {
-        ast::AstStmt::MssqlBulkInsert(_) => Some(facts::extract::MssqlDdlKind::BulkInsert),
         ast::AstStmt::MssqlCreateExternalModel(_) => {
-            Some(facts::extract::MssqlDdlKind::CreateExternalModel)
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::CreateExternalModel)
         }
         ast::AstStmt::MssqlAlterExternalModel(_) => {
-            Some(facts::extract::MssqlDdlKind::AlterExternalModel)
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::AlterExternalModel)
         }
         ast::AstStmt::MssqlDropExternalModel(_) => {
-            Some(facts::extract::MssqlDdlKind::DropExternalModel)
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::DropExternalModel)
         }
-        // CREATE LOGIN / CREATE USER (MSSQL) parse to the
-        // dialect-neutral `AstStmt::CreatePrincipal`. The
-        // MSSQL-specific source-clause classifier rides on
-        // `options.mssql_source`; those statements go through the
-        // MssqlDdlKind dispatch so rules keyed on
-        // `kind: mssql_create_login` / `kind: mssql_create_user`
-        // fire.
-        ast::AstStmt::CreatePrincipal(p) if p.options.mssql_source.is_some() => {
-            match p.principal_kind {
-                ast::types::PrincipalKind::Login => Some(facts::extract::MssqlDdlKind::CreateLogin),
-                ast::types::PrincipalKind::User => Some(facts::extract::MssqlDdlKind::CreateUser),
-                ast::types::PrincipalKind::Role => None,
-                // A Redshift GROUP is never an MSSQL principal — it has no
-                // MSSQL DDL kind. (Only reachable when mssql_source is Some,
-                // which never holds for GROUP; the arm keeps the match total.)
-                ast::types::PrincipalKind::Group => None,
-                // Application roles ride the neutral principal path
-                // (kind discriminated via ddl.principal.kind).
-                ast::types::PrincipalKind::ApplicationRole => None,
-                // A Snowflake DATABASE ROLE is never an MSSQL principal
-                // (mssql_source never holds for it); keeps the match total.
-                ast::types::PrincipalKind::DatabaseRole => None,
-            }
-        }
-        // ALTER / DROP LOGIN — LOGIN statements are T-SQL-shaped in
-        // every dialect that parses them, so they keep the
-        // mssql_-prefixed kinds for naming consistency with
-        // `mssql_create_login`.
-        ast::AstStmt::AlterPrincipal(p) if p.principal_kind == ast::types::PrincipalKind::Login => {
-            Some(facts::extract::MssqlDdlKind::AlterLogin)
-        }
-        ast::AstStmt::DropPrincipal(p) if p.principal_kind == ast::types::PrincipalKind::Login => {
-            Some(facts::extract::MssqlDdlKind::DropLogin)
-        }
-        ast::AstStmt::MssqlSetOption(_) => Some(facts::extract::MssqlDdlKind::SetOption),
-        ast::AstStmt::DropMssqlTrigger(_) => Some(facts::extract::MssqlDdlKind::DropTrigger),
-        ast::AstStmt::MssqlTriggerState(_) => Some(facts::extract::MssqlDdlKind::TriggerState),
-        _ => None,
-    };
-    if let Some(kind) = mssql_kind {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            let facts = facts::extract::derive_facts_from_mssql_ddl_plan(&plan, kind, sql);
-            out.push(facts);
-        }
-        return;
-    }
-
-    // CREATE / ALTER / DROP { USER | ROLE | LOGIN } —
-    // dialect-neutral principal substrate. Only routed here for the
-    // non-MSSQL forms (MSSQL principal statements route through the
-    // `MssqlDdlKind` dispatcher above so their existing
-    // `kind: mssql_create_login` / `mssql_create_user` YAML
-    // predicates keep firing). The neutral path projects the
-    // `principal_options` typed bag (kind + password_literal +
-    // mysql_host) under `ddl.principal.*`.
-    if matches!(
-        stmt,
-        ast::AstStmt::CreatePrincipal(_)
-            | ast::AstStmt::AlterPrincipal(_)
-            | ast::AstStmt::DropPrincipal(_)
-    ) {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            let facts = facts::extract::derive_facts_from_principal_plan(&plan, sql);
-            out.push(facts);
-        }
-        return;
-    }
-
-    // `COMMENT ON <target-kind> <name>` — cross-dialect metadata
-    // statement. Drives INFO-COMMENT-CHG (predicates `kind: comment`)
-    // and the Databricks Unity Catalog target-specific variants
-    // INFO-DBX-CAT/VOL/CONN-COMMENT-CHG (predicate
-    // `comment.target_kind: catalog | volume | connection`). Sits
-    // before the stmt-kind-only dispatch so the target_kind
-    // discriminator reaches the rule corpus.
-    if let ast::AstStmt::CommentOn(c) = stmt {
-        let facts = facts::extract::derive_facts_from_comment_on(c, sql);
-        out.push(facts);
-        return;
-    }
-
-    // SHOW <objects> — metadata introspection. Lowers to a generic
-    // DDL plan carrying the typed `show` recognition sibling; the
-    // facts projection exposes it under `ddl.show.*`.
-    if let ast::AstStmt::Show(_) = stmt {
-        let session = ir::types::SessionContext::default();
-        let inputs = ir::IrLowerInputs {
-            source: sql,
-            placeholder_spans: placeholders,
-            strict: ir::StrictMode::Permissive,
-            func_catalog: function_catalog,
-            session: &session,
-            meaning: query.meaning,
-            catalog: None,
-            model_catalog: None,
-            reasoning,
-            flatten_body_into: None,
-        };
-        if let Some(plan) = ir::lower_ddl_stmt(stmt, &inputs) {
-            if let Some(facts) = facts::extract::derive_facts_from_show_plan(&plan) {
-                out.push(facts);
-            }
-        }
-        return;
-    }
-
-    // Statement-kind-only dispatch: UNDROP TABLE / UNDROP TYPE /
-    // EXECUTE IMMEDIATE / UNDROP DATABASE / UNDROP SCHEMA / ANALYZE /
-    // CLUSTER / LISTEN / NOTIFY / UNLISTEN / CREATE AGGREGATE /
-    // CREATE OPERATOR / CREATE VECTOR INDEX / EXEC. No per-element
-    // detail surface needed — the rules predicate purely on
-    // `kind:`. Drives INFO-TBL-UNDROP / INFO-TYPE-UNDROP / DYNSQL
-    // / INFO-DB-UNDROP / INFO-SCHEMA-UNDROP / INFO-PG-MAINT-* /
-    // INFO-PG-NOTIFY-* / INFO-PG-AGG-NEW / INFO-PG-OP-NEW /
-    // INFO-MSSQL-VECIDX-NEW / INFO-MSSQL-EXEC-PROC.
-    //
-    // `EXECUTE IMMEDIATE` and `MssqlExec` additionally attach a
-    // typed `DynamicSqlCall` so DYNSQL-* rules can predicate on
-    // argument shape and parameterization at the statement level
-    // (not just kind).
-    // The dynamic-SQL calls the statement makes ([`statement_calls`]): a
-    // bare variable argument resolves through the script's classifier,
-    // so via-variable laundering (`v := '…' || x; EXECUTE v;`) reports
-    // the built shape. One in a procedure, function or trigger body reads
-    // its variables as that body assigns them ([`DdlReading::routine_calls`]).
-    let calls = {
-        let span = stmt.span();
-        match routine_calls.get(&(span.start, span.end)) {
-            Some(calls) => Some(std::borrow::Cow::Borrowed(calls)),
-            None => statement_calls(stmt, sql, dynamic_sql, fold.parameters_at(span))
-                .map(std::borrow::Cow::Owned),
-        }
-    };
-    let (run_call, reached_calls) = match calls.as_deref() {
-        Some(StatementCalls::Runs(call)) => (Some(call), &[][..]),
-        Some(StatementCalls::Reaches(reached)) => (None, reached.as_slice()),
-        None => (None, &[][..]),
-    };
-    if let (ast::AstStmt::ExecuteImmediate { span, .. }, Some(call_ir)) = (stmt, run_call) {
-        let call = facts::extract::project_dynamic_sql_call(call_ir);
-        let facts = facts::extract::derive_facts_dynamic_sql_stmt(
-            facts::StatementKind::ExecuteImmediate,
-            *span,
-            call,
-        );
-        out.push(facts);
-        return;
-    }
-    if let ast::AstStmt::ExecuteImmediateFrom(e) = stmt {
-        // Snowflake `EXECUTE IMMEDIATE FROM <stage_file>` — executes SQL
-        // loaded from a stage file (external/file-based code execution).
-        // Distinct surface from inline `EXECUTE IMMEDIATE <expr>`: the
-        // recognition primitive is the file location + whether it runs,
-        // not an injected string shape.
-        let eif_ir = ir::dynamic_sql::lower_execute_immediate_from(e, sql);
-        let eif_facts = facts::extract::project_execute_immediate_from(&eif_ir);
-        let facts = facts::extract::derive_facts_execute_immediate_from(e.span, eif_facts);
-        out.push(facts);
-        return;
-    }
-    if let ast::AstStmt::PgPrepare(p) = stmt {
-        // Top-level `PREPARE`. PG form (`PREPARE … AS <stmt>`)
-        // carries a parsed body and is not itself a dynamic-SQL
-        // surface (the AS branch executes a known statement). MySQL
-        // form (`PREPARE … FROM <expr>`) IS a dynamic-SQL surface
-        // — classify the FROM expression's shape and attach.
-        let facts = match run_call {
-            Some(c) => facts::extract::derive_facts_dynamic_sql_stmt(
-                facts::StatementKind::PgPrepare,
-                p.span,
-                facts::extract::project_dynamic_sql_call(c),
-            ),
-            None => {
-                facts::extract::derive_facts_stmt_kind_only(facts::StatementKind::PgPrepare, p.span)
-            }
-        };
-        out.push(facts);
-        return;
-    }
-    // T-SQL impersonation statements — `EXECUTE AS LOGIN/USER = …`
-    // and `REVERT`. Typed facts drive the MSSQL-EXECAS-* rules.
-    if let ast::AstStmt::MssqlExecuteAs(e) = stmt {
-        let raw = sql
-            .get(e.principal_span.start as usize..e.principal_span.end as usize)
-            .unwrap_or("");
-        // A string literal's value; a bare @variable as written.
-        let inner = ir::span_extract::literal_value_or_text(raw);
-        let impersonation = facts::ddl::ImpersonationFacts {
-            principal_kind: match e.principal_kind {
-                ast::types::AstImpersonationPrincipalKind::Login => {
-                    facts::ddl::ImpersonationPrincipalKind::Login
+        ast::AstStmt::CreatePrincipal(p) => {
+            // CREATE LOGIN / CREATE USER (MSSQL) parse to the
+            // dialect-neutral `AstStmt::CreatePrincipal`. The
+            // MSSQL-specific source-clause classifier rides on
+            // `options.mssql_source`; those statements go through the
+            // MssqlDdlKind dispatch so rules keyed on
+            // `kind: mssql_create_login` / `kind: mssql_create_user`
+            // fire.
+            if p.options.mssql_source.is_some() {
+                if let Some(x) = match p.principal_kind {
+                    ast::types::PrincipalKind::Login => {
+                        Some(facts::extract::MssqlDdlKind::CreateLogin)
+                    }
+                    ast::types::PrincipalKind::User => {
+                        Some(facts::extract::MssqlDdlKind::CreateUser)
+                    }
+                    ast::types::PrincipalKind::Role => None,
+                    // A Redshift GROUP is never an MSSQL principal — it has no
+                    // MSSQL DDL kind. (Only reachable when mssql_source is Some,
+                    // which never holds for GROUP; the arm keeps the match total.)
+                    ast::types::PrincipalKind::Group => None,
+                    // Application roles ride the neutral principal path
+                    // (kind discriminated via ddl.principal.kind).
+                    ast::types::PrincipalKind::ApplicationRole => None,
+                    // A Snowflake DATABASE ROLE is never an MSSQL principal
+                    // (mssql_source never holds for it); keeps the match total.
+                    ast::types::PrincipalKind::DatabaseRole => None,
+                } {
+                    return DdlFamily::Mssql(x);
                 }
-                ast::types::AstImpersonationPrincipalKind::User => {
-                    facts::ddl::ImpersonationPrincipalKind::User
-                }
-            },
-            principal: facts::identity::IdentName::new(inner).written_at(e.principal_span),
-            no_revert: e.no_revert,
-        };
-        let facts = facts::extract::derive_facts_mssql_impersonation(
-            facts::StatementKind::MssqlExecuteAs,
-            e.span,
-            Some(impersonation),
-        );
-        out.push(facts);
-        return;
-    }
-    if let ast::AstStmt::MssqlRevert { span, .. } = stmt {
-        let facts = facts::extract::derive_facts_mssql_impersonation(
-            facts::StatementKind::MssqlRevert,
-            *span,
-            None,
-        );
-        out.push(facts);
-        return;
-    }
-    // T-SQL `SETUSER ['username']` — the legacy, database-scoped equivalent
-    // of `EXECUTE AS USER`. Reuses the shared `ImpersonationFacts` carrier
-    // (principal kind is always User); a bare `SETUSER` is the revert form
-    // (no principal). Drives MSSQL-SETUSER-IMPERSONATION / INFO-MSSQL-SETUSER.
-    if let ast::AstStmt::MssqlSetuser(s) = stmt {
-        let impersonation = s.principal_span.map(|p| {
-            let raw = sql.get(p.start as usize..p.end as usize).unwrap_or("");
-            let inner = ir::span_extract::literal_value_or_text(raw);
-            facts::ddl::ImpersonationFacts {
-                principal_kind: facts::ddl::ImpersonationPrincipalKind::User,
-                principal: facts::identity::IdentName::new(inner).written_at(p),
-                no_revert: false,
             }
-        });
-        let facts = facts::extract::derive_facts_mssql_impersonation(
-            facts::StatementKind::MssqlSetuser,
+            DdlFamily::Principal
+        }
+        ast::AstStmt::AlterPrincipal(p) => {
+            // ALTER / DROP LOGIN — LOGIN statements are T-SQL-shaped in
+            // every dialect that parses them, so they keep the
+            // mssql_-prefixed kinds for naming consistency with
+            // `mssql_create_login`.
+            if p.principal_kind == ast::types::PrincipalKind::Login {
+                return DdlFamily::Mssql(facts::extract::MssqlDdlKind::AlterLogin);
+            }
+            DdlFamily::Principal
+        }
+        ast::AstStmt::DropPrincipal(p) => {
+            if p.principal_kind == ast::types::PrincipalKind::Login {
+                return DdlFamily::Mssql(facts::extract::MssqlDdlKind::DropLogin);
+            }
+            DdlFamily::Principal
+        }
+        ast::AstStmt::MssqlSetOption(_) => {
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::SetOption)
+        }
+        ast::AstStmt::DropMssqlTrigger(_) => {
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::DropTrigger)
+        }
+        ast::AstStmt::MssqlTriggerState(_) => {
+            DdlFamily::Mssql(facts::extract::MssqlDdlKind::TriggerState)
+        }
+        ast::AstStmt::CommentOn(c) => DdlFamily::CommentOn(c),
+        ast::AstStmt::Show(_) => DdlFamily::Show,
+        ast::AstStmt::ExecuteImmediate { span, .. } => DdlFamily::ExecuteImmediate(span),
+        ast::AstStmt::ExecuteImmediateFrom(e) => DdlFamily::ExecuteImmediateFrom(e),
+        ast::AstStmt::PgPrepare(p) => DdlFamily::PgPrepare(p),
+        ast::AstStmt::MssqlExecuteAs(e) => DdlFamily::MssqlExecuteAs(e),
+        ast::AstStmt::MssqlRevert { span, .. } => DdlFamily::MssqlRevert(span),
+        ast::AstStmt::MssqlSetuser(s) => DdlFamily::MssqlSetuser(s),
+        ast::AstStmt::MssqlAuditDdl(a) => DdlFamily::MssqlAuditDdl(a),
+        ast::AstStmt::MssqlSecurityObjectDdl(s) => DdlFamily::MssqlSecurityObjectDdl(s),
+        ast::AstStmt::MssqlExec(e) => DdlFamily::MssqlExec(e),
+        ast::AstStmt::Call { span, args, .. } => DdlFamily::Call(span, args),
+        ast::AstStmt::UndropTable(_) => DdlFamily::Stub(Stub::Command(C::UndropTable)),
+        ast::AstStmt::UndropType(_) => DdlFamily::Stub(Stub::Command(C::UndropType)),
+        ast::AstStmt::UndropDatabase(_) => DdlFamily::Stub(Stub::Command(C::UndropDatabase)),
+        ast::AstStmt::UndropSchema(_) => DdlFamily::Stub(Stub::Command(C::UndropSchema)),
+        ast::AstStmt::AnalyzeStmt(_) => DdlFamily::Stub(Stub::Command(C::Analyze)),
+        ast::AstStmt::PgCluster(_) => DdlFamily::Stub(Stub::Command(C::Cluster)),
+        ast::AstStmt::PgListen(_) => DdlFamily::Stub(Stub::Command(C::Listen)),
+        ast::AstStmt::PgNotify(_) => DdlFamily::Stub(Stub::Command(C::Notify)),
+        ast::AstStmt::PgUnlisten(_) => DdlFamily::Stub(Stub::Command(C::Unlisten)),
+        ast::AstStmt::PgCreateAggregate(s) => DdlFamily::Stub(Stub::KindOnly(
+            facts::StatementKind::PgCreateAggregate,
             s.span,
-            impersonation,
-        );
-        out.push(facts);
-        return;
-    }
-    if let ast::AstStmt::MssqlAuditDdl(a) = stmt {
-        let kind = match a.action {
-            ast::types::AstMssqlAuditAction::Create => facts::StatementKind::MssqlCreateAudit,
-            ast::types::AstMssqlAuditAction::Alter => facts::StatementKind::MssqlAlterAudit,
-            ast::types::AstMssqlAuditAction::Drop => facts::StatementKind::MssqlDropAudit,
-        };
-        let name = sql
-            .get(a.name_span.start as usize..a.name_span.end as usize)
-            .unwrap_or("");
-        let audit = facts::ddl::AuditFacts {
-            scope: match a.scope {
-                ast::types::AstMssqlAuditScope::ServerAudit => facts::ddl::AuditScope::ServerAudit,
-                ast::types::AstMssqlAuditScope::ServerAuditSpecification => {
-                    facts::ddl::AuditScope::ServerAuditSpecification
-                }
-                ast::types::AstMssqlAuditScope::DatabaseAuditSpecification => {
-                    facts::ddl::AuditScope::DatabaseAuditSpecification
-                }
-            },
-            name: facts::identity::IdentName::new(name),
-            state: a.state.map(|s| match s {
-                ast::types::AstMssqlAuditState::On => facts::ddl::DatabaseSwitchValue::On,
-                ast::types::AstMssqlAuditState::Off => facts::ddl::DatabaseSwitchValue::Off,
-            }),
-        };
-        let facts = facts::extract::derive_facts_mssql_audit(kind, a.span, audit);
-        out.push(facts);
-        return;
-    }
-    if let ast::AstStmt::MssqlSecurityObjectDdl(s) = stmt {
-        let kind = match s.action {
-            ast::types::AstMssqlAuditAction::Create => {
-                facts::StatementKind::MssqlCreateSecurityObject
-            }
-            ast::types::AstMssqlAuditAction::Alter => {
-                facts::StatementKind::MssqlAlterSecurityObject
-            }
-            ast::types::AstMssqlAuditAction::Drop => facts::StatementKind::MssqlDropSecurityObject,
-        };
-        let slice = |sp: lexer::token::Span| {
-            sql.get(sp.start as usize..sp.end as usize)
-                .unwrap_or("")
-                .to_string()
-        };
-        let security_object = facts::ddl::SecurityObjectFacts {
-            kind: match s.object {
-                ast::types::AstMssqlSecurityObjectKind::MasterKey => {
-                    facts::ddl::SecurityObjectKind::MasterKey
-                }
-                ast::types::AstMssqlSecurityObjectKind::DatabaseEncryptionKey => {
-                    facts::ddl::SecurityObjectKind::DatabaseEncryptionKey
-                }
-                ast::types::AstMssqlSecurityObjectKind::SymmetricKey => {
-                    facts::ddl::SecurityObjectKind::SymmetricKey
-                }
-                ast::types::AstMssqlSecurityObjectKind::AsymmetricKey => {
-                    facts::ddl::SecurityObjectKind::AsymmetricKey
-                }
-                ast::types::AstMssqlSecurityObjectKind::Certificate => {
-                    facts::ddl::SecurityObjectKind::Certificate
-                }
-                ast::types::AstMssqlSecurityObjectKind::Credential => {
-                    facts::ddl::SecurityObjectKind::Credential
-                }
-            },
-            name: s
-                .name_span
-                .map(|sp| facts::identity::IdentName::new(slice(sp))),
-            database_scoped: s.database_scoped,
-            password_literal: s.password_literal.map(slice),
-            secret_literal: s.secret_literal.map(slice),
-        };
-        let facts =
-            facts::extract::derive_facts_mssql_security_object(kind, s.span, security_object);
-        out.push(facts);
-        return;
-    }
-
-    if let ast::AstStmt::MssqlExec(e) = stmt {
-        // Distinguish dynamic-SQL surfaces (`EXEC(@sql)` and
-        // `EXEC sp_executesql ...`) from ordinary stored-procedure
-        // calls (`EXEC proc_name args`). Also capture the typed
-        // `mssql_exec` facts (lowercased procedure_name + args_text)
-        // so rules like MSSQL-XP-CMDSHELL can predicate on the
-        // specific procedure being invoked.
-        // Base name part only (`xp_cmdshell` in `master.dbo.xp_cmdshell`),
-        // quote-stripped via the central normalizer, then lowercased per
-        // the facts contract — qualified and bracket-quoted invocations
-        // must match the same rule predicate.
-        let procedure_name_lower = e.procedure_base_name_span.map(|s| {
-            crate::dialect::normalize_identifier(
-                sql.get(s.start as usize..s.end as usize).unwrap_or(""),
-            )
-            .to_ascii_lowercase()
-        });
-        let args_text_lower = e.args_span.map(|s| {
-            facts::identity::WrittenText::at(
-                sql.get(s.start as usize..s.end as usize)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-                s,
-            )
-        });
-        let mssql_exec_facts = Some(facts::ddl::MssqlExecFacts {
-            procedure_name: procedure_name_lower.clone(),
-            args_text: args_text_lower,
-            args: facts::extract::project_mssql_exec_args(&e.args, sql),
-        });
-
-        // `EXEC (…)` and `EXEC sp_executesql …` run SQL text; any other
-        // `EXEC` calls a procedure.
-        if let Some(call_ir) = run_call {
-            let call = facts::extract::project_dynamic_sql_call(call_ir);
-            let mut facts = facts::extract::derive_facts_dynamic_sql_stmt(
-                facts::StatementKind::MssqlExec,
-                e.span,
-                call,
-            );
-            facts.mssql_exec = mssql_exec_facts;
-            out.push(facts);
-        } else {
-            // Ordinary EXEC <proc_name> — no dynamic SQL at the
-            // call itself, but the callee's body may pass an
-            // argument on to a sink. Emit one row per sink it
-            // reaches, each carrying its provenance chain. Always
-            // also surface `mssql_exec` facts so procedure-name-keyed
-            // rules (xp_cmdshell, …) fire.
-            for call_ir in reached_calls {
-                let call = facts::extract::project_dynamic_sql_call(call_ir);
-                let mut facts = facts::extract::derive_facts_dynamic_sql_stmt(
-                    facts::StatementKind::MssqlExec,
-                    e.span,
-                    call,
-                );
-                facts.mssql_exec = mssql_exec_facts.clone();
-                out.push(facts);
-            }
-            let mut facts = facts::extract::derive_facts_stmt_kind_only(
-                facts::StatementKind::MssqlExec,
-                e.span,
-            );
-            facts.mssql_exec = mssql_exec_facts;
-            out.push(facts);
-        }
-        return;
-    }
-    if let ast::AstStmt::Call { span, .. } = stmt {
-        for call_ir in reached_calls {
-            let call = facts::extract::project_dynamic_sql_call(call_ir);
-            let facts = facts::extract::derive_facts_dynamic_sql_stmt(
-                facts::StatementKind::Call,
-                *span,
-                call,
-            );
-            out.push(facts);
-        }
-    }
-
-    let kind_only: Option<(facts::StatementKind, lexer::Span)> = match stmt {
-        ast::AstStmt::UndropTable(s) => Some((facts::StatementKind::UndropTable, s.span)),
-        ast::AstStmt::UndropType(s) => Some((facts::StatementKind::UndropType, s.span)),
-        ast::AstStmt::UndropDatabase(s) => Some((facts::StatementKind::UndropDatabase, s.span)),
-        ast::AstStmt::UndropSchema(s) => Some((facts::StatementKind::UndropSchema, s.span)),
-        ast::AstStmt::AnalyzeStmt(s) => Some((facts::StatementKind::AnalyzeStmt, s.span)),
-        ast::AstStmt::PgCluster(s) => Some((facts::StatementKind::PgCluster, s.span)),
-        ast::AstStmt::PgListen(s) => Some((facts::StatementKind::PgListen, s.span)),
-        ast::AstStmt::PgNotify(s) => Some((facts::StatementKind::PgNotify, s.span)),
-        ast::AstStmt::PgUnlisten(s) => Some((facts::StatementKind::PgUnlisten, s.span)),
-        ast::AstStmt::PgCreateAggregate(s) => {
-            Some((facts::StatementKind::PgCreateAggregate, s.span))
-        }
-        ast::AstStmt::PgCreateOperator(s) => Some((facts::StatementKind::PgCreateOperator, s.span)),
-        ast::AstStmt::MssqlCreateVectorIndex(s) => {
-            Some((facts::StatementKind::MssqlCreateVectorIndex, s.span))
+        )),
+        ast::AstStmt::PgCreateOperator(s) => DdlFamily::Stub(Stub::KindOnly(
+            facts::StatementKind::PgCreateOperator,
+            s.span,
+        )),
+        ast::AstStmt::MssqlCreateVectorIndex(_) => {
+            DdlFamily::Stub(Stub::Command(C::CreateVectorIndex))
         }
         // Scripting locals: scalar `DECLARE @var <type>` and T-SQL table
         // variable `DECLARE @t TABLE(...)`. Both lower to the IR's
@@ -6923,46 +7209,279 @@ fn ddl_statement_facts(
         // per-family fact projections — emit a kind-only stub so they
         // classify as CONTROL in the ledger instead of falling through
         // to the query evaluator's Opaque RelPlan fallback.
-        ast::AstStmt::Declare { span, .. } => Some((facts::StatementKind::Declare, *span)),
-        ast::AstStmt::DeclareTable { span, .. } => {
-            Some((facts::StatementKind::DeclareTable, *span))
-        }
+        ast::AstStmt::Declare { variables, .. } => DdlFamily::Declare(variables),
+        ast::AstStmt::DeclareTable {
+            name,
+            table_keyword_span,
+            ..
+        } => DdlFamily::DeclareTable(name, table_keyword_span),
         // PostgreSQL prepared-statement lifecycle: `EXECUTE` and
-        // `DEALLOCATE` hold no statement and reach the ledger via this
-        // kind-only stub (`PREPARE` is read above).
-        ast::AstStmt::PgExecute(s) => Some((facts::StatementKind::PgExecute, s.span)),
-        ast::AstStmt::PgDeallocate(s) => Some((facts::StatementKind::PgDeallocate, s.span)),
-        // A call is one whether or not the reasoning provider reports a
-        // sink its callee reaches.
-        ast::AstStmt::Call { span, .. } => Some((facts::StatementKind::Call, *span)),
-        ast::AstStmt::Reconfigure { span, .. } => Some((facts::StatementKind::Reconfigure, *span)),
-        ast::AstStmt::MssqlServerCommand { span, .. } => {
-            Some((facts::StatementKind::MssqlServerCommand, *span))
+        // `DEALLOCATE` hold no statement (`PREPARE` is read above).
+        ast::AstStmt::PgExecute(_) => DdlFamily::Stub(Stub::Command(C::Execute)),
+        ast::AstStmt::PgDeallocate(_) => DdlFamily::Stub(Stub::Command(C::Deallocate)),
+        ast::AstStmt::Reconfigure { span, .. } => {
+            DdlFamily::Stub(Stub::KindOnly(facts::StatementKind::Reconfigure, *span))
         }
+        ast::AstStmt::MssqlServerCommand { span, .. } => DdlFamily::Stub(Stub::KindOnly(
+            facts::StatementKind::MssqlServerCommand,
+            *span,
+        )),
         ast::AstStmt::MysqlAdmin(admin) => {
             use ast::{AstMysqlAdminKind as A, AstMysqlTableOperation as Op};
-            let kind = match &admin.kind {
-                A::TableMaintenance { operation, .. } => match operation {
-                    Op::Analyze => facts::StatementKind::AnalyzeStmt,
-                    Op::Optimize => facts::StatementKind::OptimizeTable,
-                    Op::Check => facts::StatementKind::CheckTable,
-                    Op::Checksum => facts::StatementKind::ChecksumTable,
-                    Op::Repair => facts::StatementKind::RepairTable,
-                },
-                A::Flush { .. } => facts::StatementKind::Flush,
-                A::Kill { .. } => facts::StatementKind::Kill,
-                A::AlterInstance => facts::StatementKind::AlterInstance,
-                A::Xa => facts::StatementKind::XaTransaction,
-                A::RenameUser { .. } => facts::StatementKind::RenameUser,
-            };
-            Some((kind, admin.span))
+            let kind_only = |kind| DdlFamily::Stub(Stub::KindOnly(kind, admin.span));
+            match &admin.kind {
+                A::TableMaintenance { operation, .. } => {
+                    DdlFamily::Stub(Stub::Command(match operation {
+                        Op::Analyze => C::Analyze,
+                        Op::Optimize => C::OptimizeTable,
+                        Op::Check => C::CheckTable,
+                        Op::Checksum => C::ChecksumTable,
+                        Op::Repair => C::RepairTable,
+                    }))
+                }
+                A::Flush { .. } => kind_only(facts::StatementKind::Flush),
+                A::Kill { .. } => kind_only(facts::StatementKind::Kill),
+                A::AlterInstance => kind_only(facts::StatementKind::AlterInstance),
+                A::Xa => kind_only(facts::StatementKind::XaTransaction),
+                A::RenameUser { .. } => kind_only(facts::StatementKind::RenameUser),
+            }
         }
-        _ => None,
-    };
-    if let Some((kind, span)) = kind_only {
-        let facts = facts::extract::derive_facts_stmt_kind_only(kind, span);
-        out.push(facts);
+        // The query reading reads these.
+        ast::AstStmt::Select(_)
+        | ast::AstStmt::SetSelect(_)
+        | ast::AstStmt::ValuesQuery(_)
+        | ast::AstStmt::Insert(_)
+        | ast::AstStmt::ReplaceInto(_)
+        | ast::AstStmt::MultiInsert(_)
+        | ast::AstStmt::Update(_)
+        | ast::AstStmt::Delete(_)
+        | ast::AstStmt::Merge(_)
+        | ast::AstStmt::Explain(_)
+        | ast::AstStmt::PsqlGexec(_)
+        | ast::AstStmt::Perform(_)
+        | ast::AstStmt::DeclareCursor { .. } => DdlFamily::Query,
+        ast::AstStmt::Grant(g) => DdlFamily::Privilege(ir::lower_grant_to_privilege_plan(g)),
+        ast::AstStmt::Revoke(r) => DdlFamily::Privilege(ir::lower_revoke_to_privilege_plan(r)),
+        ast::AstStmt::Deny(d) => DdlFamily::Privilege(ir::lower_deny_to_privilege_plan(d)),
+        ast::AstStmt::AlterAuthorization(a) => {
+            DdlFamily::Privilege(ir::lower_alter_authorization_to_privilege_plan(a))
+        }
+        ast::AstStmt::DeclareHandler(h) => DdlFamily::Handler(h),
+        ast::AstStmt::AlterUser(u) => DdlFamily::AlterUser(u),
+        ast::AstStmt::AlterAccount(a) => DdlFamily::AlterAccount(a),
+        // Text not parsed as a statement, and batch separators.
+        ast::AstStmt::OpaqueContent { .. }
+        | ast::AstStmt::GoBatchSeparator { .. }
+        | ast::AstStmt::ClauseFragment { .. }
+        | ast::AstStmt::JinjaPlaceholder { .. }
+        | ast::AstStmt::JinjaConditionalStmt(_)
+        | ast::AstStmt::Error { .. } => DdlFamily::Unparsed,
+        // Transaction control, control flow, cursors and SET: their kind;
+        // they name no object. A body's statements are read on their own.
+        ast::AstStmt::MssqlTryCatch(_) => kind_only(facts::StatementKind::TryCatch),
+        ast::AstStmt::MssqlIf(_) => kind_only(facts::StatementKind::If),
+        ast::AstStmt::MssqlWhile(_) => kind_only(facts::StatementKind::While),
+        ast::AstStmt::MysqlSet(_) => kind_only(facts::StatementKind::Set),
+        ast::AstStmt::Savepoint(_) => DdlFamily::Stub(Stub::Command(C::Savepoint)),
+        ast::AstStmt::SetVariable { .. } => kind_only(facts::StatementKind::Set),
+        ast::AstStmt::Block(_) => kind_only(facts::StatementKind::Block),
+        ast::AstStmt::If(_) => kind_only(facts::StatementKind::If),
+        ast::AstStmt::CaseStmt(_) => kind_only(facts::StatementKind::Case),
+        ast::AstStmt::For(_) => kind_only(facts::StatementKind::For),
+        ast::AstStmt::ForEach(_) => kind_only(facts::StatementKind::For),
+        ast::AstStmt::While(_) => kind_only(facts::StatementKind::While),
+        ast::AstStmt::Repeat(_) => kind_only(facts::StatementKind::Repeat),
+        ast::AstStmt::Loop(_) => kind_only(facts::StatementKind::Loop),
+        ast::AstStmt::OpenCursor { .. } => DdlFamily::Stub(Stub::Command(C::OpenCursor)),
+        ast::AstStmt::FetchCursor { .. } => DdlFamily::Stub(Stub::Command(C::FetchCursor)),
+        ast::AstStmt::CloseCursor { .. } => DdlFamily::Stub(Stub::Command(C::CloseCursor)),
+        ast::AstStmt::BeginTransaction { .. } => kind_only(facts::StatementKind::BeginTransaction),
+        ast::AstStmt::Commit { .. } => kind_only(facts::StatementKind::Commit),
+        ast::AstStmt::Rollback { .. } => kind_only(facts::StatementKind::Rollback),
+        ast::AstStmt::AlterReplicationGroup(_) => {
+            DdlFamily::Stub(Stub::Command(C::AlterReplicationGroup))
+        }
+        ast::AstStmt::AlterFailoverGroup(_) => {
+            DdlFamily::Stub(Stub::Command(C::AlterFailoverGroup))
+        }
+        ast::AstStmt::AlterStream(_) => DdlFamily::Stub(Stub::Command(C::AlterStream)),
+        ast::AstStmt::MssqlWaitfor(_) => kind_only(facts::StatementKind::MssqlWaitfor),
+        ast::AstStmt::MssqlPrint(_) => kind_only(facts::StatementKind::MssqlPrint),
+        ast::AstStmt::MssqlThrow(_) => kind_only(facts::StatementKind::MssqlThrow),
+        ast::AstStmt::MssqlRaiserror(_) => kind_only(facts::StatementKind::MssqlRaiserror),
+        ast::AstStmt::MysqlDo(_) => kind_only(facts::StatementKind::MysqlDo),
+        // A pipe chain's statements are read as statements of their own.
+        ast::AstStmt::PipeChain { .. } => kind_only(facts::StatementKind::PipeChain),
+        ast::AstStmt::Describe(_) => DdlFamily::Stub(Stub::Command(C::Describe)),
+        // No family reads these and no kind names them: their record is the
+        // query reading's, of kind `opaque`.
+        ast::AstStmt::SqlcmdCommand { .. }
+        | ast::AstStmt::MysqlUnlockTables(_)
+        | ast::AstStmt::MssqlGoto(_)
+        | ast::AstStmt::MssqlLabel(_)
+        | ast::AstStmt::MssqlCreateRule(_)
+        | ast::AstStmt::Assign { .. }
+        | ast::AstStmt::Let { .. }
+        | ast::AstStmt::LetCursor { .. }
+        | ast::AstStmt::Return { .. }
+        | ast::AstStmt::Raise { .. }
+        | ast::AstStmt::Signal { .. }
+        | ast::AstStmt::Resignal { .. }
+        | ast::AstStmt::GetDiagnostics { .. }
+        | ast::AstStmt::DeclareCondition { .. }
+        | ast::AstStmt::Await { .. }
+        | ast::AstStmt::Cancel { .. }
+        | ast::AstStmt::Break { .. }
+        | ast::AstStmt::Continue { .. }
+        | ast::AstStmt::Null { .. } => DdlFamily::Unread,
     }
+}
+
+/// The dynamic-SQL calls `stmt` makes ([`statement_calls`]): a bare
+/// variable argument resolves through the script's classifier, so
+/// via-variable laundering (`v := '…' || x; EXECUTE v;`) reports the built
+/// shape. One in a procedure, function or trigger body reads its variables
+/// as that body assigns them ([`DdlReading::routine_calls`]).
+fn statement_calls_at<'r>(
+    stmt: &ast::AstStmt,
+    ddl: &'r DdlReading<'_>,
+    dynamic_sql: &dyn facts::reasoning::DynamicSqlClassifier,
+) -> Option<std::borrow::Cow<'r, StatementCalls>> {
+    let span = stmt.span();
+    match ddl.routine_calls.get(&(span.start, span.end)) {
+        Some(calls) => Some(std::borrow::Cow::Borrowed(calls)),
+        None => statement_calls(stmt, ddl.sql, dynamic_sql, ddl.fold.parameters_at(span))
+            .map(std::borrow::Cow::Owned),
+    }
+}
+
+/// The facts of a function `plan`, the plan of `stmt`: the sinks a
+/// function's body reaches in the routines it calls are its body's, as a
+/// procedure's are.
+fn function_facts(
+    stmt: &ast::AstStmt,
+    mut plan: ir::FunctionPlan,
+    sql: &str,
+    script_reasoning: &dyn facts::reasoning::ScriptReasoning,
+) -> facts::StatementFacts {
+    if let ast::AstStmt::CreateFunction(s) = stmt {
+        let body = ir::procedure_plan::parsed_body(s.body_stmt.as_deref());
+        if let (Some(shape), Some(body)) = (plan.create_body.as_mut(), body) {
+            shape
+                .dynamic_sql_calls
+                .extend(script_reasoning.inter_procedural_calls(body, &s.params));
+        }
+    }
+    facts::extract::derive_facts_from_function_plan(&plan, sql)
+}
+
+/// The facts of a procedure `plan`, the plan of `stmt`, with the
+/// inter-procedural calls its body makes in its dynamic-SQL calls, so the
+/// DYNSQL family's `ddl.procedure.body.dynamic_sql_calls.exists` predicate
+/// fires on multi-procedure laundering chains.
+fn procedure_facts(
+    stmt: &ast::AstStmt,
+    mut plan: ir::ProcedurePlan,
+    sql: &str,
+    script_reasoning: &dyn facts::reasoning::ScriptReasoning,
+) -> facts::StatementFacts {
+    if let ast::AstStmt::CreateProcedure(s) = stmt {
+        for body in s.body_stmt.as_deref().into_iter().chain(&s.body_statements) {
+            let inter_proc = script_reasoning.inter_procedural_calls(body, &s.params);
+            if let Some(body_shape) = plan.create_body.as_mut() {
+                body_shape.dynamic_sql_calls.extend(inter_proc);
+            }
+        }
+    }
+    facts::extract::derive_facts_from_procedure_plan(&plan, sql)
+}
+
+/// The facts of a privilege `plan`, read from the script `sql`. With a
+/// `catalog`, the reasoning provider answers what the grant reaches.
+fn privilege_plan_facts(
+    plan: &ir::privilege_plan::PrivilegePlan,
+    sql: &str,
+    catalog: Option<&crate::catalog::CatalogIndex>,
+    reasoning: &dyn facts::reasoning::Reasoning,
+) -> facts::StatementFacts {
+    match catalog {
+        Some(_) => {
+            facts::extract::derive_facts_from_privilege_plan_with_reasoning(plan, sql, reasoning)
+        }
+        None => facts::extract::derive_facts_from_privilege_plan(plan, sql),
+    }
+}
+
+/// The policies an `ALTER USER` attaches or detaches.
+fn alter_user_facts(alter: &ast::types::AstAlterUser, sql: &str) -> facts::StatementFacts {
+    facts::extract::derive_facts_from_policy_attachment_plan(
+        &ir::PolicyAttachmentPlan::from_alter_user(alter),
+        sql,
+    )
+}
+
+/// An `ALTER ACCOUNT` that attaches a policy, else one that sets or unsets
+/// an account parameter; none for another.
+fn alter_account_facts(
+    alter: &ast::types::AstAlterAccount,
+    sql: &str,
+) -> Option<facts::StatementFacts> {
+    match ir::PolicyAttachmentPlan::from_alter_account(alter) {
+        Some(plan) => Some(facts::extract::derive_facts_from_policy_attachment_plan(
+            &plan, sql,
+        )),
+        None => ir::lower_alter_account_params_to_plan(alter, sql)
+            .map(|plan| facts::extract::derive_facts_from_account_plan(&plan, sql)),
+    }
+}
+
+/// What `calls` makes: the call that runs SQL text, and each call of a
+/// routine.
+fn split_calls(
+    calls: Option<&StatementCalls>,
+) -> (
+    Option<&ir::dynamic_sql::DynamicSqlCallIr>,
+    &[ir::dynamic_sql::DynamicSqlCallIr],
+) {
+    match calls {
+        Some(StatementCalls::Runs(call)) => (Some(call), &[]),
+        Some(StatementCalls::Reaches(reached)) => (None, reached.as_slice()),
+        None => (None, &[]),
+    }
+}
+
+/// How a statement no family reads is read.
+enum Stub {
+    /// Its kind alone: it names no object.
+    KindOnly(facts::StatementKind, lexer::Span),
+    /// What it does to the object it names ([`facts::extract::derive_facts_from_command`]).
+    Command(facts::extract::CommandKind),
+}
+
+/// The DDL plan of `stmt`, a statement of the script `sql`, lowered with no
+/// session state.
+fn command_plan(
+    stmt: &ast::AstStmt,
+    sql: &str,
+    placeholders: &[lexer::token::Span],
+    function_catalog: &ir::FunctionCatalog,
+    query: &QueryReading<'_>,
+    reasoning: &dyn facts::reasoning::Reasoning,
+) -> Option<ir::DdlPlan> {
+    let session = ir::types::SessionContext::default();
+    let inputs = ir::IrLowerInputs {
+        source: sql,
+        placeholder_spans: placeholders,
+        strict: ir::StrictMode::Permissive,
+        func_catalog: function_catalog,
+        session: &session,
+        meaning: query.meaning,
+        catalog: None,
+        model_catalog: None,
+        reasoning,
+        flatten_body_into: None,
+    };
+    ir::lower_ddl_stmt(stmt, &inputs)
 }
 
 /// What the DDL families read the statements of a script with.
@@ -7079,26 +7598,6 @@ fn routine_calls(
         }
     }
     out
-}
-
-/// The facts the DDL families derive for `stmt` ([`ddl_statement_facts`]),
-/// and its handler facts where it is a handler `ddl` reads, onto `out`.
-fn ddl_facts(
-    stmt: &ast::AstStmt,
-    ddl: &DdlReading<'_>,
-    script_reasoning: &dyn facts::reasoning::ScriptReasoning,
-    facts_out: Option<&mut StatementFactsSink<'_>>,
-    out: &mut Vec<facts::StatementFacts>,
-) {
-    ddl_statement_facts(stmt, ddl, script_reasoning, facts_out, out);
-    if let ast::AstStmt::DeclareHandler(h) = stmt {
-        if ddl.handlers.contains(&h.node_id) {
-            let plan = ir::lower_declare_handler_to_handler_plan(h, ddl.sql);
-            out.push(facts::extract::derive_facts_from_handler_plan(
-                &plan, ddl.sql,
-            ));
-        }
-    }
 }
 
 /// How a single statement node contributes to the coverage counts
@@ -8292,6 +8791,7 @@ fn collect_declare_handlers<'a>(
             | ast::BodyRole::InsertExec => continue,
             ast::BodyRole::Declarations
             | ast::BodyRole::Block
+            | ast::BodyRole::Pipe
             | ast::BodyRole::Branch
             | ast::BodyRole::Else
             | ast::BodyRole::Loop
@@ -9142,30 +9642,6 @@ fn shown_literal_spans(
     shown.spans.extend(held.spans);
     shown.vetoed.extend(held.vetoed);
     shown
-}
-
-/// The policy-attachment or account-parameter facts of `stmt`: an `ALTER
-/// USER`, or an `ALTER ACCOUNT` that attaches a policy or sets or unsets a
-/// parameter.
-fn policy_attachment_facts(stmt: &ast::AstStmt, sql: &str) -> Option<facts::StatementFacts> {
-    match stmt {
-        ast::AstStmt::AlterUser(u) => {
-            Some(facts::extract::derive_facts_from_policy_attachment_plan(
-                &ir::PolicyAttachmentPlan::from_alter_user(u),
-                sql,
-            ))
-        }
-        ast::AstStmt::AlterAccount(a) => match ir::PolicyAttachmentPlan::from_alter_account(a) {
-            Some(plan) => Some(facts::extract::derive_facts_from_policy_attachment_plan(
-                &plan, sql,
-            )),
-            // Generic `ALTER ACCOUNT SET/UNSET <param>`: account-level
-            // parameter governance.
-            None => ir::lower_alter_account_params_to_plan(a, sql)
-                .map(|plan| facts::extract::derive_facts_from_account_plan(&plan, sql)),
-        },
-        _ => None,
-    }
 }
 
 /// Fold one substitution stage's unresolved-variable placeholders (deployment
@@ -10577,6 +11053,7 @@ fn visit_statement_run<'s>(
             ast::BodyRole::Routine
             | ast::BodyRole::Declarations
             | ast::BodyRole::Block
+            | ast::BodyRole::Pipe
             | ast::BodyRole::Branch
             | ast::BodyRole::Else
             | ast::BodyRole::Loop
@@ -13225,13 +13702,16 @@ impl RelationReading<'_> {
         if self.note_rename_calls(stmt, sql, at) {
             return;
         }
-        let mut parts: Vec<String> = [&called.db, &called.schema]
+        // The routine's parts as a routine's name folds them, as the
+        // dialect names its own routines.
+        let written: Vec<&str> = [&called.db, &called.schema]
             .into_iter()
             .flatten()
-            .cloned()
+            .map(String::as_str)
+            .chain([called.name.as_str()])
             .collect();
-        parts.push(called.name.clone());
-        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let folded = dialect::normalize_routine_name(&written);
+        let parts: Vec<&str> = folded.iter().map(String::as_str).collect();
         let documented = self.dialect.system_routine(&parts).map(|routine| {
             routine.forms.iter().all(|form| {
                 form.parameters
@@ -15298,14 +15778,14 @@ pub fn change_beside_plan(stmt: &ast::AstStmt, sql: &str) -> Option<ChangeBeside
 /// What `exec` renames, where it is an `EXEC sp_rename` that renames a
 /// table or a column ([`ProcedureRename`]).
 fn procedure_rename(exec: &ast::AstMssqlExec, sql: &str) -> Option<ProcedureRename> {
-    use facts::ddl::{MssqlExecArgFacts, MssqlExecArgValueKind};
+    use facts::ddl::{CallArgumentFacts, ValueKind};
     let procedure = exec
         .procedure_base_name_span
         .and_then(|span| ir::utils::slice_span(sql, span))?;
     if !crate::dialect::normalize_identifier(procedure).eq_ignore_ascii_case("sp_rename") {
         return None;
     }
-    let args = facts::extract::project_mssql_exec_args(&exec.args, sql);
+    let args = facts::extract::project_call_arguments(&exec.args, sql);
     let arg = |name: &str, position: u32| {
         args.iter()
             .find(|arg| arg.name.as_deref() == Some(name))
@@ -15314,14 +15794,9 @@ fn procedure_rename(exec: &ast::AstMssqlExec, sql: &str) -> Option<ProcedureRena
                     .find(|arg| arg.name.is_none() && arg.position == position)
             })
     };
-    let literal = |arg: &MssqlExecArgFacts| match arg.value_kind {
-        MssqlExecArgValueKind::StringLiteral => {
-            arg.value_literal.as_ref().map(|value| value.text.clone())
-        }
-        MssqlExecArgValueKind::Number
-        | MssqlExecArgValueKind::Null
-        | MssqlExecArgValueKind::Variable
-        | MssqlExecArgValueKind::Other => None,
+    let literal = |arg: &CallArgumentFacts| match arg.value_kind {
+        ValueKind::StringLiteral => arg.value_literal.as_ref().map(|value| value.text.clone()),
+        ValueKind::Number | ValueKind::Null | ValueKind::Variable | ValueKind::Other => None,
     };
     let object = arg("objname", 0).and_then(literal)?;
     let parts = ir::lower::split_dotted_name(&object);
@@ -16251,7 +16726,10 @@ fn unsettled_body(role: ast::BodyRole) -> Option<bool> {
         | ast::BodyRole::Catch
         | ast::BodyRole::ExceptionHandler
         | ast::BodyRole::HandlerAction => Some(false),
-        ast::BodyRole::Declarations | ast::BodyRole::Block | ast::BodyRole::InsertExec => None,
+        ast::BodyRole::Declarations
+        | ast::BodyRole::Block
+        | ast::BodyRole::Pipe
+        | ast::BodyRole::InsertExec => None,
     }
 }
 
@@ -16924,6 +17402,7 @@ fn is_routine_body(role: ast::BodyRole) -> bool {
         ast::BodyRole::Routine => true,
         ast::BodyRole::Declarations
         | ast::BodyRole::Block
+        | ast::BodyRole::Pipe
         | ast::BodyRole::Branch
         | ast::BodyRole::Else
         | ast::BodyRole::Loop
@@ -17670,10 +18149,9 @@ fn use_target_components(sql: &str, span: lexer::token::Span) -> Vec<facts::Iden
         Some(s) => s.trim(),
         None => return Vec::new(),
     };
-    raw.split('.')
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(facts::IdentName::new)
+    ir::lower_ddl::split_qualified(raw)
+        .iter()
+        .map(|component| facts::IdentName::new(component.as_str()))
         .collect()
 }
 

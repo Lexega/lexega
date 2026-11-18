@@ -270,6 +270,12 @@ pub enum ParseError {
     /// More than one logical-combinator key (`all_of` / `any_of` / `not`)
     /// at the same level.
     AmbiguousCombinator { keys: Vec<String> },
+    /// A logical-combinator key shares its mapping with other keys, which
+    /// would go unread.
+    CombinatorWithSiblings {
+        combinator: String,
+        siblings: Vec<String>,
+    },
     /// The op-block map had no recognized op key.
     UnknownOp { keys: Vec<String> },
     /// A literal value couldn't be parsed (e.g. nested object where a
@@ -291,6 +297,19 @@ impl std::fmt::Display for ParseError {
             Self::AmbiguousCombinator { keys } => {
                 write!(f, "ambiguous combinator at predicate node: {:?}", keys)
             }
+            Self::CombinatorWithSiblings {
+                combinator,
+                siblings,
+            } => write!(
+                f,
+                "`{combinator}` must stand alone in its mapping, but it shares one with {}; \
+                 put every condition in one `all_of` list",
+                siblings
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::UnknownOp { keys } => {
                 write!(f, "no recognized op-block key in: {:?}", keys)
             }
@@ -337,6 +356,13 @@ pub fn parse_predicate(value: &serde_json::Value) -> Result<Predicate, ParseErro
         });
     }
     if let Some(key) = combinator_keys.into_iter().next() {
+        let siblings: Vec<String> = map.keys().filter(|k| *k != key).cloned().collect();
+        if !siblings.is_empty() {
+            return Err(ParseError::CombinatorWithSiblings {
+                combinator: key.clone(),
+                siblings,
+            });
+        }
         return parse_combinator(key, &map[key]);
     }
 

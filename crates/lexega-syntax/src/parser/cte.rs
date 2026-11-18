@@ -229,6 +229,26 @@ pub(crate) fn try_parse_single_cte(
         ));
     }
 
+    // PostgreSQL `AS [NOT] MATERIALIZED (…)`: how the query is planned,
+    // not what it reads or returns.
+    let says = |p: &Parser<'_>, n: usize, word: &str| {
+        p.peek_ahead(n)
+            .is_some_and(|tok| tok.lexeme(p.source).eq_ignore_ascii_case(word))
+    };
+    let materialized = if says(p, 0, "MATERIALIZED") {
+        let word = p.current_token_id();
+        p.advance();
+        Some((None, word))
+    } else if says(p, 0, "NOT") && says(p, 1, "MATERIALIZED") {
+        let not = p.current_token_id();
+        p.advance();
+        let word = p.current_token_id();
+        p.advance();
+        Some((Some(not), word))
+    } else {
+        None
+    };
+
     // Opening paren for subquery
     let lparen_token_id = p.current_token_id();
     let lparen_tok = p.advance().ok_or_else(|| {
@@ -305,6 +325,7 @@ pub(crate) fn try_parse_single_cte(
     // Allocate syntax node
     let syntax_id = p.syntax_arena.alloc_cte(crate::syntax::SyntaxCte {
         as_keyword: as_token_id,
+        materialized,
         l_paren: lparen_token_id,
         r_paren: rparen_token_id,
         span,

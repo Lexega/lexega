@@ -43,8 +43,8 @@ use crate::lexer::token::{Span, TokenKind};
 use crate::lexer::{Keyword, Operator, Punctuation};
 use crate::parser::core::Parser;
 use crate::parser::grant::{
-    body_start_pos_after, consume_to_terminator, consume_with_grant_option, current_position,
-    expect_keyword, parse_grantee, parse_privilege_list,
+    body_start_pos_after, consume_column_list, consume_to_terminator, consume_with_grant_option,
+    current_position, expect_keyword, parse_grantee, parse_privilege_list,
 };
 
 /// Parse a T-SQL `GRANT ...` statement. Always succeeds: typed-parse
@@ -169,6 +169,8 @@ pub(crate) fn parse_mssql_grant_object(p: &mut Parser<'_>) -> ParseResult<AstGra
     };
 
     let name_span = p.parse_qualified_name_span()?;
+    // `ON dbo.t (a, b)`: the permission on those columns only.
+    consume_column_list(p)?;
 
     Ok(AstGrantObject::Single {
         object_kind,

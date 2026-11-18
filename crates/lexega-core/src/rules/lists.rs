@@ -3,8 +3,11 @@
 
 //! Named value lists declared under `lists:` in a rule file.
 //!
-//! Values and patterns are stored ASCII-upper-cased, and a probe is
-//! folded the same way, so matching ignores ASCII case.
+//! Values and patterns are kept as written. Against most fields a list
+//! matches ignoring ASCII case; against an identifier's folded name
+//! (`*.normalized`, `*.canonical`) each item folds as a rule's literal does
+//! there ([`NameForm::fold`]), so a quoted item keeps its case where the
+//! dialect makes it count.
 
 use std::collections::BTreeMap;
 
@@ -13,6 +16,37 @@ use serde_json::Value;
 use super::compile::glob_match;
 use super::loader::{ListField, ListShapeProblem, LoadError};
 use super::schema::{V1ListBody, V1ListEntry};
+
+/// How a field holds a dialect-folded name, and so how a rule's literal or
+/// list item compared with it is folded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameForm {
+    /// One part of a name (`*.normalized`).
+    Part,
+    /// A qualified name, its parts joined with `.` (`*.canonical`).
+    Qualified,
+}
+
+impl NameForm {
+    /// The form of the field a path ends in, where it holds a folded name.
+    pub(crate) fn of_field(field: &str) -> Option<Self> {
+        match field {
+            "normalized" => Some(NameForm::Part),
+            "canonical" => Some(NameForm::Qualified),
+            _ => None,
+        }
+    }
+
+    /// `written`, a name as a rule writes it, as a field of this form holds
+    /// it under the thread's folding: one part folded, or each part of a
+    /// dotted name folded and joined as a canonical name is.
+    pub fn fold(self, written: &str) -> String {
+        match self {
+            NameForm::Part => crate::ir::normalize::normalize_identifier(written),
+            NameForm::Qualified => crate::facts::identity::canonical_of_written(written),
+        }
+    }
+}
 
 /// The values and glob patterns of one list.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -26,7 +60,22 @@ impl ValueList {
     /// ignoring ASCII case.
     pub fn holds(&self, value: &str) -> bool {
         let folded = value.to_ascii_uppercase();
-        self.values.contains(&folded) || self.patterns.iter().any(|p| glob_match(p, &folded))
+        self.values.iter().any(|v| v.eq_ignore_ascii_case(value))
+            || self
+                .patterns
+                .iter()
+                .any(|p| glob_match(&p.to_ascii_uppercase(), &folded))
+    }
+
+    /// True when `name`, a folded name of `form`, equals a list value or
+    /// matches a list pattern, each item folded as [`NameForm::fold`] folds
+    /// it.
+    pub fn holds_name(&self, name: &str, form: NameForm) -> bool {
+        self.values.iter().any(|v| form.fold(v) == name)
+            || self
+                .patterns
+                .iter()
+                .any(|p| glob_match(&form.fold(p), name))
     }
 }
 
@@ -45,6 +94,23 @@ impl ValueLists {
     /// List names in sorted order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.lists.keys().map(String::as_str)
+    }
+
+    /// The table as JSON: each list's values and patterns, by name in
+    /// sorted order.
+    pub(crate) fn as_json(&self) -> Value {
+        Value::Object(
+            self.lists
+                .iter()
+                .map(|(name, list)| {
+                    let body = serde_json::json!({
+                        "values": list.values,
+                        "patterns": list.patterns,
+                    });
+                    (name.clone(), body)
+                })
+                .collect(),
+        )
     }
 }
 
@@ -106,8 +172,8 @@ fn shape(list: &str, entry: V1ListEntry) -> Result<Shape, LoadError> {
     }
 }
 
-/// Fold string items to upper case, rejecting any other YAML type.
-fn fold_items(
+/// The string items, as written, rejecting any other YAML type.
+fn string_items(
     list: &str,
     field: ListField,
     items: Option<&[Value]>,
@@ -116,7 +182,7 @@ fn fold_items(
         .into_iter()
         .flatten()
         .map(|item| match item {
-            Value::String(s) => Ok(s.to_ascii_uppercase()),
+            Value::String(s) => Ok(s.clone()),
             other => Err(LoadError::ListValueNotString {
                 list: list.to_string(),
                 field,
@@ -127,8 +193,8 @@ fn fold_items(
 }
 
 fn build_list(list: &str, body: &V1ListBody) -> Result<ValueList, LoadError> {
-    let values = fold_items(list, ListField::Values, body.values.as_deref())?;
-    let patterns = fold_items(list, ListField::Patterns, body.patterns.as_deref())?;
+    let values = string_items(list, ListField::Values, body.values.as_deref())?;
+    let patterns = string_items(list, ListField::Patterns, body.patterns.as_deref())?;
     if let Some(bad) = patterns.iter().find(|p| p.chars().all(|c| c == '*')) {
         return Err(LoadError::InvalidListPattern {
             list: list.to_string(),

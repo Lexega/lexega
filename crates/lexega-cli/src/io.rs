@@ -152,18 +152,26 @@ fn fetch_uri(uri: &str) -> Result<String, Box<dyn std::error::Error>> {
         return Ok(String::from_utf8(output.stdout)?);
     }
 
-    // HTTPS URL: Use curl for pre-signed URLs and public endpoints
+    // A web address: a pre-signed URL or a public endpoint.
     if is_web_uri(uri) {
-        let output = Command::new("curl")
-            .args(["-sS", "-f", uri])
-            .output()
-            .map_err(|e| format!("Failed to execute 'curl'. Is curl installed? {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("curl failed for '{}': {}", uri, stderr).into());
+        let response = shared_http_client()
+            .send(&HttpRequest {
+                method: HttpMethod::Get,
+                url: uri,
+                headers: &[],
+                body: None,
+                timeout: None,
+                body_limit: None,
+            })
+            .map_err(|e| format!("Cannot fetch '{}': {}", uri, e))?;
+        let status = response.status;
+        if !(200..=299).contains(&status) {
+            return Err(format!("Cannot fetch '{}': HTTP {}", uri, status).into());
         }
-        return Ok(String::from_utf8(output.stdout)?);
+        let body = response
+            .read_body()
+            .map_err(|e| format!("Cannot fetch '{}': {}", uri, e))?;
+        return Ok(String::from_utf8(body)?);
     }
 
     // Default: local file path
@@ -636,6 +644,159 @@ pub fn write_uri(uri: &str, content: &str) -> Result<(), Box<dyn std::error::Err
     fs::write(uri, content).map_err(|e| format!("Failed to write '{}': {}", uri, e).into())
 }
 
+/// What [`write_new_uri`] found at its URI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewObject {
+    /// Nothing was there, and the content now is.
+    Written,
+    /// Something was already there, and is left as it was.
+    AlreadyThere,
+}
+
+/// Write `content` at `uri` only where nothing is there yet: an object or
+/// file already at `uri` is never replaced. The schemes are those of
+/// [`write_uri`]; S3 takes a conditional write, Cloud Storage `cp -n`, and
+/// Azure an upload that does not overwrite.
+pub fn write_new_uri(uri: &str, content: &str) -> Result<NewObject, Box<dyn std::error::Error>> {
+    if is_web_uri(uri) {
+        return Err(format!("'{}' is a web address; nothing is written to one", uri).into());
+    }
+    let staged_path = |staged: &StagedUpload| -> Result<String, Box<dyn std::error::Error>> {
+        let file = staged.write("object", content.as_bytes())?;
+        Ok(file
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "Temp file path is not valid UTF-8 (cannot pass to the CLI): {}",
+                    file.display()
+                )
+            })?
+            .to_string())
+    };
+
+    if let Some(path) = uri.strip_prefix("s3://") {
+        let (bucket, key) = path
+            .split_once('/')
+            .ok_or_else(|| format!("Invalid S3 URI '{}': expected s3://bucket/key", uri))?;
+        let staged = StagedUpload::new()?;
+        let file = staged_path(&staged)?;
+        let output = Command::new("aws")
+            .args([
+                "s3api",
+                "put-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--body",
+                &file,
+                "--if-none-match",
+                "*",
+            ])
+            .output()
+            .map_err(|e| {
+                format!(
+                    "Failed to execute 'aws s3api put-object'. Is AWS CLI installed? {}",
+                    e
+                )
+            })?;
+        if output.status.success() {
+            return Ok(NewObject::Written);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("PreconditionFailed") || stderr.contains("(412)") {
+            return Ok(NewObject::AlreadyThere);
+        }
+        return Err(format!("aws s3api put-object failed for '{}': {}", uri, stderr).into());
+    }
+
+    if uri.starts_with("gs://") {
+        let staged = StagedUpload::new()?;
+        let file = staged_path(&staged)?;
+        let output = Command::new("gsutil")
+            .args(["cp", "-n", &file, uri])
+            .output()
+            .map_err(|e| {
+                format!(
+                    "Failed to execute 'gsutil cp'. Is Google Cloud SDK installed? {}",
+                    e
+                )
+            })?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(format!("gsutil cp -n failed for '{}': {}", uri, stderr).into());
+        }
+        return Ok(if stderr.contains("Skipping existing item") {
+            NewObject::AlreadyThere
+        } else {
+            NewObject::Written
+        });
+    }
+
+    if let Some(path) = uri.strip_prefix("az://") {
+        let (container, blob_path) = path.split_once('/').ok_or_else(|| {
+            format!(
+                "Invalid Azure URI '{}': expected az://container/blob/path",
+                uri
+            )
+        })?;
+        let staged = StagedUpload::new()?;
+        let file = staged_path(&staged)?;
+        let output = Command::new("az")
+            .args([
+                "storage",
+                "blob",
+                "upload",
+                "--container-name",
+                container,
+                "--name",
+                blob_path,
+                "--file",
+                &file,
+                "--overwrite",
+                "false",
+                "--no-progress",
+            ])
+            .output()
+            .map_err(|e| {
+                format!(
+                    "Failed to execute 'az storage blob upload'. Is Azure CLI installed? {}",
+                    e
+                )
+            })?;
+        if output.status.success() {
+            return Ok(NewObject::Written);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("BlobAlreadyExists") || stderr.contains("already exists") {
+            return Ok(NewObject::AlreadyThere);
+        }
+        return Err(format!("az storage blob upload failed for '{}': {}", uri, stderr).into());
+    }
+
+    let path = Path::new(uri);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory '{}': {}", parent.display(), e))?;
+        }
+    }
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(content.as_bytes())
+                .map_err(|e| format!("Failed to write '{}': {}", uri, e))?;
+            Ok(NewObject::Written)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(NewObject::AlreadyThere),
+        Err(e) => Err(format!("Failed to write '{}': {}", uri, e).into()),
+    }
+}
+
 /// Whether `uri` is a web address, which inputs are fetched from and
 /// outputs are never written to.
 pub(crate) fn is_web_uri(uri: &str) -> bool {
@@ -717,6 +878,200 @@ impl Drop for StagedUpload {
     fn drop(&mut self) {
         // Nothing to report: a directory already gone is the aim.
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The method of an HTTP request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+/// One HTTP request.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpRequest<'a> {
+    pub method: HttpMethod,
+    pub url: &'a str,
+    /// Header fields, each a name and its value.
+    pub headers: &'a [(&'a str, &'a str)],
+    pub body: Option<&'a [u8]>,
+    /// The longest the whole exchange may take; `None` sets no limit.
+    pub timeout: Option<std::time::Duration>,
+    /// The most body bytes read before reading fails; `None` sets no limit.
+    pub body_limit: Option<u64>,
+}
+
+/// Makes HTTP requests. TLS is rustls's, certificates are checked against
+/// the operating system's store, and requests go through the proxy that
+/// `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` names (HTTP or SOCKS), except
+/// for the hosts `NO_PROXY` lists and for this machine, which is always
+/// reached directly. Redirects are not followed. Clones share one pool of
+/// kept-alive connections.
+#[derive(Clone)]
+pub struct HttpClient {
+    /// Through the environment's proxy, when one is named.
+    proxied: ureq::Agent,
+    /// For this machine: a proxy would carry its traffic elsewhere.
+    direct: ureq::Agent,
+}
+
+/// How long making a connection may take.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Default for HttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HttpClient {
+    pub fn new() -> Self {
+        Self::with_proxy(ureq::Proxy::try_from_env())
+    }
+
+    fn with_proxy(proxy: Option<ureq::Proxy>) -> Self {
+        HttpClient {
+            proxied: Self::agent(proxy),
+            direct: Self::agent(None),
+        }
+    }
+
+    fn agent(proxy: Option<ureq::Proxy>) -> ureq::Agent {
+        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+        let tls = TlsConfig::builder()
+            .provider(TlsProvider::Rustls)
+            .root_certs(RootCerts::PlatformVerifier)
+            .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .build();
+        ureq::Agent::config_builder()
+            .tls_config(tls)
+            .proxy(proxy)
+            // A status is the caller's to judge.
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+            .user_agent(concat!("lexega/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .new_agent()
+    }
+
+    /// Send `request` and return once the response's status and headers
+    /// have arrived.
+    pub fn send(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
+        let agent = if is_this_machine(request.url) {
+            &self.direct
+        } else {
+            &self.proxied
+        };
+        let response = match request.method {
+            HttpMethod::Get => self.without_body(agent.get(request.url), request),
+            HttpMethod::Delete => self.without_body(agent.delete(request.url), request),
+            HttpMethod::Post => self.with_body(agent.post(request.url), request),
+            HttpMethod::Put => self.with_body(agent.put(request.url), request),
+            HttpMethod::Patch => self.with_body(agent.patch(request.url), request),
+        }
+        .map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let (parts, body) = response.into_parts();
+        let body = match request.body_limit {
+            Some(limit) => body.into_with_config().limit(limit).reader(),
+            None => body.into_reader(),
+        };
+        Ok(HttpResponse {
+            status,
+            headers: parts.headers,
+            body,
+        })
+    }
+
+    fn without_body(
+        &self,
+        mut builder: ureq::RequestBuilder<ureq::typestate::WithoutBody>,
+        request: &HttpRequest<'_>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        // Names go out as written: some servers compare them by case.
+        for (name, value) in request.headers {
+            builder = builder.header_raw(name, value.as_bytes());
+        }
+        if let Some(timeout) = request.timeout {
+            builder = builder.config().timeout_global(Some(timeout)).build();
+        }
+        builder.call()
+    }
+
+    fn with_body(
+        &self,
+        mut builder: ureq::RequestBuilder<ureq::typestate::WithBody>,
+        request: &HttpRequest<'_>,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        // Names go out as written: some servers compare them by case.
+        for (name, value) in request.headers {
+            builder = builder.header_raw(name, value.as_bytes());
+        }
+        if let Some(timeout) = request.timeout {
+            builder = builder.config().timeout_global(Some(timeout)).build();
+        }
+        builder.send(request.body.unwrap_or_default())
+    }
+}
+
+/// Whether `url` names this machine: `localhost` or a loopback address.
+fn is_this_machine(url: &str) -> bool {
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// One client for the process, so its requests share kept-alive
+/// connections.
+pub fn shared_http_client() -> &'static HttpClient {
+    static CLIENT: std::sync::OnceLock<HttpClient> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(HttpClient::new)
+}
+
+/// A response whose status and headers have arrived. Reading it reads the
+/// body as it arrives.
+pub struct HttpResponse {
+    pub status: u16,
+    headers: ureq::http::HeaderMap,
+    body: ureq::BodyReader<'static>,
+}
+
+impl HttpResponse {
+    /// The value of the header `name`, matched without regard to case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    /// The whole body.
+    pub fn read_body(mut self) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut body = Vec::new();
+        self.body
+            .read_to_end(&mut body)
+            .map_err(|e| format!("cannot read the response body: {}", e))?;
+        Ok(body)
+    }
+}
+
+impl std::io::Read for HttpResponse {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.body.read(buf)
     }
 }
 
@@ -1821,6 +2176,20 @@ pub fn load_custom_rules(uri: &str) -> Result<lexega_core::rules::LoadedRuleset,
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_write_never_replaces_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("day/record.json");
+        let uri = path.to_str().unwrap();
+        assert_eq!(write_new_uri(uri, "first").unwrap(), NewObject::Written);
+        assert_eq!(
+            write_new_uri(uri, "second").unwrap(),
+            NewObject::AlreadyThere
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        assert!(write_new_uri("https://example.com/x", "x").is_err());
+    }
     use super::*;
 
     /// One table, declared with a quoted mixed-case name.
@@ -1980,6 +2349,84 @@ mod tests {
         assert_eq!(
             column_tags(catalogs.current().expect("loaded index")),
             ["pii"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    #[test]
+    fn this_machine_is_localhost_or_a_loopback_address() {
+        for url in [
+            "http://localhost:8080/mcp",
+            "http://LOCALHOST/",
+            "http://127.0.0.1/",
+            "http://127.9.9.9:1/x",
+            "http://[::1]:9000/mcp",
+        ] {
+            assert!(is_this_machine(url), "{url}");
+        }
+        for url in [
+            "https://example.com/",
+            "http://127.0.0.1.example.com/",
+            "http://localhost.example.com/",
+            "http://10.0.0.1/",
+            "not a url",
+        ] {
+            assert!(!is_this_machine(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn this_machine_is_reached_directly_whatever_the_proxy() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 && line != "\r\n" {
+                line.clear();
+            }
+            (&stream)
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        // A proxy that notes each connection and closes it.
+        let proxy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let proxied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&proxied);
+        std::thread::spawn(move || {
+            for stream in proxy_listener.incoming() {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{proxy_port}")).unwrap();
+        let client = HttpClient::with_proxy(Some(proxy));
+        let get = |url: &str| {
+            client.send(&HttpRequest {
+                method: HttpMethod::Get,
+                url,
+                headers: &[],
+                body: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+                body_limit: None,
+            })
+        };
+        let local = get(&format!("http://127.0.0.1:{port}/")).expect("reached directly");
+        assert_eq!(local.read_body().unwrap(), b"ok");
+        assert_eq!(proxied.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(get("http://lexega.invalid/").is_err());
+        assert_eq!(
+            proxied.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "another host goes through the proxy"
         );
     }
 }

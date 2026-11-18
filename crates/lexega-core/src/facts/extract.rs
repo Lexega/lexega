@@ -301,6 +301,7 @@ pub(crate) fn minimal_ddl_statement(
         ),
     });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: project_ir_ddl_action(plan.action),
         object_kind: ObjectKind::Generic,
         target,
@@ -419,6 +420,8 @@ pub(crate) fn minimal_ddl_statement(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -468,6 +471,8 @@ pub fn project_privilege_statement(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -
     };
     let privilege = project_privilege_facts(plan, ctx);
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -526,19 +531,19 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
             grantees,
         } => {
             let (privs, all_privileges) = project_privilege_set(privileges);
-            // PrivilegeFacts.target is single-valued in the public schema
-            // (a customer contract).
-            // For the single-object case (Snowflake / Databricks / MSSQL /
-            // MySQL / BigQuery) project the head object. Empty `objects`
-            // (MSSQL `GRANT CONTROL SERVER`) yields `target = None`.
-            // A multi-object PG grant projects its first object — rule
-            // predicates that read `target` still see one of the affected
-            // objects.
+            // `target` is the first object, `targets` every one (PostgreSQL
+            // `ON TABLE a, b`). Empty `objects` (MSSQL `GRANT CONTROL
+            // SERVER`) yields neither.
             let (target, on_future, on_all, target_plural_kind) = match objects.first() {
                 Some(obj) => project_object_target(obj, ctx.source),
                 None => (None, false, false, None),
             };
+            let targets: Vec<ObjectRef> = objects
+                .iter()
+                .filter_map(|obj| project_object_target(obj, ctx.source).0)
+                .collect();
             PrivilegeFacts {
+                targets,
                 kind,
                 privileges: privs,
                 target,
@@ -562,6 +567,7 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
             role_name_span,
             grantee,
         } => PrivilegeFacts {
+            targets: Vec::new(),
             kind,
             privileges: Vec::new(),
             target: Some(role_target(*role_name_span, ctx.source)),
@@ -581,6 +587,7 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
             role_name_span,
             grantee,
         } => PrivilegeFacts {
+            targets: Vec::new(),
             kind,
             privileges: Vec::new(),
             target: Some(database_role_target(*role_name_span, ctx.source)),
@@ -604,6 +611,7 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
             let (target, on_future, on_all, target_plural_kind) =
                 project_object_target(object, ctx.source);
             PrivilegeFacts {
+                targets: Vec::new(),
                 kind,
                 privileges: vec![Privilege::Ownership],
                 target,
@@ -624,6 +632,7 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
             }
         }
         PrivilegeShape::Unparsed { .. } => PrivilegeFacts {
+            targets: Vec::new(),
             kind,
             privileges: Vec::new(),
             target: None,
@@ -641,17 +650,18 @@ fn project_privilege_facts(plan: &PrivilegePlan, ctx: &CatalogCtx<'_>) -> Privil
         },
         PrivilegeShape::Deny {
             privileges,
-            object: _,
+            object,
             grantees,
         } => {
             let (privs, all_privileges) = project_privilege_set(privileges);
-            // DENY's optional ON clause is span-only at the IR layer
-            // today — no DNY-* rule predicates on the securable's
-            // class or name. `target: None` regardless of presence.
+            let target = object
+                .as_ref()
+                .and_then(|object| project_object_target(object, ctx.source).0);
             PrivilegeFacts {
+                targets: Vec::new(),
                 kind,
                 privileges: privs,
-                target: None,
+                target,
                 grantees: grantees
                     .iter()
                     .map(|g| project_grantee(g, ctx.source))
@@ -977,20 +987,7 @@ fn span_to_ident_name(span: Span, source: &str) -> IdentName {
 }
 
 fn parse_table_ref(span: Span, source: &str) -> TableRef {
-    let raw = span_slice(span, source).trim();
-    let parts = crate::ir::lower_ddl::split_qualified(raw);
-    let (database, schema, name) = match parts.as_slice() {
-        [n] => (None, None, n.clone()),
-        [s, n] => (None, Some(s.clone()), n.clone()),
-        [d, s, n] => (Some(d.clone()), Some(s.clone()), n.clone()),
-        _ => (None, None, raw.to_string()),
-    };
-    TableRef::new(
-        IdentName::new(name),
-        schema.map(IdentName::new),
-        database.map(IdentName::new),
-        Some(span),
-    )
+    qualified_name_to_table_ref(span_slice(span, source).trim(), Some(span))
 }
 
 /// Build a public `StatementFacts` directly from a lowered
@@ -1079,6 +1076,7 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
         // Populated by the COPY INTO <location> dispatch, which has the
         // catalog / cross-script registry needed to resolve the source's taint.
         exported_columns: Vec::new(),
+        path: None,
     };
     // COPY INTO LOCATION moves data rather than altering schema; emit
     // `DdlAction::BulkLoad` (the same variant as the inverse
@@ -1086,6 +1084,7 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
     // `kind: copy_into_location` for statement-type filtering, not
     // `ddl.action`, so this stays consistent with rule authoring.
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             StageAction::Create => DdlAction::Create,
             StageAction::Alter => DdlAction::Alter,
@@ -1096,16 +1095,18 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
             StageAction::CopyToTable => DdlAction::BulkLoad,
         },
         object_kind: ObjectKind::Stage,
-        // Same `DdlTarget` → `ObjectRef` projection the generic DDL path
-        // applies, so `COPY INTO <table>` keeps the loaded table as its target.
+        // The stage a CREATE, ALTER or DROP STAGE names or `COPY INTO @stage`
+        // unloads to; the table a COPY loads.
         target: plan.target.as_ref().map(|t| ObjectRef {
-            kind: ObjectKind::Generic,
-            name: TableRef::new(
-                IdentName::new(t.name.clone()),
-                t.schema.clone().map(IdentName::new),
-                t.db.clone().map(IdentName::new),
-                Some(t.span),
-            ),
+            kind: match plan.action {
+                StageAction::Create
+                | StageAction::Alter
+                | StageAction::Drop
+                | StageAction::CopyToLocation => ObjectKind::Stage,
+                StageAction::Load | StageAction::CopyToTable => ObjectKind::Table,
+                StageAction::Unload => ObjectKind::Generic,
+            },
+            name: ddl_target_name(t),
         }),
         options: DdlOptions {
             or_replace: plan.or_replace,
@@ -1182,6 +1183,8 @@ fn project_stage_statement(plan: &StagePlan, source: &str) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -1315,16 +1318,17 @@ fn project_storage_credential_statement(
         comment_url_password_literals: password_literals(&plan.comment_url_password_literals),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             StorageCredentialAction::Create => DdlAction::Create,
             StorageCredentialAction::Alter => DdlAction::Alter,
             StorageCredentialAction::Drop => DdlAction::Drop,
         },
-        // No `ObjectKind::StorageCredential` exists yet in the public
-        // identity taxonomy — use `Generic` and let the typed
-        // `storage_credential` projection carry the family identity.
-        object_kind: ObjectKind::Generic,
-        target: None,
+        object_kind: ObjectKind::StorageCredential,
+        target: plan.target.as_ref().map(|t| ObjectRef {
+            kind: ObjectKind::StorageCredential,
+            name: ddl_target_name(t),
+        }),
         options: DdlOptions::default(),
         alter_changes: Vec::new(),
         stage: None,
@@ -1397,6 +1401,8 @@ fn project_storage_credential_statement(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -1527,6 +1533,7 @@ fn project_dynamic_table_statement(plan: &DynamicTablePlan) -> StatementFacts {
         masking_policy_removed: plan.alter_flags.masking_policy_removed,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             DynamicTableAction::Create => DdlAction::Create,
             DynamicTableAction::Alter => DdlAction::Alter,
@@ -1623,6 +1630,8 @@ fn project_dynamic_table_statement(plan: &DynamicTablePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -1693,6 +1702,7 @@ fn project_table_alter_action(a: IrTableAlterAction) -> TableAlterAction {
             };
             TableAlterAction::RowLevelSecurity { mode }
         }
+        IrTableAlterAction::SwapWith => TableAlterAction::SwapWith,
     }
 }
 
@@ -1790,6 +1800,7 @@ fn project_table_statement(plan: &TablePlan) -> StatementFacts {
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             TableAction::Create => DdlAction::Create,
             TableAction::Alter => DdlAction::Alter,
@@ -1890,6 +1901,8 @@ fn project_table_statement(plan: &TablePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -1975,6 +1988,7 @@ pub fn derive_facts_from_table_maintenance_plan(
         }),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Maintenance,
         object_kind: ObjectKind::Table,
         target: target_ref.map(|name| ObjectRef {
@@ -2053,6 +2067,8 @@ pub fn derive_facts_from_table_maintenance_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2124,6 +2140,7 @@ fn project_pipe_statement(plan: &PipePlan) -> StatementFacts {
         refreshed: plan.alter_flags.refreshed,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             PipeAction::Create => DdlAction::Create,
             PipeAction::Alter => DdlAction::Alter,
@@ -2216,6 +2233,8 @@ fn project_pipe_statement(plan: &PipePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2286,6 +2305,7 @@ pub fn derive_facts_from_network_rule_plan(plan: &NetworkRulePlan, source: &str)
         properties_unset: plan.unset_property_names.clone(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             NetworkRuleAction::Create => DdlAction::Create,
             NetworkRuleAction::Alter => DdlAction::Alter,
@@ -2373,6 +2393,8 @@ pub fn derive_facts_from_network_rule_plan(plan: &NetworkRulePlan, source: &str)
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2447,6 +2469,7 @@ pub fn derive_facts_from_resource_monitor_plan(
         no_suspend_trigger,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ResourceMonitorAction::Create => DdlAction::Create,
             ResourceMonitorAction::Alter => DdlAction::Alter,
@@ -2534,6 +2557,8 @@ pub fn derive_facts_from_resource_monitor_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2606,6 +2631,7 @@ pub fn derive_facts_from_compute_pool_plan(plan: &ComputePoolPlan, source: &str)
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ComputePoolAction::Create => DdlAction::Create,
             ComputePoolAction::Alter => DdlAction::Alter,
@@ -2696,6 +2722,8 @@ pub fn derive_facts_from_compute_pool_plan(plan: &ComputePoolPlan, source: &str)
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2768,6 +2796,7 @@ pub fn derive_facts_from_git_repository_plan(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             GitRepositoryAction::Create => DdlAction::Create,
             GitRepositoryAction::Alter => DdlAction::Alter,
@@ -2858,6 +2887,8 @@ pub fn derive_facts_from_git_repository_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -2915,6 +2946,7 @@ pub fn derive_facts_from_external_function_plan(
         response_translator: plan.response_translator.clone(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Create,
         object_kind: ObjectKind::Function,
         target: plan.target.as_ref().map(|t| ObjectRef {
@@ -3034,6 +3066,7 @@ pub fn derive_facts_from_image_repository_plan(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ImageRepositoryAction::Create => DdlAction::Create,
             ImageRepositoryAction::Alter => DdlAction::Alter,
@@ -3124,6 +3157,8 @@ pub fn derive_facts_from_image_repository_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3190,6 +3225,7 @@ pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, source: &str) -> S
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             StreamlitAction::Create => DdlAction::Create,
             StreamlitAction::Alter => DdlAction::Alter,
@@ -3279,6 +3315,8 @@ pub fn derive_facts_from_streamlit_plan(plan: &StreamlitPlan, source: &str) -> S
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3348,6 +3386,7 @@ pub fn derive_facts_from_service_plan(plan: &ServicePlan, source: &str) -> State
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ServiceAction::Create => DdlAction::Create,
             ServiceAction::Alter => DdlAction::Alter,
@@ -3437,6 +3476,8 @@ pub fn derive_facts_from_service_plan(plan: &ServicePlan, source: &str) -> State
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3503,6 +3544,7 @@ pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, source: &str) -> Sta
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             NotebookAction::Create => DdlAction::Create,
             NotebookAction::Alter => DdlAction::Alter,
@@ -3592,6 +3634,8 @@ pub fn derive_facts_from_notebook_plan(plan: &NotebookPlan, source: &str) -> Sta
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3666,6 +3710,7 @@ pub fn derive_facts_from_semantic_view_plan(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             SemanticViewAction::Create => DdlAction::Create,
             SemanticViewAction::Alter => DdlAction::Alter,
@@ -3755,6 +3800,8 @@ pub fn derive_facts_from_semantic_view_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3825,6 +3872,7 @@ pub fn derive_facts_from_cortex_search_service_plan(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             CortexSearchServiceAction::Create => DdlAction::Create,
             CortexSearchServiceAction::Alter => DdlAction::Alter,
@@ -3915,6 +3963,8 @@ pub fn derive_facts_from_cortex_search_service_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -3980,6 +4030,7 @@ pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, source: &str) 
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ApplicationAction::Create => DdlAction::Create,
             ApplicationAction::Alter => DdlAction::Alter,
@@ -4067,6 +4118,8 @@ pub fn derive_facts_from_application_plan(plan: &ApplicationPlan, source: &str) 
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -4123,6 +4176,7 @@ pub fn derive_facts_from_application_package_plan(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ApplicationAction::Create => DdlAction::Create,
             ApplicationAction::Alter => DdlAction::Alter,
@@ -4210,6 +4264,8 @@ pub fn derive_facts_from_application_package_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -4275,6 +4331,7 @@ pub fn derive_facts_from_listing_plan(plan: &ListingPlan, source: &str) -> State
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ListingAction::Create => DdlAction::Create,
             ListingAction::Alter => DdlAction::Alter,
@@ -4362,6 +4419,8 @@ pub fn derive_facts_from_listing_plan(plan: &ListingPlan, source: &str) -> State
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -4438,19 +4497,36 @@ pub fn derive_facts_from_org_account_plan(plan: &OrgAccountPlan, source: &str) -
     statement_facts_with_ddl(kind, plan.span, Some(ddl))
 }
 
-/// Build a public `StatementFacts` from a lowered [`StageFileCommandPlan`].
-/// Recognition only — the operation kind drives the rules (GET = exfil).
+/// Build a public `StatementFacts` from a lowered [`StageFileCommandPlan`]:
+/// the stage a `PUT`, `GET`, `REMOVE` or `LIST` names as `ddl.target`, and
+/// the path within it as `ddl.stage.path`. `PUT` and `GET` move files in
+/// and out (`bulk_load`, as `COPY` does), `REMOVE` deletes files and keeps
+/// the stage (`truncate`), `LIST` reads its listing (`configure`, as `SHOW`
+/// does).
 pub fn derive_facts_from_stage_file_command_plan(
     plan: &StageFileCommandPlan,
-    _source: &str,
+    source: &str,
 ) -> StatementFacts {
-    let kind = match plan.operation {
-        StageFileOperation::Put => StatementKind::StagePut,
-        StageFileOperation::Get => StatementKind::StageGet,
-        StageFileOperation::Remove => StatementKind::StageRemove,
-        StageFileOperation::List => StatementKind::StageList,
+    let (kind, action) = match plan.operation {
+        StageFileOperation::Put => (StatementKind::StagePut, DdlAction::BulkLoad),
+        StageFileOperation::Get => (StatementKind::StageGet, DdlAction::BulkLoad),
+        StageFileOperation::Remove => (StatementKind::StageRemove, DdlAction::Truncate),
+        StageFileOperation::List => (StatementKind::StageList, DdlAction::Configure),
     };
-    statement_facts_with_ddl(kind, plan.span, None)
+    let target = plan.target.as_ref().map(|t| ObjectRef {
+        kind: ObjectKind::Stage,
+        name: ddl_target_name(t),
+    });
+    let mut ddl = DdlFacts::bare(action, ObjectKind::Stage, target);
+    ddl.stage = Some(StageDdlFacts {
+        path: plan.path.and_then(|span| {
+            source
+                .get(span.start as usize..span.end as usize)
+                .map(|text| super::identity::WrittenText::at(text.to_string(), span))
+        }),
+        ..StageDdlFacts::default()
+    });
+    statement_facts_with_ddl(kind, plan.span, Some(ddl))
 }
 
 /// Shared DdlFacts builder for account-provisioning statements.
@@ -4462,6 +4538,7 @@ fn account_provisioning_ddl(
     source: &str,
 ) -> DdlFacts {
     DdlFacts {
+        targets: Vec::new(),
         action: match action {
             AccountProvisioningAction::Create => DdlAction::Create,
             AccountProvisioningAction::Drop => DdlAction::Drop,
@@ -4556,6 +4633,8 @@ fn statement_facts_with_ddl(
     ddl: Option<DdlFacts>,
 ) -> StatementFacts {
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(span),
         query: None,
@@ -4613,6 +4692,7 @@ pub fn derive_facts_from_secret_plan(plan: &SecretPlan, source: &str) -> Stateme
         properties_unset: plan.unset_property_names.clone(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             SecretAction::Create => DdlAction::Create,
             SecretAction::Alter => DdlAction::Alter,
@@ -4700,6 +4780,8 @@ pub fn derive_facts_from_secret_plan(plan: &SecretPlan, source: &str) -> Stateme
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -4758,6 +4840,7 @@ pub fn derive_facts_from_share_plan(plan: &SharePlan, source: &str) -> Statement
         has_unknown_clauses: plan.has_unknown_clauses,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ShareAction::Create => DdlAction::Create,
             ShareAction::Alter => DdlAction::Alter,
@@ -4845,6 +4928,8 @@ pub fn derive_facts_from_share_plan(plan: &SharePlan, source: &str) -> Statement
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -4945,6 +5030,7 @@ fn project_tag_statement(plan: &TagPlan) -> StatementFacts {
     }
 
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             TagAction::Create | TagAction::Undrop => DdlAction::Create,
             TagAction::Alter => DdlAction::Alter,
@@ -5037,6 +5123,8 @@ fn project_tag_statement(plan: &TagPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -5099,6 +5187,7 @@ fn project_file_format_statement(plan: &FileFormatPlan) -> StatementFacts {
     };
 
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             FileFormatAction::Create => DdlAction::Create,
             FileFormatAction::Alter => DdlAction::Alter,
@@ -5191,6 +5280,8 @@ fn project_file_format_statement(plan: &FileFormatPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -5257,6 +5348,7 @@ fn project_session_statement(plan: &SessionPlan) -> StatementFacts {
     };
 
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Alter,
         object_kind: ObjectKind::Session,
         target: None,
@@ -5333,6 +5425,8 @@ fn project_session_statement(plan: &SessionPlan) -> StatementFacts {
     };
 
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::AlterSession,
         source_span: Some(plan.span),
         query: None,
@@ -5369,26 +5463,17 @@ fn project_session_statement(plan: &SessionPlan) -> StatementFacts {
     }
 }
 
-/// Split a dotted `db.schema.name` string into a [`TableRef`].
-/// Quoted segments are preserved as written.
+/// The [`TableRef`] a dotted `[server.]db.schema.name` string names, each
+/// part as written: a dot inside quotes separates nothing, and a quoted
+/// path is read as its parts where the dialect reads it so (BigQuery).
 fn qualified_name_to_table_ref(raw: &str, span: Option<Span>) -> TableRef {
-    let parts: Vec<&str> = raw.split('.').collect();
-    match parts.as_slice() {
-        [n] => TableRef::new(IdentName::new((*n).to_string()), None, None, span),
-        [s, n] => TableRef::new(
-            IdentName::new((*n).to_string()),
-            Some(IdentName::new((*s).to_string())),
-            None,
-            span,
-        ),
-        [d, s, n] => TableRef::new(
-            IdentName::new((*n).to_string()),
-            Some(IdentName::new((*s).to_string())),
-            Some(IdentName::new((*d).to_string())),
-            span,
-        ),
-        _ => TableRef::new(IdentName::new(raw.to_string()), None, None, span),
-    }
+    let parts = crate::ir::lower_ddl::relation_parts_written(raw);
+    let mut qualifiers = parts.iter().rev().map(|part| IdentName::new(part.as_str()));
+    let name = qualifiers.next().unwrap_or_else(|| IdentName::new(raw));
+    let schema = qualifiers.next();
+    let database = qualifiers.next();
+    let server = qualifiers.next();
+    TableRef::new(name, schema, database, span).with_server(server)
 }
 
 // ---------------------------------------------------------------------------
@@ -5412,6 +5497,7 @@ fn project_stream_statement(plan: &StreamPlan) -> StatementFacts {
         insert_only: plan.create_flags.insert_only,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             StreamAction::Create => DdlAction::Create,
             StreamAction::Drop => DdlAction::Drop,
@@ -5503,6 +5589,8 @@ fn project_stream_statement(plan: &StreamPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -5587,6 +5675,7 @@ fn project_datashare_statement(plan: &DatasharePlan) -> StatementFacts {
     };
 
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             DatashareAction::Create => DdlAction::Create,
             DatashareAction::Alter => DdlAction::Alter,
@@ -5679,6 +5768,8 @@ fn project_datashare_statement(plan: &DatasharePlan) -> StatementFacts {
     };
 
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -5792,6 +5883,7 @@ fn project_schema_statement(plan: &SchemaPlan) -> StatementFacts {
                     && crate::ir::normalize::dialect_in_force().drop_schema_drops_contents())),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             SchemaAction::Create => DdlAction::Create,
             SchemaAction::Alter => DdlAction::Alter,
@@ -5886,6 +5978,8 @@ fn project_schema_statement(plan: &SchemaPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -5970,6 +6064,7 @@ fn project_catalog_statement(plan: &CatalogPlan) -> StatementFacts {
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             CatalogAction::Create => DdlAction::Create,
             CatalogAction::Alter => DdlAction::Alter,
@@ -6063,6 +6158,8 @@ fn project_catalog_statement(plan: &CatalogPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -6157,6 +6254,7 @@ fn project_volume_statement(plan: &VolumePlan) -> StatementFacts {
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             VolumeAction::Create => DdlAction::Create,
             VolumeAction::Alter => DdlAction::Alter,
@@ -6252,6 +6350,8 @@ fn project_volume_statement(plan: &VolumePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -6333,6 +6433,7 @@ fn project_external_location_statement(
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ExternalLocationAction::Create => DdlAction::Create,
             ExternalLocationAction::Alter => DdlAction::Alter,
@@ -6419,6 +6520,8 @@ fn project_external_location_statement(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -6495,6 +6598,7 @@ fn project_connection_statement(plan: &ConnectionPlan, source: &str) -> Statemen
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ConnectionAction::Create => DdlAction::Create,
             ConnectionAction::Alter => DdlAction::Alter,
@@ -6582,6 +6686,8 @@ fn project_connection_statement(plan: &ConnectionPlan, source: &str) -> Statemen
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -6657,6 +6763,7 @@ fn project_external_data_source_statement(plan: &ExternalDataSourcePlan) -> Stat
         pushdown: plan.pushdown,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: ddl_action,
         object_kind: ObjectKind::Generic,
         target: Some(ObjectRef {
@@ -6744,6 +6851,8 @@ fn project_external_data_source_statement(plan: &ExternalDataSourcePlan) -> Stat
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: None,
@@ -6801,6 +6910,7 @@ fn project_foreign_server_statement(plan: &ForeignServerPlan) -> StatementFacts 
         ForeignServerAction::Alter => (StatementKind::AlterForeignServer, DdlAction::Alter),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: ddl_action,
         object_kind: ObjectKind::Generic,
         target: Some(ObjectRef {
@@ -6887,6 +6997,8 @@ fn project_foreign_server_statement(plan: &ForeignServerPlan) -> StatementFacts 
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -6937,6 +7049,7 @@ fn project_server_configuration_statement(plan: &ServerConfigurationPlan) -> Sta
         subsystem: plan.subsystem.clone(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Alter,
         object_kind: ObjectKind::Generic,
         target: None,
@@ -7012,6 +7125,8 @@ fn project_server_configuration_statement(plan: &ServerConfigurationPlan) -> Sta
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::AlterServerConfiguration,
         source_span: Some(plan.span),
         query: None,
@@ -7103,14 +7218,10 @@ fn project_event_statement(plan: &EventPlan) -> StatementFacts {
     };
     let target = plan.name.as_ref().map(|name| ObjectRef {
         kind: ObjectKind::Generic,
-        name: TableRef::new(
-            IdentName::new(name.clone()),
-            None,
-            None,
-            Some(plan.name_span),
-        ),
+        name: qualified_name_to_table_ref(name, Some(plan.name_span)),
     });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: ddl_action,
         object_kind: ObjectKind::Generic,
         target,
@@ -7186,6 +7297,8 @@ fn project_event_statement(plan: &EventPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -7255,14 +7368,10 @@ fn project_trigger_create_statement(plan: &TriggerCreatePlan) -> StatementFacts 
     // DDL object so name-scoped rules see it.
     let target = plan.target_table.as_ref().map(|name| ObjectRef {
         kind: ObjectKind::Trigger,
-        name: TableRef::new(
-            IdentName::new(name.clone()),
-            None,
-            None,
-            Some(plan.target_table_span),
-        ),
+        name: qualified_name_to_table_ref(name, Some(plan.target_table_span)),
     });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Create,
         object_kind: ObjectKind::Trigger,
         target,
@@ -7338,6 +7447,8 @@ fn project_trigger_create_statement(plan: &TriggerCreatePlan) -> StatementFacts 
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::CreateMysqlTrigger,
         source_span: Some(plan.span),
         query: None,
@@ -7396,14 +7507,10 @@ fn project_mysql_load_data_statement(plan: &MysqlLoadDataPlan) -> StatementFacts
     };
     let target = plan.target_table.as_ref().map(|name| ObjectRef {
         kind: ObjectKind::Table,
-        name: TableRef::new(
-            IdentName::new(name.clone()),
-            None,
-            None,
-            plan.target_table_span,
-        ),
+        name: qualified_name_to_table_ref(name, plan.target_table_span),
     });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::BulkLoad,
         object_kind: ObjectKind::Table,
         target,
@@ -7479,6 +7586,8 @@ fn project_mysql_load_data_statement(plan: &MysqlLoadDataPlan) -> StatementFacts
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MysqlLoadData,
         source_span: Some(plan.span),
         query: None,
@@ -7541,6 +7650,7 @@ pub fn derive_facts_from_foreign_table_plan(
         _ => (None, None, plan.name.clone()),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Create,
         object_kind: ObjectKind::ExternalTable,
         target: Some(ObjectRef {
@@ -7627,6 +7737,8 @@ pub fn derive_facts_from_foreign_table_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::CreateForeignTable,
         source_span: Some(plan.span),
         query: None,
@@ -7691,6 +7803,7 @@ pub fn derive_facts_from_import_foreign_schema_plan(
         options_present: plan.options_present,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Create,
         object_kind: ObjectKind::Generic,
         target: Some(ObjectRef {
@@ -7774,6 +7887,8 @@ pub fn derive_facts_from_import_foreign_schema_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::ImportForeignSchema,
         source_span: Some(plan.span),
         query: None,
@@ -7847,6 +7962,7 @@ fn project_user_mapping_statement(plan: &UserMappingPlan) -> StatementFacts {
         UserMappingAction::Drop => (StatementKind::DropUserMapping, DdlAction::Drop),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: ddl_action,
         object_kind: ObjectKind::Generic,
         target: Some(ObjectRef {
@@ -7934,6 +8050,8 @@ fn project_user_mapping_statement(plan: &UserMappingPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -7981,6 +8099,7 @@ fn project_flow_statement(plan: &FlowPlan) -> StatementFacts {
         FlowAction::Create => StatementKind::CreateFlow,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             FlowAction::Create => DdlAction::Create,
         },
@@ -8058,6 +8177,8 @@ fn project_flow_statement(plan: &FlowPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -8121,6 +8242,8 @@ fn project_use_statement(plan: &UsePlan) -> StatementFacts {
     });
     let use_facts = UseFacts { kind, target };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::Use,
         source_span: Some(plan.span),
         query: None,
@@ -8189,12 +8312,41 @@ pub fn derive_facts_from_comment_on(
         "SEQUENCE" => CommentTargetKind::Sequence,
         _ => CommentTargetKind::Other,
     };
+    // The object commented on; for a column, its table.
+    let (object_kind, of_column) = match target_kind {
+        CommentTargetKind::Column => (ObjectKind::Table, true),
+        CommentTargetKind::Table => (ObjectKind::Table, false),
+        CommentTargetKind::Schema => (ObjectKind::Schema, false),
+        CommentTargetKind::Database => (ObjectKind::Database, false),
+        CommentTargetKind::Catalog => (ObjectKind::Catalog, false),
+        CommentTargetKind::Volume => (ObjectKind::Volume, false),
+        CommentTargetKind::Index => (ObjectKind::Index, false),
+        CommentTargetKind::Function => (ObjectKind::Function, false),
+        CommentTargetKind::Procedure => (ObjectKind::Procedure, false),
+        CommentTargetKind::View => (ObjectKind::View, false),
+        CommentTargetKind::Sequence => (ObjectKind::Sequence, false),
+        CommentTargetKind::Connection | CommentTargetKind::Other => (ObjectKind::Generic, false),
+    };
+    let target = match of_column {
+        true => crate::ir::lower_ddl::column_table_target(stmt.object_name, source),
+        false => crate::ir::lower_ddl::target_from(stmt.object_name, source),
+    };
+    let ddl = DdlFacts::bare(
+        DdlAction::Comment,
+        object_kind,
+        target.as_ref().map(|t| ObjectRef {
+            kind: object_kind,
+            name: ddl_target_name(t),
+        }),
+    );
     let comment = crate::facts::CommentOnFacts { target_kind };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::Comment,
         source_span: Some(stmt.span),
         query: None,
-        ddl: None,
+        ddl: Some(ddl),
         privilege: None,
         policy: None,
         algebra: AlgebraFacts::default(),
@@ -8227,8 +8379,237 @@ pub fn derive_facts_from_comment_on(
     }
 }
 
+/// A statement that runs, restores, maintains, prepares or alters an object
+/// it names, read by [`derive_facts_from_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// `CALL p(…)`.
+    Call,
+    UndropTable,
+    UndropSchema,
+    UndropDatabase,
+    UndropType,
+    /// PostgreSQL `ANALYZE [t]`, MySQL `ANALYZE TABLE t, …`.
+    Analyze,
+    /// PostgreSQL `CLUSTER [t]`.
+    Cluster,
+    /// MySQL `OPTIMIZE TABLE t, …`.
+    OptimizeTable,
+    /// MySQL `CHECK TABLE t, …`.
+    CheckTable,
+    /// MySQL `CHECKSUM TABLE t, …`.
+    ChecksumTable,
+    /// MySQL `REPAIR TABLE t, …`.
+    RepairTable,
+    /// `PREPARE name …`: a prepared statement made.
+    Prepare,
+    /// `EXECUTE name`: a prepared statement run.
+    Execute,
+    /// `DEALLOCATE [PREPARE] name`.
+    Deallocate,
+    /// T-SQL `CREATE VECTOR INDEX`.
+    CreateVectorIndex,
+    /// Snowflake `ALTER STREAM`.
+    AlterStream,
+    /// Snowflake `ALTER REPLICATION GROUP`.
+    AlterReplicationGroup,
+    /// Snowflake `ALTER FAILOVER GROUP`.
+    AlterFailoverGroup,
+    /// T-SQL `EXEC p …`.
+    MssqlExec,
+    /// `DESCRIBE <object>`: the object, of the kind its plan names.
+    Describe,
+    /// `OPEN`, `FETCH` or `CLOSE` of a cursor: the cursor.
+    OpenCursor,
+    FetchCursor,
+    CloseCursor,
+    /// PostgreSQL `LISTEN`, `NOTIFY` or `UNLISTEN`: the channel.
+    Listen,
+    Notify,
+    Unlisten,
+    /// `SAVEPOINT` or `RELEASE`: the savepoint.
+    Savepoint,
+}
+
+/// The facts of the statement of `kind` at `span`: what it does to the
+/// object it names, its DDL `plan`'s target.
+pub fn derive_facts_from_command(
+    kind: CommandKind,
+    span: Span,
+    plan: Option<&crate::ir::DdlPlan>,
+) -> StatementFacts {
+    let (stmt_kind, action, object_kind) = match kind {
+        CommandKind::Call => (
+            StatementKind::Call,
+            DdlAction::Execute,
+            ObjectKind::Procedure,
+        ),
+        CommandKind::UndropTable => (
+            StatementKind::UndropTable,
+            DdlAction::Restore,
+            ObjectKind::Table,
+        ),
+        CommandKind::UndropSchema => (
+            StatementKind::UndropSchema,
+            DdlAction::Restore,
+            ObjectKind::Schema,
+        ),
+        CommandKind::UndropDatabase => (
+            StatementKind::UndropDatabase,
+            DdlAction::Restore,
+            ObjectKind::Database,
+        ),
+        CommandKind::UndropType => (
+            StatementKind::UndropType,
+            DdlAction::Restore,
+            ObjectKind::PgType,
+        ),
+        CommandKind::Analyze => (
+            StatementKind::AnalyzeStmt,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::Cluster => (
+            StatementKind::PgCluster,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::OptimizeTable => (
+            StatementKind::OptimizeTable,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::CheckTable => (
+            StatementKind::CheckTable,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::ChecksumTable => (
+            StatementKind::ChecksumTable,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::RepairTable => (
+            StatementKind::RepairTable,
+            DdlAction::Maintenance,
+            ObjectKind::Table,
+        ),
+        CommandKind::Prepare => (
+            StatementKind::PgPrepare,
+            DdlAction::Create,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Execute => (
+            StatementKind::PgExecute,
+            DdlAction::Execute,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Deallocate => (
+            StatementKind::PgDeallocate,
+            DdlAction::Drop,
+            ObjectKind::Generic,
+        ),
+        CommandKind::CreateVectorIndex => (
+            StatementKind::MssqlCreateVectorIndex,
+            DdlAction::Create,
+            ObjectKind::Index,
+        ),
+        CommandKind::AlterStream => (
+            StatementKind::AlterStream,
+            DdlAction::Alter,
+            ObjectKind::Stream,
+        ),
+        CommandKind::AlterReplicationGroup => (
+            StatementKind::AlterReplicationGroup,
+            DdlAction::Alter,
+            ObjectKind::ReplicationGroup,
+        ),
+        CommandKind::AlterFailoverGroup => (
+            StatementKind::AlterFailoverGroup,
+            DdlAction::Alter,
+            ObjectKind::FailoverGroup,
+        ),
+        CommandKind::MssqlExec => (
+            StatementKind::MssqlExec,
+            DdlAction::Execute,
+            ObjectKind::Procedure,
+        ),
+        CommandKind::OpenCursor => (
+            StatementKind::OpenCursor,
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+        ),
+        CommandKind::FetchCursor => (
+            StatementKind::FetchCursor,
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+        ),
+        CommandKind::CloseCursor => (
+            StatementKind::CloseCursor,
+            DdlAction::ControlFlow,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Listen => (
+            StatementKind::PgListen,
+            DdlAction::Configure,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Notify => (
+            StatementKind::PgNotify,
+            DdlAction::Configure,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Unlisten => (
+            StatementKind::PgUnlisten,
+            DdlAction::Configure,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Savepoint => (
+            StatementKind::Savepoint,
+            DdlAction::Transaction,
+            ObjectKind::Generic,
+        ),
+        CommandKind::Describe => (
+            StatementKind::Describe,
+            DdlAction::Configure,
+            plan.map_or(ObjectKind::Generic, |plan| plan.object_kind),
+        ),
+    };
+    let target = plan
+        .and_then(|plan| plan.target.as_ref())
+        .map(|target| ObjectRef {
+            kind: object_kind,
+            name: ddl_target_name(target),
+        });
+    let mut facts = derive_facts_stmt_kind_only(stmt_kind, span);
+    facts.ddl = Some(DdlFacts::bare(action, object_kind, target));
+    facts
+}
+
+/// The DDL facts `plan` names: its action, `object_kind`, and its target as
+/// an object of that kind. For a family whose own facts name no object.
+pub(crate) fn ddl_of_plan(plan: &crate::ir::DdlPlan, object_kind: ObjectKind) -> DdlFacts {
+    let target = plan.target.as_ref().map(|target| ObjectRef {
+        kind: object_kind,
+        name: ddl_target_name(target),
+    });
+    DdlFacts::bare(project_ir_ddl_action(plan.action), object_kind, target)
+}
+
+/// The name a DDL target gives an object, as facts name it.
+pub(crate) fn ddl_target_name(target: &crate::ir::ddl_plan::DdlTarget) -> TableRef {
+    TableRef::new(
+        IdentName::new(target.name.clone()),
+        target.schema.clone().map(IdentName::new),
+        target.db.clone().map(IdentName::new),
+        Some(target.span),
+    )
+}
+
 pub fn derive_facts_stmt_kind_only(kind: StatementKind, span: Span) -> StatementFacts {
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(span),
         query: None,
@@ -8277,6 +8658,8 @@ pub fn derive_facts_dynamic_sql_stmt(
     call: DynamicSqlCall,
 ) -> StatementFacts {
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(span),
         query: None,
@@ -8381,6 +8764,8 @@ pub fn derive_facts_mssql_impersonation(
     impersonation: Option<crate::facts::ddl::ImpersonationFacts>,
 ) -> StatementFacts {
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(span),
         query: None,
@@ -8463,6 +8848,7 @@ pub fn derive_facts_from_pg_copy_plan(
             name: table_ref,
         };
         DdlFacts {
+            targets: Vec::new(),
             action,
             object_kind: ObjectKind::Table,
             target: Some(target_ref),
@@ -8539,6 +8925,8 @@ pub fn derive_facts_from_pg_copy_plan(
         }
     });
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::PgCopy,
         source_span: Some(plan.span),
         query: None,
@@ -8604,6 +8992,8 @@ pub fn derive_facts_from_backup_plan(
         encryption: plan.encryption,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlBackup,
         source_span: Some(plan.span),
         query: None,
@@ -8656,6 +9046,8 @@ pub fn derive_facts_from_dbcc_plan(
         command: plan.command.clone(),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlDbcc,
         source_span: Some(plan.span),
         query: None,
@@ -8736,6 +9128,8 @@ pub fn derive_facts_from_key_management_plan(
         password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlKeyManagement,
         source_span: Some(plan.span),
         query: None,
@@ -8803,10 +9197,22 @@ pub fn derive_facts_from_security_policy_plan(
         has_block_predicate: plan.has_block_predicate,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlSecurityPolicy,
         source_span: Some(plan.span),
         query: None,
-        ddl: None,
+        ddl: Some(DdlFacts::bare(
+            match plan.action {
+                AstAction::Create => DdlAction::Create,
+                AstAction::Alter => DdlAction::Alter,
+            },
+            ObjectKind::RowAccessPolicy,
+            plan.target.as_ref().map(|t| ObjectRef {
+                kind: ObjectKind::RowAccessPolicy,
+                name: ddl_target_name(t),
+            }),
+        )),
         privilege: None,
         policy: None,
         algebra: AlgebraFacts::default(),
@@ -8871,6 +9277,8 @@ pub fn derive_facts_from_key_backup_plan(
         password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlKeyBackup,
         source_span: Some(plan.span),
         query: None,
@@ -8938,6 +9346,8 @@ pub fn derive_facts_from_assembly_plan(
         from_file: plan.from_file,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlAssembly,
         source_span: Some(plan.span),
         query: None,
@@ -8999,10 +9409,20 @@ pub fn derive_facts_from_add_signature_plan(
         password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlAddSignature,
         source_span: Some(plan.span),
         query: None,
-        ddl: None,
+        // Signing a module changes what it may do.
+        ddl: Some(DdlFacts::bare(
+            DdlAction::Alter,
+            ObjectKind::Generic,
+            plan.target.as_ref().map(|t| ObjectRef {
+                kind: ObjectKind::Generic,
+                name: ddl_target_name(t),
+            }),
+        )),
         privilege: None,
         policy: None,
         algebra: AlgebraFacts::default(),
@@ -9064,6 +9484,8 @@ pub fn derive_facts_from_service_master_key_plan(
         password_literals: password_literals(&plan.password_literals),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlServiceMasterKey,
         source_span: Some(plan.span),
         query: None,
@@ -9166,6 +9588,8 @@ pub fn derive_facts_from_pg_default_privileges_plan(
         grant_option_for: plan.grant_option_for,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::PgDefaultPrivileges,
         source_span: Some(plan.span),
         query: None,
@@ -9229,6 +9653,8 @@ pub fn derive_facts_from_restore_plan(
         replace: plan.replace,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::MssqlRestore,
         source_span: Some(plan.span),
         query: None,
@@ -9295,6 +9721,7 @@ fn project_task_statement(plan: &TaskPlan) -> StatementFacts {
         actions,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             TaskAction::Create => DdlAction::Create,
             TaskAction::Alter => DdlAction::Alter,
@@ -9389,6 +9816,8 @@ fn project_task_statement(plan: &TaskPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -9495,6 +9924,7 @@ pub fn derive_facts_from_alert_plan(plan: &AlertPlan, _source: &str) -> Statemen
         actions,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             AlertAction::Create => DdlAction::Create,
             AlertAction::Alter => DdlAction::Alter,
@@ -9587,6 +10017,8 @@ pub fn derive_facts_from_alert_plan(plan: &AlertPlan, _source: &str) -> Statemen
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -9636,6 +10068,7 @@ pub fn derive_facts_from_data_metric_function_plan(
         secure: plan.is_secure,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             DataMetricFunctionAction::Create => DdlAction::Create,
             DataMetricFunctionAction::Drop => DdlAction::Drop,
@@ -9722,6 +10155,8 @@ pub fn derive_facts_from_data_metric_function_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -9792,6 +10227,7 @@ pub fn derive_facts_from_replication_failover_group_plan(
         has_replication_schedule: plan.has_replication_schedule,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ReplicationFailoverGroupAction::Create => DdlAction::Create,
             ReplicationFailoverGroupAction::Drop => DdlAction::Drop,
@@ -9878,6 +10314,8 @@ pub fn derive_facts_from_replication_failover_group_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -9926,6 +10364,7 @@ pub fn derive_facts_from_account_plan(plan: &AccountPlan, _source: &str) -> Stat
         parameters_unset: plan.parameters_unset.iter().map(to_param).collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: DdlAction::Alter,
         object_kind: ObjectKind::Account,
         target: None,
@@ -10001,6 +10440,8 @@ pub fn derive_facts_from_account_plan(plan: &AccountPlan, _source: &str) -> Stat
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::AlterAccount,
         source_span: Some(plan.span),
         query: None,
@@ -10096,6 +10537,7 @@ fn project_function_statement(plan: &FunctionPlan) -> StatementFacts {
         loadable_library: plan.loadable_library.clone(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             FunctionAction::Create => DdlAction::Create,
             FunctionAction::Alter => DdlAction::Alter,
@@ -10189,6 +10631,8 @@ fn project_function_statement(plan: &FunctionPlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -10323,6 +10767,8 @@ fn project_handler_statement(plan: &HandlerPlan) -> StatementFacts {
         body: project_handler_body(&plan.body),
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: StatementKind::DeclareHandler,
         source_span: Some(plan.span),
         query: None,
@@ -10401,6 +10847,7 @@ fn project_procedure_statement(plan: &ProcedurePlan) -> StatementFacts {
         runs_as: plan.runs_as.map(project_execute_as_mode),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             ProcedureAction::Create => DdlAction::Create,
             ProcedureAction::Alter => DdlAction::Alter,
@@ -10494,6 +10941,8 @@ fn project_procedure_statement(plan: &ProcedurePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -10786,6 +11235,7 @@ fn project_database_statement(plan: &DatabasePlan) -> StatementFacts {
             .collect(),
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             DatabaseAction::Create => DdlAction::Create,
             DatabaseAction::Alter => DdlAction::Alter,
@@ -10879,6 +11329,8 @@ fn project_database_statement(plan: &DatabasePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -10948,6 +11400,7 @@ fn project_warehouse_statement(plan: &WarehousePlan) -> StatementFacts {
         tag_unset: plan.alter_flags.tag_unset,
     };
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             WarehouseAction::Create => DdlAction::Create,
             WarehouseAction::Alter => DdlAction::Alter,
@@ -11040,6 +11493,8 @@ fn project_warehouse_statement(plan: &WarehousePlan) -> StatementFacts {
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -11104,6 +11559,8 @@ fn project_policy_attachment_statement(
     };
     let attachment = project_policy_attachment_facts(plan, source);
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -11328,6 +11785,7 @@ pub fn derive_facts_from_mssql_ddl_plan(
         .as_ref()
         .map(project_principal_options);
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action,
         object_kind,
         target,
@@ -11412,6 +11870,8 @@ pub fn derive_facts_from_mssql_ddl_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: None,
@@ -11664,6 +12124,7 @@ pub fn derive_facts_from_principal_plan(
         .as_ref()
         .map(project_principal_options);
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action,
         object_kind,
         target,
@@ -11744,6 +12205,8 @@ pub fn derive_facts_from_principal_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: None,
@@ -11987,8 +12450,50 @@ pub fn derive_facts_from_pg_ddl_plan(
     };
     // The plan read the target from its text, folding one that names no
     // relation: its name is read from the text again.
+    // `ALTER TABLE … TRIGGER` targets the table its triggers are on.
+    let target_kind = match kind {
+        PgDdlKind::AlterPgTableTriggerState => ObjectKind::Table,
+        PgDdlKind::CreateDomain
+        | PgDdlKind::AlterDomain
+        | PgDdlKind::DropDomain
+        | PgDdlKind::CreateExtension
+        | PgDdlKind::RefreshMatview
+        | PgDdlKind::Reindex
+        | PgDdlKind::CreateIndex
+        | PgDdlKind::CreateSynonym
+        | PgDdlKind::AlterIndex
+        | PgDdlKind::DoBlock
+        | PgDdlKind::CreatePgTrigger
+        | PgDdlKind::AlterPgTrigger
+        | PgDdlKind::DropPgTrigger
+        | PgDdlKind::DropPgIndex
+        | PgDdlKind::DropPgExtension
+        | PgDdlKind::CreatePgRole
+        | PgDdlKind::AlterPgRole
+        | PgDdlKind::DropPgRole
+        | PgDdlKind::PgSet
+        | PgDdlKind::PgDiscard
+        | PgDdlKind::CreatePgRule
+        | PgDdlKind::AlterPgRule
+        | PgDdlKind::DropPgRule
+        | PgDdlKind::PgDropOwned
+        | PgDdlKind::PgReassignOwned
+        | PgDdlKind::PgCreateTablespace
+        | PgDdlKind::PgAlterTablespace
+        | PgDdlKind::PgDropTablespace
+        | PgDdlKind::PgPublication
+        | PgDdlKind::PgSubscription
+        | PgDdlKind::PgAlterSystem
+        | PgDdlKind::PgLockTable
+        | PgDdlKind::PgDropSequence
+        | PgDdlKind::PgDropType
+        | PgDdlKind::CreateSequence
+        | PgDdlKind::AlterSequence
+        | PgDdlKind::CreateType
+        | PgDdlKind::AlterType => plan.object_kind,
+    };
     let target = plan.target.as_ref().map(|t| ObjectRef {
-        kind: ObjectKind::Generic,
+        kind: target_kind,
         name: parse_table_ref(t.span, source),
     });
     let domain = plan
@@ -12027,8 +12532,9 @@ pub fn derive_facts_from_pg_ddl_plan(
             action: project_ir_pg_session_action(detail.action),
         });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action,
-        object_kind: ObjectKind::Generic,
+        object_kind: plan.object_kind,
         target,
         options: DdlOptions {
             if_exists: plan.options.if_exists,
@@ -12115,6 +12621,8 @@ pub fn derive_facts_from_pg_ddl_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: None,
@@ -12483,6 +12991,7 @@ pub fn derive_facts_from_bq_ddl_plan(
             });
     let bq_options = plan.bq_options.as_ref().map(project_ir_bq_options);
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action,
         object_kind,
         target,
@@ -12563,6 +13072,8 @@ pub fn derive_facts_from_bq_ddl_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: bq_assert_query,
@@ -12860,6 +13371,7 @@ pub fn derive_facts_from_view_ddl_plan(
         ),
     });
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action,
         object_kind,
         target,
@@ -12942,6 +13454,8 @@ pub fn derive_facts_from_view_ddl_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind: stmt_kind,
         source_span: Some(plan.span),
         query: None,
@@ -13170,6 +13684,8 @@ pub fn project_query_statement(
     let source_span = outer_span.or_else(|| Some(plan.span()));
     let query_facts = project_query_facts(plan, bindings, derived_facts, ctx);
     StatementFacts {
+        declare: None,
+        call: None,
         kind: statement_kind_from_rel_plan(plan),
         source_span,
         query: Some(query_facts),
@@ -17106,6 +17622,14 @@ impl<'a, 'r> QueryWalker<'a, 'r> {
                 self.ctx.source,
                 self.bindings,
                 Some(self.reasoning),
+                crate::ir::always_true::RowsCounted::All,
+            ),
+            has_non_null_tautology_where: crate::ir::always_true::has_tautology_where(
+                plan,
+                self.ctx.source,
+                self.bindings,
+                Some(self.reasoning),
+                crate::ir::always_true::RowsCounted::ExceptNullCompared,
             ),
             has_limit: derived_facts.has_limit,
             has_qualify: derived_facts.has_qualify,
@@ -18108,12 +18632,7 @@ fn principal_source<'a>(
         }
         RelPlan::TableFunction { call, span, .. } => {
             call.called_function().map(|func| PrincipalSource {
-                name: PublicTableRef::new(
-                    resolved_func_name(func, functions),
-                    None,
-                    None,
-                    Some(*span),
-                ),
+                name: resolved_func_table_ref(func, functions, *span),
                 call: Some(call),
             })
         }
@@ -18938,6 +19457,32 @@ fn resolved_func_name(
     PublicIdentName::new(resolved_func_canonical_name(func, catalog))
 }
 
+/// The function `func` calls as a relation is named: each dotted part of
+/// its name a part of the reference (`dbo.fn` is schema `dbo`, name `fn`).
+fn resolved_func_table_ref(
+    func: &ResolvedFunc,
+    catalog: &crate::ir::FunctionCatalog,
+    span: Span,
+) -> PublicTableRef {
+    let written = resolved_func_canonical_name(func, catalog);
+    let parts = crate::ir::lower_ddl::split_qualified(&written);
+    let mut qualifiers = parts.iter().rev();
+    let name = qualifiers.next().map_or_else(
+        || PublicIdentName::new(written.as_str()),
+        |part| PublicIdentName::new(part.as_str()),
+    );
+    let schema = qualifiers
+        .next()
+        .map(|part| PublicIdentName::new(part.as_str()));
+    let database = qualifiers
+        .next()
+        .map(|part| PublicIdentName::new(part.as_str()));
+    let server = qualifiers
+        .next()
+        .map(|part| PublicIdentName::new(part.as_str()));
+    PublicTableRef::new(name, schema, database, Some(span)).with_server(server)
+}
+
 /// Catalog-derived classification of a function call: `(is_temporal,
 /// is_deterministic, is_aggregate, is_window)`. All `false` for an
 /// unresolved call — there is no catalog entry to flag — matching the
@@ -19159,6 +19704,7 @@ pub fn derive_facts_from_policy_plan(
     };
     let policy = project_policy_facts(plan, source);
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             PolicyAction::Create => DdlAction::Create,
             PolicyAction::Alter => DdlAction::Alter,
@@ -19244,6 +19790,8 @@ pub fn derive_facts_from_policy_plan(
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,
@@ -20568,14 +21116,14 @@ fn project_network_shape(s: &NetworkPolicyShape, source: &str) -> NetworkPolicyF
 }
 
 /// Project an `EXEC <proc>` call's typed argument list into
-/// [`MssqlExecArgFacts`] — the recognition primitive rules predicate on.
+/// [`CallArgumentFacts`] — the recognition primitive rules predicate on.
 /// Dialect-neutral: records each argument's (optional) named-parameter
 /// name and the typed shape of its value.
-pub(crate) fn project_mssql_exec_args(
+pub(crate) fn project_call_arguments(
     args: &[crate::ast::AstCallArg],
     source: &str,
-) -> Vec<crate::facts::ddl::MssqlExecArgFacts> {
-    use crate::facts::ddl::{MssqlExecArgFacts, MssqlExecArgValueKind};
+) -> Vec<crate::facts::ddl::CallArgumentFacts> {
+    use crate::facts::ddl::CallArgumentFacts;
     args.iter()
         .enumerate()
         .map(|(position, arg)| {
@@ -20586,47 +21134,8 @@ pub(crate) fn project_mssql_exec_args(
                     .trim_start_matches('@')
                     .to_ascii_lowercase()
             });
-            let (value_kind, value_literal, value_number) = match &arg.value {
-                AstExpr::Literal {
-                    literal: AstLiteral::String { span },
-                    ..
-                } => {
-                    let raw = source
-                        .get(span.start as usize..span.end as usize)
-                        .unwrap_or("");
-                    (
-                        MssqlExecArgValueKind::StringLiteral,
-                        Some(super::identity::WrittenText::at(
-                            literal_value_or_text(raw).to_ascii_lowercase(),
-                            *span,
-                        )),
-                        None,
-                    )
-                }
-                AstExpr::Literal {
-                    literal: AstLiteral::Number { span },
-                    ..
-                } => (
-                    MssqlExecArgValueKind::Number,
-                    None,
-                    source
-                        .get(span.start as usize..span.end as usize)
-                        .and_then(|raw| raw.trim().parse::<i64>().ok()),
-                ),
-                AstExpr::Literal {
-                    literal: AstLiteral::Money { .. },
-                    ..
-                } => (MssqlExecArgValueKind::Number, None, None),
-                AstExpr::Literal {
-                    literal: AstLiteral::Null { .. },
-                    ..
-                } => (MssqlExecArgValueKind::Null, None, None),
-                AstExpr::Ident { .. } | AstExpr::Placeholder { .. } => {
-                    (MssqlExecArgValueKind::Variable, None, None)
-                }
-                _ => (MssqlExecArgValueKind::Other, None, None),
-            };
-            MssqlExecArgFacts {
+            let (value_kind, value_literal, value_number) = value_shape(&arg.value, source);
+            CallArgumentFacts {
                 name,
                 position: u32::try_from(position).unwrap_or(u32::MAX),
                 value_kind,
@@ -20636,6 +21145,99 @@ pub(crate) fn project_mssql_exec_args(
             }
         })
         .collect()
+}
+
+/// The shape of the value `expr` writes, with a string literal's decoded
+/// text, lowercased, and an integer literal's number.
+fn value_shape(
+    expr: &AstExpr,
+    source: &str,
+) -> (
+    crate::facts::ddl::ValueKind,
+    Option<super::identity::WrittenText>,
+    Option<f64>,
+) {
+    use crate::facts::ddl::ValueKind;
+    match expr {
+        AstExpr::Literal {
+            literal: AstLiteral::String { span },
+            ..
+        } => {
+            let raw = source
+                .get(span.start as usize..span.end as usize)
+                .unwrap_or("");
+            (
+                ValueKind::StringLiteral,
+                Some(super::identity::WrittenText::at(
+                    literal_value_or_text(raw).to_ascii_lowercase(),
+                    *span,
+                )),
+                None,
+            )
+        }
+        AstExpr::Literal {
+            literal: AstLiteral::Number { span },
+            ..
+        } => (
+            ValueKind::Number,
+            None,
+            source
+                .get(span.start as usize..span.end as usize)
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+                .filter(|number| number.is_finite()),
+        ),
+        AstExpr::Literal {
+            literal: AstLiteral::Money { .. },
+            ..
+        } => (ValueKind::Number, None, None),
+        AstExpr::Literal {
+            literal: AstLiteral::Null { .. },
+            ..
+        } => (ValueKind::Null, None, None),
+        AstExpr::Ident { .. } | AstExpr::Placeholder { .. } => (ValueKind::Variable, None, None),
+        _ => (ValueKind::Other, None, None),
+    }
+}
+
+/// The variables of a `DECLARE`, `variables`, read from `source`.
+pub(crate) fn project_declare(
+    variables: &[crate::ast::AstDeclaredVariable],
+    source: &str,
+) -> crate::facts::ddl::DeclareFacts {
+    let text = |span: Span| source.get(span.start as usize..span.end as usize);
+    crate::facts::ddl::DeclareFacts {
+        variables: variables
+            .iter()
+            .map(|variable| crate::facts::ddl::DeclaredVariableFacts {
+                name: IdentName::new(text(variable.name.span).unwrap_or("")),
+                data_type: variable
+                    .type_span
+                    .and_then(text)
+                    .map(|written| written.trim().to_string()),
+                default: variable
+                    .default_expr
+                    .as_deref()
+                    .map(|expr| value_shape(expr, source).0),
+            })
+            .collect(),
+    }
+}
+
+/// The table variable a T-SQL `DECLARE @t TABLE (…)` makes: its name at
+/// `name`, its type the `TABLE` word at `table`.
+pub(crate) fn project_declare_table(
+    name: Span,
+    table: Span,
+    source: &str,
+) -> crate::facts::ddl::DeclareFacts {
+    let text = |span: Span| source.get(span.start as usize..span.end as usize);
+    crate::facts::ddl::DeclareFacts {
+        variables: vec![crate::facts::ddl::DeclaredVariableFacts {
+            name: IdentName::new(text(name).unwrap_or("")),
+            data_type: text(table).map(|written| written.trim().to_string()),
+            default: None,
+        }],
+    }
 }
 
 fn project_session_shape(s: &SessionPolicyShape) -> SessionPolicyFacts {
@@ -20770,6 +21372,7 @@ pub fn derive_facts_from_integration_plan(plan: &IntegrationPlan, source: &str) 
     };
     let integration = project_integration_facts(plan, source, target.clone());
     let ddl = DdlFacts {
+        targets: Vec::new(),
         action: match plan.action {
             IntegrationAction::Create => DdlAction::Create,
             IntegrationAction::Alter => DdlAction::Alter,
@@ -20854,6 +21457,8 @@ pub fn derive_facts_from_integration_plan(plan: &IntegrationPlan, source: &str) 
         trigger_body: None,
     };
     StatementFacts {
+        declare: None,
+        call: None,
         kind,
         source_span: Some(plan.span),
         query: None,

@@ -9,6 +9,7 @@
 use crate::ast::NodeId;
 use crate::context::node_metadata::TableRef;
 use crate::facts::statement::{StatementFacts, StatementKind};
+use crate::facts::ObjectKind;
 use crate::lexer::Span;
 use std::collections::{BTreeMap, HashSet};
 
@@ -376,6 +377,7 @@ pub fn classify_statement_kind(kind: StatementKind) -> StatementClassification {
         // observability statements (EXPORT / ASSERT / OPTIMIZE / VACUUM)
         K::Use
         | K::Show
+        | K::Describe
         | K::MssqlBackup
         | K::MssqlRestore
         | K::MssqlDbcc
@@ -403,6 +405,12 @@ pub fn classify_statement_kind(kind: StatementKind) -> StatementClassification {
         | K::Repeat
         | K::TryCatch
         | K::Block
+        | K::PipeChain
+        | K::MssqlWaitfor
+        | K::MssqlPrint
+        | K::MssqlThrow
+        | K::MssqlRaiserror
+        | K::MysqlDo
         | K::Declare
         | K::DeclareTable
         | K::DeclareCursor
@@ -461,6 +469,9 @@ pub struct StatementSemantics {
     /// Exactly one classification per statement
     pub classification: StatementClassification,
 
+    /// The statement's kind.
+    pub(crate) kind: StatementKind,
+
     /// Source span
     pub span: Span,
 
@@ -487,6 +498,25 @@ pub struct StatementSemantics {
 
     /// The object a DDL statement targets, of whatever kind.
     pub(crate) ddl_target: Option<TableRef>,
+
+    /// The statement is in the body of a routine, trigger, event, task or
+    /// rule, which the statement creating it defines and does not run.
+    pub defined: bool,
+    /// The kind of `ddl_target`, where the statement changes it: none
+    /// for a target the statement only reads.
+    pub(crate) changed_object_kind: Option<ObjectKind>,
+
+    /// The object whose privileges a GRANT, REVOKE or DENY changes, and
+    /// its kind.
+    pub(crate) privilege_target: Option<(ObjectKind, TableRef)>,
+
+    /// The objects after the first of a list the statement changes, with
+    /// their kinds (`DROP TABLE a, b`, `GRANT … ON a, b`).
+    pub(crate) further_objects: Vec<(ObjectKind, TableRef)>,
+
+    /// The routine, task or prepared statement the statement runs, and its
+    /// kind.
+    pub(crate) run_target: Option<(ObjectKind, TableRef)>,
 
     /// The tables of the three lists that an attached catalog is asked
     /// for, from every fact of the statement.
@@ -714,7 +744,16 @@ impl StatementLedger {
     /// classification (inner DML/DDL) still create entries, preserving
     /// their table-access projection; genuine top-level Opaque is never
     /// contained in a body region and still counts as skipped.
-    pub fn populate_from_fact(&mut self, fact: &StatementFacts, body_regions: &[Span]) {
+    ///
+    /// `defined_regions` are the bodies whose statements the script defines
+    /// and does not run: those of routines, triggers, events, tasks and
+    /// rules, not of a `DO` block.
+    pub fn populate_from_fact(
+        &mut self,
+        fact: &StatementFacts,
+        body_regions: &[Span],
+        defined_regions: &[Span],
+    ) {
         self.finalized = true;
         let classification = classify_statement_kind(fact.kind);
         let span = fact.source_span.unwrap_or(Span { start: 0, end: 0 });
@@ -762,8 +801,16 @@ impl StatementLedger {
                     | crate::facts::ObjectKind::ExternalTable
             )
         });
+        // The objects after the first of a list (`DROP TABLE a, b`).
+        let further_ddl: Vec<TableRef> = fact
+            .ddl
+            .iter()
+            .flat_map(|d| d.targets.iter().skip(1))
+            .map(|obj| facts_tableref_to_metadata(&obj.name))
+            .collect();
         let tables_modified_ddl: Vec<TableRef> = ddl_target
             .iter()
+            .chain(&further_ddl)
             .filter(|_| table_shaped)
             .cloned()
             .collect();
@@ -877,15 +924,73 @@ impl StatementLedger {
             });
         }
 
+        // Whether the target is changed follows from what the statement
+        // does to it, whatever else it reads.
+        let changes_target = fact.ddl.as_ref().is_some_and(|ddl| {
+            use crate::facts::DdlAction;
+            match ddl.action {
+                DdlAction::Create
+                | DdlAction::Alter
+                | DdlAction::Drop
+                | DdlAction::Rename
+                | DdlAction::Truncate
+                | DdlAction::Comment
+                | DdlAction::Refresh
+                // Vacuum, optimize, restore and repair rewrite a table;
+                // the few that only read it are counted with them.
+                | DdlAction::Maintenance
+                | DdlAction::BulkLoad
+                | DdlAction::Restore
+                | DdlAction::Grant
+                | DdlAction::Revoke => true,
+                DdlAction::Configure
+                | DdlAction::ControlFlow
+                | DdlAction::Transaction
+                | DdlAction::Backup
+                | DdlAction::Execute => false,
+            }
+        });
+        let changed_object_kind = ddl_object.map(|obj| obj.kind).filter(|_| changes_target);
+        // The routine, task or prepared statement it runs.
+        let run_target = fact
+            .ddl
+            .as_ref()
+            .filter(|ddl| ddl.action == crate::facts::DdlAction::Execute)
+            .and_then(|ddl| ddl.target.as_ref())
+            .map(|obj| (obj.kind, facts_tableref_to_metadata(&obj.name)));
+        let privilege_target = fact
+            .privilege
+            .as_ref()
+            .and_then(|p| p.target.as_ref())
+            .map(|obj| (obj.kind, facts_tableref_to_metadata(&obj.name)));
+        let changed_further = fact
+            .ddl
+            .iter()
+            .filter(|_| changes_target)
+            .flat_map(|d| d.targets.iter().skip(1));
+        let granted_further = fact.privilege.iter().flat_map(|p| p.targets.iter().skip(1));
+        let further_objects: Vec<(ObjectKind, TableRef)> = changed_further
+            .chain(granted_further)
+            .map(|obj| (obj.kind, facts_tableref_to_metadata(&obj.name)))
+            .collect();
+
         let semantics = StatementSemantics {
             classification,
+            kind: fact.kind,
             span,
+            defined: defined_regions
+                .iter()
+                .any(|r| span.start >= r.start && span.end <= r.end),
             has_where,
             has_tautology_where,
             tables_read,
             tables_written,
             tables_modified_ddl,
             ddl_target,
+            changed_object_kind,
+            privilege_target,
+            further_objects,
+            run_target,
             catalog_subjects,
         };
 
@@ -1040,7 +1145,50 @@ impl StatementLedger {
             .map(|t| shown(t).canonical())
             .collect();
 
+        // One subject per statement, in script order: the tables its DML
+        // writes, then the object its DDL changes and the object whose
+        // privileges it changes, each unless already named.
+        let subjects: Vec<StatementSubject> = self
+            .entries
+            .values()
+            .map(|s| {
+                let mut objects: Vec<SubjectObject> = s
+                    .tables_written_dml()
+                    .iter()
+                    .map(|t| SubjectObject {
+                        kind: ObjectKind::Table,
+                        name: crate::context::node_metadata::TableKey::of(&shown(t)).to_string(),
+                    })
+                    .collect();
+                let changed = s.changed_object_kind.zip(s.ddl_target.as_ref());
+                let granted = s
+                    .privilege_target
+                    .as_ref()
+                    .map(|(kind, target)| (*kind, target));
+                let further = s
+                    .further_objects
+                    .iter()
+                    .map(|(kind, target)| (*kind, target));
+                let run = s.run_target.as_ref().map(|(kind, target)| (*kind, target));
+                for (kind, target) in changed.into_iter().chain(granted).chain(further).chain(run) {
+                    let name =
+                        crate::context::node_metadata::TableKey::of(&shown(target)).to_string();
+                    if !objects.iter().any(|o| o.name == name) {
+                        objects.push(SubjectObject { kind, name });
+                    }
+                }
+                StatementSubject {
+                    kind: s.kind,
+                    objects,
+                    defined: s.defined,
+                    runs: Vec::new(),
+                    span: s.span,
+                }
+            })
+            .collect();
+
         DerivedMetrics {
+            subjects,
             tables_written,
             tables_read,
             ddl_operations,
@@ -1056,9 +1204,50 @@ impl StatementLedger {
     }
 }
 
+/// What one statement acts on: its kind and the objects it changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "StatementSubject"))]
+pub struct StatementSubject {
+    pub kind: StatementKind,
+    /// The objects the statement writes, creates, alters or drops, whose
+    /// privileges it grants, revokes or denies, or which it runs (a
+    /// procedure it calls, a task it executes). Empty for a statement that
+    /// acts on none, or none it names.
+    pub objects: Vec<SubjectObject>,
+    /// The statement is in the body of a procedure, function, trigger,
+    /// event, task or rule: the statement that creates that defines it,
+    /// and it runs only when that is called or fires.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defined: bool,
+    /// The statements of the SQL text this statement runs, where the text
+    /// is known: the body of an `EXECUTE IMMEDIATE` or of a procedure's
+    /// dynamic SQL.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<StatementSubject>,
+    /// Where the statement is in the analyzed text.
+    #[serde(skip)]
+    #[cfg_attr(feature = "schema", schemars(skip))]
+    pub span: Span,
+}
+
+/// An object a statement changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "schema", schemars(rename = "SubjectObject"))]
+pub struct SubjectObject {
+    pub kind: ObjectKind,
+    /// The name, each part folded as the dialect folds identifiers
+    /// (quotes removed, unquoted case folded), so two spellings of one
+    /// object name it alike; masked where a report masks it.
+    pub name: String,
+}
+
 /// All metrics derived from ledger (never stored in ledger)
 #[derive(Debug, Clone)]
 pub struct DerivedMetrics {
+    /// What each statement acts on, in script order.
+    pub subjects: Vec<StatementSubject>,
     pub tables_written: HashSet<String>,
     pub tables_read: HashSet<String>,
     pub ddl_operations: usize,
@@ -1098,8 +1287,13 @@ impl MetricsCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::CatalogSubject;
+    use super::{
+        classify_statement_kind, CatalogSubject, StatementLedger, StatementSemantics,
+        StatementSubject, SubjectObject,
+    };
+    use crate::ast::NodeId;
     use crate::context::node_metadata::TableRef;
+    use crate::facts::{ObjectKind, StatementKind};
     use crate::lexer::Span;
 
     fn subject(at: u32, created: bool, statement: Span) -> CatalogSubject {
@@ -1136,6 +1330,108 @@ mod tests {
             .iter()
             .zip(expected)
             .all(|(got, want)| std::ptr::eq(*got, want)));
+    }
+
+    /// A ledger of one statement of `kind` at `span` that writes `written`
+    /// and whose DDL changes `changed`.
+    fn ledger_of(
+        kind: StatementKind,
+        span: Span,
+        written: Vec<TableRef>,
+        changed: Option<(ObjectKind, TableRef)>,
+    ) -> StatementLedger {
+        let mut ledger = StatementLedger::new();
+        ledger.add_statement(
+            NodeId::new(span.start),
+            StatementSemantics {
+                classification: classify_statement_kind(kind),
+                kind,
+                span,
+                defined: false,
+                has_where: true,
+                has_tautology_where: false,
+                tables_read: Vec::new(),
+                tables_written: written,
+                tables_modified_ddl: Vec::new(),
+                changed_object_kind: changed.as_ref().map(|(kind, _)| *kind),
+                ddl_target: changed.map(|(_, target)| target),
+                privilege_target: None,
+                further_objects: Vec::new(),
+                run_target: None,
+                catalog_subjects: Vec::new(),
+            },
+        );
+        ledger
+    }
+
+    fn table_at(name: &str, span: Span) -> TableRef {
+        TableRef {
+            server: None,
+            db: Some("db".to_string()),
+            schema: None,
+            name: name.to_string(),
+            span: Some(span),
+        }
+    }
+
+    #[test]
+    fn a_subject_names_a_masked_object_masked() {
+        let _folding = crate::ir::normalize::default_folding();
+        let statement = Span { start: 0, end: 40 };
+        let name = Span { start: 12, end: 20 };
+        let ledger = ledger_of(
+            StatementKind::Delete,
+            statement,
+            vec![table_at("orders", name)],
+            None,
+        );
+        let subject = |masked: bool| ledger.derive_metrics_masking(&|_| masked).subjects;
+        assert_eq!(
+            subject(false),
+            vec![StatementSubject {
+                kind: StatementKind::Delete,
+                objects: vec![SubjectObject {
+                    kind: ObjectKind::Table,
+                    name: "DB.ORDERS".to_string(),
+                }],
+                defined: false,
+                runs: Vec::new(),
+                span: statement,
+            }]
+        );
+        // Each part is masked.
+        assert_eq!(
+            subject(true)[0].objects[0].name,
+            format!("{0}.{0}", crate::facts::MASKED_VALUE)
+        );
+    }
+
+    #[test]
+    fn a_subject_names_an_object_once_and_a_changed_ddl_target_by_its_kind() {
+        let _folding = crate::ir::normalize::default_folding();
+        let statement = Span { start: 0, end: 40 };
+        let name = Span { start: 12, end: 20 };
+        let both = ledger_of(
+            StatementKind::Insert,
+            statement,
+            vec![table_at("t", name)],
+            Some((ObjectKind::Table, table_at("t", name))),
+        );
+        assert_eq!(both.derive_metrics().subjects[0].objects.len(), 1);
+
+        let dropped = ledger_of(
+            StatementKind::DropView,
+            statement,
+            Vec::new(),
+            Some((ObjectKind::View, table_at("v", name))),
+        );
+        assert_eq!(
+            dropped.derive_metrics().subjects[0].objects,
+            vec![SubjectObject {
+                kind: ObjectKind::View,
+                name: "DB.V".to_string(),
+            }]
+        );
     }
 
     #[test]

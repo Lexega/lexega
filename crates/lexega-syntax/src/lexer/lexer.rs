@@ -237,6 +237,20 @@ static KEYWORDS: phf::Map<&'static str, Keyword> = phf_map! {
 };
 
 /// Lexer mode for handling SQL vs. Jinja tokenization.
+/// What a block comment's body read as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockComment {
+    /// A comment, closed.
+    Closed(TriviaKind),
+    /// Ran to the end of the text with its `*/` unmatched.
+    Unterminated,
+    /// The opening marker of a MySQL executable comment; its content is SQL.
+    Executable,
+    /// Closed, but holding a `/*` in a dialect whose comments may or may not
+    /// nest, so where it ends is not known.
+    Unreadable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexMode {
     /// Standard SQL tokenization.
@@ -292,6 +306,9 @@ pub struct Lexer<'src> {
     /// an `Unknown` token (instead of swallowing the rest of the file as a
     /// comment) so the parser surfaces it as unparsed content.
     unterminated_comment: Option<Span>,
+    /// Inside a MySQL executable comment, between its opening marker and
+    /// its `*/`.
+    executable_comment: bool,
     /// Where the dialect writes a `$$…$$` string as words: the offset of the
     /// `$$` that closes the string an opening `$$` began, which no word,
     /// quote or comment inside the string reads past.
@@ -361,6 +378,7 @@ impl<'src> Lexer<'src> {
             jinja_tag_first: false,
             dollar_bodies: Vec::new(),
             unterminated_comment: None,
+            executable_comment: false,
             dollar_words_close: None,
             dollar_quotes: Vec::new(),
             client_delimiter: None,
@@ -420,33 +438,50 @@ impl<'src> Lexer<'src> {
     /// Consume a block comment body after the opening `/*` has already been consumed.
     /// Handles:
     /// - Nested block comments (`/* ... /* ... */ ... */`) when the dialect supports them
-    /// - MySQL version comments (`/*! ... */`) detection
-    ///
-    /// Returns `(kind, terminated)`. `terminated` is false when the scan reached
-    /// the end of the lexable region with the `*/` still unmatched (`depth > 0`).
-    fn consume_block_comment_body(&mut self) -> (TriviaKind, bool) {
-        // Detect MySQL version comment: /*! ... */ or /*!NNNNN ... */
-        let trivia_kind =
-            if self.dialect.supports_version_comments() && matches!(self.peek_char(), Some('!')) {
-                TriviaKind::MysqlVersionComment
-            } else {
-                TriviaKind::BlockComment
+    /// - MySQL executable comments (`/*! ... */`), whose opening marker alone
+    ///   is consumed: the text after it is SQL
+    /// - A dialect whose comments may or may not nest: a body holding `/*`
+    ///   is unreadable
+    fn consume_block_comment_body(&mut self) -> BlockComment {
+        if self.dialect.supports_version_comments() {
+            let marker = match (self.peek_char(), self.peek_next_char()) {
+                (Some('!'), _) => Some(1),
+                (Some('M'), Some('!')) => Some(2),
+                _ => None,
             };
+            if let Some(len) = marker {
+                for _ in 0..len {
+                    self.bump();
+                }
+                // The server version the content needs, which it is read
+                // as meeting.
+                while matches!(self.peek_char(), Some(c) if c.is_ascii_digit()) {
+                    self.bump();
+                }
+                return BlockComment::Executable;
+            }
+        }
 
         let nesting = self.dialect.supports_nested_block_comments();
+        let ambiguous = self.dialect.block_comment_nesting_unknown();
+        let mut holds_opener = false;
         let start = self.current_pos();
         let mut depth: u32 = 1;
         while let Some(c) = self.peek_char() {
             // Inside a `$$` string written as words, the text ends at its
             // closer, which ends the comment's text too.
             if self.at_dollar_words_close(start) {
-                return (trivia_kind, true);
+                return BlockComment::Closed(TriviaKind::BlockComment);
             }
-            if c == '/' && nesting {
+            if c == '/' && (nesting || ambiguous) {
                 self.bump();
                 if let Some('*') = self.peek_char() {
                     self.bump();
-                    depth += 1;
+                    if nesting {
+                        depth += 1;
+                    } else {
+                        holds_opener = true;
+                    }
                     continue;
                 }
                 continue;
@@ -466,7 +501,33 @@ impl<'src> Lexer<'src> {
             self.bump();
         }
 
-        (trivia_kind, depth == 0)
+        match (depth == 0, holds_opener) {
+            (false, _) => BlockComment::Unterminated,
+            (true, true) => BlockComment::Unreadable,
+            (true, false) => BlockComment::Closed(TriviaKind::BlockComment),
+        }
+    }
+
+    /// At the `*/` that closes the executable comment being read: consume
+    /// it and return its trivia.
+    fn take_executable_close(&mut self) -> Option<Trivia> {
+        if !(self.executable_comment
+            && self.peek_char() == Some('*')
+            && self.peek_next_char() == Some('/'))
+        {
+            return None;
+        }
+        let start = self.current_pos();
+        self.bump();
+        self.bump();
+        self.executable_comment = false;
+        Some(Trivia {
+            kind: TriviaKind::MysqlVersionComment,
+            span: Span {
+                start,
+                end: self.current_pos(),
+            },
+        })
     }
 
     fn peek_char(&self) -> Option<char> {
@@ -729,6 +790,10 @@ impl<'src> Lexer<'src> {
             if self.is_eof() {
                 break;
             }
+            if let Some(close) = self.take_executable_close() {
+                trivia.push(close);
+                continue;
+            }
 
             let start = self.current_pos();
             let ch = match self.peek_char() {
@@ -834,7 +899,10 @@ impl<'src> Lexer<'src> {
             if ch == '/' {
                 // C-style line comment "// ..." (Snowflake supports this)
                 // EXCEPTION: Inside Jinja expressions {{ }}, "//" is floor division operator, not comment
-                if let Some('/') = self.peek_next_char() {
+                if let (Some('/'), true) = (
+                    self.peek_next_char(),
+                    self.dialect.slash_slash_is_line_comment(),
+                ) {
                     // Only treat as comment if:
                     // 1. We're in regular SQL (mode = Sql), OR
                     // 2. We're in Jinja statement mode {% %} (where SQL can appear)
@@ -877,17 +945,30 @@ impl<'src> Lexer<'src> {
                     self.bump(); // consume /
                     self.bump(); // consume *
 
-                    let (comment_kind, terminated) = self.consume_block_comment_body();
+                    let body = self.consume_block_comment_body();
 
                     let end = self.current_pos();
-                    if !terminated && self.mode == LexMode::Sql && self.dollar_bodies.is_empty() {
-                        // Ran to EOF with no closing `*/`. Record the span; the
-                        // next SQL-token step emits it as an Unknown token so the
-                        // parser surfaces it as unparsed content instead of the
-                        // rest of the file vanishing into a comment.
-                        self.unterminated_comment = Some(Span { start, end });
-                        break;
-                    }
+                    let comment_kind = match body {
+                        BlockComment::Closed(kind) => kind,
+                        BlockComment::Executable => {
+                            self.executable_comment = true;
+                            TriviaKind::MysqlVersionComment
+                        }
+                        BlockComment::Unterminated | BlockComment::Unreadable
+                            if self.mode == LexMode::Sql && self.dollar_bodies.is_empty() =>
+                        {
+                            // Ran to EOF with no closing `*/`, or cannot be read
+                            // one way. Record the span; the next SQL-token step
+                            // emits it as an Unknown token so the parser surfaces
+                            // it as unparsed content instead of text vanishing
+                            // into a comment.
+                            self.unterminated_comment = Some(Span { start, end });
+                            break;
+                        }
+                        BlockComment::Unterminated | BlockComment::Unreadable => {
+                            TriviaKind::BlockComment
+                        }
+                    };
                     trivia.push(Trivia {
                         kind: comment_kind,
                         span: Span { start, end },
@@ -3714,6 +3795,10 @@ impl<'src> Lexer<'src> {
             if self.is_eof() {
                 break;
             }
+            if let Some(close) = self.take_executable_close() {
+                trivia.push(close);
+                continue;
+            }
             let start = self.current_pos();
             let ch = match self.peek_char() {
                 Some(c) => c,
@@ -3750,16 +3835,28 @@ impl<'src> Lexer<'src> {
                     self.bump(); // consume '/'
                     self.bump(); // consume '*'
 
-                    let (trivia_kind, terminated) = self.consume_block_comment_body();
+                    let body = self.consume_block_comment_body();
 
                     let end = self.current_pos();
-                    if !terminated && self.mode == LexMode::Sql && self.dollar_bodies.is_empty() {
-                        // Unterminated: hand it to the next SQL-token step as an
-                        // Unknown token rather than swallowing the rest of the file
-                        // as trailing trivia on the current token.
-                        self.unterminated_comment = Some(Span { start, end });
-                        break;
-                    }
+                    let trivia_kind = match body {
+                        BlockComment::Closed(kind) => kind,
+                        BlockComment::Executable => {
+                            self.executable_comment = true;
+                            TriviaKind::MysqlVersionComment
+                        }
+                        BlockComment::Unterminated | BlockComment::Unreadable
+                            if self.mode == LexMode::Sql && self.dollar_bodies.is_empty() =>
+                        {
+                            // Hand it to the next SQL-token step as an Unknown
+                            // token rather than letting text vanish as trailing
+                            // trivia on the current token.
+                            self.unterminated_comment = Some(Span { start, end });
+                            break;
+                        }
+                        BlockComment::Unterminated | BlockComment::Unreadable => {
+                            TriviaKind::BlockComment
+                        }
+                    };
                     trivia.push(Trivia {
                         kind: trivia_kind,
                         span: Span { start, end },

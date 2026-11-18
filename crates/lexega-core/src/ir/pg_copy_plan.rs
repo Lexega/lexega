@@ -98,12 +98,9 @@ fn lower_pg_copy_subject_table(
     if start >= end || end > source.len() {
         return None;
     }
-    let raw = &source[start..end];
-    let parts: Vec<String> = raw
-        .split('.')
-        .map(|p| p.trim().trim_matches('"').to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
+    // Each part as written: a quoted part keeps its quotes, so folding
+    // keeps its case.
+    let parts = crate::ir::lower_ddl::relation_parts_written(&source[start..end]);
     let len = parts.len();
     if len == 0 {
         return None;

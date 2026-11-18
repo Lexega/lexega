@@ -4,6 +4,26 @@
 describe behaviour visible to users of the crate: what parses, what the AST
 carries, and how formatting changes.
 
+## 3.1.0
+
+### Changed
+
+- `//` starts a line comment only where `Dialect::slash_slash_is_line_comment` is true (Snowflake); elsewhere it is two `/` tokens.
+- In MySQL, an executable comment (`/*!`, `/*!NNNNN`, MariaDB `/*M!`) is lexed as its markers, `TriviaKind::MysqlVersionComment` trivia for the opener and for the `*/`, and the SQL between them as tokens.
+- Databricks block comments nest. A block comment holding `/*` in a dialect whose `Dialect::block_comment_nesting_unknown` is true (Redshift) is lexed as an `Unknown` token.
+
+### Breaking
+
+- `SyntaxCte` has a new field, `materialized`.
+- `BodyRole` has a new variant, `Pipe`: `AstStmt::bodies` gives a pipe chain's statements (`a ->> b`) as a body.
+
+### Added
+
+- `Dialect::slash_slash_is_line_comment` and `Dialect::block_comment_nesting_unknown`, both false by default.
+- `SyntaxCte::materialized`: PostgreSQL's `[NOT] MATERIALIZED` tokens, which `WITH x AS [NOT] MATERIALIZED (…)` now parses with.
+- A privilege's column list (`SELECT (a, b)`) is part of its span, and SQL Server's `ON t (a, b)` securable parses; such grants read as typed grants, not `Unparsed`.
+- `AstAlterTableActionKind::DropColumnMask` also holds SQL Server's `ALTER COLUMN … DROP MASKED`.
+
 ## 3.0.0
 
 More SQL parses, object names are read one way everywhere, and the tree records more of what a statement writes. The breaking changes are to struct literals and exhaustive `match`es on the tree.

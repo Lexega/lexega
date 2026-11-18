@@ -156,9 +156,18 @@ pub struct QueryFacts {
     /// Convenience properties — outer-scope-only (equivalent to
     /// `scopes[0].<property>`).
     pub has_where: bool,
-    /// Outer-scope WHERE clause contains at least one tautology subexpression (e.g. `1=1`, `TRUE`).
+    /// The predicate that bounds the statement (an `UPDATE` / `DELETE`
+    /// `WHERE`, a `MERGE … ON`, the outer scope's `WHERE`) holds on every
+    /// row: `1 = 1`, `TRUE`, `x IS NULL OR x IS NOT NULL`, or `x = x` and
+    /// `x IS NOT NULL` where the catalog declares `x` NOT NULL.
     #[serde(default)]
     pub has_tautology_where: bool,
+    /// The predicate that bounds the statement holds on every row except,
+    /// at most, rows in which a column it compares with itself (`x = x`),
+    /// or whose every value its disjuncts cover (`x = 1 OR x <> 1`), is
+    /// NULL. True whenever `has_tautology_where` is.
+    #[serde(default)]
+    pub has_non_null_tautology_where: bool,
     pub has_limit: bool,
     pub has_qualify: bool,
     pub has_having: bool,
@@ -305,6 +314,7 @@ impl QueryFacts {
             file_exports,
             has_where,
             has_tautology_where,
+            has_non_null_tautology_where,
             has_limit,
             has_qualify,
             has_having,
@@ -339,6 +349,7 @@ impl QueryFacts {
             && file_exports.is_empty()
             && !(*has_where
                 || *has_tautology_where
+                || *has_non_null_tautology_where
                 || *has_limit
                 || *has_qualify
                 || *has_having

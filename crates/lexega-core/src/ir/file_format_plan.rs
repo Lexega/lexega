@@ -168,17 +168,8 @@ fn target_from_name(source: &str, name: &crate::ast::AstObjectRef) -> FileFormat
 
 fn target_from_span(source: &str, span: Span) -> FileFormatTarget {
     let raw = span_text(source, span).trim();
-    let parts: Vec<&str> = raw.split('.').collect();
-    let (db, schema, name) = match parts.as_slice() {
-        [n] => (None, None, (*n).to_string()),
-        [s, n] => (None, Some((*s).to_string()), (*n).to_string()),
-        [d, s, n] => (
-            Some((*d).to_string()),
-            Some((*s).to_string()),
-            (*n).to_string(),
-        ),
-        _ => (None, None, raw.to_string()),
-    };
+    let (db, schema, name) =
+        crate::ir::utils::text_name_parts(raw).unwrap_or_else(|| (None, None, raw.to_string()));
     FileFormatTarget {
         name,
         schema,

@@ -44,8 +44,8 @@ use crate::lexer::token::{LiteralKind, Span, TokenKind};
 use crate::lexer::{Keyword, Operator, Punctuation};
 use crate::parser::core::Parser;
 use crate::parser::grant::{
-    body_start_pos_after, consume_to_terminator, consume_with_grant_option, current_position,
-    expect_keyword,
+    body_start_pos_after, consume_column_list, consume_to_terminator, consume_with_grant_option,
+    current_position, expect_keyword,
 };
 
 /// Parse a MySQL `GRANT ...` statement. Always succeeds: typed-parse
@@ -185,6 +185,10 @@ fn parse_one_mysql_privilege(p: &mut Parser<'_>) -> ParseResult<AstPrivilege> {
             }
             _ => break,
         }
+    }
+    // `SELECT (a, b)`: the privilege on those columns only.
+    if let Some(columns) = consume_column_list(p)? {
+        end = columns.end;
     }
     Ok(AstPrivilege {
         kind: classify_mysql_privilege(&lexemes),

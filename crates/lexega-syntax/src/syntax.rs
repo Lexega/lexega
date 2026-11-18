@@ -1261,6 +1261,9 @@ pub struct SyntaxTypePrecisionScale {
 pub struct SyntaxCte {
     /// AS keyword token
     pub as_keyword: TokenId,
+    /// PostgreSQL's `[NOT] MATERIALIZED` between `AS` and the parenthesis:
+    /// the `NOT` token where written, and the `MATERIALIZED` token.
+    pub materialized: Option<(Option<TokenId>, TokenId)>,
     /// Opening parenthesis before subquery
     pub l_paren: TokenId,
     /// Closing parenthesis after subquery

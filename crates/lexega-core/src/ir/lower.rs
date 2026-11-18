@@ -14764,6 +14764,7 @@ impl<'src> LowerCtx<'src> {
                     .collect(),
             },
         };
+        let split_parts = crate::ir::utils::relation_written_parts(split_parts);
         let mut tref = match split_parts.as_slice() {
             [Some(name)] => TableRef::new(name.clone()),
             [schema, Some(name)] => {
@@ -18803,7 +18804,7 @@ impl<'src> LowerCtx<'src> {
     /// source's column, whatever precedes it.
     fn struct_path(&self, qualifier: Span) -> Option<(Option<Span>, Span, Vec<Span>)> {
         let raw = slice_span(self.source, qualifier)?;
-        let segments = object_ref_segments(raw, qualifier.start);
+        let segments = crate::ir::utils::dotted_name_segments(raw, qualifier.start);
         let (head, rest) = segments.split_first()?;
         if self.lambda_parameter(&self.column_at(*head)).is_some() {
             return Some((None, *head, rest.to_vec()));
@@ -21477,9 +21478,10 @@ fn lower_create_table_columns(source: &str, ct: &AstCreateTable) -> Option<Vec<I
 }
 
 /// Split a possibly-qualified identifier path (`db.schema.table`) on
-/// unquoted dots. Double-quoted segments are kept intact so identifiers
-/// with embedded dots (`"schema.with.dots"."table"`) survive.
-/// `IDENTIFIER('…')` is split as the name its string writes.
+/// unquoted dots (as `dotted_name_segments` reads them): quoted
+/// parts are kept intact so identifiers with embedded dots
+/// (`"schema.with.dots"."table"`) survive. `IDENTIFIER('…')` is split as
+/// the name its string writes.
 pub fn split_object_ref(raw: &str) -> Vec<String> {
     match crate::ir::utils::identifier_string_name(raw) {
         Some(written) => split_dotted_name(&written),
@@ -21550,39 +21552,13 @@ pub fn routine_names_agree(a: &[IdentKey], b: &[IdentKey]) -> bool {
             })
 }
 
-/// [`split_object_ref`] of a name written as text, never `IDENTIFIER(…)`.
+/// [`split_object_ref`] of a name written as text, never `IDENTIFIER(…)`:
+/// each part as written ([`crate::ir::utils::dotted_name_segments`]).
 pub(crate) fn split_dotted_name(raw: &str) -> Vec<String> {
-    object_ref_segments(raw, 0)
+    crate::ir::utils::dotted_name_segments(raw, 0)
         .into_iter()
         .map(|segment| slice_span(raw, segment).unwrap_or("").to_string())
         .collect()
-}
-
-/// The span of each segment of the dotted name `raw`, which starts at
-/// `start` of the source. A dot inside double quotes separates nothing;
-/// an empty last segment is dropped.
-fn object_ref_segments(raw: &str, start: u32) -> Vec<Span> {
-    let mut out = Vec::new();
-    let mut from = 0usize;
-    let mut in_quote = false;
-    let span = |from: usize, to: usize| Span {
-        start: start + from as u32,
-        end: start + to as u32,
-    };
-    for (at, ch) in raw.char_indices() {
-        match ch {
-            '"' => in_quote = !in_quote,
-            '.' if !in_quote => {
-                out.push(span(from, at));
-                from = at + 1;
-            }
-            _ => {}
-        }
-    }
-    if from < raw.len() {
-        out.push(span(from, raw.len()));
-    }
-    out
 }
 
 /// What an unattributed column is compared under: each segment of its

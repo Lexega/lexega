@@ -25,7 +25,9 @@ pub mod schema;
 
 pub use builtin_rules::{all_builtin_rules, canonical_rule_id, former_ids_for};
 pub use compile::{compile, CompileError, CompiledPredicate};
-pub use engine::{evaluate_rules, evaluate_rules_with_explain, rule_holds, MessageTemplate, Rule};
+pub use engine::{
+    evaluate_rules, evaluate_rules_with_explain, rule_holds, MessageTemplate, Rule, TriggersDigest,
+};
 pub use finding::{EmissionMode, FactWitness, Finding, FindingEvidence, RuleExplanation};
 pub use lists::{ListChanges, ValueList, ValueLists};
 pub use loader::{
@@ -245,6 +247,51 @@ pub fn merge_full_rule_corpus(
 /// Layer a partial override's fields onto the built-in rule. The
 /// built-in's `triggers` / `emission` / `per_statement` are inherited
 /// verbatim — the loader guarantees a partial entry never sets those.
+/// SHA-256, in hex, of what `rules` evaluate, in evaluation order: each
+/// rule's id, former ids, level, message, switches and triggers. Two
+/// corpora with one digest report the same findings on every statement.
+pub fn corpus_sha256(rules: &[Rule]) -> String {
+    use sha2::{Digest, Sha256};
+
+    use crate::facts::RiskLevel;
+
+    fn feed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    for rule in rules {
+        feed(&mut hasher, rule.id.as_bytes());
+        hasher.update((rule.former_ids.len() as u64).to_le_bytes());
+        for former in &rule.former_ids {
+            feed(&mut hasher, former.as_bytes());
+        }
+        feed(&mut hasher, rule.description.as_bytes());
+        match &rule.message_template {
+            Some(template) => feed(&mut hasher, template.raw.as_bytes()),
+            None => hasher.update([0xff]),
+        }
+        hasher.update([
+            match rule.risk_level {
+                RiskLevel::Info => 0,
+                RiskLevel::Low => 1,
+                RiskLevel::Medium => 2,
+                RiskLevel::High => 3,
+                RiskLevel::Critical => 4,
+            },
+            u8::from(rule.enabled),
+            match rule.emission {
+                EmissionMode::Once => 0,
+                EmissionMode::PerWitness => 1,
+            },
+            u8::from(rule.per_statement),
+        ]);
+        hasher.update(rule.triggers_digest.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 fn apply_partial_overlay(base: Rule, overlay: PartialRuleOverride) -> Rule {
     let Rule {
         id,
@@ -253,6 +300,7 @@ fn apply_partial_overlay(base: Rule, overlay: PartialRuleOverride) -> Rule {
         risk_level,
         enabled,
         triggers,
+        triggers_digest,
         message_template,
         emission,
         per_statement,
@@ -270,6 +318,7 @@ fn apply_partial_overlay(base: Rule, overlay: PartialRuleOverride) -> Rule {
         risk_level: overlay.risk_level.unwrap_or(risk_level),
         enabled: overlay.enabled.unwrap_or(enabled),
         triggers,
+        triggers_digest,
         message_template: new_message_template,
         emission,
         per_statement,
@@ -303,6 +352,108 @@ lists:
 
     fn ids(rules: &[Rule]) -> Vec<&str> {
         rules.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    const ONE_RULE: &str = r#"
+rules:
+  - id: X-1
+    risk_level: high
+    message: unbounded delete
+    triggers:
+      all_of:
+        - kind: delete
+        - query.has_where: false
+"#;
+
+    fn digest(yaml: &str) -> String {
+        corpus_sha256(&corpus(yaml, false))
+    }
+
+    #[test]
+    fn a_corpus_digest_ignores_how_the_file_is_written() {
+        let reordered = r#"
+# the same rule, its keys in another order
+rules:
+  - triggers: {all_of: [{kind: delete}, {"query.has_where": false}]}
+    message: unbounded delete
+    id: X-1
+    risk_level: high
+"#;
+        assert_eq!(digest(ONE_RULE), digest(reordered));
+
+        let json = r#"{"rules": [{"id": "X-1", "risk_level": "high",
+            "message": "unbounded delete",
+            "triggers": {"all_of": [{"kind": "delete"}, {"query.has_where": false}]}}]}"#;
+        let from_json = load_v1_rules_from_json(json.as_bytes()).expect("rule file loads");
+        let from_json = build_v1_rule_corpus(from_json, false).expect("corpus builds");
+        assert_eq!(digest(ONE_RULE), corpus_sha256(&from_json));
+    }
+
+    #[test]
+    fn a_corpus_digest_changes_with_each_part_of_a_rule() {
+        let base = digest(ONE_RULE);
+        for (from, to) in [
+            ("kind: delete", "kind: update"),
+            ("risk_level: high", "risk_level: critical"),
+            ("message: unbounded delete", "message: delete of every row"),
+            ("id: X-1", "id: X-2"),
+            ("    triggers:", "    enabled: false\n    triggers:"),
+            ("    triggers:", "    per_statement: true\n    triggers:"),
+        ] {
+            assert!(ONE_RULE.contains(from), "{from}");
+            assert_ne!(base, digest(&ONE_RULE.replace(from, to)), "{from} -> {to}");
+        }
+        let second = ONE_RULE.replace("X-1", "X-2");
+        let two = format!(
+            "{ONE_RULE}{}",
+            second.trim_start().trim_start_matches("rules:")
+        );
+        assert_eq!(corpus(&two, false).len(), 2);
+        assert_ne!(base, digest(&two));
+    }
+
+    #[test]
+    fn a_corpus_digest_follows_a_list_a_rule_names() {
+        let with_list = |values: &str| {
+            format!(
+                r#"
+lists:
+  watched: {{values: [{values}]}}
+rules:
+  - id: X-1
+    risk_level: high
+    message: watched role
+    triggers:
+      privilege.target.name.canonical: {{in_list: watched}}
+  - id: X-2
+    risk_level: high
+    message: any grant
+    triggers:
+      kind: grant
+"#
+            )
+        };
+        let one = corpus(&with_list("ADMIN"), false);
+        let other = corpus(&with_list("ADMIN, OWNER"), false);
+        assert_ne!(one[0].triggers_digest, other[0].triggers_digest);
+        assert_eq!(one[1].triggers_digest, other[1].triggers_digest);
+        assert_ne!(corpus_sha256(&one), corpus_sha256(&other));
+    }
+
+    #[test]
+    fn an_override_changes_the_builtin_corpus_digest() {
+        let builtins = all_builtin_rules().expect("built-in corpus loads");
+        let (_, first) = builtin(builtins[0].id.as_str());
+        let overridden = corpus(
+            &format!("rules:\n  - id: {}\n    enabled: false\n", first.id),
+            true,
+        );
+        assert_eq!(overridden.len(), builtins.len());
+        assert_ne!(corpus_sha256(builtins), corpus_sha256(&overridden));
+        assert_eq!(
+            corpus_sha256(builtins),
+            corpus_sha256(&corpus("lists: {}", true))
+        );
     }
 
     fn builtin_ids() -> Vec<&'static str> {

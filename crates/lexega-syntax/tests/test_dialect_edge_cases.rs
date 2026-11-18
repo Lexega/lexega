@@ -588,57 +588,80 @@ fn test_postgres_no_version_comments() {
 }
 
 #[test]
-fn test_mysql_version_comment_content_preserved() {
-    // The version comment span should include the full /*!...*/ text
+fn test_mysql_version_comment_content_is_lexed_as_sql() {
+    // The server runs what an executable comment holds: its markers are
+    // trivia and the text between them is tokens.
     let sql = "SELECT /*!50100 PARTITION BY HASH(id) */ 1";
     let d = mysql();
     let result = tokenize_with_dialect(sql, &*d);
-    let mut found = false;
-    for tok in &result.tokens {
-        for t in &tok.leading_trivia {
-            if t.kind == TriviaKind::MysqlVersionComment {
-                let text = &sql[t.span.start as usize..t.span.end as usize];
-                assert!(
-                    text.starts_with("/*!"),
-                    "Version comment should start with /*!, got: '{}'",
-                    text
-                );
-                assert!(
-                    text.ends_with("*/"),
-                    "Version comment should end with */, got: '{}'",
-                    text
-                );
-                assert!(
-                    text.contains("PARTITION"),
-                    "Version comment should contain SQL content, got: '{}'",
-                    text
-                );
-                found = true;
-            }
-        }
-        for t in &tok.trailing_trivia {
-            if t.kind == TriviaKind::MysqlVersionComment {
-                let text = &sql[t.span.start as usize..t.span.end as usize];
-                assert!(
-                    text.starts_with("/*!"),
-                    "Version comment should start with /*!, got: '{}'",
-                    text
-                );
-                assert!(
-                    text.ends_with("*/"),
-                    "Version comment should end with */, got: '{}'",
-                    text
-                );
-                assert!(
-                    text.contains("PARTITION"),
-                    "Version comment should contain SQL content, got: '{}'",
-                    text
-                );
-                found = true;
-            }
-        }
+    let markers: Vec<&str> = result
+        .tokens
+        .iter()
+        .flat_map(|t| t.leading_trivia.iter().chain(&t.trailing_trivia))
+        .filter(|t| t.kind == TriviaKind::MysqlVersionComment)
+        .map(|t| &sql[t.span.start as usize..t.span.end as usize])
+        .collect();
+    assert_eq!(markers, ["/*!50100", "*/"]);
+    assert_eq!(
+        token_lexemes(sql, &*d),
+        ["SELECT", "PARTITION", "BY", "HASH", "(", "id", ")", "1"]
+    );
+}
+
+#[test]
+fn test_mysql_executable_comment_forms_hold_statements() {
+    let d = mysql();
+    for sql in [
+        "/*! DROP TABLE users */",
+        "/*!50000 DROP TABLE users */",
+        "/*M!100100 DROP TABLE users */",
+    ] {
+        assert_eq!(token_lexemes(sql, &*d), ["DROP", "TABLE", "users"], "{sql}");
     }
-    assert!(found, "Should have found a MysqlVersionComment trivia");
+    // A string holding `*/` inside the comment is a string.
+    assert_eq!(
+        token_lexemes("/*! SELECT '*/' */ ", &*d),
+        ["SELECT", "'*/'"]
+    );
+    // Elsewhere `/*!` is a plain comment.
+    assert!(
+        token_lexemes("/*! DROP TABLE users */ SELECT 1", &*postgres())
+            .iter()
+            .all(|t| *t != "DROP")
+    );
+}
+
+#[test]
+fn test_double_slash_is_a_comment_in_snowflake_only() {
+    let sql = "SELECT 4 //* x */ 2; DROP TABLE users";
+    for d in [postgres(), mysql(), mssql(), bigquery()] {
+        let lexemes = token_lexemes(sql, &*d);
+        assert!(lexemes.contains(&"DROP"), "{}: {:?}", d.name(), lexemes);
+    }
+    let snowflake_lexemes = token_lexemes("SELECT 4 // DROP TABLE users", &*snowflake());
+    assert_eq!(snowflake_lexemes, ["SELECT", "4"]);
+}
+
+#[test]
+fn test_databricks_nests_block_comments() {
+    let sql = "/* /* */ SELECT '*/ DROP TABLE users; --'";
+    let lexemes = token_lexemes(sql, &*lexega_syntax::dialect::databricks());
+    assert_eq!(lexemes, ["DROP", "TABLE", "users", ";"]);
+}
+
+#[test]
+fn test_redshift_comment_holding_an_opener_is_unreadable() {
+    let d = lexega_syntax::dialect::redshift();
+    let kinds = token_kinds("/* /* */ SELECT 1", &*d);
+    assert!(
+        matches!(kinds.first(), Some(TokenKind::Unknown)),
+        "{kinds:?}"
+    );
+    let plain = token_kinds("/* plain */ SELECT 1", &*d);
+    assert!(
+        !plain.iter().any(|k| matches!(k, TokenKind::Unknown)),
+        "{plain:?}"
+    );
 }
 
 // ============================================================================

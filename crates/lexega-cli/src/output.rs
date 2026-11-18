@@ -450,6 +450,39 @@ pub fn print_finding_explanation(report: &analyzer::AnalysisReport, source: &str
             }
         }
     }
+    // A finding raised in SQL a statement runs (an `EXECUTE IMMEDIATE`
+    // body) is evaluated apart from the statement's own facts: it stands
+    // under the innermost statement whose text holds it.
+    for entry in report.entries() {
+        let Some(rule) = entry.rule_id() else {
+            continue;
+        };
+        for evidence in entry.evidence() {
+            let (line, column) = match evidence {
+                analyzer::RiskEvidence::RuleMatch {
+                    line_number: Some(line),
+                    column_number: Some(column),
+                    ..
+                } => (*line, *column),
+                analyzer::RiskEvidence::RuleMatch { .. }
+                | analyzer::RiskEvidence::TableReference { .. }
+                | analyzer::RiskEvidence::PredicateInfo { .. } => continue,
+            };
+            let Some(offset) = line_index.offset_at(source, line, column) else {
+                continue;
+            };
+            let holder = by_span
+                .keys()
+                .filter(|(start, end)| (*start as usize) <= offset && offset < *end as usize)
+                .min_by_key(|(start, end)| end - start)
+                .copied();
+            if let Some((_, rules)) = holder.and_then(|key| by_span.get_mut(&key)) {
+                if !rules.iter().any(|known| known == rule) {
+                    rules.push(rule.to_string());
+                }
+            }
+        }
+    }
     for (_, rules) in by_span.values_mut() {
         rules.sort();
     }
@@ -683,6 +716,8 @@ pub fn print_fact_explanation(report: &analyzer::AnalysisReport, _source: &str, 
             }
             if query.has_tautology_where {
                 println!("  Has Tautology WHERE: true");
+            } else if query.has_non_null_tautology_where {
+                println!("  Has Tautology WHERE (but for NULLs): true");
             }
             if query.has_limit {
                 println!("  Has LIMIT: true");

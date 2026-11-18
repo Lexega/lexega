@@ -5,6 +5,58 @@
 
 use crate::lexer::Span;
 
+/// The parts of a relation's name as written, `None` for an omitted part
+/// (`db..name`): a quoted path is read as its parts where the dialect reads
+/// it so (BigQuery's `` `p.d.t` `` is `` `p` ``, `` `d` ``, `` `t` ``). The
+/// one place a relation's written parts are read; every relation built from
+/// SQL text takes its parts from here.
+pub(crate) fn relation_written_parts(written: Vec<Option<String>>) -> Vec<Option<String>> {
+    let present: Vec<&str> = written.iter().flatten().map(String::as_str).collect();
+    let pieces = crate::dialect::relation_written_parts(&present);
+    if pieces.len() == present.len() {
+        return written;
+    }
+    pieces.into_iter().map(Some).collect()
+}
+
+/// The span of each part of the dotted name `raw`, which starts at `start`
+/// of the source: a dot inside quotes (`"…"`, `` `…` ``, `[…]`) separates
+/// nothing. Each part is as written, untrimmed; an empty last part (a
+/// trailing dot) is dropped. The one reading of where a dotted name splits.
+pub(crate) fn dotted_name_segments(raw: &str, start: u32) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    let mut close: Option<char> = None;
+    let mut chars = raw.char_indices().peekable();
+    let span = |from: usize, to: usize| Span {
+        start: start + from as u32,
+        end: start + to as u32,
+    };
+    while let Some((at, ch)) = chars.next() {
+        match close {
+            // `]]` inside brackets is a `]` of the name.
+            Some(']') if ch == ']' && chars.peek().is_some_and(|&(_, next)| next == ']') => {
+                chars.next();
+            }
+            Some(quote) if ch == quote => close = None,
+            Some(_) => {}
+            None => match ch {
+                '"' | '`' => close = Some(ch),
+                '[' => close = Some(']'),
+                '.' => {
+                    out.push(span(from, at));
+                    from = at + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    if from < raw.len() {
+        out.push(span(from, raw.len()));
+    }
+    out
+}
+
 /// Slice the source text covered by a span, or `None` if the span is out of range.
 pub fn slice_span(source: &str, span: Span) -> Option<&str> {
     source.get(span.start as usize..span.end as usize)
@@ -139,15 +191,19 @@ pub(crate) fn routine_name_parts(
     source: &str,
     name: &crate::ast::AstObjectRef,
 ) -> Option<(Option<String>, Option<String>, String)> {
-    written_name_parts(source, name).or_else(|| {
-        let written = name_before_argument_list(slice_span(source, name.span)?)?;
-        match crate::ir::lower_ddl::split_qualified(written).as_slice() {
-            [n] => Some((None, None, n.clone())),
-            [s, n] => Some((None, Some(s.clone()), n.clone())),
-            [d, s, n] => Some((Some(d.clone()), Some(s.clone()), n.clone())),
-            _ => None,
-        }
-    })
+    written_name_parts(source, name)
+        .or_else(|| text_name_parts(name_before_argument_list(slice_span(source, name.span)?)?))
+}
+
+/// The `[[db.]schema.]name` parts the text `written` spells, each as
+/// written ([`relation_written_parts`]); `None` for none or more than three.
+pub(crate) fn text_name_parts(written: &str) -> Option<(Option<String>, Option<String>, String)> {
+    match crate::ir::lower_ddl::relation_parts_written(written).as_slice() {
+        [n] => Some((None, None, n.clone())),
+        [s, n] => Some((None, Some(s.clone()), n.clone())),
+        [d, s, n] => Some((Some(d.clone()), Some(s.clone()), n.clone())),
+        _ => None,
+    }
 }
 
 /// The `[[db.]schema.]name` parts `name` spells, each as written, or, for
@@ -177,6 +233,10 @@ pub(crate) fn written_name_parts(
             parts
         }
     };
+    let written: Vec<String> = relation_written_parts(written.into_iter().map(Some).collect())
+        .into_iter()
+        .flatten()
+        .collect();
     match written.as_slice() {
         [n] => Some((None, None, (*n).to_string())),
         [s, n] => Some((None, Some((*s).to_string()), (*n).to_string())),
@@ -186,5 +246,55 @@ pub(crate) fn written_name_parts(
             (*n).to_string(),
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod dotted_name_tests {
+    use super::*;
+
+    fn parts(raw: &str) -> Vec<&str> {
+        dotted_name_segments(raw, 0)
+            .into_iter()
+            .map(|segment| slice_span(raw, segment).unwrap_or(""))
+            .collect()
+    }
+
+    /// A dot inside any quoting splits nothing; `]]` stays inside brackets.
+    #[test]
+    fn a_dotted_name_splits_only_at_dots_outside_quotes() {
+        assert_eq!(parts("db.sch.t"), ["db", "sch", "t"]);
+        assert_eq!(parts(r#""a.b".t"#), [r#""a.b""#, "t"]);
+        assert_eq!(parts("`a.b`.t"), ["`a.b`", "t"]);
+        assert_eq!(parts("[a.b].t"), ["[a.b]", "t"]);
+        assert_eq!(parts("[a]].b].t"), ["[a]].b]", "t"]);
+        assert_eq!(parts("db..t"), ["db", "", "t"]);
+        assert_eq!(parts("db."), ["db"]);
+    }
+
+    /// A relation's parts are read once: a BigQuery path is its parts, a
+    /// quoted name holding dots elsewhere is one part, an omitted part
+    /// stays omitted.
+    #[test]
+    fn a_relations_parts_follow_the_dialects_path_rule() {
+        let written = |parts: &[Option<&str>]| -> Vec<Option<String>> {
+            parts.iter().map(|part| part.map(str::to_string)).collect()
+        };
+        {
+            let _bigquery = crate::ir::normalize::set_normalization_dialect("bigquery");
+            assert_eq!(
+                relation_written_parts(written(&[Some("`p.d.t`")])),
+                written(&[Some("`p`"), Some("`d`"), Some("`t`")])
+            );
+        }
+        let _snowflake = crate::ir::normalize::default_folding();
+        assert_eq!(
+            relation_written_parts(written(&[Some(r#""p.d.t""#)])),
+            written(&[Some(r#""p.d.t""#)])
+        );
+        assert_eq!(
+            relation_written_parts(written(&[Some("db"), None, Some("t")])),
+            written(&[Some("db"), None, Some("t")])
+        );
     }
 }

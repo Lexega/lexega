@@ -5233,7 +5233,8 @@ pub enum AstAlterTableActionKind {
         using_columns: Vec<AstExpr>,
     },
 
-    /// Databricks: ALTER COLUMN <col> DROP MASK
+    /// Databricks `ALTER COLUMN <col> DROP MASK`, SQL Server `ALTER COLUMN
+    /// <col> DROP MASKED`: the column's mask is removed.
     DropColumnMask {
         alter_span: Option<Span>,
         column_span: Option<Span>,
@@ -8410,6 +8411,9 @@ pub enum BodyRole {
     Declarations,
     /// A block's statements, or a T-SQL `TRY` block's.
     Block,
+    /// The statements of a pipe chain (`a ->> b`), each run in turn and
+    /// reading the result of the one before.
+    Pipe,
     /// One branch of a conditional: an `IF` or `ELSEIF`, a `CASE`'s `WHEN`,
     /// a T-SQL `IF`'s statement.
     Branch,
@@ -8452,6 +8456,7 @@ impl AstStmt {
         let mut bodies = Vec::new();
         let mut push = |role: BodyRole, stmts| bodies.push(StatementBody { role, stmts });
         match self {
+            AstStmt::PipeChain { stmts, .. } => push(BodyRole::Pipe, stmts),
             AstStmt::Block(b) => {
                 push(BodyRole::Declarations, &b.decls);
                 push(BodyRole::Block, &b.body);
@@ -8771,7 +8776,6 @@ impl AstStmt {
             | AstStmt::PgSet(_)
             | AstStmt::PgSubscription(_)
             | AstStmt::PgUnlisten(_)
-            | AstStmt::PipeChain { .. }
             | AstStmt::Raise { .. }
             | AstStmt::Reindex(_)
             | AstStmt::RepairTable(_)

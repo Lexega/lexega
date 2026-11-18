@@ -2628,10 +2628,23 @@ pub trait Dialect: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Whether `/*!...*/` version comments should be tagged as executable content.
-    /// MySQL: true (version comments contain conditional SQL).
-    /// Snowflake/PostgreSQL: false (all `/* */` are plain block comments).
+    /// Whether `/*!...*/` (and MariaDB `/*M!...*/`) comments hold SQL the
+    /// server runs: their markers are trivia and the text between is lexed
+    /// as SQL. MySQL: true. Elsewhere every `/* */` is a plain comment.
     fn supports_version_comments(&self) -> bool {
+        false
+    }
+
+    /// Whether `//` starts a line comment. Snowflake: true. Elsewhere `//`
+    /// is two `/` tokens, and `//*` begins a block comment after a `/`.
+    fn slash_slash_is_line_comment(&self) -> bool {
+        false
+    }
+
+    /// Whether it is unknown if the dialect's block comments nest. A block
+    /// comment that holds a `/*` is then not read as either: it is lexed as
+    /// unreadable text, which strict analysis refuses.
+    fn block_comment_nesting_unknown(&self) -> bool {
         false
     }
 
@@ -3602,6 +3615,10 @@ pub trait Dialect: Send + Sync + std::fmt::Debug {
 pub struct SnowflakeDialect;
 
 impl Dialect for SnowflakeDialect {
+    fn slash_slash_is_line_comment(&self) -> bool {
+        true
+    }
+
     fn type_synonyms(&self) -> &'static [TypeSynonyms] {
         SNOWFLAKE_TYPE_SYNONYMS
     }
@@ -4196,6 +4213,20 @@ impl NormalizationConfig {
         pieces
     }
 
+    /// The written parts `written` of a relation's name, a quoted path
+    /// written as one part per piece, each quoted as the path was
+    /// (BigQuery's `` `prod.core.orders` `` is `` `prod` ``, `` `core` ``,
+    /// `` `orders` ``): the parts [`Self::relation_parts`] folds.
+    fn relation_written_parts(&self, written: &[&str]) -> Vec<String> {
+        self.name_pieces(written)
+            .into_iter()
+            .map(|(piece, in_path)| match in_path {
+                true => format!("`{piece}`"),
+                false => piece.to_string(),
+            })
+            .collect()
+    }
+
     /// The parts the written parts `written` of a relation's name name,
     /// each as this configuration compares a relation's part: a quoted
     /// path read as its parts ([`Self::name_pieces`]).
@@ -4374,6 +4405,13 @@ pub fn normalize_routine_name(written: &[&str]) -> Vec<String> {
 /// reads `name` as a quoted identifier (`"x"`, `` `x` ``, `[x]`).
 pub fn identifier_quoted_inner(name: &str) -> Option<&str> {
     read_normalization_config().quoted_inner(name)
+}
+
+/// The written parts `written` of a relation's name, a quoted path written
+/// as one quoted part per piece under the thread's dialect
+/// (`NormalizationConfig::relation_written_parts`).
+pub fn relation_written_parts(written: &[&str]) -> Vec<String> {
+    read_normalization_config().relation_written_parts(written)
 }
 
 /// The parts the written parts `written` of a relation's name name, each
@@ -5988,7 +6026,7 @@ impl Dialect for DatabricksDialect {
     // ========================================================================
 
     fn supports_nested_block_comments(&self) -> bool {
-        false // Databricks does not support nested block comments
+        true // Databricks nests bracketed comments
     }
 
     fn requires_space_after_double_dash(&self) -> bool {
@@ -8893,7 +8931,11 @@ impl Dialect for RedshiftDialect {
     // ========================================================================
 
     fn supports_nested_block_comments(&self) -> bool {
-        false // Redshift does not support nested block comments
+        false
+    }
+
+    fn block_comment_nesting_unknown(&self) -> bool {
+        true
     }
 
     // ========================================================================

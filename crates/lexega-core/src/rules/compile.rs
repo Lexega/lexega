@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use super::explain::{ExplainTrace, MatchReason, UnmatchReason};
 use super::finding::RuleExplanation;
-use super::lists::{ValueList, ValueLists};
+use super::lists::{NameForm, ValueList, ValueLists};
 use super::predicate::{
     FieldName, FieldPath, NumericOp, ParseError, Predicate, PredicateLiteral, Quantifier,
     ScalarMatch, ScalarOp,
@@ -52,6 +52,10 @@ pub enum CompileError {
     /// customer rule at load time rather than letting the rule
     /// compile and silently never fire.
     UnknownRootField { path: String, unknown_root: String },
+    /// A path names no fact below its first field: a field the facts do
+    /// not have, or a field of a list's elements reached without naming an
+    /// element. Surfaces a typo at load time, as `UnknownRootField` does.
+    UnknownFactPath { path: String, problem: PathProblem },
     /// An `in_list` / `not_in_list` operator names a list the table does
     /// not hold. List names are exact.
     UnknownList { list: String },
@@ -74,6 +78,29 @@ impl std::fmt::Display for CompileError {
                 "unknown root field '{}' in path '{}': not a top-level StatementFacts field",
                 unknown_root, path
             ),
+            Self::UnknownFactPath { path, problem } => match problem {
+                PathProblem::UnknownField {
+                    field,
+                    under,
+                    suggestion,
+                } => {
+                    write!(f, "unknown field '{field}' in path '{path}': ")?;
+                    match under.is_empty() {
+                        true => write!(f, "the statement's facts have no such field")?,
+                        false => write!(f, "'{under}' has no such field")?,
+                    }
+                    match suggestion {
+                        Some(nearest) => write!(f, "; did you mean '{nearest}'?"),
+                        None => Ok(()),
+                    }
+                }
+                PathProblem::ThroughList { list } => write!(
+                    f,
+                    "path '{path}' reads a field of the elements of '{list}', a list: \
+                     name one element ('{list}.0.…') or quantify the list \
+                     ('{list}: {{ exists: … }}')"
+                ),
+            },
             Self::UnknownList { list } => write!(f, "unknown list '{}'", list),
             Self::UnknownStatementKind { kind, suggestion } => {
                 write!(f, "unknown statement kind '{}'", kind)?;
@@ -290,6 +317,26 @@ pub fn compile_with_lists(
     lists: &ValueLists,
 ) -> Result<CompiledPredicate, CompileError> {
     validate_root_field_paths(predicate)?;
+    validate_fact_paths(predicate, FACTS_ROOT, "")?;
+    build_compiled(predicate, lists)
+}
+
+/// [`compile_with_lists`] for a predicate read over values of any shape:
+/// its paths below their first field are not checked against the facts.
+#[cfg(test)]
+fn compile_any_shape(
+    predicate: &Predicate,
+    lists: &ValueLists,
+) -> Result<CompiledPredicate, CompileError> {
+    validate_root_field_paths(predicate)?;
+    build_compiled(predicate, lists)
+}
+
+/// The compiled form of a predicate whose paths were checked.
+fn build_compiled(
+    predicate: &Predicate,
+    lists: &ValueLists,
+) -> Result<CompiledPredicate, CompileError> {
     let root_mask = predicate_root_mask(predicate);
     let kind_gate = predicate_kind_gate(predicate);
     let category = super::category::category_of_rule(predicate);
@@ -423,44 +470,58 @@ fn check_statement_kinds(s: &ScalarMatch) -> Result<(), CompileError> {
     Ok(())
 }
 
-/// Snake-case names of every top-level field on
-/// `crate::facts::StatementFacts`. Kept in sync with the struct
-/// definition in `src/facts/statement.rs`; if a new top-level field
-/// is added there, this list must grow with it.
-const KNOWN_STATEMENT_FACTS_ROOTS: &[&str] = &[
-    "kind",
-    "source_span",
-    "query",
-    "ddl",
-    "privilege",
-    "policy",
-    "policy_attachment",
-    "integration",
-    "use_stmt",
-    "pg_copy",
-    "mssql_backup",
-    "mssql_restore",
-    "mssql_dbcc",
-    "mssql_key_management",
-    "mssql_security_policy",
-    "mssql_key_backup",
-    "mssql_assembly",
-    "mssql_add_signature",
-    "mssql_service_master_key",
-    "pg_default_privileges",
-    "comment",
-    "handler",
-    "dynamic_sql_calls",
-    "mssql_exec",
-    "impersonation",
-    "execute_immediate_from",
-    "audit",
-    "security_object",
-    "algebra",
-    "blast_radius",
-    "script_context",
-    "diff",
-];
+/// The names of the top-level fields of `crate::facts::StatementFacts`,
+/// as its serde derive names them: the roots a rule's path may start at.
+/// Read from the derive, so every field of the struct is a root and no
+/// other name is.
+fn statement_facts_roots() -> &'static [&'static str] {
+    static ROOTS: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(serde_struct_fields::<crate::facts::StatementFacts>)
+}
+
+/// The field names a struct `T` deserializes, from its serde derive, which
+/// hands them to [`serde::Deserializer::deserialize_struct`]. Empty where
+/// `T` does not deserialize as a struct.
+fn serde_struct_fields<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    let mut fields = None;
+    // The deserializer records the names and answers with an error: no
+    // value is read, so the error is the expected outcome.
+    let _ = T::deserialize(StructFields(&mut fields));
+    fields.unwrap_or(&[])
+}
+
+/// A deserializer that reads only the field names a struct's derive passes
+/// it.
+struct StructFields<'a>(&'a mut Option<&'static [&'static str]>);
+
+impl<'de> serde::Deserializer<'de> for StructFields<'_> {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        Err(serde::de::Error::custom(
+            "only a struct's field names are read",
+        ))
+    }
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        *self.0 = Some(fields);
+        Err(serde::de::Error::custom("the field names are read"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+        identifier ignored_any
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Fact-family dispatch index.
@@ -494,12 +555,12 @@ const KNOWN_STATEMENT_FACTS_ROOTS: &[&str] = &[
 const AMBIENT_ROOTS: &[&str] = &["kind", "source_span", "algebra", "script_context"];
 
 /// Bit (`1 << idx`) assigned to a non-ambient known root, or 0 for an
-/// ambient/unknown root. Index = position in `KNOWN_STATEMENT_FACTS_ROOTS`
+/// ambient/unknown root. Index = position in [`statement_facts_roots`]
 /// skipping ambient roots. Degrades to 0 past 32 roots so future growth
 /// stays sound (always-evaluate) rather than overflowing the shift.
 fn root_mask_bit(name: &str) -> u32 {
     let mut idx = 0u32;
-    for root in KNOWN_STATEMENT_FACTS_ROOTS {
+    for root in statement_facts_roots() {
         if AMBIENT_ROOTS.contains(root) {
             continue;
         }
@@ -627,7 +688,7 @@ pub(crate) fn facts_present_mask(facts_value: &Value) -> u32 {
     };
     let mut mask = 0u32;
     let mut idx = 0u32;
-    for root in KNOWN_STATEMENT_FACTS_ROOTS {
+    for root in statement_facts_roots() {
         if AMBIENT_ROOTS.contains(root) {
             continue;
         }
@@ -845,6 +906,233 @@ fn validate_root_field_paths(p: &Predicate) -> Result<(), CompileError> {
     }
 }
 
+/// Every fact path a rule may name, as `generate_schema` writes them from
+/// the facts types: a block per root (`@StatementFacts`, then each list's
+/// element type) and a line per path, ending ` >Type` for a list of
+/// objects and ` *` where the fields below are not known.
+const FACT_PATHS: &str = include_str!("fact_paths.txt");
+
+/// The root of a statement's facts in [`FACT_PATHS`].
+const FACTS_ROOT: &str = "StatementFacts";
+
+/// What a path in [`FACT_PATHS`] leads to.
+#[derive(Debug, Clone, Copy)]
+enum PathTo {
+    /// A value with no fields of its own: a scalar, a list of scalars.
+    Value,
+    /// A list of objects, each read under the named root.
+    Elements(&'static str),
+    /// Something whose fields are not known.
+    Open,
+}
+
+/// One root's paths, and every shorter path a longer one runs through.
+#[derive(Default)]
+struct RootPaths {
+    paths: std::collections::HashMap<&'static str, PathTo>,
+    inner: std::collections::HashSet<&'static str>,
+}
+
+impl RootPaths {
+    fn holds(&self, path: &str) -> bool {
+        self.paths.contains_key(path) || self.inner.contains(path)
+    }
+
+    /// The names of the fields directly under `at` (the root's own for an
+    /// empty `at`).
+    fn fields_under(&self, at: &str) -> Vec<&'static str> {
+        let mut names = std::collections::BTreeSet::new();
+        for path in self.paths.keys() {
+            let rest = match at.is_empty() {
+                true => Some(*path),
+                false => path
+                    .strip_prefix(at)
+                    .and_then(|rest| rest.strip_prefix('.')),
+            };
+            if let Some(rest) = rest {
+                names.insert(rest.split_once('.').map_or(rest, |(first, _)| first));
+            }
+        }
+        names.into_iter().collect()
+    }
+}
+
+fn fact_paths() -> &'static std::collections::HashMap<&'static str, RootPaths> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<&'static str, RootPaths>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table: std::collections::HashMap<&'static str, RootPaths> =
+            std::collections::HashMap::new();
+        let mut root: Option<&'static str> = None;
+        for line in FACT_PATHS.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('@') {
+                root = Some(name);
+                table.entry(name).or_default();
+                continue;
+            }
+            let Some(root) = root else {
+                continue;
+            };
+            let (path, to) = match line.split_once(' ') {
+                Some((path, end)) => match end.strip_prefix('>') {
+                    Some(element) => (path, PathTo::Elements(element)),
+                    None => (path, PathTo::Open),
+                },
+                None => (line, PathTo::Value),
+            };
+            let entry = table.entry(root).or_default();
+            for (at, _) in path.match_indices('.') {
+                entry.inner.insert(&path[..at]);
+            }
+            entry.paths.insert(path, to);
+        }
+        table
+    })
+}
+
+/// Why a rule's path names no fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathProblem {
+    /// `field` is not a field of what the path names before it, `under`
+    /// (empty for the statement's facts themselves). `suggestion` is the
+    /// nearest field there is.
+    UnknownField {
+        field: String,
+        under: String,
+        suggestion: Option<String>,
+    },
+    /// The path reads a field of the elements of `list` without naming an
+    /// element, which reads nothing.
+    ThroughList { list: String },
+}
+
+/// Where a valid path leads: the root a quantifier's body is read under,
+/// or nothing a body could be read under.
+enum PathEnd {
+    Elements(&'static str),
+    Other,
+}
+
+/// Resolve `path`, read under `root`, against [`FACT_PATHS`]. `shown` is the
+/// path of `root` within the statement's facts, for the problem's names.
+fn resolve_fact_path(
+    root: &'static str,
+    path: &FieldPath,
+    shown: &str,
+) -> Result<PathEnd, PathProblem> {
+    let table = fact_paths();
+    let mut root = root;
+    let mut at = String::new();
+    let mut walked = shown.to_string();
+    for segment in &path.segments {
+        let Some(paths) = table.get(root) else {
+            return Ok(PathEnd::Other);
+        };
+        let here = paths.paths.get(at.as_str()).copied();
+        match segment {
+            FieldName::Index(index) => {
+                match here {
+                    Some(PathTo::Elements(element)) => {
+                        root = element;
+                        at.clear();
+                    }
+                    Some(PathTo::Open) => return Ok(PathEnd::Other),
+                    Some(PathTo::Value) | None => {}
+                }
+                if !walked.is_empty() {
+                    walked.push('.');
+                }
+                walked.push_str(&index.to_string());
+            }
+            FieldName::Named(name) => {
+                match here {
+                    Some(PathTo::Open) => return Ok(PathEnd::Other),
+                    Some(PathTo::Elements(_)) => {
+                        return Err(PathProblem::ThroughList { list: walked });
+                    }
+                    Some(PathTo::Value) | None => {}
+                }
+                let candidate = match at.is_empty() {
+                    true => name.clone(),
+                    false => format!("{at}.{name}"),
+                };
+                if !paths.holds(&candidate) {
+                    let fields = paths.fields_under(&at);
+                    return Err(PathProblem::UnknownField {
+                        field: name.clone(),
+                        under: walked,
+                        suggestion: nearest_name(name, &fields).map(str::to_string),
+                    });
+                }
+                at = candidate;
+                if !walked.is_empty() {
+                    walked.push('.');
+                }
+                walked.push_str(name);
+            }
+        }
+    }
+    let end = table
+        .get(root)
+        .and_then(|paths| paths.paths.get(at.as_str()).copied());
+    Ok(match end {
+        Some(PathTo::Elements(element)) => PathEnd::Elements(element),
+        Some(PathTo::Value) | Some(PathTo::Open) | None => PathEnd::Other,
+    })
+}
+
+/// Refuse a path, anywhere in `p`, that names no fact: read under `root`,
+/// whose path within the statement's facts is `shown`. A quantifier's body
+/// is read under the list's element type.
+fn validate_fact_paths(p: &Predicate, root: &'static str, shown: &str) -> Result<(), CompileError> {
+    let check = |path: &FieldPath| {
+        resolve_fact_path(root, path, shown).map_err(|problem| CompileError::UnknownFactPath {
+            path: match shown.is_empty() {
+                true => path.render(),
+                false => format!("{shown}.{}", path.render()),
+            },
+            problem,
+        })
+    };
+    match p {
+        Predicate::AllOf(parts) | Predicate::AnyOf(parts) => {
+            for part in parts {
+                validate_fact_paths(part, root, shown)?;
+            }
+            Ok(())
+        }
+        Predicate::Not(inner) => validate_fact_paths(inner, root, shown),
+        Predicate::Scalar(s) => {
+            check(&s.path)?;
+            s.op.compared_field()
+                .map_or(Ok(()), |field| check(field).map(|_| ()))
+        }
+        Predicate::Relational(r) => {
+            let end = check(&r.path)?;
+            let body = match &r.quantifier {
+                Quantifier::Exists(body)
+                | Quantifier::All(body)
+                | Quantifier::None(body)
+                | Quantifier::Each(body) => body,
+                Quantifier::Count(_) => return Ok(()),
+            };
+            match end {
+                PathEnd::Elements(element) => {
+                    let inner = match shown.is_empty() {
+                        true => r.path.render(),
+                        false => format!("{shown}.{}", r.path.render()),
+                    };
+                    validate_fact_paths(body, element, &inner)
+                }
+                PathEnd::Other => Ok(()),
+            }
+        }
+    }
+}
+
 fn check_root_segment(path: &super::predicate::FieldPath) -> Result<(), CompileError> {
     use super::predicate::FieldName;
     let Some(first) = path.segments.first() else {
@@ -859,7 +1147,7 @@ fn check_root_segment(path: &super::predicate::FieldPath) -> Result<(), CompileE
         // a misleading error.
         FieldName::Index(_) => return Ok(()),
     };
-    if KNOWN_STATEMENT_FACTS_ROOTS.contains(&root_name) {
+    if statement_facts_roots().contains(&root_name) {
         Ok(())
     } else {
         Err(CompileError::UnknownRootField {
@@ -1107,26 +1395,23 @@ fn evaluate_node<'v>(
 // Scalar evaluation.
 // ─────────────────────────────────────────────────────────────────────
 
-/// True iff the leaf path segment names a dialect-folded identifier
-/// field (`IdentName.normalized` or any `*.canonical` joined-normalized
-/// form). Rule literals targeting these paths must run through the
-/// active dialect's identifier normalizer before comparison so rule
-/// authors can write `name.normalized: PUBLIC` once and have it match
-/// in Snowflake/MSSQL (upper-fold) AND PostgreSQL/Databricks
-/// (lower-fold). The active dialect is threaded from the analyzer to
-/// `normalize_identifier` by the analysis's dialect scope.
-fn path_is_dialect_folded(path: &FieldPath) -> bool {
-    matches!(
-        path.segments.last(),
-        Some(FieldName::Named(n)) if n == "normalized" || n == "canonical"
-    )
+/// The form of the dialect-folded name the path's leaf names
+/// (`IdentName.normalized`, any `*.canonical`). Rule literals targeting
+/// these paths are folded as the active dialect folds names before
+/// comparison, so rule authors can write `name.normalized: PUBLIC` once
+/// and have it match in Snowflake/MSSQL (upper-fold) AND
+/// PostgreSQL/Databricks (lower-fold). The active dialect is threaded from
+/// the analyzer by the analysis's dialect scope.
+fn folded_name_form(path: &FieldPath) -> Option<NameForm> {
+    match path.segments.last() {
+        Some(FieldName::Named(n)) => NameForm::of_field(n),
+        Some(FieldName::Index(_)) | None => None,
+    }
 }
 
-fn fold_string_literal(lit: &PredicateLiteral) -> Cow<'_, PredicateLiteral> {
+fn fold_string_literal(lit: &PredicateLiteral, form: NameForm) -> Cow<'_, PredicateLiteral> {
     match lit {
-        PredicateLiteral::String(s) => Cow::Owned(PredicateLiteral::String(
-            crate::ir::normalize::normalize_identifier(s),
-        )),
+        PredicateLiteral::String(s) => Cow::Owned(PredicateLiteral::String(form.fold(s))),
         other => Cow::Borrowed(other),
     }
 }
@@ -1146,7 +1431,7 @@ fn evaluate_scalar(
     let scalar_path = || Prefix::Field(&prefix, &s.path).render();
     let pass: bool;
     let op_name: &'static str = scalar_op_name(&s.op);
-    let fold_lits = path_is_dialect_folded(&s.path);
+    let name_form = folded_name_form(&s.path);
     // The `(op, resolved)` pair drives both the bool result and (in
     // explain mode) the rejection-reason classification. Scalar ops
     // split into three categories:
@@ -1243,12 +1528,17 @@ fn evaluate_scalar(
             // dialect's identifier normalizer to each string literal
             // before comparison. Outside that path family the literal
             // is used verbatim.
-            let fold = |lit| {
-                if fold_lits {
-                    fold_string_literal(lit)
-                } else {
-                    Cow::Borrowed(lit)
-                }
+            let fold = |lit| match name_form {
+                Some(form) => fold_string_literal(lit, form),
+                None => Cow::Borrowed(lit),
+            };
+            // A list holds an identifier's folded name where it holds each
+            // item folded as a literal is; any other field, ignoring case.
+            let held = |text: &str| {
+                lists.iter().any(|list| match name_form {
+                    Some(form) => list.holds_name(text, form),
+                    None => list.holds(text),
+                })
             };
             pass = match op {
                 ScalarOp::Eq(lit) | ScalarOp::EqExplicit(lit) => match_eq(v, &fold(lit)),
@@ -1259,12 +1549,9 @@ fn evaluate_scalar(
                 ScalarOp::Lte(lit) => compare_lit(v, &fold(lit), |a, b| a <= b),
                 ScalarOp::Matches(glob) => match v {
                     Value::String(s) => {
-                        let pat: std::borrow::Cow<'_, str> = if fold_lits {
-                            std::borrow::Cow::Owned(crate::ir::normalize::normalize_identifier(
-                                glob,
-                            ))
-                        } else {
-                            std::borrow::Cow::Borrowed(glob.as_str())
+                        let pat: std::borrow::Cow<'_, str> = match name_form {
+                            Some(form) => std::borrow::Cow::Owned(form.fold(glob)),
+                            None => std::borrow::Cow::Borrowed(glob.as_str()),
                         };
                         glob_match(&pat, s)
                     }
@@ -1272,12 +1559,8 @@ fn evaluate_scalar(
                 },
                 ScalarOp::In(list) => list.iter().any(|lit| match_eq(v, &fold(lit))),
                 ScalarOp::NotIn(list) => !list.iter().any(|lit| match_eq(v, &fold(lit))),
-                ScalarOp::InList(_) => {
-                    matches!(v, Value::String(text) if lists.iter().any(|l| l.holds(text)))
-                }
-                ScalarOp::NotInList(_) => {
-                    matches!(v, Value::String(text) if !lists.iter().any(|l| l.holds(text)))
-                }
+                ScalarOp::InList(_) => matches!(v, Value::String(text) if held(text)),
+                ScalarOp::NotInList(_) => matches!(v, Value::String(text) if !held(text)),
                 ScalarOp::Contains(lit) => match v {
                     Value::Array(items) => items.iter().any(|e| match_eq(e, &fold(lit))),
                     _ => false,
@@ -1956,6 +2239,8 @@ mod tests {
 
     fn empty_facts(kind: StatementKind) -> StatementFacts {
         StatementFacts {
+            declare: None,
+            call: None,
             kind,
             source_span: None,
             query: None,
@@ -1992,9 +2277,10 @@ mod tests {
         }
     }
 
+    /// The predicate `yaml`, compiled to be read over any shape of value.
     fn compile_yaml(yaml: &str) -> CompiledPredicate {
         let parsed = parse_yaml(yaml).expect("predicate parses");
-        compile(&parsed).expect("predicate compiles")
+        compile_any_shape(&parsed, &ValueLists::default()).expect("predicate compiles")
     }
 
     #[test]
@@ -2417,6 +2703,26 @@ any_of:
     }
 
     #[test]
+    fn the_roots_are_the_fields_of_statement_facts() {
+        let roots = statement_facts_roots();
+        for field in [
+            "kind",
+            "query",
+            "ddl",
+            "privilege",
+            "call",
+            "script_context",
+            "diff",
+        ] {
+            assert!(roots.contains(&field), "{field} in {roots:?}");
+        }
+        let mut distinct = roots.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), roots.len(), "{roots:?}");
+    }
+
+    #[test]
     fn kind_gate_index_consistency() {
         // The set-time index (string → StatementKind → as usize) must equal
         // the check-time index (facts.kind as usize) for the bitset to be
@@ -2643,9 +2949,10 @@ any_of:
             Err(CompileError::UnknownRootField { unknown_root, .. }) if unknown_root == "qurey"
         ));
         // Inside a quantifier the field is the element's, of any name.
-        assert!(compile(&parse(
-            "query.items: { exists: { left: { all_in_field: qurey } } }"
-        ))
+        assert!(compile_any_shape(
+            &parse("query.items: { exists: { left: { all_in_field: qurey } } }"),
+            &ValueLists::default()
+        )
         .is_ok());
     }
 
@@ -2719,7 +3026,7 @@ any_of:
 
     fn holds_with_lists(yaml: &str, facts: Value) -> bool {
         let parsed = parse_yaml(yaml).expect("predicate parses");
-        compile_with_lists(&parsed, &list_table())
+        compile_any_shape(&parsed, &list_table())
             .expect("predicate compiles")
             .evaluate_value(&facts)
             .is_match()
@@ -2763,7 +3070,7 @@ any_of:
     fn unknown_list_is_a_compile_error() {
         let parsed = parse_yaml("query.x: { in_list: nope }").expect("predicate parses");
         assert!(matches!(
-            compile_with_lists(&parsed, &list_table()),
+            compile_any_shape(&parsed, &list_table()),
             Err(CompileError::UnknownList { list }) if list == "nope"
         ));
     }
@@ -2773,7 +3080,7 @@ any_of:
         let parsed =
             parse_yaml("query.x: { in_list: Credential_References }").expect("predicate parses");
         assert!(matches!(
-            compile_with_lists(&parsed, &list_table()),
+            compile_any_shape(&parsed, &list_table()),
             Err(CompileError::UnknownList { list }) if list == "Credential_References"
         ));
     }
@@ -2802,7 +3109,7 @@ any_of:
         let parsed = parse_yaml("query.items: { none: { value: { in_list: nope } } }")
             .expect("predicate parses");
         assert!(matches!(
-            compile_with_lists(&parsed, &list_table()),
+            compile_any_shape(&parsed, &list_table()),
             Err(CompileError::UnknownList { list }) if list == "nope"
         ));
     }
@@ -2810,7 +3117,7 @@ any_of:
     #[test]
     fn explain_renders_list_names() {
         let parsed = parse_yaml("query.x: { not_in_list: [dummies, refs] }").expect("parses");
-        let compiled = compile_with_lists(&parsed, &list_table()).expect("compiles");
+        let compiled = compile_any_shape(&parsed, &list_table()).expect("compiles");
         let facts = x("REPLACE_ME".into());
         let (result, exp) = compiled.evaluate_value_with_explain(&facts);
         assert!(!result.is_match());

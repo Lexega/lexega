@@ -759,6 +759,14 @@ pub fn format_with_clause(
 
                     printer.push(" ");
                     printer.push_token_id(syntax.as_keyword);
+                    if let Some((not, word)) = syntax.materialized {
+                        if let Some(not) = not {
+                            printer.push(" ");
+                            printer.push_token_id(not);
+                        }
+                        printer.push(" ");
+                        printer.push_token_id(word);
+                    }
                     printer.push(" ");
                     // Use lparen token from syntax node to preserve trailing trivia
                     printer.push_token_id(syntax.l_paren);

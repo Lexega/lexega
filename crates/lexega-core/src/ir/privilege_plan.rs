@@ -377,12 +377,11 @@ fn lower_object_scope(scope: &AstObjectScope) -> PrivilegeObjectScope {
 /// distinct from `PrivilegeShape::Privilege`.
 pub fn lower_deny_to_privilege_plan(d: &AstDeny) -> PrivilegePlan {
     let privileges = lower_privilege_list(&d.privileges);
-    let object = d.object_span.as_ref().map(|_| {
-        // No DNY-* rule currently predicates on the securable's class
-        // or name; surface a placeholder `Account` to indicate that some
-        // ON clause was present. Promote to a typed shape when the
-        // first rule needs it (see [`AstDeny::object_span`]).
-        PrivilegeObject::Account
+    let object = d.object_span.as_ref().map(|on| match &on.object {
+        Some(object) => lower_grant_object(object),
+        // An ON clause whose securable did not parse names some
+        // securable, unnamed.
+        None => PrivilegeObject::Account,
     });
     let grantees = d.grantees.iter().map(lower_grantee).collect();
     let options = PrivilegeOptions {

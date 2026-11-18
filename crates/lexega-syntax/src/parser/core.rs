@@ -1159,8 +1159,7 @@ impl<'a> Parser<'a> {
 
         // Find first unconsumed non-EOF token
         let mut unconsumed_tokens = Vec::new();
-        for i in self.idx..self.tokens.len() {
-            let tok = &self.tokens[i];
+        for (i, tok) in self.tokens.iter().enumerate().skip(self.idx) {
             if !matches!(tok.kind, TokenKind::Eof) {
                 unconsumed_tokens.push((i, tok.clone()));
             }

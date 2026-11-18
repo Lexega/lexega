@@ -17,7 +17,7 @@ pub use config::AnalysisConfig;
 pub use evidence_utils::{LineIndex, TextPosition};
 pub use gl_sast::{to_gl_sast, GlSastReport};
 pub(crate) use metrics::CatalogSubject;
-pub use metrics::MetricsCollector;
+pub use metrics::{MetricsCollector, StatementSubject, SubjectObject};
 pub use placeholder_classifier::{
     classify_placeholder, classify_placeholders, compute_placeholder_stats, PlaceholderStats,
 };
@@ -674,6 +674,10 @@ pub struct AnalysisReport {
     /// Contains the last role in the file.
     #[serde(skip)]
     pub assumed_role: Option<String>,
+
+    /// What each analyzed statement acts on, in script order.
+    #[serde(skip)]
+    pub subjects: Vec<StatementSubject>,
 }
 
 impl AnalysisReport {
@@ -711,6 +715,7 @@ impl AnalysisReport {
             trace_mode: None,
             catalog_info: CatalogInfo::default(),
             assumed_role: None,
+            subjects: Vec::new(),
         }
     }
 

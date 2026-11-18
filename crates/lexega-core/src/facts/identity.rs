@@ -175,6 +175,48 @@ impl From<&str> for IdentName {
     }
 }
 
+/// The folded parts of a qualified name joined with `.`, as
+/// [`TableRef::canonical`] writes them: a part holding a `.` or a `"` is
+/// written in double quotes, each `"` in it doubled, so a name of one part
+/// never reads as a name of several.
+pub(crate) fn join_canonical<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for (at, part) in parts.into_iter().enumerate() {
+        if at > 0 {
+            out.push('.');
+        }
+        match part.contains(['.', '"']) {
+            true => {
+                out.push('"');
+                out.push_str(&part.replace('"', "\"\""));
+                out.push('"');
+            }
+            false => out.push_str(part),
+        }
+    }
+    out
+}
+
+/// `written`, a qualified name as a rule or a list writes it, in the form
+/// [`TableRef::canonical`] takes under the thread's folding: its parts read
+/// as a relation's are (`crate::ir::utils::relation_written_parts`), each
+/// folded as the dialect folds a relation's name, quotes removed.
+pub(crate) fn canonical_of_written(written: &str) -> String {
+    let parts = crate::ir::lower_ddl::split_qualified_keeping_empty(written)
+        .into_iter()
+        .map(|part| (!part.is_empty()).then_some(part))
+        .collect();
+    let folded: Vec<String> = crate::ir::utils::relation_written_parts(parts)
+        .iter()
+        .map(|part| {
+            part.as_deref()
+                .map(crate::ir::normalize::normalize_identifier)
+                .unwrap_or_default()
+        })
+        .collect();
+    join_canonical(folded.iter().map(String::as_str))
+}
+
 /// A fully-qualified table reference. Customer rules match against
 /// `canonical` for the cross-dialect-stable identity, or against
 /// `name` / `schema` / `database` for component-level matching.
@@ -191,7 +233,8 @@ pub struct TableRef {
     /// three-part-or-fewer case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<IdentName>,
-    /// `[server.]database.schema.table` joined with normalized component forms.
+    /// `[server.]database.schema.table` joined with normalized component
+    /// forms; a part holding a `.` is written in double quotes.
     pub canonical: String,
     /// The same parts joined as the statement wrote them.
     #[serde(default)]
@@ -305,18 +348,16 @@ impl TableRef {
         schema: &Option<IdentName>,
         name: &IdentName,
     ) -> String {
-        let base = match (database, schema) {
-            (Some(db), Some(sc)) => {
-                format!("{}.{}.{}", db.normalized, sc.normalized, name.normalized)
-            }
-            (None, Some(sc)) => format!("{}.{}", sc.normalized, name.normalized),
-            (Some(db), None) => format!("{}..{}", db.normalized, name.normalized),
-            (None, None) => name.normalized.clone(),
-        };
-        match server {
-            Some(srv) => format!("{}.{}", srv.normalized, base),
-            None => base,
+        fn part(ident: &IdentName) -> &str {
+            ident.normalized.as_str()
         }
+        let base: Vec<&str> = match (database, schema) {
+            (Some(db), Some(sc)) => vec![part(db), part(sc), part(name)],
+            (None, Some(sc)) => vec![part(sc), part(name)],
+            (Some(db), None) => vec![part(db), "", part(name)],
+            (None, None) => vec![part(name)],
+        };
+        join_canonical(server.map(part).into_iter().chain(base))
     }
 }
 

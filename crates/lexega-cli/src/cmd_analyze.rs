@@ -930,10 +930,14 @@ pub(crate) fn run(args: &[String], ext: &dyn Extension, scope: Scope) {
         print_usage(program, ext, change);
         process::exit(1);
     }
-    // Runtime mode prints one decision and nothing else.
+    // Runtime mode prints one decision and nothing else: on standard
+    // output unless --decision-out names a file.
     if runtime_mode && policy_path.is_none() {
         eprintln!("Error: --mode runtime requires --policy");
         process::exit(1);
+    }
+    if runtime_mode && decision_out.is_none() {
+        decision_out = Some("-".to_string());
     }
 
     // CI strict mode: a missing policy is a hard error so the gate can't be

@@ -93,13 +93,12 @@ fn first_component_target(source: &str, span: Span) -> Option<UseTarget> {
     }
     // Take the first dotted component before normalizing: the first
     // part is the role.
-    let first = raw.split('.').next().unwrap_or(raw).trim();
-    if first.is_empty() {
-        return None;
-    }
+    let first = crate::ir::lower_ddl::split_qualified(raw)
+        .into_iter()
+        .next()?;
     Some(UseTarget {
-        raw: first.to_string(),
-        normalized: normalize_identifier(first),
+        normalized: normalize_identifier(&first),
+        raw: first,
         span,
     })
 }

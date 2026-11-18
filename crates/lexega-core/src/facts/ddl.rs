@@ -21,7 +21,13 @@ use super::literal::{DataType, LiteralValue};
 pub struct DdlFacts {
     pub action: DdlAction,
     pub object_kind: ObjectKind,
+    /// The object the statement acts on; for a list (`DROP TABLE a, b`),
+    /// the first of `targets`.
     pub target: Option<ObjectRef>,
+    /// Every object the statement acts on, in the order written: `target`
+    /// alone, or each object of a list (`DROP TABLE a, b`, `TRUNCATE a, b`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ObjectRef>,
     pub options: DdlOptions,
     /// The list of changes applied by this ALTER statement. Empty for non-ALTER actions.
     pub alter_changes: Vec<AlterChange>,
@@ -342,6 +348,93 @@ pub struct DdlFacts {
     /// HTTPS service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_function: Option<ExternalFunctionFacts>,
+}
+
+impl DdlFacts {
+    /// Facts of `action` on `target`, an object of `object_kind`, with
+    /// nothing else known.
+    pub(crate) fn bare(
+        action: DdlAction,
+        object_kind: ObjectKind,
+        target: Option<ObjectRef>,
+    ) -> Self {
+        Self {
+            action,
+            object_kind,
+            target,
+            targets: Vec::new(),
+            options: DdlOptions::default(),
+            alter_changes: Vec::new(),
+            stage: None,
+            storage_credential: None,
+            dynamic_table: None,
+            pipe: None,
+            task: None,
+            database: None,
+            warehouse: None,
+            stream: None,
+            schema: None,
+            function: None,
+            procedure: None,
+            trigger_body: None,
+            table: None,
+            catalog: None,
+            table_maintenance: None,
+            volume: None,
+            external_location: None,
+            connection: None,
+            external_data_source: None,
+            foreign_server: None,
+            user_mapping: None,
+            foreign_table: None,
+            import_foreign_schema: None,
+            flow: None,
+            mssql_set_option: None,
+            mssql_principal: None,
+            principal: None,
+            domain: None,
+            index: None,
+            trigger: None,
+            trigger_state: None,
+            pg_session: None,
+            bq_assert: None,
+            bq_create_model: None,
+            bq_export_data: None,
+            bq_options: None,
+            datashare: None,
+            tag: None,
+            file_format: None,
+            session: None,
+            share: None,
+            secret: None,
+            network_rule: None,
+            resource_monitor: None,
+            compute_pool: None,
+            git_repository: None,
+            image_repository: None,
+            streamlit: None,
+            service: None,
+            notebook: None,
+            alert: None,
+            data_metric_function: None,
+            replication_failover_group: None,
+            account: None,
+            semantic_view: None,
+            cortex_search_service: None,
+            application: None,
+            application_package: None,
+            listing: None,
+            managed_account: None,
+            show: None,
+            synonym: None,
+            server_configuration: None,
+            mysql_load_data: None,
+            event: None,
+            create_trigger: None,
+            view: None,
+            external_function: None,
+        }
+    }
 }
 
 /// Recognition facts for a `SHOW` metadata statement: which object
@@ -1008,34 +1101,73 @@ pub struct MssqlExecFacts {
     /// has literal value `cmdexec`" instead of scanning [`Self::args_text`].
     /// Empty for the bare dynamic-SQL form `EXEC(@sql)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<MssqlExecArgFacts>,
+    pub args: Vec<CallArgumentFacts>,
 }
 
-/// One argument of an `EXEC <proc> …` call, typed for structural
-/// predicate matching. Dialect-neutral recognition: the name and value
-/// shape are recorded; which names/values are dangerous is rule policy.
+/// The variables a `DECLARE` makes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct DeclareFacts {
+    /// Each variable, in the order written.
+    pub variables: Vec<DeclaredVariableFacts>,
+}
+
+/// One variable a `DECLARE` makes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct DeclaredVariableFacts {
+    /// The variable's name (`@sql`, `v_count`).
+    pub name: super::identity::IdentName,
+    /// Its type as written, T-SQL's `AS` with it (`NVARCHAR(MAX)`,
+    /// `TABLE` for a table variable). Omitted where none is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<String>,
+    /// The shape of its default. Omitted where it has none, and for a name
+    /// declared with others after the first, which holds their default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<ValueKind>,
+}
+
+/// The arguments a statement passes to the routine it calls: `CALL p(…)`,
+/// T-SQL `EXEC p …`. The routine is the statement's `ddl.target`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct CallFacts {
+    /// Each argument, in the order written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<CallArgumentFacts>,
+}
+
+/// One argument a statement passes to the routine it calls (`CALL p(…)`,
+/// T-SQL `EXEC p …`): its name where written by name, its position, and
+/// the shape of its value. Which names and values are dangerous is rule
+/// policy.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub struct MssqlExecArgFacts {
-    /// Named-parameter name with the leading `@` stripped and lowercased
-    /// (`rmtpassword` from `@rmtpassword = …`). `None` for a positional
-    /// argument.
+pub struct CallArgumentFacts {
+    /// The parameter name it is written to, lowercased, a leading `@`
+    /// stripped (`rmtpassword` from `@rmtpassword = …`, `days` from
+    /// `days => 30`). `None` for a positional argument.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Zero-based position of the argument in the call's argument list,
     /// named arguments included.
     pub position: u32,
     /// Shape of the argument value.
-    pub value_kind: MssqlExecArgValueKind,
+    pub value_kind: ValueKind,
     /// For a string-literal value, its decoded inner text lowercased
     /// (`cmdexec` from `N'CmdExec'`); `None` for non-string values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_literal: Option<super::identity::WrittenText>,
-    /// For an integer-literal value (`1` in `@configvalue = 1`), the
-    /// number; `None` for any other value, including decimals.
+    /// For a numeric-literal value (`1` in `@configvalue = 1`, `-1`,
+    /// `3.5`, `3e0`), the number, a whole number written as an integer;
+    /// `None` for any other value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_number: Option<i64>,
+    pub value_number: Option<f64>,
     /// Where the source writes the value.
     #[serde(skip)]
     pub(crate) value_origin: super::identity::TextOrigin,
@@ -1044,13 +1176,13 @@ pub struct MssqlExecArgFacts {
 /// An argument as it serializes: its number left out where a report prints
 /// it and the source's text of the value is masked
 /// (`super::secrets::masked_in_print`).
-impl Serialize for MssqlExecArgFacts {
+impl Serialize for CallArgumentFacts {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let number = self
             .value_number
             .filter(|_| !self.value_origin.masked_in_print());
-        let mut out = serializer.serialize_struct("MssqlExecArgFacts", 5)?;
+        let mut out = serializer.serialize_struct("CallArgumentFacts", 5)?;
         match &self.name {
             Some(name) => out.serialize_field("name", name)?,
             None => out.skip_field("name")?,
@@ -1061,7 +1193,13 @@ impl Serialize for MssqlExecArgFacts {
             Some(literal) => out.serialize_field("value_literal", literal)?,
             None => out.skip_field("value_literal")?,
         }
+        // A whole number within the range an `f64` holds exactly is written
+        // as an integer, so `value_number: 1` reads `1.0` as `1`.
+        const EXACT: f64 = 9_007_199_254_740_992.0;
         match number {
+            Some(number) if number.fract() == 0.0 && number.abs() <= EXACT => {
+                out.serialize_field("value_number", &(number as i64))?
+            }
             Some(number) => out.serialize_field("value_number", &number)?,
             None => out.skip_field("value_number")?,
         }
@@ -1069,11 +1207,12 @@ impl Serialize for MssqlExecArgFacts {
     }
 }
 
-/// Shape of an `EXEC` argument value.
+/// The shape of a value a statement passes or assigns: an argument's, a
+/// declared variable's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum MssqlExecArgValueKind {
+pub enum ValueKind {
     /// A string literal (`'x'`, `N'x'`).
     StringLiteral,
     /// A numeric literal.
@@ -1334,6 +1473,11 @@ pub struct StageDdlFacts {
     /// loads and for CREATE / ALTER / DROP STAGE.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exported_columns: Vec<ExportedColumn>,
+    /// The path a `PUT`, `GET`, `REMOVE` or `LIST` names within its stage,
+    /// from its `/` (`/2024/` in `REMOVE @raw/2024/`), as written. Omitted
+    /// elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<super::identity::WrittenText>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -3625,6 +3769,9 @@ pub enum TableAlterAction {
     /// SECURITY`. `mode` names which form: enabling/forcing tightens
     /// row-level security; disabling/un-forcing relaxes it.
     RowLevelSecurity { mode: RowLevelSecurityMode },
+    /// `ALTER TABLE … SWAP WITH <other>` — the two tables exchange their
+    /// contents and metadata.
+    SwapWith,
 }
 
 /// Which `ROW LEVEL SECURITY` toggle an `ALTER TABLE` applied.

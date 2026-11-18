@@ -10,6 +10,7 @@
 //! - Azure DevOps (Pipelines)
 
 use super::ci_env::{detect_ci_platform, CiPlatform};
+use super::io::{HttpMethod, HttpRequest};
 use std::env;
 
 /// Context extracted from CI environment
@@ -191,10 +192,10 @@ const COMMENTS_PER_PAGE: usize = 100;
 /// The most pages of comments read in search of an earlier review comment.
 const MAX_COMMENT_PAGES: usize = 50;
 
-/// Extra (non-secret) headers required by the GitHub API.
-const GITHUB_API_HEADERS: &[&str] = &[
-    "Accept: application/vnd.github+json",
-    "X-GitHub-Api-Version: 2022-11-28",
+/// Extra headers required by the GitHub API.
+const GITHUB_API_HEADERS: &[(&str, &str)] = &[
+    ("Accept", "application/vnd.github+json"),
+    ("X-GitHub-Api-Version", "2022-11-28"),
 ];
 
 /// Display label for error messages.
@@ -207,20 +208,14 @@ fn platform_label(platform: &CiPlatform) -> &'static str {
     }
 }
 
-/// Platform-appropriate auth header line. Fed to curl via `--config -` on
-/// stdin so the token never appears on argv (visible in /proc) or on disk.
-fn auth_header(ctx: &PRContext) -> String {
+/// The platform's auth header: its name and value.
+fn auth_header(ctx: &PRContext) -> (&'static str, String) {
     match ctx.platform {
-        CiPlatform::GitLab => format!("PRIVATE-TOKEN: {}", ctx.token),
+        CiPlatform::GitLab => ("PRIVATE-TOKEN", ctx.token.clone()),
         CiPlatform::GitHub | CiPlatform::Bitbucket | CiPlatform::AzureDevOps => {
-            format!("Authorization: Bearer {}", ctx.token)
+            ("Authorization", format!("Bearer {}", ctx.token))
         }
     }
-}
-
-/// Escape a value for a double-quoted curl config entry.
-fn curl_config_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Truncated JSON for error messages.
@@ -228,126 +223,42 @@ fn json_snippet(value: &serde_json::Value) -> String {
     value.to_string().chars().take(200).collect()
 }
 
-/// Run curl and return (http_status, raw_response_body).
-///
-/// The auth header travels via `--config -` on stdin; the JSON payload via a
-/// temp file (`--data-binary @file`), which sidesteps argv size limits — the
-/// payload is markdown headed for a public PR comment, not a secret. Command
-/// spawns curl directly (execve, no shell), so neither channel is ever
-/// shell-parsed. The response body lands in a temp file and the `-w` write-out
-/// confines stdout to the status code.
-fn curl_transport(
-    method: &str,
+/// Make one API call and return (http_status, raw_response_body).
+fn transport(
+    method: HttpMethod,
     url: &str,
-    auth: &str,
-    extra_headers: &[&str],
+    auth: (&str, &str),
+    extra_headers: &[(&str, &str)],
     payload: Option<&serde_json::Value>,
 ) -> Result<(u16, Vec<u8>), String> {
-    use std::io::Write;
-
-    // The request and the response are files in a private directory that is
-    // removed on every way out of this function.
-    let staged = crate::io::StagedUpload::new()
-        .map_err(|e| format!("Failed to make a private staging directory: {}", e))?;
-    let body_path = staged.path("response.json");
-
-    let body_path_str = body_path.to_str().ok_or_else(|| {
-        format!(
-            "Temp path is not valid UTF-8 (cannot pass to curl): {}",
-            body_path.display()
-        )
-    })?;
-
-    let mut args: Vec<String> = vec![
-        "-sS".to_string(),
-        "--max-time".to_string(),
-        "30".to_string(),
-        "-X".to_string(),
-        method.to_string(),
-        "--config".to_string(),
-        "-".to_string(),
-        "-o".to_string(),
-        body_path_str.to_string(),
-        "-w".to_string(),
-        "%{http_code}".to_string(),
-    ];
-    for header in extra_headers {
-        args.push("-H".to_string());
-        args.push((*header).to_string());
+    let mut headers: Vec<(&str, &str)> = vec![auth];
+    headers.extend_from_slice(extra_headers);
+    let body = payload.map(|p| p.to_string().into_bytes());
+    if body.is_some() {
+        headers.push(("Content-Type", "application/json"));
     }
-    if let Some(p) = payload {
-        let payload_path = staged
-            .write("payload.json", p.to_string().as_bytes())
-            .map_err(|e| format!("Failed to write request payload: {}", e))?;
-        let payload_path_str = payload_path.to_str().ok_or_else(|| {
-            format!(
-                "Temp path is not valid UTF-8 (cannot pass to curl): {}",
-                payload_path.display()
-            )
-        })?;
-        args.push("-H".to_string());
-        args.push("Content-Type: application/json".to_string());
-        args.push("--data-binary".to_string());
-        args.push(format!("@{}", payload_path_str));
-    }
-    args.push(url.to_string());
-
-    let mut child = match std::process::Command::new("curl")
-        .args(&args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!("Failed to execute curl: {}", e));
-        }
-    };
-
-    if let Some(ref mut stdin) = child.stdin {
-        // Result deliberately discarded: returning early would orphan the
-        // running curl child (Child::drop neither kills nor reaps). The
-        // failure still surfaces — curl exits non-zero on a truncated config,
-        // and an unauthenticated request fails the status check.
-        let _ = writeln!(stdin, "header = \"{}\"", curl_config_escape(auth));
-    }
-    drop(child.stdin.take());
-
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(format!("Failed to wait for curl: {}", e));
-        }
-    };
-
-    if !output.status.success() {
-        return Err(format!(
-            "curl request failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    // curl claimed success but its `-o` body file is unreadable: fail the
-    // call rather than hand back an empty body (2xx + empty body would
-    // otherwise read as a successful API response).
-    let body = match std::fs::read(&body_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(format!("Failed to read response body file: {}", e));
-        }
-    };
-
-    let status_text = String::from_utf8_lossy(&output.stdout);
-    let status: u16 = status_text.trim().parse().map_err(|_| {
-        format!(
-            "Could not read HTTP status from curl write-out: {:?}",
-            status_text
-        )
-    })?;
-
+    let response = crate::io::shared_http_client()
+        .send(&HttpRequest {
+            method,
+            url,
+            headers: &headers,
+            body: body.as_deref(),
+            timeout: Some(API_TIMEOUT),
+            body_limit: Some(API_BODY_LIMIT),
+        })
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+    let status = response.status;
+    let body = response
+        .read_body()
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
     Ok((status, body))
 }
+
+/// How long one API call may take.
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most of an API response read.
+const API_BODY_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Execute an API call. Success means a 2xx status AND a JSON body (empty
 /// body allowed). The JSON requirement is not redundant with the status
@@ -355,13 +266,20 @@ fn curl_transport(
 /// fails.
 fn api_call(
     ctx: &PRContext,
-    method: &str,
+    method: HttpMethod,
     url: &str,
-    extra_headers: &[&str],
+    extra_headers: &[(&str, &str)],
     payload: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let label = platform_label(&ctx.platform);
-    let (status, body) = curl_transport(method, url, &auth_header(ctx), extra_headers, payload)?;
+    let (auth_name, auth_value) = auth_header(ctx);
+    let (status, body) = transport(
+        method,
+        url,
+        (auth_name, &auth_value),
+        extra_headers,
+        payload,
+    )?;
 
     let value = if body.is_empty() {
         serde_json::Value::Null
@@ -477,7 +395,7 @@ fn post_github_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
         );
         api_call(
             ctx,
-            "PATCH",
+            HttpMethod::Patch,
             &update_url,
             GITHUB_API_HEADERS,
             Some(&payload),
@@ -485,7 +403,13 @@ fn post_github_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
         eprintln!("✓ Updated existing PR comment (id: {})", comment_id);
     } else {
         // Create new comment
-        api_call(ctx, "POST", &list_url, GITHUB_API_HEADERS, Some(&payload))?;
+        api_call(
+            ctx,
+            HttpMethod::Post,
+            &list_url,
+            GITHUB_API_HEADERS,
+            Some(&payload),
+        )?;
         eprintln!("✓ Posted new PR comment");
     }
 
@@ -507,11 +431,11 @@ fn post_gitlab_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
             "{}/projects/{}/merge_requests/{}/notes/{}",
             ctx.api_url, ctx.repo, ctx.pr_number, note_id
         );
-        api_call(ctx, "PUT", &update_url, &[], Some(&payload))?;
+        api_call(ctx, HttpMethod::Put, &update_url, &[], Some(&payload))?;
         eprintln!("✓ Updated existing MR note (id: {})", note_id);
     } else {
         // Create new note
-        api_call(ctx, "POST", &list_url, &[], Some(&payload))?;
+        api_call(ctx, HttpMethod::Post, &list_url, &[], Some(&payload))?;
         eprintln!("✓ Posted new MR note");
     }
 
@@ -528,7 +452,7 @@ fn post_bitbucket_comment(ctx: &PRContext, body: &str) -> Result<(), String> {
     // Finding an earlier comment on Bitbucket means paging through every
     // comment, so each run posts a new one.
     let payload = serde_json::json!({ "content": { "raw": body } });
-    api_call(ctx, "POST", &url, &[], Some(&payload))?;
+    api_call(ctx, HttpMethod::Post, &url, &[], Some(&payload))?;
     eprintln!("✓ Posted PR comment");
 
     Ok(())
@@ -547,7 +471,7 @@ fn post_azure_devops_comment(ctx: &PRContext, body: &str) -> Result<(), String> 
             ctx.api_url, ctx.repo, ctx.pr_number, thread_id, comment_id
         );
         let payload = serde_json::json!({ "content": body });
-        api_call(ctx, "PATCH", &update_url, &[], Some(&payload))?;
+        api_call(ctx, HttpMethod::Patch, &update_url, &[], Some(&payload))?;
         eprintln!("✓ Updated existing PR thread comment (id: {})", comment_id);
     } else {
         // status "closed": an informational comment must never block PR completion
@@ -560,7 +484,7 @@ fn post_azure_devops_comment(ctx: &PRContext, body: &str) -> Result<(), String> 
             }],
             "status": "closed"
         });
-        api_call(ctx, "POST", &threads_url, &[], Some(&payload))?;
+        api_call(ctx, HttpMethod::Post, &threads_url, &[], Some(&payload))?;
         eprintln!("✓ Posted new PR thread comment");
     }
 
@@ -573,11 +497,11 @@ fn post_azure_devops_comment(ctx: &PRContext, body: &str) -> Result<(), String> 
 fn find_marked_comment(
     ctx: &PRContext,
     list_url: &str,
-    headers: &[&str],
+    headers: &[(&str, &str)],
 ) -> Result<Option<u64>, String> {
     for page in 1..=MAX_COMMENT_PAGES {
         let url = format!("{}?per_page={}&page={}", list_url, COMMENTS_PER_PAGE, page);
-        let value = api_call(ctx, "GET", &url, headers, None)?;
+        let value = api_call(ctx, HttpMethod::Get, &url, headers, None)?;
         let comments = value.as_array().ok_or_else(|| {
             format!(
                 "Unexpected {} API response shape (expected array): {}",
@@ -604,7 +528,7 @@ fn find_existing_azure_devops_comment(
     ctx: &PRContext,
     threads_url: &str,
 ) -> Result<Option<(u64, u64)>, String> {
-    let value = api_call(ctx, "GET", threads_url, &[], None)?;
+    let value = api_call(ctx, HttpMethod::Get, threads_url, &[], None)?;
 
     // Threads list: {"value": [{"id": N, "comments": [{"id": M, "content": "..."}]}], "count": K}
     let threads = value

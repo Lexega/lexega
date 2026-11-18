@@ -105,6 +105,9 @@ pub(crate) enum IrTableAlterAction {
     DropDataMetricFunction,
     /// PG `ALTER TABLE … [ENABLE|DISABLE|FORCE|NO FORCE] ROW LEVEL SECURITY`.
     RowLevelSecurity { mode: IrRowLevelSecurityMode },
+    /// `ALTER TABLE … SWAP WITH <other>` — exchanges the two tables'
+    /// contents and metadata.
+    SwapWith,
 }
 
 /// IR-internal mirror of [`crate::ast::AstRowLevelSecurityMode`].
@@ -620,9 +623,10 @@ fn classify_alter_action(
         }
 
         // ───────────── Actions that do not map to any TBL-* rule ─────────────
+        K::SwapWith { .. } => actions.push(IrTableAlterAction::SwapWith),
+
         K::RenameColumn { .. }
         | K::ChangeColumn { .. }
-        | K::SwapWith { .. }
         | K::AlterColumn { .. }
         | K::AlterColumnList { .. }
         | K::AddConstraint { .. }
@@ -695,17 +699,8 @@ pub(crate) fn target_from_span(source: &str, span: Span) -> TableTarget {
         .get(span.start as usize..span.end as usize)
         .unwrap_or("")
         .trim();
-    let parts: Vec<&str> = raw.split('.').collect();
-    let (db, schema, name) = match parts.as_slice() {
-        [n] => (None, None, (*n).to_string()),
-        [s, n] => (None, Some((*s).to_string()), (*n).to_string()),
-        [d, s, n] => (
-            Some((*d).to_string()),
-            Some((*s).to_string()),
-            (*n).to_string(),
-        ),
-        _ => (None, None, raw.to_string()),
-    };
+    let (db, schema, name) =
+        crate::ir::utils::text_name_parts(raw).unwrap_or_else(|| (None, None, raw.to_string()));
     TableTarget {
         name,
         schema,

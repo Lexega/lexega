@@ -43,7 +43,7 @@ use super::builtin_rules::{
     builtin_corpus_json, builtin_list_rule_ids, builtin_lists, canonical_rule_id,
 };
 use super::compile::{compile_with_lists, CompileError};
-use super::engine::{MessageTemplate, Rule};
+use super::engine::{MessageTemplate, Rule, TriggersDigest};
 use super::finding::EmissionMode;
 use super::lists::{apply_file_lists, define_builtin_lists, ListChanges, ValueLists};
 use super::predicate::{names_a_list, parse_predicate, Predicate, Quantifier, RelationalMatch};
@@ -672,6 +672,7 @@ fn classify_full(
         CompileError::Parse(_)
         | CompileError::Internal(_)
         | CompileError::UnknownRootField { .. }
+        | CompileError::UnknownFactPath { .. }
         | CompileError::UnknownStatementKind { .. } => LoadError::PredicateCompile {
             rule_id: id.clone(),
             message: format!("{}", e),
@@ -690,6 +691,7 @@ fn classify_full(
         }
     });
 
+    let triggers_digest = TriggersDigest::of(&triggers, names_a_list(&parsed).then_some(lists));
     let rule = Rule {
         id,
         former_ids,
@@ -697,6 +699,7 @@ fn classify_full(
         risk_level,
         enabled: enabled.unwrap_or(true),
         triggers: compiled,
+        triggers_digest,
         message_template: Some(MessageTemplate::new(message)),
         emission: resolved_emission,
         per_statement: per_statement.unwrap_or(false),
@@ -915,7 +918,7 @@ rules:
     risk_level: high
     message: "m"
     triggers:
-      query.x: { in_list: nope }
+      ddl.target.name.canonical: { in_list: nope }
 "#;
         let err = load_v1_rules(yaml).expect_err("rejects unknown list");
         assert_eq!(

@@ -425,10 +425,48 @@ fn parse_one_privilege(p: &mut Parser<'_>) -> ParseResult<AstPrivilege> {
     }
 
     let kind = classify_privilege(&lexemes);
+    // `SELECT (a, b)`: the privilege on those columns only.
+    if let Some(columns) = consume_column_list(p)? {
+        end = columns.end;
+    }
     Ok(AstPrivilege {
         kind,
         span: Span { start, end },
     })
+}
+
+/// A parenthesized column list, `(a, b, …)`, where one comes next: its
+/// span, the list consumed.
+pub(crate) fn consume_column_list(p: &mut Parser<'_>) -> ParseResult<Option<Span>> {
+    if !peek_token_kind(p, TokenKind::Punctuation(Punctuation::LParen)) {
+        return Ok(None);
+    }
+    let open = consume_one(p)?;
+    loop {
+        let name = consume_one(p)?;
+        if !is_privilege_part(name) {
+            return Err(invalid_stmt(
+                name.span,
+                format!("Expected a column name, found '{}'", name.lexeme(p.source)),
+            ));
+        }
+        let next = consume_one(p)?;
+        match next.kind {
+            TokenKind::Punctuation(Punctuation::Comma) => continue,
+            TokenKind::Punctuation(Punctuation::RParen) => {
+                return Ok(Some(Span {
+                    start: open.span.start,
+                    end: next.span.end,
+                }))
+            }
+            _ => {
+                return Err(invalid_stmt(
+                    next.span,
+                    format!("Expected ',' or ')', found '{}'", next.lexeme(p.source)),
+                ))
+            }
+        }
+    }
 }
 
 /// Predicate: tokens that may participate in a privilege name.

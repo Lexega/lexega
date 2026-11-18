@@ -341,12 +341,16 @@ pub fn print_risk_usage(program: &str, ext: &dyn Extension) {
         println!("Policy Enforcement (the only way to block - set LEXEGA_CI=1 for strict mode):");
         println!("  --policy <URI>           Evaluate policy bundle (local, s3://, gs://, az://)");
         println!("  --env <NAME>             Environment context (required with --policy)");
-        println!("  --decision-out <URI>     Write the policy's decision artifact (local, s3://, gs://, az://; requires --policy)");
+        println!("  --decision-out <URI>     Write the policy's decision artifact (local, s3://, gs://, az://, or - for");
+        println!("                           standard output; required with --policy, except under --mode runtime)");
         println!("                       Tip: use a unique per-run directory/prefix (e.g. .../$GITHUB_RUN_ID/) to avoid overwriting previous runs");
         println!(
             "  --exceptions <URI>       Optional exception grants file (local, s3://, gs://, az://)"
         );
-        println!("  --mode <MODE>            ci (default), or runtime: one file or stdin, the decision as JSON on stdout (requires --policy)");
+        println!("  --mode <MODE>            ci (default), or runtime: one file or stdin, the decision as JSON on stdout");
+        println!(
+            "                           unless --decision-out names a file (requires --policy)"
+        );
         println!();
     }
     println!("Custom Rules:");
@@ -538,15 +542,22 @@ pub fn print_rule_syntax(program: &str, ext: &dyn Extension) {
     println!("  ddl.target.name.database: {{ exists: true }}");
     println!("                                       # path resolves non-null");
     println!("  mssql_exec.procedure_name: {{ not_in_list: my_procs }}");
-    println!("                                       # named list (see LISTS), ignoring");
-    println!("                                       # case; in_list is the converse");
+    println!("                                       # named list (see LISTS); in_list is");
+    println!("                                       # the converse");
+    println!("  kind: {{ in: [call, mssql_exec] }}     # a CALL or a T-SQL EXEC of a routine:");
+    println!("  ddl.target.name.canonical: {{ not_in_list: approved_procs }}");
+    println!("                                       # the routine called; its arguments");
+    println!("                                       # are call.arguments (position, name,");
+    println!("                                       # value_kind, value_literal, value_number)");
     println!();
     println!("Both list operators read strings only: an absent or non-string value");
     println!("makes both false.");
     println!();
     println!("Identifier matches: predicate against `name.normalized`, never");
     println!("`name.raw` — normalization is dialect-aware (Snowflake upper-folds,");
-    println!("PostgreSQL lower-folds, etc.).");
+    println!("PostgreSQL lower-folds, etc.). A literal on a `normalized` or `canonical`");
+    println!("path folds the same way, so `orders` matches any unquoted spelling; quote");
+    println!("it ('\"MyDomain\"') to name a case-sensitive object.");
     println!();
 
     println!("LISTS");
@@ -567,6 +578,9 @@ pub fn print_rule_syntax(program: &str, ext: &dyn Extension) {
     println!("        values: [\"\", CHANGEME]");
     println!();
     println!("Built-in lists: credential_dummies, credential_references.");
+    println!("Against a `normalized` or `canonical` name each item folds as a literal");
+    println!("does (quote it to keep its case); against any other field a list ignores");
+    println!("case.");
     println!("Items must be strings (quote a number such as 1234); a pattern of only");
     println!("`*` is rejected.");
     println!();

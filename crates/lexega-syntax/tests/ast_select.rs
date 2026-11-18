@@ -3348,3 +3348,23 @@ fn a_mysql_set_password_joined_to_a_templated_string_is_one_templated_string() {
         assert_eq!(&src[span.start as usize..span.end as usize], value, "{src}");
     }
 }
+
+#[test]
+fn a_cte_marked_materialized_reads_and_formats_back() {
+    let pg = lexega_syntax::dialect::postgres();
+    for src in [
+        "WITH x AS MATERIALIZED (SELECT * FROM a.b) SELECT * FROM x",
+        "WITH x AS NOT MATERIALIZED (SELECT id FROM t), y AS (SELECT 1) SELECT * FROM x, y",
+    ] {
+        let script = lexega_syntax::parse_sql_with_dialect(src, pg.as_ref()).expect("parse");
+        assert_eq!(script.stmts.len(), 1, "{src}");
+        let config = lexega_syntax::FormatterConfig {
+            dialect: pg.clone(),
+            ..Default::default()
+        };
+        let formatted = lexega_syntax::format_sql_with_config(src, &config).expect("format");
+        assert!(formatted.contains("MATERIALIZED"), "{formatted}");
+        lexega_syntax::verify_formatting_safe_with_dialect(src, &formatted, pg.as_ref())
+            .expect("round trip");
+    }
+}

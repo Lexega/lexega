@@ -291,6 +291,9 @@ pub struct DynamicBodyOutcome {
     pub findings: Vec<(crate::lexer::token::Span, crate::analyzer::RuleMatch)>,
     pub tables_read: std::collections::HashSet<String>,
     pub tables_written: std::collections::HashSet<String>,
+    /// What each statement of a body acts on, with the span of the
+    /// statement that runs the body.
+    pub subjects: Vec<(crate::lexer::token::Span, crate::analyzer::StatementSubject)>,
 }
 
 impl DynamicBodyOutcome {
@@ -299,6 +302,7 @@ impl DynamicBodyOutcome {
             findings: Vec::new(),
             tables_read: std::collections::HashSet::new(),
             tables_written: std::collections::HashSet::new(),
+            subjects: Vec::new(),
         }
     }
 }
@@ -323,6 +327,7 @@ pub const REASONING_FIELDS: &[(&str, &str)] = &[
     // A predicate that keeps every row only because a column is proven
     // non-null.
     ("*", "has_tautology_where"),
+    ("*", "has_non_null_tautology_where"),
     // Uniqueness and key relationships of join columns.
     ("on_columns", "unique_key_backing_known"),
     ("on_columns", "unique_key_backed"),

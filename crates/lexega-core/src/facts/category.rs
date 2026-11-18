@@ -384,6 +384,7 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         // Session / transaction / scripting control-flow mechanics.
         K::Use
         | K::Show
+        | K::Describe
         | K::Set
         | K::Reset
         | K::BeginTransaction
@@ -398,6 +399,12 @@ pub fn category_of_kind(kind: StatementKind) -> RuleCategory {
         | K::Repeat
         | K::TryCatch
         | K::Block
+        | K::PipeChain
+        | K::MssqlWaitfor
+        | K::MssqlPrint
+        | K::MssqlThrow
+        | K::MssqlRaiserror
+        | K::MysqlDo
         | K::Declare
         | K::DeclareTable
         | K::DeclareCursor

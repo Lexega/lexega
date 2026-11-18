@@ -24,6 +24,8 @@ pub struct MssqlAddSignaturePlan {
     pub signer_kind: SignerKind,
     /// Each inline `WITH PASSWORD = '…'` that unlocks the signer, decoded.
     pub password_literals: Vec<String>,
+    /// The module the signature is added to, as written.
+    pub target: Option<super::ddl_plan::DdlTarget>,
     pub node_id: NodeId,
     pub span: Span,
 }
@@ -37,6 +39,10 @@ pub fn lower_add_signature_to_plan(
         counter: s.counter,
         signer_kind: s.signer_kind,
         password_literals: string_literal_values(&s.password_literal_spans, source),
+        target: s
+            .module
+            .as_ref()
+            .and_then(|module| super::lower_ddl::target_from_name(module, source)),
         node_id: s.node_id,
         span: s.span,
     }

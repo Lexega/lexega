@@ -1,7 +1,7 @@
 [package]
 name = "lexega-cli"
 # Released in lockstep with the Lexega engine; the two version numbers match.
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Command-line interface for the Lexega SQL governance recognition engine: format, analyze and review SQL before it runs"
@@ -18,7 +18,7 @@ name = "lexega"
 path = "src/main.rs"
 
 [dependencies]
-lexega-core = { path = "../lexega-core", version = "3.0.0", features = ["cli"] }
+lexega-core = { path = "../lexega-core", version = "3.1.0", features = ["cli"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
@@ -27,6 +27,11 @@ dunce = "1.0"
 walkdir = "2.5"
 glob = "0.3"
 rayon = "1.10"
+# HTTP for https:// inputs, PR comments and remote MCP servers: TLS by
+# rustls on ring, certificates from the operating system's store, HTTP and
+# SOCKS proxies.
+ureq = { version = "3.5.1", default-features = false, features = ["rustls-no-provider", "platform-verifier", "socks-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -17,6 +17,16 @@ rules:
         - kind: grant
         - privilege.with_grant_option: true
 
+  - id: GRT-UNMASK
+    risk_level: critical
+    message: "UNMASK granted. The grantee reads the values dynamic data masking hides from it."
+    triggers:
+      all_of:
+        - kind: grant
+        - privilege.privileges:
+            exists:
+              other.normalized: { in: [UNMASK] }
+
   - id: GRT-ALL-PRIV
     risk_level: high
     message: "Avoid GRANT ALL PRIVILEGES. Use specific privilege grants to follow the principle of least privilege."
@@ -457,6 +467,39 @@ rules:
               name.normalized:
                 in: [GUEST]
 
+  - id: MYSQL-GRT-SUPER
+    risk_level: critical
+    message: "GRANT SUPER detected. SUPER lets the account change global system variables, kill other sessions, write while the server is read-only, and create routines and views that run as any account (DEFINER), which makes it a path to every privilege on the server. MySQL 8 deprecates it for narrower dynamic privileges; grant the ones the account needs."
+    triggers:
+      all_of:
+        - kind: grant
+        - privilege.privileges:
+            exists:
+              other.normalized:
+                in: [SUPER]
+
+  - id: MYSQL-GRT-FILE
+    risk_level: high
+    message: "GRANT FILE detected. FILE lets the account read and write files on the database server host through LOAD DATA INFILE, SELECT ... INTO OUTFILE and LOAD_FILE(), wherever the server process can and secure_file_priv allows. It is a global privilege and cannot be limited to one database. Verify the account needs server-side files."
+    triggers:
+      all_of:
+        - kind: grant
+        - privilege.privileges:
+            exists:
+              other.normalized:
+                in: [FILE]
+
+  - id: MYSQL-GRT-PROCESS
+    risk_level: medium
+    message: "GRANT PROCESS detected. PROCESS shows the account the statement every session is running (SHOW PROCESSLIST and the process list tables), including literals such as passwords in statements other users run. Verify intent."
+    triggers:
+      all_of:
+        - kind: grant
+        - privilege.privileges:
+            exists:
+              other.normalized:
+                in: [PROCESS]
+
 
   - id: CRED-AWS-LEAK
     risk_level: critical
@@ -659,6 +702,15 @@ rules:
       all_of:
         - query.file_exports:
             exists: true
+
+  - id: MYSQL-LOAD-FILE
+    risk_level: high
+    message: "LOAD_FILE() reads a file on the database server host into the query. It returns the content of any file the server process can read and secure_file_priv allows, so server configuration, keys and other databases' files can be read through SQL. Verify the path is fixed and the file is meant to be read by the database."
+    triggers:
+      query.function_calls:
+        exists:
+          name.normalized:
+            in: [LOAD_FILE]
 
   - id: MSSQL-OPENROWSET-INLINE-CRED
     risk_level: critical
@@ -3972,6 +4024,14 @@ rules:
         - kind: drop_schema
         - ddl.schema.drops_contents: true
 
+  - id: SCHEMA-REPLACE
+    risk_level: critical
+    message: "CREATE OR REPLACE SCHEMA replaces any schema of that name: every table and row in it is dropped."
+    triggers:
+      all_of:
+        - kind: create_schema
+        - ddl.options.or_replace: true
+
   - id: SCHEMA-DROP-RESTRICT
     risk_level: medium
     message: "DROP SCHEMA without CASCADE: the drop is refused while the schema holds any object, and removes it once empty. Verify nothing still depends on the schema."
@@ -5057,7 +5117,7 @@ rules:
 
   - id: TBL-REPLACE
     risk_level: high
-    message: "CREATE OR REPLACE TABLE detected. Existing table definition (and potentially data semantics) is replaced."
+    message: "CREATE OR REPLACE TABLE replaces any table of that name: every row it holds is dropped."
     triggers:
       all_of:
         - kind: create_table
@@ -5134,6 +5194,16 @@ rules:
       all_of:
         - kind: alter_table
         - ddl.table.aggregation_policy_removed: true
+
+  - id: TBL-SWAP
+    risk_level: critical
+    message: "ALTER TABLE SWAP WITH exchanges the two tables: the table's rows and definition are replaced by the other table's."
+    triggers:
+      all_of:
+        - kind: alter_table
+        - ddl.table.actions:
+            exists:
+              kind: swap_with
 
   - id: TBL-JOINPOL-SET
     risk_level: info
@@ -6263,13 +6333,16 @@ rules:
 
   - id: DML-WRITE-UNBOUNDED
     risk_level: critical
-    message: "Unbounded write operation detected - the statement has no WHERE clause or its WHERE clause matches every row. This affects ALL rows in the target table(s)."
+    message: "Unbounded write operation detected - the statement has no WHERE clause, or its WHERE clause matches every row (a comparison such as `id = id` spares only the rows where `id` is NULL). This affects ALL rows in the target table(s)."
     triggers:
       all_of:
         - kind: { in: [delete, update, merge] }
         - any_of:
             - query.has_where: false
             - query.has_tautology_where: true
+            # `x = x`, or disjuncts that cover every value of `x`, spare
+            # only the rows where `x` is NULL.
+            - query.has_non_null_tautology_where: true
         # A join, or the query a table is written through, bounds the
         # rows of every table the statement writes.
         - not:
@@ -6287,14 +6360,22 @@ rules:
                               - not:
                                   percent: true
                               - count: { lt: 100 }
-        # A cap on the rows written bounds them, unless it may be every row.
+        # A cap on the rows written bounds them, unless it may be every row:
+        # a percent of 100 or more, or a count at the largest values, the
+        # idiom for no cap (MySQL's `LIMIT 18446744073709551615`).
         - not:
             all_of:
               - query.target_rows.cap: { exists: true }
               - any_of:
-                  - not:
-                      query.target_rows.cap.percent: true
-                  - query.target_rows.cap.count: { lt: 100 }
+                  - all_of:
+                      - not:
+                          query.target_rows.cap.percent: true
+                      - any_of:
+                          - query.target_rows.cap.count: { exists: false }
+                          - query.target_rows.cap.count: { lt: 2147483647 }
+                  - all_of:
+                      - query.target_rows.cap.percent: true
+                      - query.target_rows.cap.count: { lt: 100 }
         # A temporary table or a table variable is the session's own.
         - not:
             query.writes_table:
@@ -8109,6 +8190,14 @@ rules:
       all_of:
         - kind: drop_database
 
+  - id: DB-REPLACE
+    risk_level: critical
+    message: "CREATE OR REPLACE DATABASE replaces any database of that name: every schema, table and row in it is dropped."
+    triggers:
+      all_of:
+        - kind: create_database
+        - ddl.options.or_replace: true
+
   - id: INFO-DB-NEW
     risk_level: info
     message: "Database created. New database provisioned."
@@ -8539,6 +8628,89 @@ rules:
               all_of:
                 - name: subsystem
                 - value_literal: cmdexec
+
+  - id: MSSQL-XP-FILESYSTEM
+    risk_level: high
+    message: "Extended procedure reads the server's file system (xp_dirtree, xp_fileexist, xp_subdirs). It lists directories or tests for a file as the SQL Server service account, and given a UNC path (\\\\host\\share) it makes the server authenticate to that host over SMB, where the service account's credentials can be captured or relayed. Verify the path is local and fixed, and that the caller needs it."
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - mssql_exec.procedure_name:
+            in: [xp_dirtree, xp_fileexist, xp_subdirs]
+
+  - id: MSSQL-XP-REGISTRY-READ
+    risk_level: high
+    message: "Extended procedure reads the Windows registry (xp_regread, xp_instance_regread, xp_regenumkeys, xp_regenumvalues and their instance forms). It returns keys and values as the SQL Server service account, which can include service configuration and stored credentials. Verify the key read is one the script needs."
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - mssql_exec.procedure_name:
+            in:
+              - xp_regread
+              - xp_instance_regread
+              - xp_regenumkeys
+              - xp_instance_regenumkeys
+              - xp_regenumvalues
+              - xp_instance_regenumvalues
+
+  - id: MSSQL-XP-REGISTRY-WRITE
+    risk_level: critical
+    message: "Extended procedure changes the Windows registry (xp_regwrite, xp_regdeletekey, xp_regdeletevalue, the multi-string forms and their instance forms). It writes or deletes keys as the SQL Server service account: a way to change server and operating-system configuration from SQL, including what runs at startup. Require explicit approval."
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - mssql_exec.procedure_name:
+            in:
+              - xp_regwrite
+              - xp_instance_regwrite
+              - xp_regdeletekey
+              - xp_instance_regdeletekey
+              - xp_regdeletevalue
+              - xp_instance_regdeletevalue
+              - xp_regaddmultistring
+              - xp_instance_regaddmultistring
+              - xp_regremovemultistring
+              - xp_instance_regremovemultistring
+
+  - id: MSSQL-STARTUP-PROC
+    risk_level: high
+    message: "sp_procoption marks a procedure to run at instance startup. A startup procedure runs with sysadmin rights each time SQL Server starts, with no caller to trace it to, which makes it a persistence mechanism. Verify the procedure named and who can alter it."
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - mssql_exec.procedure_name: sp_procoption
+        # Silent only where the option value is written as off.
+        - not:
+            mssql_exec.args:
+              exists:
+                all_of:
+                  - any_of:
+                      - name: optionvalue
+                      - all_of:
+                          - name:
+                              exists: false
+                          - position: 2
+                  - value_literal:
+                      in: ["off", "false"]
+
+  - id: MSSQL-DBMAIL-EGRESS
+    risk_level: medium
+    message: "sp_send_dbmail sends query results or server files by email (@query, @file_attachments). The rows or files leave the database by mail, beyond its access controls and auditing. Verify the recipients, the query and the attached paths."
+    triggers:
+      all_of:
+        - kind: mssql_exec
+        - mssql_exec.procedure_name: sp_send_dbmail
+        # Named, or far enough along a positional list to reach either.
+        - mssql_exec.args:
+            exists:
+              any_of:
+                - name:
+                    in: [query, file_attachments]
+                - all_of:
+                    - name:
+                        exists: false
+                    - position:
+                        gte: 11
 
   - id: MSSQL-SRVROLE-MEMBER-ADD
     risk_level: high

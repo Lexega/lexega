@@ -11,10 +11,10 @@
 //!
 //! | Dialect      | Shape                                                          |
 //! |--------------|----------------------------------------------------------------|
-//! | T-SQL        | `@name TYPE [= default] [OUTPUT|OUT|READONLY]`                  |
-//! | PostgreSQL   | `[IN|OUT|INOUT|VARIADIC] [name] TYPE [DEFAULT expr]`            |
+//! | T-SQL        | `@name TYPE [= default] [OUTPUT\|OUT\|READONLY]`                |
+//! | PostgreSQL   | `[IN\|OUT\|INOUT\|VARIADIC] [name] TYPE [DEFAULT expr]`         |
 //! | Snowflake    | `name TYPE [DEFAULT expr]` (no OUT — return via RETURNS)        |
-//! | MySQL        | `[IN|OUT|INOUT] name TYPE`                                      |
+//! | MySQL        | `[IN\|OUT\|INOUT] name TYPE`                                    |
 //! | BigQuery     | `[name] TYPE`                                                   |
 //! | Databricks   | `name TYPE`                                                     |
 //!

@@ -58,16 +58,12 @@ use super::statement_plan::StatementPlan;
 /// recursively via [`super::lower_dispatch::lower_stmt`]; non-body
 /// variants ignore everything but `inputs.source`.
 ///
-/// A target that names a relation or a principal keeps each part as
-/// written; any other target holds each part folded.
+/// The target names its object with each part as written, quotes and
+/// case kept; a name is compared through the identifiers that fold it
+/// (`IdentKey`, `TableKey`), which keep a quoted part's case where the
+/// dialect makes it count.
 pub fn lower_ddl_stmt(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
-    let mut plan = lower_ddl_plan(stmt, inputs)?;
-    if !target_names_a_relation(stmt, &plan) && !target_names_a_principal(&plan) {
-        if let Some(target) = plan.target.as_mut() {
-            fold_target_parts(target);
-        }
-    }
-    Some(plan)
+    lower_ddl_plan(stmt, inputs)
 }
 
 /// Whether `plan` drops, replaces, renames or swaps a schema or a
@@ -186,21 +182,58 @@ pub(crate) fn target_names_a_relation(stmt: &AstStmt, plan: &DdlPlan) -> bool {
     }
 }
 
-/// Whether the target of `plan` names a principal: a role, a user, a
-/// group, or a login a principal statement names.
-fn target_names_a_principal(plan: &DdlPlan) -> bool {
-    plan.principal_options.is_some()
-        || matches!(
-            plan.object_kind,
-            ObjectKind::Role | ObjectKind::User | ObjectKind::Group
-        )
-}
-
-/// Fold each part of `target` as the identifier normaliser does.
-fn fold_target_parts(target: &mut DdlTarget) {
-    target.name = normalize_identifier(&target.name);
-    for part in [&mut target.schema, &mut target.db].into_iter().flatten() {
-        *part = normalize_identifier(part);
+/// The kind of object a `DESCRIBE` of `kind` describes; `Generic` where no
+/// public kind names it.
+fn described_object_kind(kind: &crate::ast::AstDescribeKind) -> ObjectKind {
+    use crate::ast::AstDescribeKind as D;
+    match kind {
+        D::Table | D::EventTable | D::IcebergTable | D::Detail | D::SearchOptimization => {
+            ObjectKind::Table
+        }
+        D::View => ObjectKind::View,
+        D::MaterializedView => ObjectKind::MaterializedView,
+        D::DynamicTable => ObjectKind::DynamicTable,
+        D::ExternalTable => ObjectKind::ExternalTable,
+        D::Function => ObjectKind::Function,
+        D::Procedure => ObjectKind::Procedure,
+        D::MaskingPolicy => ObjectKind::MaskingPolicy,
+        D::RowAccessPolicy => ObjectKind::RowAccessPolicy,
+        D::AggregationPolicy => ObjectKind::AggregationPolicy,
+        D::ProjectionPolicy => ObjectKind::ProjectionPolicy,
+        D::JoinPolicy => ObjectKind::JoinPolicy,
+        D::NetworkPolicy => ObjectKind::NetworkPolicy,
+        D::PasswordPolicy => ObjectKind::PasswordPolicy,
+        D::SessionPolicy => ObjectKind::SessionPolicy,
+        D::AuthenticationPolicy => ObjectKind::AuthenticationPolicy,
+        D::NetworkRule => ObjectKind::NetworkRule,
+        D::Stage => ObjectKind::Stage,
+        D::FileFormat => ObjectKind::FileFormat,
+        D::Stream => ObjectKind::Stream,
+        D::Pipe => ObjectKind::Pipe,
+        D::Task => ObjectKind::Task,
+        D::Alert => ObjectKind::Alert,
+        D::Sequence => ObjectKind::Sequence,
+        D::Schema => ObjectKind::Schema,
+        D::Database => ObjectKind::Database,
+        D::Catalog => ObjectKind::Catalog,
+        D::Warehouse => ObjectKind::Warehouse,
+        D::User => ObjectKind::User,
+        D::Share => ObjectKind::Share,
+        D::Secret => ObjectKind::Secret,
+        D::Credential => ObjectKind::StorageCredential,
+        D::ExternalLocation => ObjectKind::ExternalLocation,
+        D::Volume => ObjectKind::Volume,
+        D::PackagesPolicy
+        | D::Integration
+        | D::Streamlit
+        | D::Service
+        | D::Connection
+        | D::Provider
+        | D::Recipient
+        | D::Result
+        | D::Transaction
+        | D::Query
+        | D::Other => ObjectKind::Generic,
     }
 }
 
@@ -1476,8 +1509,10 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         }
         AstStmt::Describe(s) => Some(simple(
             DdlAction::Configure,
-            ObjectKind::Generic,
-            None,
+            described_object_kind(&s.kind),
+            s.object
+                .as_ref()
+                .and_then(|name| target_from_name(name, source)),
             s.node_id,
             s.span,
         )),
@@ -1539,7 +1574,7 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         )),
         AstStmt::AnalyzeStmt(s) => Some(simple(
             DdlAction::Configure,
-            ObjectKind::Generic,
+            ObjectKind::Table,
             optional_target_from(s.table_name, source),
             s.node_id,
             s.span,
@@ -1709,7 +1744,20 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
             s.span,
         )),
         AstStmt::AlterIndex(s) => {
-            let mut p = simple(DdlAction::Alter, ObjectKind::Index, None, s.node_id, s.span);
+            let index = match &s.action {
+                crate::ast::AlterIndexAction::Named { name, .. } => target_from(*name, source),
+                crate::ast::AlterIndexAction::OnObject { name, .. } => {
+                    optional_target_from(*name, source)
+                }
+                crate::ast::AlterIndexAction::AllInTablespace { .. } => None,
+            };
+            let mut p = simple(
+                DdlAction::Alter,
+                ObjectKind::Index,
+                index,
+                s.node_id,
+                s.span,
+            );
             p.pg_index = Some(crate::ir::ddl_plan::IrIndexDetail {
                 action: project_ast_alter_index_action(&s.action),
             });
@@ -1717,7 +1765,13 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         }
         AstStmt::Reindex(s) => Some(simple(
             DdlAction::Configure,
-            ObjectKind::Index,
+            match s.target_type {
+                crate::ast::ReindexTargetType::Index => ObjectKind::Index,
+                crate::ast::ReindexTargetType::Table => ObjectKind::Table,
+                crate::ast::ReindexTargetType::Schema => ObjectKind::Schema,
+                crate::ast::ReindexTargetType::Database => ObjectKind::Database,
+                crate::ast::ReindexTargetType::System => ObjectKind::Generic,
+            },
             optional_target_from(s.name, source),
             s.node_id,
             s.span,
@@ -1802,7 +1856,10 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         AstStmt::PgDeallocate(s) => Some(simple(
             DdlAction::Drop,
             ObjectKind::Generic,
-            None,
+            match s.target {
+                crate::ast::PgDeallocateTarget::Name(name) => target_from(name, source),
+                crate::ast::PgDeallocateTarget::All(_) => None,
+            },
             s.node_id,
             s.span,
         )),
@@ -1867,35 +1924,38 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         AstStmt::PgListen(s) => Some(simple(
             DdlAction::Configure,
             ObjectKind::Generic,
-            None,
+            target_from(s.channel, source),
             s.node_id,
             s.span,
         )),
         AstStmt::PgNotify(s) => Some(simple(
             DdlAction::Configure,
             ObjectKind::Generic,
-            None,
+            optional_target_from(s.channel, source),
             s.node_id,
             s.span,
         )),
         AstStmt::PgUnlisten(s) => Some(simple(
             DdlAction::Configure,
             ObjectKind::Generic,
-            None,
+            optional_target_from(s.channel, source),
             s.node_id,
             s.span,
         )),
+        // The first table locked; the facts list every one.
         AstStmt::PgLockTable(s) => Some(simple(
             DdlAction::Configure,
-            ObjectKind::Generic,
-            None,
+            ObjectKind::Table,
+            s.tables
+                .first()
+                .and_then(|table| target_from_name(table, source)),
             s.node_id,
             s.span,
         )),
         AstStmt::PgCreateRule(s) => Some(with_body(
             DdlAction::Create,
             ObjectKind::PgRule,
-            None,
+            target_from(s.rule_name, source),
             lower_bodies(stmt, inputs),
             s.node_id,
             s.span,
@@ -1951,8 +2011,10 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         )),
         AstStmt::PgCluster(s) => Some(simple(
             DdlAction::Configure,
-            ObjectKind::Generic,
-            None,
+            ObjectKind::Table,
+            s.table
+                .as_ref()
+                .and_then(|table| target_from_name(table, source)),
             s.node_id,
             s.span,
         )),
@@ -2256,14 +2318,7 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         AstStmt::BqCreateSnapshotTable(s) => Some(simple(
             DdlAction::Create,
             ObjectKind::Generic,
-            crate::ir::utils::written_name_parts(source, &s.name).map(|(db, schema, name)| {
-                DdlTarget {
-                    name,
-                    schema,
-                    db,
-                    span: s.name.span,
-                }
-            }),
+            target_from_name(&s.name, source),
             s.node_id,
             s.span,
         )),
@@ -3213,21 +3268,41 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
             *node_id,
             *span,
         )),
-        AstStmt::OpenCursor { node_id, span, .. } => Some(simple(
+        AstStmt::OpenCursor {
+            node_id,
+            span,
+            cursor_name_span,
+            ..
+        } => Some(simple(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
-            None,
+            target_from(*cursor_name_span, source),
             *node_id,
             *span,
         )),
         // MySQL administration: the kind carries it.
-        AstStmt::MysqlAdmin(admin) => Some(simple(
-            DdlAction::ControlFlow,
-            ObjectKind::Generic,
-            None,
-            admin.node_id,
-            admin.span,
-        )),
+        // A table maintenance statement's target is the first table it
+        // names; the facts list every one.
+        AstStmt::MysqlAdmin(admin) => {
+            let (object_kind, target) = match &admin.kind {
+                crate::ast::AstMysqlAdminKind::TableMaintenance { tables, .. } => (
+                    ObjectKind::Table,
+                    tables.first().and_then(|table| target_from(*table, source)),
+                ),
+                crate::ast::AstMysqlAdminKind::Flush { .. }
+                | crate::ast::AstMysqlAdminKind::Kill { .. }
+                | crate::ast::AstMysqlAdminKind::AlterInstance
+                | crate::ast::AstMysqlAdminKind::Xa
+                | crate::ast::AstMysqlAdminKind::RenameUser { .. } => (ObjectKind::Generic, None),
+            };
+            Some(simple(
+                DdlAction::ControlFlow,
+                object_kind,
+                target,
+                admin.node_id,
+                admin.span,
+            ))
+        }
         // MySQL's function from a shared library.
         AstStmt::MysqlCreateLoadableFunction(f) => Some(simple(
             DdlAction::Create,
@@ -3252,17 +3327,27 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
             d.node_id,
             d.span,
         )),
-        AstStmt::FetchCursor { node_id, span, .. } => Some(simple(
+        AstStmt::FetchCursor {
+            node_id,
+            span,
+            cursor_name_span,
+            ..
+        } => Some(simple(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
-            None,
+            target_from(*cursor_name_span, source),
             *node_id,
             *span,
         )),
-        AstStmt::CloseCursor { node_id, span, .. } => Some(simple(
+        AstStmt::CloseCursor {
+            node_id,
+            span,
+            cursor_name_span,
+            ..
+        } => Some(simple(
             DdlAction::ControlFlow,
             ObjectKind::Generic,
-            None,
+            target_from(*cursor_name_span, source),
             *node_id,
             *span,
         )),
@@ -3331,7 +3416,7 @@ fn lower_ddl_plan(stmt: &AstStmt, inputs: &IrLowerInputs) -> Option<DdlPlan> {
         AstStmt::Savepoint(s) => Some(simple(
             DdlAction::Transaction,
             ObjectKind::Generic,
-            None,
+            target_from(s.name.span, source),
             s.node_id,
             s.span,
         )),
@@ -4408,6 +4493,7 @@ fn lower_bodies(stmt: &AstStmt, inputs: &IrLowerInputs) -> Vec<Rc<StatementPlan>
             | crate::ast::BodyRole::InsertExec => false,
             crate::ast::BodyRole::Declarations
             | crate::ast::BodyRole::Block
+            | crate::ast::BodyRole::Pipe
             | crate::ast::BodyRole::Branch
             | crate::ast::BodyRole::Else
             | crate::ast::BodyRole::Loop
@@ -5078,8 +5164,33 @@ pub(crate) fn target_from(span: Span, source: &str) -> Option<DdlTarget> {
     if start >= end || end > source.len() {
         return None;
     }
-    let raw = &source[start..end];
-    let parts = split_qualified(raw);
+    target_of_parts(&relation_parts_written(&source[start..end]), span)
+}
+
+/// The parts of the relation name `text` writes, each as written
+/// ([`crate::ir::utils::relation_written_parts`]).
+pub(crate) fn relation_parts_written(text: &str) -> Vec<String> {
+    crate::ir::utils::relation_written_parts(split_qualified(text).into_iter().map(Some).collect())
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The table of the column whose qualified name `source` writes at `span`
+/// (`db.schema.table.column`): every part but the last.
+pub(crate) fn column_table_target(span: Span, source: &str) -> Option<DdlTarget> {
+    let start = span.start as usize;
+    let end = span.end as usize;
+    if start >= end || end > source.len() {
+        return None;
+    }
+    let parts = split_qualified(&source[start..end]);
+    let (_column, table) = parts.split_last()?;
+    target_of_parts(table, span)
+}
+
+/// The target named by `parts`, its last three as name, schema, database.
+fn target_of_parts(parts: &[String], span: Span) -> Option<DdlTarget> {
     let len = parts.len();
     if len == 0 {
         return None;
@@ -5123,9 +5234,14 @@ pub(crate) fn target_from_name(name: &crate::ast::AstObjectRef, source: &str) ->
         let (db, schema, table) = crate::ir::utils::written_name_parts(source, name)?;
         Some([db, schema, Some(table)].into_iter().flatten().collect())
     });
-    let Some(mut written) = written else {
+    let Some(written) = written else {
         return target_from(name.span, source);
     };
+    let mut written: Vec<String> =
+        crate::ir::utils::relation_written_parts(written.into_iter().map(Some).collect())
+            .into_iter()
+            .flatten()
+            .collect();
     let table = written.pop()?;
     let schema = written.pop();
     let db = written.pop();
@@ -5657,52 +5773,29 @@ pub(crate) fn split_qualified(s: &str) -> Vec<String> {
 
 /// [`split_qualified`] of a name written as text, never `IDENTIFIER(…)`.
 fn split_qualified_text(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut quote_close: Option<char> = None;
+    split_qualified_parts(s, false)
+}
 
-    for ch in s.chars() {
-        match quote_close {
-            Some(close) => {
-                current.push(ch);
-                if ch == close {
-                    quote_close = None;
-                }
-            }
-            None => match ch {
-                '"' => {
-                    current.push(ch);
-                    quote_close = Some('"');
-                }
-                '`' => {
-                    current.push(ch);
-                    quote_close = Some('`');
-                }
-                '[' => {
-                    current.push(ch);
-                    quote_close = Some(']');
-                }
-                '.' => {
-                    let trimmed = current.trim();
-                    if !trimmed.is_empty() {
-                        parts.push(trimmed.to_string());
-                    }
-                    current.clear();
-                }
-                c if c.is_whitespace() => {
-                    // Skip whitespace at the top level so spans that
-                    // include trailing trivia still parse cleanly.
-                }
-                _ => current.push(ch),
-            },
-        }
-    }
+/// The parts of the dotted name `s`, as [`split_qualified`] reads them,
+/// with an empty part kept where two dots meet (`db..name`).
+pub(crate) fn split_qualified_keeping_empty(s: &str) -> Vec<String> {
+    split_qualified_parts(s, true)
+}
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        parts.push(trimmed.to_string());
-    }
-    parts
+/// The parts of the dotted name `s` ([`crate::ir::utils::dotted_name_segments`]),
+/// each trimmed of the whitespace around it; an empty part kept only where
+/// `keep_empty` says.
+fn split_qualified_parts(s: &str, keep_empty: bool) -> Vec<String> {
+    crate::ir::utils::dotted_name_segments(s, 0)
+        .into_iter()
+        .map(|segment| {
+            crate::ir::utils::slice_span(s, segment)
+                .unwrap_or("")
+                .trim()
+        })
+        .filter(|part| keep_empty || !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

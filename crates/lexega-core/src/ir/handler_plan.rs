@@ -504,6 +504,7 @@ fn collect_body_statement_kinds(stmt: &AstStmt, kinds: &mut Vec<HandlerBodyState
             | crate::ast::BodyRole::InsertExec => continue,
             crate::ast::BodyRole::Declarations
             | crate::ast::BodyRole::Block
+            | crate::ast::BodyRole::Pipe
             | crate::ast::BodyRole::Branch
             | crate::ast::BodyRole::Else
             | crate::ast::BodyRole::Loop

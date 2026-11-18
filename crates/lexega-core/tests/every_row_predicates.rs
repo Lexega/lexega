@@ -191,6 +191,31 @@ fn is_not_null_alone_is_not_every_row() {
 }
 
 #[test]
+fn a_comparison_that_spares_only_null_rows_leaves_a_write_unbounded() {
+    for sql in [
+        "DELETE FROM orders WHERE id = id;",
+        "UPDATE orders SET status = 'x' WHERE id >= id;",
+        "DELETE FROM orders WHERE orders.id <= orders.id;",
+        "DELETE FROM orders WHERE x = 1 OR x <> 1;",
+        "DELETE FROM orders WHERE id = id OR region = 'EU';",
+        "MERGE INTO orders USING s ON orders.id = orders.id WHEN MATCHED THEN DELETE;",
+    ] {
+        let ids = rule_ids(sql);
+        assert!(ids.contains("DML-WRITE-UNBOUNDED"), "{sql}: {ids:?}");
+    }
+    for sql in [
+        "DELETE FROM orders WHERE id = id AND region = 'EU';",
+        "DELETE FROM orders WHERE id <> id;",
+        "DELETE FROM orders WHERE id < id;",
+        "DELETE FROM orders WHERE id = parent_id;",
+        "DELETE FROM orders WHERE NOT (deleted_at IS NULL);",
+    ] {
+        let ids = rule_ids(sql);
+        assert!(!ids.contains("DML-WRITE-UNBOUNDED"), "{sql}: {ids:?}");
+    }
+}
+
+#[test]
 fn a_predicate_on_the_current_date_is_reported() {
     let ids = rule_ids("SELECT id FROM orders WHERE created_at > CURRENT_DATE;");
     assert!(ids.contains("INFO-Q-PRED-TEMPORAL"), "{ids:?}");

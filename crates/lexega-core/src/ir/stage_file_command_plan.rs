@@ -24,6 +24,11 @@ pub struct StageFileCommandPlan {
     /// The `@<stage>` reference (data source/target), as written, when present.
     pub stage_ref: Option<String>,
     pub stage_ref_span: Option<Span>,
+    /// The named stage the reference names, as written; `None` for a user
+    /// (`@~`) or table (`@%t`) stage, and where there is no reference.
+    pub target: Option<super::ddl_plan::DdlTarget>,
+    /// The path written against the stage's name, from its `/`.
+    pub path: Option<Span>,
     pub node_id: NodeId,
     pub span: Span,
 }
@@ -44,6 +49,11 @@ pub fn lower_stage_file_command_to_plan(
             .and_then(|sp| slice_span(source, sp))
             .map(|t| t.trim().to_string()),
         stage_ref_span: s.stage_ref_span,
+        target: s
+            .stage
+            .as_ref()
+            .and_then(|stage| super::lower_ddl::target_from_name(&stage.name, source)),
+        path: s.stage.as_ref().and_then(|stage| stage.path),
         node_id: s.node_id,
         span: s.span,
     }

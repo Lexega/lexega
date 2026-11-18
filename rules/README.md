@@ -1,6 +1,6 @@
 # Lexega rule corpus
 
-The built-in rules of [Lexega](https://lexega.com): 957 predicates over the
+The built-in rules of [Lexega](https://lexega.com): 970 predicates over the
 facts [`lexega-core`](../crates/lexega-core) extracts from a SQL statement,
 written as data in [`builtin_rules.yaml`](builtin_rules.yaml).
 
@@ -111,7 +111,7 @@ text stays unrendered. A team that wants them reported replaces
 
 ## What is in it
 
-By severity: 91 critical, 80 high, 286 medium, 194 low, 306 info.
+By severity: 97 critical, 85 high, 288 medium, 194 low, 306 info.
 
 An identifier starts with what the rule looks at: a platform (`SNW-`
 Snowflake, `MSSQL-`, `PG-` PostgreSQL, `DBX-` Databricks, `BQ-` BigQuery,

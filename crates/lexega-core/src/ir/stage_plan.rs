@@ -81,9 +81,10 @@ pub struct StagePlan {
     /// `NAME = VALUE` copy options carried from a `COPY INTO` statement
     /// (either direction). Empty for CREATE / ALTER / DROP STAGE.
     pub copy_options: Vec<AstCopyOption>,
-    /// DDL target object. Carries the loaded table for
-    /// `COPY INTO <table>` (`CopyToTable`); `None` for the other actions,
-    /// whose facts have never carried a stage/location target.
+    /// DDL target object, as written: the stage a CREATE, ALTER or DROP
+    /// STAGE names, the stage `COPY INTO @stage` unloads to, and the table a
+    /// `COPY INTO <table>` or Redshift `COPY` loads. `None` for the other
+    /// actions.
     pub target: Option<DdlTarget>,
     pub node_id: NodeId,
     pub span: Span,
@@ -232,7 +233,7 @@ pub fn lower_create_stage_to_stage_plan(
     StagePlan {
         action: StageAction::Create,
         copy_options: Vec::new(),
-        target: None,
+        target: super::lower_ddl::target_from(s.name_span, source),
         or_replace: s.or_replace_span.is_some(),
         credentials,
         url_span: s
@@ -328,7 +329,7 @@ pub fn lower_alter_stage_to_stage_plan(
     StagePlan {
         action: StageAction::Alter,
         copy_options: Vec::new(),
-        target: None,
+        target: super::lower_ddl::target_from(s.name_span, source),
         or_replace: false,
         credentials,
         url_literal,
@@ -360,7 +361,10 @@ pub fn lower_drop_stage_to_stage_plan(s: &AstDrop, source: &str) -> Option<Stage
     Some(StagePlan {
         action: StageAction::Drop,
         copy_options: Vec::new(),
-        target: None,
+        target: s
+            .target_name
+            .as_ref()
+            .and_then(|name| super::lower_ddl::target_from_name(name, source)),
         or_replace: false,
         credentials: StageCredentials::None,
         url_literal: None,
@@ -426,6 +430,7 @@ pub fn lower_copy_into_location_to_stage_plan(
     location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
     copy_options: &[AstCopyOption],
+    into_stage: Option<&crate::ast::AstStageRef>,
 ) -> StagePlan {
     let creds = if credentials.is_empty() {
         StageCredentials::None
@@ -452,7 +457,8 @@ pub fn lower_copy_into_location_to_stage_plan(
         unbounded_export,
         has_unknown_clauses: false,
         copy_options: copy_options.to_vec(),
-        target: None,
+        target: into_stage
+            .and_then(|stage| super::lower_ddl::target_from_name(&stage.name, source)),
         node_id,
         span,
     }
@@ -567,6 +573,7 @@ pub fn lower_redshift_copy_to_stage_plan(
     source: &str,
     location: StageLocation<'_>,
     credentials: &[AstStageCredentialOption],
+    table_name: Span,
 ) -> StagePlan {
     let creds = if credentials.is_empty() {
         StageCredentials::None
@@ -580,7 +587,7 @@ pub fn lower_redshift_copy_to_stage_plan(
     StagePlan {
         action: StageAction::Load,
         copy_options: Vec::new(),
-        target: None,
+        target: super::lower_ddl::target_from(table_name, source),
         or_replace: false,
         credentials: creds,
         url_literal,

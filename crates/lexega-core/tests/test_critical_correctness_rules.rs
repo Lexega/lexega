@@ -493,3 +493,100 @@ fn test_view_drop_rule() {
         rule_ids(&report)
     );
 }
+
+/// The rules, findings and context alike, that `sql` raises read as
+/// `dialect`.
+fn rules_in(sql: &str, dialect: lexega_core::dialect::DialectRef) -> HashSet<String> {
+    let config = AnalysisConfig {
+        dialect: Some(dialect),
+        ..Default::default()
+    };
+    let report = analyze_risk_with_policy_config(sql, &config).expect("analysis");
+    report
+        .entries()
+        .map(|entry| {
+            let RuleMatch::Analysis(finding) = entry;
+            finding.matched_rule.clone()
+        })
+        .collect()
+}
+
+#[test]
+fn replacing_a_database_or_a_schema_is_critical() {
+    use lexega_core::dialect::snowflake;
+    assert!(rules_in("CREATE OR REPLACE DATABASE prod", snowflake()).contains("DB-REPLACE"));
+    assert!(!rules_in("CREATE DATABASE prod", snowflake()).contains("DB-REPLACE"));
+    assert!(rules_in("CREATE OR REPLACE SCHEMA a.b", snowflake()).contains("SCHEMA-REPLACE"));
+    assert!(!rules_in("CREATE SCHEMA IF NOT EXISTS a.b", snowflake()).contains("SCHEMA-REPLACE"));
+}
+
+#[test]
+fn swapping_a_table_is_critical() {
+    use lexega_core::dialect::snowflake;
+    let swapped = rules_in(
+        "ALTER TABLE analytics.orders SWAP WITH analytics.orders_empty",
+        snowflake(),
+    );
+    assert!(swapped.contains("TBL-SWAP"), "{swapped:?}");
+    assert!(
+        !rules_in("ALTER TABLE analytics.orders RENAME TO o2", snowflake()).contains("TBL-SWAP")
+    );
+}
+
+#[test]
+fn removing_sql_server_masking_is_critical() {
+    use lexega_core::dialect::mssql;
+    assert!(rules_in(
+        "ALTER TABLE dbo.Customers ALTER COLUMN SSN DROP MASKED",
+        mssql()
+    )
+    .contains("TBL-MASK-RMV"));
+    for unmask in [
+        "GRANT UNMASK TO ReportingRole",
+        "GRANT UNMASK ON dbo.Customers(SSN) TO ReportingRole",
+        "GRANT UNMASK ON SCHEMA::dbo TO ReportingRole",
+    ] {
+        assert!(rules_in(unmask, mssql()).contains("GRT-UNMASK"), "{unmask}");
+    }
+    assert!(
+        !rules_in("GRANT SELECT ON dbo.Customers TO ReportingRole", mssql()).contains("GRT-UNMASK")
+    );
+}
+
+#[test]
+fn a_column_level_grant_to_public_is_seen() {
+    use lexega_core::dialect::{mssql, mysql, postgres};
+    assert!(rules_in(
+        "GRANT SELECT (ssn, email) ON customers TO PUBLIC",
+        postgres()
+    )
+    .contains("GRT-TO-PUBLIC"));
+    assert!(
+        rules_in("GRANT SELECT (SSN) ON dbo.Customers TO public", mssql())
+            .contains("GRT-TO-PUBLIC")
+    );
+    assert!(
+        rules_in("GRANT SELECT (ssn) ON db.customers TO ''@'%'", mysql()).contains("GRT-TO-PUBLIC")
+    );
+}
+
+#[test]
+fn a_cap_at_the_no_limit_idiom_bounds_nothing() {
+    use lexega_core::dialect::{mssql, mysql};
+    for unbounded in [
+        "DELETE FROM users LIMIT 18446744073709551615",
+        "DELETE FROM users WHERE 1",
+        "DELETE FROM users WHERE 1 BETWEEN 0 AND 2",
+        "UPDATE users SET a = 1 WHERE 'x' LIKE '%'",
+    ] {
+        assert!(
+            rules_in(unbounded, mysql()).contains("DML-WRITE-UNBOUNDED"),
+            "{unbounded}"
+        );
+    }
+    assert!(!rules_in("DELETE FROM users LIMIT 1000", mysql()).contains("DML-WRITE-UNBOUNDED"));
+    assert!(!rules_in("DELETE FROM users LIMIT @n", mysql()).contains("DML-WRITE-UNBOUNDED"));
+    assert!(
+        !rules_in("DELETE TOP (10) PERCENT FROM users", mssql()).contains("DML-WRITE-UNBOUNDED")
+    );
+}

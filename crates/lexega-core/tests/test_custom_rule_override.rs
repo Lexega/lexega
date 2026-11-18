@@ -654,3 +654,553 @@ fn a_cloned_configuration_shares_its_corpus() {
     };
     assert!(std::sync::Arc::ptr_eq(run, file));
 }
+
+/// Whether a corpus of the built-ins and `custom_yaml` raises `rule` on
+/// `sql`, read in `dialect`.
+fn custom_rule_fires(
+    custom_yaml: &str,
+    dialect: lexega_core::dialect::DialectRef,
+    rule: &str,
+    sql: &str,
+) -> bool {
+    let config = AnalysisConfig {
+        dialect: Some(dialect),
+        ..config_with_overlay(custom_yaml)
+    };
+    analyze_risk_with_policy_config(sql, &config)
+        .expect("analyze succeeds")
+        .entries()
+        .any(|entry| entry.rule_id() == Some(rule))
+}
+
+/// A custom rule that allows only named procedures to be called reads the
+/// procedure as Snowflake names it: any spelling of an approved name
+/// passes, a quoted name keeps its case, and a call it cannot read, or one
+/// made in a block, is held to the list too.
+#[test]
+fn a_call_allowlist_reads_the_procedure_as_the_database_names_it() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-CALL-ALLOWLIST
+    risk_level: critical
+    message: "Only approved stored procedures may be called."
+    triggers:
+      all_of:
+        - kind: call
+        - any_of:
+            - ddl.target:
+                exists: false
+            - ddl.target.name.canonical:
+                not_in: [PROD.CORE.REFRESH_ORDERS]
+"#;
+    let fires = |sql: &str| {
+        custom_rule_fires(
+            RULES,
+            lexega_core::dialect::snowflake(),
+            "ORG-CALL-ALLOWLIST",
+            sql,
+        )
+    };
+    for sql in [
+        "CALL prod.core.refresh_orders('2024-01-01');",
+        "call PROD.Core.Refresh_Orders();",
+        r#"CALL "PROD"."CORE"."REFRESH_ORDERS"();"#,
+    ] {
+        assert!(!fires(sql), "{sql}");
+    }
+    for sql in [
+        "CALL prod.core.purge_all();",
+        r#"CALL "prod"."core"."refresh_orders"();"#,
+        "CALL refresh_orders();",
+        "BEGIN CALL prod.core.purge_all(); END;",
+    ] {
+        assert!(fires(sql), "{sql}");
+    }
+}
+
+/// A quoted name keeps the case the dialect gives it in the facts a custom
+/// rule reads: PostgreSQL folds `MyDomain` to `mydomain` and keeps
+/// `"MyDomain"`. A rule's literal on a `normalized` name folds the same
+/// way, so the quoted literal names the case-sensitive domain.
+#[test]
+fn a_custom_rule_reads_a_quoted_name_with_its_case() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-DOMAIN-GUARD
+    risk_level: high
+    message: "The MyDomain domain is protected."
+    triggers:
+      all_of:
+        - kind: pg_drop_domain
+        - ddl.target.name.name.normalized: '"MyDomain"'
+"#;
+    let fires = |sql: &str| {
+        custom_rule_fires(
+            RULES,
+            lexega_core::dialect::postgres(),
+            "ORG-DOMAIN-GUARD",
+            sql,
+        )
+    };
+    assert!(fires(r#"DROP DOMAIN "MyDomain";"#));
+    assert!(!fires("DROP DOMAIN MyDomain;"));
+}
+
+/// A custom rule on the arguments a statement passes to the routine it
+/// calls holds across dialects: Snowflake's `CALL` and T-SQL's `EXEC`
+/// carry the routine in `ddl.target` and each argument in
+/// `call.arguments`, by position and name, with its value's shape. A value
+/// the rule cannot read, or an argument left out, is held to it too.
+#[test]
+fn a_custom_rule_reads_the_arguments_of_a_call_in_any_dialect() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-PURGE-RETENTION
+    risk_level: critical
+    message: "purge_orders must keep at least 7 days."
+    triggers:
+      all_of:
+        - kind:
+            in: [call, mssql_exec]
+        - ddl.target.name.name.normalized: PURGE_ORDERS
+        - any_of:
+            - call.arguments:
+                exists: false
+            - call.arguments:
+                exists:
+                  all_of:
+                    - position: 0
+                    - any_of:
+                        - value_kind:
+                            not_in: [number]
+                        - value_number:
+                            lt: 7
+"#;
+    let fires = |dialect, sql: &str| custom_rule_fires(RULES, dialect, "ORG-PURGE-RETENTION", sql);
+    let snowflake = lexega_core::dialect::snowflake;
+    let mssql = lexega_core::dialect::mssql;
+    assert!(!fires(snowflake(), "CALL prod.core.purge_orders(30);"));
+    assert!(fires(snowflake(), "CALL prod.core.purge_orders(0);"));
+    assert!(fires(
+        snowflake(),
+        "CALL prod.core.purge_orders(days => 3);"
+    ));
+    assert!(fires(snowflake(), "CALL prod.core.purge_orders(:days);"));
+    assert!(fires(snowflake(), "CALL prod.core.purge_orders();"));
+    assert!(!fires(snowflake(), "CALL prod.core.refresh_orders(0);"));
+    assert!(!fires(mssql(), "EXEC dbo.purge_orders 30;"));
+    assert!(fires(mssql(), "EXEC dbo.purge_orders 0;"));
+    assert!(fires(mssql(), "EXEC dbo.purge_orders @days = 2;"));
+    assert!(fires(mssql(), "EXEC [dbo].[PURGE_ORDERS] @days;"));
+}
+
+/// A custom rule reads the stage a `GET` or `REMOVE` names, and the path
+/// within it: files may not be fetched from an export stage, and may be
+/// removed only under `/tmp/`, a REMOVE of a whole stage included.
+#[test]
+fn a_custom_rule_reads_the_stage_and_path_a_file_command_names() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-NO-EXPORT-GET
+    risk_level: critical
+    message: "Files may not be fetched from an export stage."
+    triggers:
+      all_of:
+        - kind: stage_get
+        - ddl.target.name.canonical:
+            in: [PROD.CORE.EXPORTS]
+  - id: ORG-REMOVE-TMP-ONLY
+    risk_level: critical
+    message: "Files may be removed only under /tmp/."
+    triggers:
+      all_of:
+        - kind: stage_remove
+        - not:
+            ddl.stage.path:
+              matches: "/tmp/*"
+"#;
+    let fires =
+        |rule, sql: &str| custom_rule_fires(RULES, lexega_core::dialect::snowflake(), rule, sql);
+    assert!(fires(
+        "ORG-NO-EXPORT-GET",
+        "GET @prod.core.exports/q3/ file:///tmp/out/;"
+    ));
+    assert!(fires(
+        "ORG-NO-EXPORT-GET",
+        "GET @PROD.CORE.EXPORTS file:///tmp/out/;"
+    ));
+    assert!(!fires(
+        "ORG-NO-EXPORT-GET",
+        "GET @prod.core.landing/q3/ file:///tmp/out/;"
+    ));
+    assert!(!fires(
+        "ORG-REMOVE-TMP-ONLY",
+        "REMOVE @prod.core.raw/tmp/old.csv;"
+    ));
+    assert!(fires(
+        "ORG-REMOVE-TMP-ONLY",
+        "REMOVE @prod.core.raw/2024/old/;"
+    ));
+    assert!(fires("ORG-REMOVE-TMP-ONLY", "REMOVE @prod.core.raw;"));
+}
+
+/// A named list read against an identifier's folded name folds each item
+/// as a literal does: a list allowlist passes every spelling of an approved
+/// procedure and holds a quoted, case-sensitive one to the list, as `not_in`
+/// does; a pattern item folds the same way.
+#[test]
+fn a_named_list_reads_an_identifier_as_a_literal_does() {
+    const RULES: &str = r#"
+lists:
+  approved_procs:
+    values: [prod.core.refresh_orders]
+    patterns: ["PROD.REPORTING.*"]
+rules:
+  - id: ORG-CALL-LIST
+    risk_level: critical
+    message: "Only approved stored procedures may be called."
+    triggers:
+      all_of:
+        - kind: call
+        - any_of:
+            - ddl.target:
+                exists: false
+            - ddl.target.name.canonical:
+                not_in_list: approved_procs
+"#;
+    let fires = |sql: &str| {
+        custom_rule_fires(
+            RULES,
+            lexega_core::dialect::snowflake(),
+            "ORG-CALL-LIST",
+            sql,
+        )
+    };
+    for sql in [
+        "CALL prod.core.refresh_orders();",
+        "call PROD.Core.Refresh_Orders();",
+        r#"CALL "PROD"."CORE"."REFRESH_ORDERS"();"#,
+        "CALL prod.reporting.daily_totals();",
+    ] {
+        assert!(!fires(sql), "{sql}");
+    }
+    for sql in [
+        r#"CALL "prod"."core"."refresh_orders"();"#,
+        "CALL prod.core.purge_all();",
+        "CALL refresh_orders();",
+    ] {
+        assert!(fires(sql), "{sql}");
+    }
+}
+
+/// A custom rule reads the object a statement acts on in `ddl.target`
+/// where it lives in no family of its own: every table a `LOCK TABLE`
+/// names, the table a column comment is on, the database a T-SQL backup
+/// reads, the kind of what a `REINDEX` rebuilds.
+#[test]
+fn a_custom_rule_reads_the_object_a_statement_acts_on() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-LOCK
+    risk_level: high
+    message: "Orders may not be locked."
+    triggers:
+      all_of:
+        - kind: pg_lock_table
+        - ddl.targets:
+            exists:
+              name.canonical: { in: [prod.orders] }
+  - id: ORG-COMMENT
+    risk_level: low
+    message: "Orders' comments are owned by the data team."
+    triggers:
+      all_of:
+        - kind: comment
+        - ddl.target.name.canonical: { in: [PROD.CORE.ORDERS] }
+  - id: ORG-BACKUP
+    risk_level: high
+    message: "The sales database is backed up by the platform team."
+    triggers:
+      all_of:
+        - kind: mssql_backup
+        - ddl.target.name.name.normalized: SALES
+  - id: ORG-REINDEX-TABLE
+    risk_level: low
+    message: "Reindex an index, not a whole table."
+    triggers:
+      all_of:
+        - kind: pg_reindex
+        - ddl.target.kind: table
+"#;
+    let fires = |dialect, rule, sql: &str| custom_rule_fires(RULES, dialect, rule, sql);
+    let (pg, sf, ms) = (
+        lexega_core::dialect::postgres,
+        lexega_core::dialect::snowflake,
+        lexega_core::dialect::mssql,
+    );
+    assert!(fires(
+        pg(),
+        "ORG-LOCK",
+        "LOCK TABLE prod.audit, prod.orders IN EXCLUSIVE MODE;"
+    ));
+    assert!(!fires(
+        pg(),
+        "ORG-LOCK",
+        "LOCK TABLE prod.audit IN EXCLUSIVE MODE;"
+    ));
+    assert!(fires(
+        sf(),
+        "ORG-COMMENT",
+        "COMMENT ON COLUMN prod.core.orders.amount IS 'x';"
+    ));
+    assert!(fires(
+        sf(),
+        "ORG-COMMENT",
+        "COMMENT ON TABLE prod.core.orders IS 'x';"
+    ));
+    assert!(!fires(
+        sf(),
+        "ORG-COMMENT",
+        "COMMENT ON TABLE prod.core.items IS 'x';"
+    ));
+    assert!(fires(
+        ms(),
+        "ORG-BACKUP",
+        "BACKUP DATABASE [sales] TO DISK = 'D:\\b\\s.bak';"
+    ));
+    assert!(fires(
+        pg(),
+        "ORG-REINDEX-TABLE",
+        "REINDEX TABLE prod.orders;"
+    ));
+    assert!(!fires(
+        pg(),
+        "ORG-REINDEX-TABLE",
+        "REINDEX INDEX prod.orders_pk;"
+    ));
+}
+
+/// A custom rule reads the variables a `DECLARE` makes, and the cursor,
+/// channel or savepoint a statement names.
+#[test]
+fn a_custom_rule_reads_declared_variables_and_session_names() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-DECLARE-LITERAL
+    risk_level: low
+    message: "Variables take their values from parameters, not literals."
+    triggers:
+      all_of:
+        - kind: declare
+        - declare.variables:
+            exists:
+              default: string_literal
+  - id: ORG-NOTIFY
+    risk_level: low
+    message: "Only the orders channel is notified."
+    triggers:
+      all_of:
+        - kind: pg_notify
+        - not:
+            ddl.target.name.name.normalized: orders_changed
+  - id: ORG-CURSOR
+    risk_level: low
+    message: "The purge cursor may not be opened."
+    triggers:
+      all_of:
+        - kind: open_cursor
+        - ddl.target.name.name.normalized: PURGE_CURSOR
+"#;
+    let fires = |dialect, rule, sql: &str| custom_rule_fires(RULES, dialect, rule, sql);
+    let (pg, ms) = (lexega_core::dialect::postgres, lexega_core::dialect::mssql);
+    assert!(fires(
+        ms(),
+        "ORG-DECLARE-LITERAL",
+        "DECLARE @key NVARCHAR(50) = N'x';"
+    ));
+    assert!(!fires(ms(), "ORG-DECLARE-LITERAL", "DECLARE @n INT = 1;"));
+    assert!(fires(pg(), "ORG-NOTIFY", "NOTIFY payroll_changed;"));
+    assert!(!fires(pg(), "ORG-NOTIFY", "NOTIFY orders_changed;"));
+    assert!(fires(ms(), "ORG-CURSOR", "OPEN purge_cursor;"));
+    assert!(!fires(ms(), "ORG-CURSOR", "OPEN report_cursor;"));
+}
+
+/// A one-part quoted name holding dots is not the name of its parts, and a
+/// rule's quoted, dotted literal or list item names the object its parts
+/// name: the allowlist holds against both.
+#[test]
+fn a_quoted_name_holding_dots_is_not_the_name_of_its_parts() {
+    const RULES: &str = r#"
+lists:
+  approved_procs:
+    values: ['"analytics".ops.refresh_orders', "[dbo].[usp_rebuild_stats]"]
+rules:
+  - id: ORG-CALL-ALLOWLIST
+    risk_level: critical
+    message: "Only approved stored procedures may be called."
+    triggers:
+      all_of:
+        - kind: call
+        - ddl.target.name.canonical: { not_in: [ANALYTICS.OPS.REFRESH_ORDERS] }
+  - id: ORG-CALL-LISTED
+    risk_level: low
+    message: "A listed procedure."
+    triggers:
+      all_of:
+        - kind: { in: [call, mssql_exec] }
+        - ddl.target.name.canonical: { in_list: approved_procs }
+"#;
+    let fires = |dialect, rule, sql: &str| custom_rule_fires(RULES, dialect, rule, sql);
+    let (sf, ms) = (lexega_core::dialect::snowflake, lexega_core::dialect::mssql);
+    for sql in [
+        r#"CALL "ANALYTICS.OPS.REFRESH_ORDERS"(30);"#,
+        r#"CALL ANALYTICS."OPS.REFRESH_ORDERS"(30);"#,
+        r#"CALL "analytics".ops.refresh_orders(30);"#,
+    ] {
+        assert!(fires(sf(), "ORG-CALL-ALLOWLIST", sql), "{sql}");
+    }
+    assert!(!fires(
+        sf(),
+        "ORG-CALL-ALLOWLIST",
+        "CALL analytics.ops.refresh_orders(30);"
+    ));
+    assert!(fires(
+        sf(),
+        "ORG-CALL-LISTED",
+        r#"CALL "analytics".OPS.Refresh_Orders();"#
+    ));
+    assert!(!fires(
+        sf(),
+        "ORG-CALL-LISTED",
+        "CALL analytics.ops.refresh_orders();"
+    ));
+    assert!(fires(
+        ms(),
+        "ORG-CALL-LISTED",
+        "EXEC dbo.usp_rebuild_stats @days = 7;"
+    ));
+    assert!(!fires(
+        ms(),
+        "ORG-CALL-LISTED",
+        "EXEC [dbo.usp_rebuild_stats] @days = 7;"
+    ));
+}
+
+/// A rule whose path names no fact, below its first field or in a
+/// quantifier's body, or reads a list's elements without naming one, is
+/// refused when it loads; so is a combinator that shares its mapping with
+/// another condition, which would go unread.
+#[test]
+fn a_rule_that_would_read_nothing_is_refused_when_it_loads() {
+    let refusal = |triggers: &str| {
+        let yaml = format!(
+            "rules:\n  - id: ORG-T\n    risk_level: low\n    message: t\n    triggers:\n{triggers}"
+        );
+        match load_v1_rules(&yaml) {
+            Ok(_) => panic!("loaded:\n{triggers}"),
+            Err(error) => error.to_string(),
+        }
+    };
+    let typo = refusal("      ddl.taget.name.canonical: { in: [A.B.C] }\n");
+    assert!(typo.contains("did you mean 'target'"), "{typo}");
+    let body = refusal("      call.arguments: { exists: { value_numbr: { lt: 7 } } }\n");
+    assert!(body.contains("did you mean 'value_number'"), "{body}");
+    let through = refusal("      call.arguments.value_number: { lt: 7 }\n");
+    assert!(through.contains("a list"), "{through}");
+    let beside = refusal(
+        "      not:\n        ddl.target.name.canonical: { in: [A.B.C] }\n        any_of: [ { kind: call } ]\n",
+    );
+    assert!(beside.contains("must stand alone"), "{beside}");
+    for valid in [
+        "      call.arguments: { exists: { value_number: { lt: 7 } } }\n",
+        "      call.arguments.0.value_number: { lt: 7 }\n",
+        "      ddl.target: { exists: false }\n",
+        "      query.scopes: { each: { where_predicates: { each: { root.kind: column } } } }\n",
+    ] {
+        assert!(
+            load_v1_rules(&format!(
+            "rules:\n  - id: ORG-T\n    risk_level: low\n    message: t\n    triggers:\n{valid}"
+        ))
+            .is_ok(),
+            "{valid}"
+        );
+    }
+}
+
+/// A floor on a numeric argument reads the number however it is written:
+/// a decimal, an exponent or a sign.
+#[test]
+fn a_numeric_argument_floor_reads_every_spelling_of_the_number() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-RETENTION-FLOOR
+    risk_level: critical
+    message: "Retention must be at least 7 days."
+    triggers:
+      all_of:
+        - kind: { in: [call, mssql_exec] }
+        - call.arguments:
+            exists:
+              all_of:
+                - any_of: [ { position: 0 }, { name: days } ]
+                - value_number: { lt: 7 }
+  - id: ORG-RETENTION-ONE
+    risk_level: low
+    message: "One day."
+    triggers:
+      call.arguments: { exists: { value_number: 1 } }
+"#;
+    let fires = |dialect, rule, sql: &str| custom_rule_fires(RULES, dialect, rule, sql);
+    let (sf, ms) = (lexega_core::dialect::snowflake, lexega_core::dialect::mssql);
+    for sql in [
+        "CALL ops.purge(3);",
+        "CALL ops.purge(3.0);",
+        "CALL ops.purge(3e0);",
+        "CALL ops.purge(6.5);",
+        "CALL ops.purge(-1);",
+    ] {
+        assert!(fires(sf(), "ORG-RETENTION-FLOOR", sql), "{sql}");
+    }
+    for sql in [
+        "CALL ops.purge(30);",
+        "CALL ops.purge(7.0);",
+        "CALL ops.purge(7e1);",
+    ] {
+        assert!(!fires(sf(), "ORG-RETENTION-FLOOR", sql), "{sql}");
+    }
+    assert!(fires(
+        ms(),
+        "ORG-RETENTION-FLOOR",
+        "EXEC ops.purge @days = 3.0;"
+    ));
+    assert!(fires(sf(), "ORG-RETENTION-ONE", "CALL ops.purge(1.0);"));
+}
+
+/// A statement that names its target by text (MySQL `LOAD DATA`, a BigQuery
+/// path in backticks) names it by its parts, so a rule on its `canonical`
+/// name matches the dotted name; a BigQuery path keeps its case, as a
+/// quoted literal names it.
+#[test]
+fn a_target_named_by_text_is_named_by_its_parts() {
+    const RULES: &str = r#"
+rules:
+  - id: ORG-NO-LOAD-ORDERS
+    risk_level: high
+    message: "Orders are not bulk loaded."
+    triggers:
+      ddl.target.name.canonical: { in: [prod.orders, '`prod.core.orders`'] }
+"#;
+    let fires = |dialect, sql: &str| custom_rule_fires(RULES, dialect, "ORG-NO-LOAD-ORDERS", sql);
+    assert!(fires(
+        lexega_core::dialect::mysql(),
+        "LOAD DATA INFILE '/tmp/o.csv' INTO TABLE prod.orders FIELDS TERMINATED BY ',';"
+    ));
+    assert!(fires(
+        lexega_core::dialect::bigquery(),
+        "LOAD DATA INTO `prod.core.orders` FROM FILES (format = 'CSV', uris = ['gs://b/o.csv']);"
+    ));
+    assert!(!fires(
+        lexega_core::dialect::mysql(),
+        "LOAD DATA INFILE '/tmp/o.csv' INTO TABLE `prod.orders` FIELDS TERMINATED BY ',';"
+    ));
+}
